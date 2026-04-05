@@ -255,11 +255,37 @@ pub fn modal_backdrop(pal: &Palette) -> container::Style {
 /// Selected file/item highlight.
 pub fn selected_item(pal: &Palette) -> container::Style {
     container::Style {
-        background: Some(Background::Color(pal.accent_dim)),
+        background: Some(Background::Color(pal.surface_active)),
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
             radius: 5.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Hovered item highlight.
+pub fn hovered_item(pal: &Palette) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(pal.surface_hover)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 5.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Danger/destructive action container.
+pub fn danger_surface(pal: &Palette) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color { a: 0.1, ..pal.danger })),
+        border: Border {
+            color: pal.danger,
+            width: 1.0,
+            radius: 6.0.into(),
         },
         ..Default::default()
     }

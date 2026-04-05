@@ -108,8 +108,6 @@ enum Message {
 
     /// Background image loaded from disk
     BackgroundLoaded(usize, Option<Vec<u8>>),
-    /// Unsplash thumbnail bytes loaded
-    UnsplashThumbnailLoaded(String, Vec<u8>),
     /// Unsplash photo downloaded to disk
     UnsplashDownloaded {
         filename: String,
@@ -120,6 +118,10 @@ enum Message {
     LocalFileCopied(String),
     /// Background config saved
     BackgroundConfigSaved,
+    /// Agent context files synced (WORKSHOP.md etc.)
+    AgentContextSynced,
+    /// Periodic sparks poll tick
+    SparksPoll,
 }
 
 impl std::fmt::Debug for Message {
@@ -142,14 +144,13 @@ impl std::fmt::Debug for Message {
             Self::Background(m) => write!(f, "Background({m:?})"),
             Self::StatusBar(m) => write!(f, "StatusBar({m:?})"),
             Self::BackgroundLoaded(i, _) => write!(f, "BackgroundLoaded({i})"),
-            Self::UnsplashThumbnailLoaded(id, _) => {
-                write!(f, "UnsplashThumbnailLoaded({id})")
-            }
             Self::UnsplashDownloaded { filename, .. } => {
                 write!(f, "UnsplashDownloaded({filename})")
             }
             Self::LocalFileCopied(name) => write!(f, "LocalFileCopied({name})"),
             Self::BackgroundConfigSaved => write!(f, "BackgroundConfigSaved"),
+            Self::AgentContextSynced => write!(f, "AgentContextSynced"),
+            Self::SparksPoll => write!(f, "SparksPoll"),
         }
     }
 }
@@ -279,6 +280,52 @@ impl App {
             Message::SparksLoaded(idx, sparks) => {
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     ws.sparks = sparks;
+
+                    // Regenerate .ryve/WORKSHOP.md with current spark state
+                    if !ws.config.agents.disable_sync {
+                        let dir = ws.directory.clone();
+                        let ryve_dir = ws.ryve_dir.clone();
+                        let config = ws.config.clone();
+                        let pool = ws.sparks_db.clone();
+                        let snap = ws.sparks.clone();
+                        let ws_id = ws.id.to_string();
+                        return Task::perform(
+                            async move {
+                                // Load supplemental context from DB
+                                let (constraints, failing_contracts, active_assignments) =
+                                    if let Some(ref pool) = pool {
+                                        let c = data::sparks::constraint_helpers::list(pool, &ws_id)
+                                            .await
+                                            .unwrap_or_default();
+                                        let fc = data::sparks::contract_repo::list_failing(pool, &ws_id)
+                                            .await
+                                            .unwrap_or_default();
+                                        // Collect active assignments across all sparks
+                                        let mut assigns = Vec::new();
+                                        for spark in &snap {
+                                            if let Ok(Some(a)) = data::sparks::assignment_repo::active_for_spark(pool, &spark.id).await {
+                                                assigns.push(a);
+                                            }
+                                        }
+                                        (c, fc, assigns)
+                                    } else {
+                                        (Vec::new(), Vec::new(), Vec::new())
+                                    };
+
+                                let ctx = data::agent_context::WorkshopContext {
+                                    sparks: snap,
+                                    constraints,
+                                    failing_contracts,
+                                    active_assignments,
+                                };
+                                let _ = data::agent_context::sync(
+                                    &dir, &ryve_dir, &config, &ctx,
+                                )
+                                .await;
+                            },
+                            |_| Message::AgentContextSynced,
+                        );
+                    }
                 }
                 Task::none()
             }
@@ -350,7 +397,7 @@ impl App {
                             let pool = ws.sparks_db.clone();
                             let ws_id = ws.id.to_string();
                             return Task::perform(
-                                file_viewer::load_file(tab_id, file_path, repo_root, pool, ws_id),
+                                file_viewer::load_file(tab_id, file_path, repo_root, pool, ws_id, self.appearance == style::Appearance::Light),
                                 Message::FileViewer,
                             );
                         }
@@ -415,13 +462,14 @@ impl App {
                     file_viewer::Message::FileLoaded {
                         tab_id,
                         content,
+                        lines,
                         line_changes,
                         spark_links,
                     } => {
                         // Find which workshop owns this tab
                         for ws in &mut self.workshops {
                             if let Some(viewer) = ws.file_viewers.get_mut(&tab_id) {
-                                viewer.set_content(content, line_changes, spark_links);
+                                viewer.set_content(content, lines, line_changes, spark_links);
                                 break;
                             }
                         }
@@ -429,12 +477,13 @@ impl App {
                     file_viewer::Message::GoToSpark(_spark_id) => {
                         // TODO: navigate to spark detail / select spark in panel
                     }
-                    file_viewer::Message::Scrolled(offset) => {
+                    file_viewer::Message::Scrolled { offset_y, viewport_height } => {
                         if let Some(idx) = self.active_workshop {
                             let ws = &mut self.workshops[idx];
                             if let Some(active_id) = ws.bench.active_tab {
                                 if let Some(viewer) = ws.file_viewers.get_mut(&active_id) {
-                                    viewer.scroll_offset = offset;
+                                    viewer.scroll_offset = offset_y;
+                                    viewer.viewport_height = viewport_height;
                                 }
                             }
                         }
@@ -472,6 +521,7 @@ impl App {
                                     session.name.clone(),
                                     Some(&resume_agent),
                                     next_id,
+                                    Some(&session_id),
                                 );
 
                                 // Update the existing session to active
@@ -512,23 +562,109 @@ impl App {
             }
             Message::Bench(msg) => self.handle_bench_message(msg),
             Message::Sparks(msg) => {
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
                 match msg {
                     screen::sparks::Message::Refresh => {
-                        if let Some(idx) = self.active_workshop {
-                            if let Some(ws) = self.workshops.get(idx) {
-                                if let Some(ref pool) = ws.sparks_db {
-                                    let pool = pool.clone();
-                                    let ws_id = ws.id.to_string();
-                                    return Task::perform(
-                                        load_sparks(pool, ws_id),
-                                        move |sparks| Message::SparksLoaded(idx, sparks),
-                                    );
-                                }
+                        if let Some(ws) = self.workshops.get(idx) {
+                            if let Some(ref pool) = ws.sparks_db {
+                                let pool = pool.clone();
+                                let ws_id = ws.id.to_string();
+                                return Task::perform(
+                                    load_sparks(pool, ws_id),
+                                    move |sparks| Message::SparksLoaded(idx, sparks),
+                                );
                             }
                         }
                     }
                     screen::sparks::Message::SelectSpark(_id) => {
                         // TODO: open spark detail view
+                    }
+                    screen::sparks::Message::ShowCreateForm => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_create_form.visible = true;
+                            ws.spark_create_form.title.clear();
+                        }
+                    }
+                    screen::sparks::Message::CreateFormTitleChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_create_form.title = val;
+                        }
+                    }
+                    screen::sparks::Message::CancelCreate => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_create_form.visible = false;
+                            ws.spark_create_form.title.clear();
+                        }
+                    }
+                    screen::sparks::Message::SubmitNewSpark => {
+                        let ws = &mut self.workshops[idx];
+                        let title = ws.spark_create_form.title.trim().to_string();
+                        if title.is_empty() {
+                            return Task::none();
+                        }
+                        ws.spark_create_form.visible = false;
+                        ws.spark_create_form.title.clear();
+
+                        if let Some(ref pool) = ws.sparks_db {
+                            let pool = pool.clone();
+                            let ws_id = ws.id.to_string();
+                            return Task::perform(
+                                async move {
+                                    let new = data::sparks::types::NewSpark {
+                                        title,
+                                        description: String::new(),
+                                        spark_type: data::sparks::types::SparkType::Task,
+                                        priority: 2,
+                                        workshop_id: ws_id.clone(),
+                                        assignee: None,
+                                        owner: None,
+                                        parent_id: None,
+                                        due_at: None,
+                                        estimated_minutes: None,
+                                        metadata: None,
+                                        risk_level: None,
+                                        scope_boundary: None,
+                                    };
+                                    let _ = data::sparks::spark_repo::create(&pool, new).await;
+                                    load_sparks(pool, ws_id).await
+                                },
+                                move |sparks| Message::SparksLoaded(idx, sparks),
+                            );
+                        }
+                    }
+                    screen::sparks::Message::CycleStatus(id, new_status) => {
+                        if let Some(ws) = self.workshops.get(idx) {
+                            if let Some(ref pool) = ws.sparks_db {
+                                let pool = pool.clone();
+                                let ws_id = ws.id.to_string();
+                                return Task::perform(
+                                    async move {
+                                        if new_status == "closed" {
+                                            let _ = data::sparks::spark_repo::close(
+                                                &pool, &id, "completed", "user",
+                                            )
+                                            .await;
+                                        } else {
+                                            let status = data::sparks::types::SparkStatus::from_str(&new_status);
+                                            if let Some(s) = status {
+                                                let upd = data::sparks::types::UpdateSpark {
+                                                    status: Some(s),
+                                                    ..Default::default()
+                                                };
+                                                let _ = data::sparks::spark_repo::update(
+                                                    &pool, &id, upd, "user",
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                        load_sparks(pool, ws_id).await
+                                    },
+                                    move |sparks| Message::SparksLoaded(idx, sparks),
+                                );
+                            }
+                        }
                     }
                 }
                 Task::none()
@@ -550,15 +686,6 @@ impl App {
                 Task::none()
             }
             Message::BackgroundLoaded(_, None) => Task::none(),
-            Message::UnsplashThumbnailLoaded(id, bytes) => {
-                if let Some(idx) = self.active_workshop {
-                    let ws = &mut self.workshops[idx];
-                    ws.background_picker
-                        .thumbnails
-                        .insert(id, iced::widget::image::Handle::from_bytes(bytes));
-                }
-                Task::none()
-            }
             Message::UnsplashDownloaded {
                 filename,
                 photographer,
@@ -616,6 +743,23 @@ impl App {
                 ])
             }
             Message::BackgroundConfigSaved => Task::none(),
+            Message::AgentContextSynced => Task::none(),
+            Message::SparksPoll => {
+                // Reload sparks for the active workshop on each poll tick
+                if let Some(idx) = self.active_workshop {
+                    if let Some(ws) = self.workshops.get(idx) {
+                        if let Some(ref pool) = ws.sparks_db {
+                            let pool = pool.clone();
+                            let ws_id = ws.id.to_string();
+                            return Task::perform(
+                                load_sparks(pool, ws_id),
+                                move |sparks| Message::SparksLoaded(idx, sparks),
+                            );
+                        }
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -648,10 +792,36 @@ impl App {
 
         match msg {
             screen::bench::Message::SelectTab(id) => {
-                self.workshops[idx].bench.active_tab = Some(id);
+                let ws = &mut self.workshops[idx];
+                let prev_tab = ws.bench.active_tab;
+                ws.bench.active_tab = Some(id);
+
+                // Evict the previously-focused file viewer to free memory
+                if let Some(prev_id) = prev_tab {
+                    if prev_id != id {
+                        if let Some(prev_viewer) = ws.file_viewers.get_mut(&prev_id) {
+                            prev_viewer.evict();
+                        }
+                    }
+                }
+
                 // Focus the terminal immediately so it accepts keyboard input
-                if let Some(term) = self.workshops[idx].terminals.get(&id) {
+                if let Some(term) = ws.terminals.get(&id) {
                     return iced_term::TerminalView::focus(term.widget_id().clone());
+                }
+
+                // Reload an evicted file viewer when its tab becomes active
+                if let Some(viewer) = ws.file_viewers.get(&id) {
+                    if !viewer.is_loaded() {
+                        let path = viewer.path.clone();
+                        let repo_root = ws.directory.clone();
+                        let pool = ws.sparks_db.clone();
+                        let ws_id = ws.id.to_string();
+                        return Task::perform(
+                            file_viewer::load_file(id, path, repo_root, pool, ws_id, self.appearance == style::Appearance::Light),
+                            Message::FileViewer,
+                        );
+                    }
                 }
             }
             screen::bench::Message::CloseTab(id) => {
@@ -689,17 +859,17 @@ impl App {
             screen::bench::Message::NewTerminal => {
                 let next_id = &mut self.next_terminal_id;
                 let tab_id =
-                    self.workshops[idx].spawn_terminal("Terminal".to_string(), None, next_id);
+                    self.workshops[idx].spawn_terminal("Terminal".to_string(), None, next_id, None);
                 if let Some(term) = self.workshops[idx].terminals.get(&tab_id) {
                     return iced_term::TerminalView::focus(term.widget_id().clone());
                 }
             }
             screen::bench::Message::NewCodingAgent(agent) => {
                 let title = agent.display_name.clone();
+                let session_id = Uuid::new_v4().to_string();
                 let next_id = &mut self.next_terminal_id;
                 let tab_id =
-                    self.workshops[idx].spawn_terminal(title.clone(), Some(&agent), next_id);
-                let session_id = Uuid::new_v4().to_string();
+                    self.workshops[idx].spawn_terminal(title.clone(), Some(&agent), next_id, Some(&session_id));
                 self.workshops[idx].agent_sessions.push(AgentSession {
                     id: session_id.clone(),
                     name: title.clone(),
@@ -732,6 +902,55 @@ impl App {
                     ));
                 }
                 if let Some(term) = self.workshops[idx].terminals.get(&tab_id) {
+                    tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
+                }
+                return Task::batch(tasks);
+            }
+            screen::bench::Message::NewCustomAgent(agent_idx) => {
+                let ws = &mut self.workshops[idx];
+                let def = match ws.custom_agents.get(agent_idx) {
+                    Some(d) => d.clone(),
+                    None => return Task::none(),
+                };
+                let session_id = Uuid::new_v4().to_string();
+                let next_id = &mut self.next_terminal_id;
+                let tab_id = ws.spawn_custom_agent(&def, next_id, &session_id);
+                ws.agent_sessions.push(AgentSession {
+                    id: session_id.clone(),
+                    name: def.name.clone(),
+                    agent: CodingAgent {
+                        display_name: def.name.clone(),
+                        command: def.command.clone(),
+                        args: def.args.clone(),
+                        resume: coding_agents::ResumeStrategy::None,
+                    },
+                    tab_id: Some(tab_id),
+                    active: true,
+                    resume_id: None,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                });
+
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if let Some(ref pool) = ws.sparks_db {
+                    let pool = pool.clone();
+                    let ws_id = ws.id.to_string();
+                    let new_session = data::sparks::types::NewAgentSession {
+                        id: session_id,
+                        workshop_id: ws_id,
+                        agent_name: def.name,
+                        agent_command: def.command,
+                        agent_args: def.args,
+                        session_label: None,
+                        resume_id: None,
+                    };
+                    tasks.push(Task::perform(
+                        async move {
+                            let _ = data::sparks::agent_session_repo::create(&pool, &new_session).await;
+                        },
+                        |_| Message::AgentSessionSaved,
+                    ));
+                }
+                if let Some(term) = ws.terminals.get(&tab_id) {
                     tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
                 }
                 return Task::batch(tasks);
@@ -814,7 +1033,9 @@ impl App {
                         Task::perform(
                             async move { data::unsplash::fetch_thumbnail_bytes(&url).await },
                             move |result| match result {
-                                Ok(bytes) => Message::UnsplashThumbnailLoaded(id.clone(), bytes),
+                                Ok(bytes) => Message::Background(
+                                    screen::background_picker::Message::ThumbnailLoaded(id.clone(), bytes),
+                                ),
                                 Err(_) => Message::BackgroundConfigSaved, // no-op
                             },
                         )
@@ -823,8 +1044,10 @@ impl App {
 
                 Task::batch(tasks)
             }
-            screen::background_picker::Message::ThumbnailLoaded(_, _) => {
-                // Handled via UnsplashThumbnailLoaded at the top level
+            screen::background_picker::Message::ThumbnailLoaded(id, bytes) => {
+                ws.background_picker
+                    .thumbnails
+                    .insert(id, iced::widget::image::Handle::from_bytes(bytes));
                 Task::none()
             }
             screen::background_picker::Message::SelectPhoto(photo) => {
@@ -877,7 +1100,10 @@ impl App {
             })
             .collect();
 
-        Subscription::batch(term_subs)
+        let poll = iced::time::every(std::time::Duration::from_secs(3))
+            .map(|_| Message::SparksPoll);
+
+        Subscription::batch(term_subs.into_iter().chain(std::iter::once(poll)))
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1002,7 +1228,7 @@ impl App {
         let bench = self.view_bench(ws, has_bg, &pal);
 
         // -- Right: sparks panel --
-        let sparks_panel = screen::sparks::view(&ws.sparks, &pal, has_bg).map(Message::Sparks);
+        let sparks_panel = screen::sparks::view(&ws.sparks, &pal, has_bg, &ws.spark_create_form).map(Message::Sparks);
 
         let sparks_col = container(sparks_panel)
             .width(ws.sparks_width())
@@ -1074,7 +1300,8 @@ impl App {
     }
 
     fn view_agents<'a>(&'a self, ws: &'a Workshop, has_bg: bool) -> Element<'a, Message> {
-        screen::agents::view(&ws.agent_sessions, has_bg).map(Message::Agents)
+        let pal = self.appearance.palette();
+        screen::agents::view(&ws.agent_sessions, pal, has_bg).map(Message::Agents)
     }
 
     fn view_bench<'a>(&'a self, ws: &'a Workshop, has_bg: bool, pal: &style::Palette) -> Element<'a, Message> {
@@ -1086,7 +1313,7 @@ impl App {
                     .map(|e| Message::Bench(screen::bench::Message::TerminalEvent(e)))
                     .into()
             } else if let Some(viewer) = ws.file_viewers.get(&active_id) {
-                file_viewer::view(viewer, has_bg).map(Message::FileViewer)
+                file_viewer::view(viewer, &self.appearance.palette(), has_bg).map(Message::FileViewer)
             } else {
                 container(text("Loading...").size(14))
                     .center(Length::Fill)
@@ -1110,7 +1337,7 @@ impl App {
             .height(Length::Fill);
 
         // Overlay the dropdown menu on top of the content area
-        if let Some(dropdown) = ws.bench.view_dropdown(&self.available_agents, pal) {
+        if let Some(dropdown) = ws.bench.view_dropdown(&self.available_agents, &ws.custom_agents, pal) {
             stack![
                 body,
                 // Position the dropdown just below the tab bar

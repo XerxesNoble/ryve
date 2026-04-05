@@ -11,9 +11,11 @@ use super::types::*;
 
 pub async fn record(pool: &SqlitePool, new: NewEvent) -> Result<(), SparksError> {
     let now = Utc::now().to_rfc3339();
+    let actor_type = new.actor_type.map(|a| a.as_str().to_string());
+    let change_nature = new.change_nature.map(|c| c.as_str().to_string());
 
     sqlx::query(
-        "INSERT INTO events (spark_id, actor, field_name, old_value, new_value, reason, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO events (spark_id, actor, field_name, old_value, new_value, reason, timestamp, actor_type, change_nature, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&new.spark_id)
     .bind(&new.actor)
@@ -22,10 +24,27 @@ pub async fn record(pool: &SqlitePool, new: NewEvent) -> Result<(), SparksError>
     .bind(&new.new_value)
     .bind(&new.reason)
     .bind(&now)
+    .bind(&actor_type)
+    .bind(&change_nature)
+    .bind(&new.session_id)
     .execute(pool)
     .await?;
 
     Ok(())
+}
+
+pub async fn list_by_actor_type(
+    pool: &SqlitePool,
+    spark_id: &str,
+    actor_type: &str,
+) -> Result<Vec<Event>, SparksError> {
+    Ok(sqlx::query_as::<_, Event>(
+        "SELECT * FROM events WHERE spark_id = ? AND actor_type = ? ORDER BY timestamp ASC",
+    )
+    .bind(spark_id)
+    .bind(actor_type)
+    .fetch_all(pool)
+    .await?)
 }
 
 pub async fn list_for_spark(pool: &SqlitePool, spark_id: &str) -> Result<Vec<Event>, SparksError> {

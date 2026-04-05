@@ -75,6 +75,57 @@ impl Repository {
         Ok(parse_worktree_list(&stdout))
     }
 
+    /// Create a new worktree with a new branch.
+    /// Runs `git worktree add -b <branch> <target_path>`.
+    pub async fn create_worktree(
+        &self,
+        branch: &str,
+        target: &Path,
+    ) -> Result<(), GitError> {
+        let output = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                &target.to_string_lossy(),
+            ])
+            .current_dir(&self.path)
+            .output()
+            .await
+            .map_err(GitError::Io)?;
+
+        if !output.status.success() {
+            return Err(GitError::Command(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Remove a worktree.
+    /// Runs `git worktree remove --force <target_path>`.
+    pub async fn remove_worktree(&self, target: &Path) -> Result<(), GitError> {
+        let output = Command::new("git")
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &target.to_string_lossy(),
+            ])
+            .current_dir(&self.path)
+            .output()
+            .await
+            .map_err(GitError::Io)?;
+
+        if !output.status.success() {
+            return Err(GitError::Command(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Get the current branch name (or HEAD if detached).
     pub async fn current_branch(&self) -> Result<String, GitError> {
         let output = Command::new("git")
@@ -348,4 +399,87 @@ pub enum GitError {
     Io(#[from] std::io::Error),
     #[error("git command failed: {0}")]
     Command(String),
+}
+
+// ── Spark-commit linkage helpers ─────────────────────
+
+/// Parse spark IDs from a commit message. Matches `[sp-xxxx]` patterns.
+pub fn parse_spark_refs(message: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut start = 0;
+    while let Some(idx) = message[start..].find("[sp-") {
+        let abs = start + idx;
+        // Expect "[sp-XXXX]" — 4 hex chars after "sp-"
+        if abs + 9 <= message.len() && message.as_bytes()[abs + 8] == b']' {
+            let candidate = &message[abs + 1..abs + 8]; // "sp-XXXX"
+            if candidate.len() == 7
+                && candidate[3..].chars().all(|c| c.is_ascii_hexdigit())
+            {
+                refs.push(candidate.to_string());
+            }
+        }
+        start = abs + 1;
+    }
+    refs
+}
+
+/// A commit that references one or more sparks.
+#[derive(Debug, Clone)]
+pub struct CommitSparkRef {
+    pub hash: String,
+    pub message: String,
+    pub author: String,
+    pub timestamp: String,
+    pub spark_ids: Vec<String>,
+}
+
+/// Scan recent commits for spark references in their messages.
+/// If `since` is provided, only commits after that date are scanned.
+pub async fn scan_commits_for_sparks(
+    repo_path: &Path,
+    since: Option<&str>,
+) -> Result<Vec<CommitSparkRef>, GitError> {
+    let mut cmd = Command::new("git");
+    cmd.args(["log", "--format=%H%n%s%n%an%n%aI%n---"])
+        .current_dir(repo_path);
+
+    if let Some(date) = since {
+        cmd.arg(format!("--since={date}"));
+    } else {
+        cmd.arg("-100"); // Default: last 100 commits
+    }
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        return Err(GitError::Command(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut results = Vec::new();
+
+    for block in stdout.split("---\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        let lines: Vec<&str> = block.lines().collect();
+        if lines.len() < 4 {
+            continue;
+        }
+
+        let spark_ids = parse_spark_refs(lines[1]);
+        if !spark_ids.is_empty() {
+            results.push(CommitSparkRef {
+                hash: lines[0].to_string(),
+                message: lines[1].to_string(),
+                author: lines[2].to_string(),
+                timestamp: lines[3].to_string(),
+                spark_ids,
+            });
+        }
+    }
+
+    Ok(results)
 }

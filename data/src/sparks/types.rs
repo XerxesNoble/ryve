@@ -30,6 +30,18 @@ pub struct Spark {
     pub closed_reason: Option<String>,
     pub due_at: Option<String>,
     pub defer_until: Option<String>,
+    pub risk_level: Option<String>,
+    pub scope_boundary: Option<String>,
+}
+
+impl Spark {
+    /// Parse structured intent from the metadata JSON `"intent"` key.
+    pub fn intent(&self) -> SparkIntent {
+        serde_json::from_str::<serde_json::Value>(&self.metadata)
+            .ok()
+            .and_then(|v| serde_json::from_value(v["intent"].clone()).ok())
+            .unwrap_or_default()
+    }
 }
 
 pub struct NewSpark {
@@ -44,6 +56,8 @@ pub struct NewSpark {
     pub due_at: Option<String>,
     pub estimated_minutes: Option<i32>,
     pub metadata: Option<String>,
+    pub risk_level: Option<RiskLevel>,
+    pub scope_boundary: Option<String>,
 }
 
 #[derive(Default)]
@@ -60,6 +74,8 @@ pub struct UpdateSpark {
     pub defer_until: Option<Option<String>>,
     pub estimated_minutes: Option<Option<i32>>,
     pub metadata: Option<String>,
+    pub risk_level: Option<RiskLevel>,
+    pub scope_boundary: Option<Option<String>>,
 }
 
 #[derive(Default)]
@@ -71,6 +87,7 @@ pub struct SparkFilter {
     pub spark_type: Option<SparkType>,
     pub parent_id: Option<String>,
     pub stamp: Option<String>,
+    pub risk_level: Option<RiskLevel>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +247,9 @@ pub struct Event {
     pub new_value: Option<String>,
     pub reason: Option<String>,
     pub timestamp: String,
+    pub actor_type: Option<String>,
+    pub change_nature: Option<String>,
+    pub session_id: Option<String>,
 }
 
 pub struct NewEvent {
@@ -239,6 +259,9 @@ pub struct NewEvent {
     pub old_value: Option<String>,
     pub new_value: Option<String>,
     pub reason: Option<String>,
+    pub actor_type: Option<ActorType>,
+    pub change_nature: Option<ChangeNature>,
+    pub session_id: Option<String>,
 }
 
 // ── Ember ──────────────────────────────────────────────
@@ -391,4 +414,310 @@ pub struct NewAgentSession {
     pub agent_args: Vec<String>,
     pub session_label: Option<String>,
     pub resume_id: Option<String>,
+}
+
+// ── Structured Intent ────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    Trivial,
+    Normal,
+    Elevated,
+    Critical,
+}
+
+impl RiskLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Trivial => "trivial",
+            Self::Normal => "normal",
+            Self::Elevated => "elevated",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+/// Structured intent embedded in spark metadata JSON under the `"intent"` key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SparkIntent {
+    #[serde(default)]
+    pub problem_statement: Option<String>,
+    #[serde(default)]
+    pub invariants: Vec<String>,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    #[serde(default)]
+    pub verification_summary: Option<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+}
+
+// ── Verification Contract ────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractKind {
+    TestPass,
+    NoApiBreak,
+    CustomCommand,
+    GrepAbsent,
+    GrepPresent,
+}
+
+impl ContractKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TestPass => "test_pass",
+            Self::NoApiBreak => "no_api_break",
+            Self::CustomCommand => "custom_command",
+            Self::GrepAbsent => "grep_absent",
+            Self::GrepPresent => "grep_present",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractStatus {
+    Pending,
+    Pass,
+    Fail,
+    Skipped,
+}
+
+impl ContractStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractEnforcement {
+    Advisory,
+    Required,
+}
+
+impl ContractEnforcement {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::Required => "required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Contract {
+    pub id: i64,
+    pub spark_id: String,
+    pub kind: String,
+    pub description: String,
+    pub check_command: Option<String>,
+    pub pattern: Option<String>,
+    pub file_glob: Option<String>,
+    pub enforcement: String,
+    pub status: String,
+    pub last_checked_at: Option<String>,
+    pub last_checked_by: Option<String>,
+    pub created_at: String,
+}
+
+pub struct NewContract {
+    pub spark_id: String,
+    pub kind: ContractKind,
+    pub description: String,
+    pub check_command: Option<String>,
+    pub pattern: Option<String>,
+    pub file_glob: Option<String>,
+    pub enforcement: ContractEnforcement,
+}
+
+// ── Provenance ───────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorType {
+    Human,
+    Hand,
+    System,
+    Unknown,
+}
+
+impl ActorType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Hand => "hand",
+            Self::System => "system",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeNature {
+    Code,
+    Refactor,
+    Format,
+    Generated,
+    Review,
+    Config,
+    Documentation,
+    Test,
+}
+
+impl ChangeNature {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Refactor => "refactor",
+            Self::Format => "format",
+            Self::Generated => "generated",
+            Self::Review => "review",
+            Self::Config => "config",
+            Self::Documentation => "documentation",
+            Self::Test => "test",
+        }
+    }
+}
+
+// ── Commit Link ──────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct CommitLink {
+    pub id: i64,
+    pub spark_id: String,
+    pub commit_hash: String,
+    pub commit_message: Option<String>,
+    pub author: Option<String>,
+    pub committed_at: Option<String>,
+    pub workshop_id: String,
+    pub linked_by: String,
+    pub created_at: String,
+}
+
+pub struct NewCommitLink {
+    pub spark_id: String,
+    pub commit_hash: String,
+    pub commit_message: Option<String>,
+    pub author: Option<String>,
+    pub committed_at: Option<String>,
+    pub workshop_id: String,
+    pub linked_by: String,
+}
+
+// ── Architectural Constraint ─────────────────────────
+
+/// Stored as JSON value in an engraving with key prefix `constraint:`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchConstraint {
+    pub rule: String,
+    pub kind: ConstraintKind,
+    #[serde(default)]
+    pub check: Option<ConstraintCheck>,
+    pub severity: ConstraintSeverity,
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintKind {
+    ImportBoundary,
+    DataFlow,
+    NamingConvention,
+    SecurityPolicy,
+    PerformanceBudget,
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstraintCheck {
+    #[serde(rename = "type")]
+    pub check_type: String,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub glob: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+// ── Hand Assignment ──────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentStatus {
+    Active,
+    Completed,
+    HandedOff,
+    Abandoned,
+    Expired,
+}
+
+impl AssignmentStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::HandedOff => "handed_off",
+            Self::Abandoned => "abandoned",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentRole {
+    Owner,
+    Assistant,
+    Observer,
+}
+
+impl AssignmentRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Assistant => "assistant",
+            Self::Observer => "observer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct HandAssignment {
+    pub id: i64,
+    pub session_id: String,
+    pub spark_id: String,
+    pub status: String,
+    pub role: String,
+    pub assigned_at: String,
+    pub last_heartbeat_at: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub handoff_to: Option<String>,
+    pub handoff_reason: Option<String>,
+}
+
+pub struct NewHandAssignment {
+    pub session_id: String,
+    pub spark_id: String,
+    pub role: AssignmentRole,
 }

@@ -182,7 +182,12 @@ pub fn view<'a>(state: &'a FileExplorerState, root: &'a Path, pal: &Palette) -> 
     let pal = *pal;
     let branch_label = state.branch.as_deref().unwrap_or("no branch");
 
+    let root_icon = svg(icons::root_folder_icon(true))
+        .width(16)
+        .height(16);
+
     let header = row![
+        root_icon,
         text("Files").size(14).color(pal.text_primary),
         Space::new().width(Length::Fill),
         text(branch_label)
@@ -241,7 +246,7 @@ fn collect_nodes<'a>(
 
     // Determine git status color for this entry
     let rel_path = node.path.strip_prefix(root).unwrap_or(&node.path);
-    let git_color = file_git_color(rel_path, &node.kind, &state.git_statuses);
+    let git_color = file_git_color(rel_path, &node.kind, &state.git_statuses, pal);
 
     let icon_handle = match node.kind {
         NodeKind::Directory => icons::folder_icon(&node.name, is_expanded),
@@ -328,13 +333,13 @@ fn file_git_color(
     rel_path: &Path,
     kind: &NodeKind,
     statuses: &HashMap<PathBuf, FileStatus>,
+    pal: &Palette,
 ) -> Color {
     if *kind == NodeKind::File {
         if let Some(status) = statuses.get(rel_path) {
             return status_color(*status);
         }
-        // Default: normal text
-        return Color::from_rgb(0.78, 0.78, 0.78);
+        return pal.text_primary;
     }
 
     // Directory: check if any child file has a git status
@@ -353,7 +358,7 @@ fn file_git_color(
 
     match most_important {
         Some(status) => status_color(status),
-        None => Color::from_rgb(0.78, 0.78, 0.78),
+        None => pal.text_primary,
     }
 }
 

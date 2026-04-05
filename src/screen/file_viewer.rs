@@ -2,9 +2,14 @@
 // Copyright 2026 Loomantix
 
 //! File viewer — syntax-highlighted code display with git diff gutter and spark links.
+//!
+//! Uses viewport-based rendering: only visible lines (plus a small overscan)
+//! are materialised as iced widgets. Off-screen content is represented by
+//! fixed-height spacers so the scrollbar stays accurate.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use data::git::LineChange;
 use data::sparks::types::SparkFileLink;
@@ -13,21 +18,29 @@ use iced::{Color, Element, Font, Length, Theme};
 use syntect::highlighting::{self, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
+use crate::style::Palette;
+
+// ── Shared syntax resources (loaded once) ────────────
+
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
 // ── Messages ──────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// File content loaded from disk.
+    /// File content loaded from disk (already highlighted).
     FileLoaded {
         tab_id: u64,
         content: String,
+        lines: Vec<HighlightedLine>,
         line_changes: HashMap<u32, LineChange>,
         spark_links: Vec<SparkFileLink>,
     },
     /// Navigate to a linked spark.
     GoToSpark(String),
-    /// Scroll position changed.
-    Scrolled(f32),
+    /// Viewport changed — carries scroll‑y offset and viewport height.
+    Scrolled { offset_y: f32, viewport_height: f32 },
 }
 
 // ── State ─────────────────────────────────────────────
@@ -35,11 +48,16 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub struct FileViewerState {
     pub path: PathBuf,
+    /// Raw file text — kept only for potential future edits / search.
     pub content: String,
+    /// Pre-highlighted lines. Empty while the async load is in-flight.
     pub lines: Vec<HighlightedLine>,
     pub line_changes: HashMap<u32, LineChange>,
     pub spark_links: Vec<SparkFileLink>,
+    /// Current vertical scroll offset in pixels.
     pub scroll_offset: f32,
+    /// Last-known viewport height in pixels (updated on every scroll event).
+    pub viewport_height: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -64,20 +82,35 @@ impl FileViewerState {
             line_changes: HashMap::new(),
             spark_links: Vec::new(),
             scroll_offset: 0.0,
+            viewport_height: 900.0, // reasonable default until first scroll event
         }
     }
 
-    /// Set content and compute syntax highlighting.
+    /// Accept pre-highlighted content from the async loader.
     pub fn set_content(
         &mut self,
         content: String,
+        lines: Vec<HighlightedLine>,
         line_changes: HashMap<u32, LineChange>,
         spark_links: Vec<SparkFileLink>,
     ) {
+        self.content = content;
+        self.lines = lines;
         self.line_changes = line_changes;
         self.spark_links = spark_links;
-        self.lines = highlight_content(&content, &self.path);
-        self.content = content;
+    }
+
+    /// Evict heavy data for a background tab. Preserves path + scroll state.
+    pub fn evict(&mut self) {
+        self.content = String::new();
+        self.lines = Vec::new();
+        self.line_changes = HashMap::new();
+        self.spark_links = Vec::new();
+    }
+
+    /// Whether this viewer has content loaded.
+    pub fn is_loaded(&self) -> bool {
+        !self.lines.is_empty()
     }
 
     /// Get spark links that apply to a specific line.
@@ -98,12 +131,17 @@ impl FileViewerState {
     }
 }
 
-// ── Syntax highlighting ──────────────────────────────
+// ── Syntax highlighting (runs off the main thread) ───
 
-fn highlight_content(content: &str, path: &Path) -> Vec<HighlightedLine> {
-    let ss = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
-    let theme = &ts.themes["base16-ocean.dark"];
+pub fn highlight_content(content: &str, path: &Path, light_mode: bool) -> Vec<HighlightedLine> {
+    let ss = &*SYNTAX_SET;
+    let ts = &*THEME_SET;
+    let theme_name = if light_mode {
+        "InspiredGitHub"
+    } else {
+        "base16-ocean.dark"
+    };
+    let theme = &ts.themes[theme_name];
 
     let syntax = path
         .extension()
@@ -116,7 +154,7 @@ fn highlight_content(content: &str, path: &Path) -> Vec<HighlightedLine> {
 
     for line in content.lines() {
         let ranges = highlighter
-            .highlight_line(line, &ss)
+            .highlight_line(line, ss)
             .unwrap_or_default();
 
         let spans = ranges
@@ -144,17 +182,20 @@ fn syntect_to_iced_color(c: highlighting::Color) -> Color {
     Color::from_rgba8(c.r, c.g, c.b, c.a as f32 / 255.0)
 }
 
-// ── View ──────────────────────────────────────────────
+// ── View (viewport-culled) ───────────────────────────
 
 const MONO_FONT: Font = Font::MONOSPACE;
 const FONT_SIZE: f32 = 13.0;
 const LINE_HEIGHT: f32 = 20.0;
 const GUTTER_WIDTH: f32 = 16.0;
+/// Extra lines rendered above/below the visible window to reduce flicker.
+const OVERSCAN: usize = 20;
 
-/// Render the file viewer for a tab.
-pub fn view<'a>(state: &'a FileViewerState, has_bg: bool) -> Element<'a, Message> {
+/// Render the file viewer for a tab. Only the visible slice of lines is
+/// materialised as widgets; the rest is represented by spacers.
+pub fn view<'a>(state: &'a FileViewerState, pal: &Palette, has_bg: bool) -> Element<'a, Message> {
     if state.lines.is_empty() {
-        return container(text("Loading...").size(14))
+        return container(text("Loading...").size(14).color(pal.text_secondary))
             .center(Length::Fill)
             .into();
     }
@@ -162,9 +203,28 @@ pub fn view<'a>(state: &'a FileViewerState, has_bg: bool) -> Element<'a, Message
     let total_lines = state.lines.len();
     let line_num_chars = total_lines.to_string().len().max(3);
 
-    let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(total_lines);
+    // ── Compute visible range ──
+    let first_visible = (state.scroll_offset / LINE_HEIGHT).floor().max(0.0) as usize;
+    let lines_in_viewport =
+        (state.viewport_height / LINE_HEIGHT).ceil() as usize + 1;
+    let range_start = first_visible.saturating_sub(OVERSCAN);
+    let range_end = (first_visible + lines_in_viewport + OVERSCAN).min(total_lines);
 
-    for (idx, line) in state.lines.iter().enumerate() {
+    // ── Build spacers + visible rows ──
+    let top_pad = range_start as f32 * LINE_HEIGHT;
+    let bottom_pad = (total_lines - range_end) as f32 * LINE_HEIGHT;
+
+    let visible_count = range_end - range_start;
+    let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(visible_count + 2);
+
+    // Top spacer (preserves scroll position)
+    if top_pad > 0.0 {
+        rows.push(Space::new().width(Length::Fill).height(top_pad).into());
+    }
+
+    // Only materialise widgets for the visible slice
+    for idx in range_start..range_end {
+        let line = &state.lines[idx];
         let line_num = (idx + 1) as u32;
 
         // ── Git gutter indicator ──
@@ -175,7 +235,7 @@ pub fn view<'a>(state: &'a FileViewerState, has_bg: bool) -> Element<'a, Message
         let line_num_el = text(num_str)
             .size(FONT_SIZE)
             .font(MONO_FONT)
-            .color(Color::from_rgb(0.4, 0.4, 0.45));
+            .color(pal.text_tertiary);
 
         // ── Spark link indicator ──
         let spark_links = state.spark_links_for_line(line_num);
@@ -223,6 +283,11 @@ pub fn view<'a>(state: &'a FileViewerState, has_bg: bool) -> Element<'a, Message
         rows.push(styled_row.into());
     }
 
+    // Bottom spacer
+    if bottom_pad > 0.0 {
+        rows.push(Space::new().width(Length::Fill).height(bottom_pad).into());
+    }
+
     let code_column = iced::widget::Column::with_children(rows)
         .spacing(0)
         .width(Length::Fill);
@@ -230,6 +295,13 @@ pub fn view<'a>(state: &'a FileViewerState, has_bg: bool) -> Element<'a, Message
     scrollable(code_column)
         .height(Length::Fill)
         .width(Length::Fill)
+        .on_scroll(|viewport| {
+            let offset = viewport.absolute_offset();
+            Message::Scrolled {
+                offset_y: offset.y,
+                viewport_height: viewport.bounds().height,
+            }
+        })
         .into()
 }
 
@@ -277,7 +349,6 @@ fn render_highlighted_line<'a>(line: &'a HighlightedLine) -> Element<'a, Message
             .color(span.color);
 
         if span.bold || span.italic {
-            // Iced Font doesn't have per-span bold/italic easily, use monospace always
             t = t.font(MONO_FONT);
         } else {
             t = t.font(MONO_FONT);
@@ -286,7 +357,6 @@ fn render_highlighted_line<'a>(line: &'a HighlightedLine) -> Element<'a, Message
         parts.push(t.into());
     }
 
-    // Use a row for the spans — they flow horizontally
     iced::widget::Row::with_children(parts)
         .spacing(0)
         .height(LINE_HEIGHT)
@@ -295,13 +365,15 @@ fn render_highlighted_line<'a>(line: &'a HighlightedLine) -> Element<'a, Message
 
 // ── Async loading ─────────────────────────────────────
 
-/// Load file content, git diff, and spark links for a file tab.
+/// Load file content, git diff, spark links, and pre-compute syntax highlighting.
+/// All heavy work happens off the main thread.
 pub async fn load_file(
     tab_id: u64,
     path: PathBuf,
     repo_root: PathBuf,
     pool: Option<sqlx::SqlitePool>,
     workshop_id: String,
+    light_mode: bool,
 ) -> Message {
     // Read file content
     let content = tokio::fs::read_to_string(&path)
@@ -332,9 +404,19 @@ pub async fn load_file(
         Vec::new()
     };
 
+    // Syntax highlighting — runs on the blocking tokio thread pool
+    let highlight_path = path.clone();
+    let highlight_content_str = content.clone();
+    let lines = tokio::task::spawn_blocking(move || {
+        highlight_content(&highlight_content_str, &highlight_path, light_mode)
+    })
+    .await
+    .unwrap_or_else(|_| vec![HighlightedLine { spans: Vec::new() }]);
+
     Message::FileLoaded {
         tab_id,
         content,
+        lines,
         line_changes,
         spark_links,
     }

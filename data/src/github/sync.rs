@@ -161,6 +161,8 @@ impl GitHubSync {
                 due_at: None,
                 estimated_minutes: None,
                 metadata: None,
+                risk_level: None,
+                scope_boundary: None,
             };
 
             let spark = spark_repo::create(pool, new).await?;

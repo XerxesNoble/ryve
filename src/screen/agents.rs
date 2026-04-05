@@ -4,10 +4,11 @@
 //! Agents panel — lists active and past coding agent sessions.
 
 use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Color, Element, Length, Theme};
+use iced::{Element, Length, Theme};
 use uuid::Uuid;
 
 use crate::coding_agents::{CodingAgent, ResumeStrategy};
+use crate::style::Palette;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -47,8 +48,8 @@ impl AgentSession {
 }
 
 /// Render the agents panel.
-pub fn view<'a>(sessions: &'a [AgentSession], has_bg: bool) -> Element<'a, Message> {
-    let header = text("Agents").size(14);
+pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, has_bg: bool) -> Element<'a, Message> {
+    let header = text("Agents").size(14).color(pal.text_primary);
 
     let mut content = column![header].spacing(6).padding(10);
 
@@ -59,7 +60,7 @@ pub fn view<'a>(sessions: &'a [AgentSession], has_bg: bool) -> Element<'a, Messa
         content = content.push(
             text("No agent sessions")
                 .size(12)
-                .color(Color::from_rgb(0.5, 0.5, 0.55)),
+                .color(pal.text_tertiary),
         );
     }
 
@@ -68,15 +69,15 @@ pub fn view<'a>(sessions: &'a [AgentSession], has_bg: bool) -> Element<'a, Messa
         content = content.push(
             text("Active")
                 .size(10)
-                .color(Color::from_rgb(0.5, 0.5, 0.55)),
+                .color(pal.text_secondary),
         );
         for session in &active {
             let id = Uuid::parse_str(&session.id).unwrap_or_else(|_| Uuid::nil());
             let indicator = text("\u{25CF} ") // ● dot
                 .size(10)
-                .color(Color::from_rgb(0.3, 0.85, 0.4));
+                .color(pal.accent);
 
-            let label = text(&session.name).size(12);
+            let label = text(&session.name).size(12).color(pal.text_primary);
 
             let btn = button(row![indicator, label].spacing(4).align_y(iced::Alignment::Center))
                 .style(button::text)
@@ -84,7 +85,18 @@ pub fn view<'a>(sessions: &'a [AgentSession], has_bg: bool) -> Element<'a, Messa
                 .padding([3, 6])
                 .on_press(Message::SelectAgent(id));
 
-            content = content.push(btn);
+            let active_item = container(btn)
+                .width(Length::Fill)
+                .style(move |_theme: &Theme| container::Style {
+                    background: Some(iced::Background::Color(pal.accent_dim)),
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+
+            content = content.push(active_item);
         }
     }
 
@@ -94,58 +106,53 @@ pub fn view<'a>(sessions: &'a [AgentSession], has_bg: bool) -> Element<'a, Messa
         content = content.push(
             text("History")
                 .size(10)
-                .color(Color::from_rgb(0.5, 0.5, 0.55)),
+                .color(pal.text_secondary),
         );
 
         for session in &past {
             let can_resume = session.can_resume();
 
-            let indicator_color = Color::from_rgb(0.45, 0.45, 0.5);
             let indicator = text("\u{25CB} ") // ○ hollow dot
                 .size(10)
-                .color(indicator_color);
+                .color(pal.text_tertiary);
 
-            let name_color = Color::from_rgb(0.6, 0.6, 0.65);
-            let label = text(&session.name).size(12).color(name_color);
+            let label = text(&session.name).size(12).color(pal.text_secondary);
+            let time_label = text(format_relative_time(&session.started_at))
+                .size(9)
+                .color(pal.text_tertiary);
 
-            let session_row = if can_resume {
+            let mut session_row = row![indicator, label, time_label, Space::new().width(Length::Fill)]
+                .spacing(4)
+                .align_y(iced::Alignment::Center);
+
+            if can_resume {
                 let resume_btn = button(
                     text("\u{25B6}") // ▶
                         .size(10)
-                        .color(Color::from_rgb(0.5, 0.75, 0.95)),
+                        .color(pal.accent),
                 )
                 .style(button::text)
                 .padding([2, 4])
                 .on_press(Message::ResumeAgent(session.id.clone()));
 
-                row![indicator, label, Space::new().width(Length::Fill), resume_btn]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center)
-            } else {
-                row![indicator, label]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center)
-            };
+                session_row = session_row.push(resume_btn);
+            }
 
-            let session_style: fn(&Theme) -> container::Style = if has_bg {
-                |_theme: &Theme| container::Style {
-                    background: Some(iced::Background::Color(Color::from_rgba(
-                        1.0, 1.0, 1.0, 0.03,
-                    ))),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            } else {
-                |_theme: &Theme| container::Style::default()
-            };
+            let delete_btn = button(
+                text("\u{00D7}") // ×
+                    .size(12)
+                    .color(pal.danger),
+            )
+            .style(button::text)
+            .padding([2, 4])
+            .on_press(Message::DeleteSession(session.id.clone()));
+
+            session_row = session_row.push(delete_btn);
 
             let item = container(session_row)
                 .width(Length::Fill)
                 .padding([3, 6])
-                .style(session_style);
+                .style(move |_theme: &Theme| crate::style::hovered_item(&pal));
 
             content = content.push(item);
         }
@@ -155,4 +162,22 @@ pub fn view<'a>(sessions: &'a [AgentSession], has_bg: bool) -> Element<'a, Messa
         .height(Length::Fill)
         .width(Length::Fill)
         .into()
+}
+
+/// Format an RFC 3339 timestamp as a short relative time string (e.g. "2h ago", "3d ago").
+fn format_relative_time(rfc3339: &str) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return String::new();
+    };
+    let duration = chrono::Utc::now().signed_duration_since(then);
+
+    if duration.num_minutes() < 1 {
+        "now".to_string()
+    } else if duration.num_minutes() < 60 {
+        format!("{}m ago", duration.num_minutes())
+    } else if duration.num_hours() < 24 {
+        format!("{}h ago", duration.num_hours())
+    } else {
+        format!("{}d ago", duration.num_days())
+    }
 }

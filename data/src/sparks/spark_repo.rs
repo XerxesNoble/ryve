@@ -16,9 +16,11 @@ pub async fn create(pool: &SqlitePool, new: NewSpark) -> Result<Spark, SparksErr
     let spark_type = new.spark_type.as_str();
     let metadata = new.metadata.unwrap_or_else(|| "{}".to_string());
 
+    let risk_level = new.risk_level.map(|r| r.as_str().to_string());
+
     sqlx::query(
-        "INSERT INTO sparks (id, title, description, status, priority, spark_type, assignee, owner, parent_id, workshop_id, estimated_minutes, metadata, created_at, updated_at, due_at)
-         VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sparks (id, title, description, status, priority, spark_type, assignee, owner, parent_id, workshop_id, estimated_minutes, metadata, created_at, updated_at, due_at, risk_level, scope_boundary)
+         VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&new.title)
@@ -34,6 +36,8 @@ pub async fn create(pool: &SqlitePool, new: NewSpark) -> Result<Spark, SparksErr
     .bind(&now)
     .bind(&now)
     .bind(&new.due_at)
+    .bind(&risk_level)
+    .bind(&new.scope_boundary)
     .execute(pool)
     .await?;
 
@@ -47,6 +51,9 @@ pub async fn create(pool: &SqlitePool, new: NewSpark) -> Result<Spark, SparksErr
             old_value: None,
             new_value: Some("open".to_string()),
             reason: Some("created".to_string()),
+            actor_type: Some(ActorType::System),
+            change_nature: None,
+            session_id: None,
         },
     )
     .await?;
@@ -90,6 +97,11 @@ pub async fn update(
     let defer_until = upd.defer_until.unwrap_or(existing.defer_until);
     let estimated_minutes = upd.estimated_minutes.unwrap_or(existing.estimated_minutes);
     let metadata = upd.metadata.unwrap_or(existing.metadata);
+    let risk_level = upd
+        .risk_level
+        .map(|r| Some(r.as_str().to_string()))
+        .unwrap_or(existing.risk_level);
+    let scope_boundary = upd.scope_boundary.unwrap_or(existing.scope_boundary);
 
     // Record changed fields as events
     if status != old_status {
@@ -102,13 +114,16 @@ pub async fn update(
                 old_value: Some(old_status),
                 new_value: Some(status.clone()),
                 reason: None,
+                actor_type: None,
+                change_nature: None,
+                session_id: None,
             },
         )
         .await?;
     }
 
     sqlx::query(
-        "UPDATE sparks SET title=?, description=?, status=?, priority=?, spark_type=?, assignee=?, owner=?, parent_id=?, due_at=?, defer_until=?, estimated_minutes=?, metadata=?, updated_at=? WHERE id=?",
+        "UPDATE sparks SET title=?, description=?, status=?, priority=?, spark_type=?, assignee=?, owner=?, parent_id=?, due_at=?, defer_until=?, estimated_minutes=?, metadata=?, updated_at=?, risk_level=?, scope_boundary=? WHERE id=?",
     )
     .bind(&title)
     .bind(&description)
@@ -123,6 +138,8 @@ pub async fn update(
     .bind(estimated_minutes)
     .bind(&metadata)
     .bind(&now)
+    .bind(&risk_level)
+    .bind(&scope_boundary)
     .bind(id)
     .execute(pool)
     .await?;
@@ -157,6 +174,9 @@ pub async fn close(
             old_value: None,
             new_value: Some("closed".to_string()),
             reason: Some(reason.to_string()),
+            actor_type: None,
+            change_nature: None,
+            session_id: None,
         },
     )
     .await?;
@@ -211,6 +231,10 @@ pub async fn list(pool: &SqlitePool, filter: SparkFilter) -> Result<Vec<Spark>, 
     if let Some(ref pid) = filter.parent_id {
         sql.push_str(" AND parent_id = ?");
         args.push(pid.clone());
+    }
+    if let Some(ref r) = filter.risk_level {
+        sql.push_str(" AND risk_level = ?");
+        args.push(r.as_str().to_string());
     }
 
     sql.push_str(" ORDER BY priority ASC, created_at ASC");

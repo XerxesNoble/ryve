@@ -32,19 +32,24 @@ impl CodingAgent {
                 }
                 Some((self.command.clone(), args))
             }
-            ResumeStrategy::ResumeWithId => {
-                let id = resume_id?;
-                let mut args = self.args.clone();
-                args.push("--resume".to_string());
-                args.push(id.to_string());
-                Some((self.command.clone(), args))
-            }
             ResumeStrategy::SessionResume => {
                 let id = resume_id?;
                 // e.g., `goose session resume <id>`
                 Some((self.command.clone(), vec!["session".into(), "resume".into(), id.to_string()]))
             }
             ResumeStrategy::None => None,
+        }
+    }
+}
+
+impl CodingAgent {
+    /// Return the CLI flag for injecting a system prompt file, if supported.
+    pub fn system_prompt_flag(&self) -> Option<&'static str> {
+        match self.command.as_str() {
+            "claude" => Some("--system-prompt"),
+            "codex" => Some("--instructions"),
+            "aider" => Some("--read"),
+            _ => None,
         }
     }
 }
@@ -60,8 +65,6 @@ impl fmt::Display for CodingAgent {
 pub enum ResumeStrategy {
     /// Pass `--resume` flag (e.g., `claude --resume`)
     ResumeFlag,
-    /// Pass `--resume <session_id>` (e.g., `codex --resume <id>`)
-    ResumeWithId,
     /// Resume via session subcommand (e.g., `goose session resume <id>`)
     SessionResume,
     /// No built-in resume support

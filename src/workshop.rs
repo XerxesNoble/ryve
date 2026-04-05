@@ -6,7 +6,7 @@
 //! sparks database, agent definitions, and context files.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use data::ryve_dir::{AgentDef, RyveDir, WorkshopConfig};
 use data::sparks::types::Spark;
@@ -47,6 +47,8 @@ pub struct Workshop {
     pub background_handle: Option<iced::widget::image::Handle>,
     /// Background picker modal state.
     pub background_picker: PickerState,
+    /// Inline spark create form state.
+    pub spark_create_form: crate::screen::sparks::CreateForm,
 }
 
 impl Workshop {
@@ -68,6 +70,7 @@ impl Workshop {
             agent_context: None,
             background_handle: None,
             background_picker: PickerState::new(),
+            spark_create_form: Default::default(),
         }
     }
 
@@ -131,6 +134,7 @@ impl Workshop {
         title: String,
         agent: Option<&CodingAgent>,
         next_terminal_id: &mut u64,
+        session_id: Option<&str>,
     ) -> u64 {
         let kind = match agent {
             Some(a) => TabKind::CodingAgent(a.clone()),
@@ -141,14 +145,38 @@ impl Workshop {
         *next_terminal_id += 1;
         self.bench.create_tab(tab_id, title, kind);
 
+        // Create a worktree for agent sessions (not plain terminals)
+        let working_dir = if let (Some(agent), Some(sid)) = (agent, session_id) {
+            match create_hand_worktree(&self.directory, &self.ryve_dir, sid) {
+                Ok(wt_path) => wt_path,
+                Err(e) => {
+                    log::warn!("Failed to create worktree for hand {sid}: {e}");
+                    self.directory.clone()
+                }
+            }
+        } else {
+            self.directory.clone()
+        };
+
         let mut settings = iced_term::settings::Settings::default();
         settings.font.size = 14.0;
         settings.theme.color_pallete.background = app_background_color();
-        settings.backend.working_directory = Some(self.directory.clone());
+        settings.backend.working_directory = Some(working_dir);
 
         if let Some(agent) = agent {
+            let mut args = agent.args.clone();
+
+            // Inject system prompt flag for agents that support it
+            if let Some(flag) = agent.system_prompt_flag() {
+                let prompt_path = self.ryve_dir.workshop_md_path();
+                if prompt_path.exists() {
+                    args.push(flag.to_string());
+                    args.push(prompt_path.to_string_lossy().into_owned());
+                }
+            }
+
             (settings.backend.program, settings.backend.args) =
-                wrap_command_with_bottom_pin(&agent.command, &agent.args);
+                wrap_command_with_bottom_pin(&agent.command, &args);
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
             (settings.backend.program, settings.backend.args) =
@@ -163,7 +191,12 @@ impl Workshop {
     }
 
     /// Spawn a terminal for a custom agent definition.
-    pub fn spawn_custom_agent(&mut self, def: &AgentDef, next_terminal_id: &mut u64) -> u64 {
+    pub fn spawn_custom_agent(
+        &mut self,
+        def: &AgentDef,
+        next_terminal_id: &mut u64,
+        session_id: &str,
+    ) -> u64 {
         let tab_id = *next_terminal_id;
         *next_terminal_id += 1;
         self.bench.create_tab(
@@ -177,10 +210,19 @@ impl Workshop {
             }),
         );
 
+        // Create a worktree for this hand
+        let working_dir = match create_hand_worktree(&self.directory, &self.ryve_dir, session_id) {
+            Ok(wt_path) => wt_path,
+            Err(e) => {
+                log::warn!("Failed to create worktree for hand {session_id}: {e}");
+                self.directory.clone()
+            }
+        };
+
         let mut settings = iced_term::settings::Settings::default();
         settings.font.size = 14.0;
         settings.theme.color_pallete.background = app_background_color();
-        settings.backend.working_directory = Some(self.directory.clone());
+        settings.backend.working_directory = Some(working_dir);
         (settings.backend.program, settings.backend.args) =
             wrap_command_with_bottom_pin(&def.command, &def.args);
         for (k, v) in &def.env {
@@ -239,6 +281,51 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// Create a git worktree for a Hand session (blocking).
+/// Returns the worktree path on success.
+fn create_hand_worktree(
+    workshop_dir: &Path,
+    ryve_dir: &RyveDir,
+    session_id: &str,
+) -> Result<PathBuf, String> {
+    // Only create worktrees for git repos
+    let git_dir = workshop_dir.join(".git");
+    if !git_dir.exists() {
+        return Err("not a git repository".to_string());
+    }
+
+    let short_id = &session_id[..8.min(session_id.len())];
+    let branch = format!("hand/{short_id}");
+    let wt_dir = ryve_dir.root().join("worktrees").join(short_id);
+
+    // Skip if worktree already exists
+    if wt_dir.exists() {
+        return Ok(wt_dir);
+    }
+
+    // Create parent dir
+    std::fs::create_dir_all(wt_dir.parent().unwrap_or(ryve_dir.root()))
+        .map_err(|e| e.to_string())?;
+
+    let output = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &wt_dir.to_string_lossy(),
+        ])
+        .current_dir(workshop_dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    Ok(wt_dir)
+}
+
 fn app_background_color() -> String {
     let color = Theme::Dark.palette().background;
 
@@ -275,6 +362,18 @@ pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::spa
     let config = data::ryve_dir::load_config(&ryve_dir).await;
     let custom_agents = data::ryve_dir::load_agent_defs(&ryve_dir).await;
     let agent_context = data::ryve_dir::load_agents_context(&ryve_dir).await;
+
+    // Inject pointers into agent boot files (WORKSHOP.md will be written
+    // once sparks are loaded — see SparksLoaded handler in main).
+    if !config.agents.disable_sync {
+        let ctx = data::agent_context::WorkshopContext {
+            sparks: Vec::new(),
+            constraints: Vec::new(),
+            failing_contracts: Vec::new(),
+            active_assignments: Vec::new(),
+        };
+        let _ = data::agent_context::sync(&directory, &ryve_dir, &config, &ctx).await;
+    }
 
     Ok(WorkshopInit {
         pool,

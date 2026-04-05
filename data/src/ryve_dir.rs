@@ -60,6 +60,10 @@ impl RyveDir {
         self.root.join("backgrounds")
     }
 
+    pub fn workshop_md_path(&self) -> PathBuf {
+        self.root.join("WORKSHOP.md")
+    }
+
     /// Create the `.ryve/` directory structure if it doesn't exist.
     pub async fn ensure_exists(&self) -> Result<(), std::io::Error> {
         tokio::fs::create_dir_all(&self.root).await?;
@@ -102,6 +106,10 @@ pub struct WorkshopConfig {
     /// Background image settings.
     #[serde(default)]
     pub background: BackgroundConfig,
+
+    /// Agent context injection settings.
+    #[serde(default)]
+    pub agents: AgentsConfig,
 }
 
 impl Default for WorkshopConfig {
@@ -114,6 +122,7 @@ impl Default for WorkshopConfig {
             default_owner: None,
             explorer: ExplorerConfig::default(),
             background: BackgroundConfig::default(),
+            agents: AgentsConfig::default(),
         }
     }
 }
@@ -176,7 +185,6 @@ impl Default for ExplorerConfig {
 fn default_ignore_patterns() -> Vec<String> {
     [
         ".git",
-        ".ryve",
         "node_modules",
         "target",
         ".DS_Store",
@@ -228,6 +236,18 @@ impl Default for BackgroundConfig {
 
 fn default_dim_opacity() -> f32 {
     0.7
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentsConfig {
+    /// Override which agent boot files get the Ryve pointer injection.
+    /// Defaults to `["CLAUDE.md", ".cursorrules", ".github/copilot-instructions.md"]`.
+    #[serde(default)]
+    pub target_files: Option<Vec<String>>,
+
+    /// Disable automatic context injection entirely.
+    #[serde(default)]
+    pub disable_sync: bool,
 }
 
 fn default_sidebar_width() -> f32 {

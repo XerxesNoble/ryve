@@ -5,8 +5,12 @@
 
 pub mod agent_session_repo;
 pub mod alloy_repo;
+pub mod assignment_repo;
 pub mod bond_repo;
 pub mod comment_repo;
+pub mod commit_link_repo;
+pub mod constraint_helpers;
+pub mod contract_repo;
 pub mod file_link_repo;
 pub mod ember_repo;
 pub mod engraving_repo;

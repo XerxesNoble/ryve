@@ -3,13 +3,14 @@
 
 //! Bench panel — tabbed workspace for terminal sessions and coding agents.
 
-use iced::widget::{Space, button, column, container, row, text};
+use iced::widget::{Space, button, column, container, row, text, tooltip};
 use iced::{Element, Length, Theme};
 
 use std::path::PathBuf;
 
 use crate::coding_agents::CodingAgent;
 use crate::style::{self, Palette};
+use data::ryve_dir::AgentDef;
 
 /// A tab in the bench — either a plain terminal, coding agent, or file viewer.
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ pub enum Message {
     ToggleDropdown,
     NewTerminal,
     NewCodingAgent(CodingAgent),
+    NewCustomAgent(usize),
     TerminalEvent(iced_term::Event),
 }
 
@@ -79,7 +81,17 @@ impl BenchState {
                 pal.text_secondary
             };
 
+            let (kind_icon, tip_text) = match &tab.kind {
+                TabKind::Terminal => ("\u{25B8}", "Terminal".to_string()),
+                TabKind::CodingAgent(agent) => ("\u{2726}", agent.display_name.clone()),
+                TabKind::FileViewer(path) => (
+                    "\u{25A2}",
+                    path.to_string_lossy().to_string(),
+                ),
+            };
+
             let tab_content = row![
+                text(kind_icon).size(10).color(text_color),
                 button(text(&tab.title).size(12).color(text_color))
                     .style(button::text)
                     .padding(0)
@@ -96,7 +108,11 @@ impl BenchState {
                 .padding([4, 10])
                 .style(move |_theme: &Theme| style::tab_pill(&pal, is_active));
 
-            tab_row = tab_row.push(pill);
+            tab_row = tab_row.push(
+                tooltip(pill, text(tip_text).size(11), tooltip::Position::Bottom)
+                    .gap(4)
+                    .style(move |_theme: &Theme| style::dropdown(&pal)),
+            );
         }
 
         let new_btn = button(text("+  \u{25BE}").size(13).color(pal.text_secondary))
@@ -115,6 +131,7 @@ impl BenchState {
     pub fn view_dropdown<'a>(
         &'a self,
         available_agents: &'a [CodingAgent],
+        custom_agents: &'a [AgentDef],
         pal: &Palette,
     ) -> Option<Element<'a, Message>> {
         if !self.dropdown_open {
@@ -139,6 +156,21 @@ impl BenchState {
                     .width(Length::Fill)
                     .on_press(Message::NewCodingAgent(agent.clone())),
             );
+        }
+
+        if !custom_agents.is_empty() {
+            menu = menu.push(
+                text("Custom").size(10).color(pal.text_tertiary),
+            );
+            for (i, def) in custom_agents.iter().enumerate() {
+                let label = format!("New {}...", def.name);
+                menu = menu.push(
+                    button(text(label).size(13).color(pal.text_primary))
+                        .style(button::text)
+                        .width(Length::Fill)
+                        .on_press(Message::NewCustomAgent(i)),
+                );
+            }
         }
 
         let dropdown = container(menu)
