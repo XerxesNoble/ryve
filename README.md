@@ -97,26 +97,39 @@ Multi-tool workflow
 
 Ryve detects supported coding tools on your PATH and can launch them directly into Bench tabs.
 
-Supported tools currently include:
-	•	Claude Code
-	•	Codex
-	•	Aider
-	•	Goose
-	•	Continue
-	•	Cline
+Supported tools (must support system prompt injection):
+	•	Claude Code (`--system-prompt`)
+	•	Codex (`--instructions`)
+	•	Aider (`--read`)
+	•	OpenCode (`--prompt`)
+
+Only agents that accept system prompt injection are supported. Ryve requires control over each Hand's instructions to enforce workgraph coordination rules.
+
+Worktree isolation
+
+Every Hand spawns in its own git worktree (`.ryve/worktrees/<session>/`), preventing merge conflicts between concurrent agents working on the same project.
 
 Workgraph-driven coordination
 
-Ryve embeds structured work tracking directly into the editor through:
-	•	Sparks for work items
-	•	Bonds for dependencies
-	•	Embers for short-lived signals
-	•	Engravings for persistent knowledge
-	•	Alloys for coordination patterns
+The workgraph is the nervous system of Ryve. Every Hand reads `.ryve/WORKSHOP.md` (injected via system prompt) which contains active sparks, architectural constraints, failing contracts, and coordination rules. The workgraph database is the source of truth; WORKSHOP.md is a generated projection.
+
+The workgraph includes:
+	•	Sparks — work items with structured intent (problem, invariants, risk, scope)
+	•	Bonds — dependency graph with cycle detection
+	•	Contracts — machine-checkable verification criteria (required/advisory)
+	•	Embers — ephemeral inter-Hand signals with TTL
+	•	Engravings — persistent knowledge and architectural constraints
+	•	Alloys — coordination patterns (scatter/watch/chain)
+	•	Hand Assignments — liveness-aware claims with heartbeat and handoff
+	•	Commit Links — git commits linked to sparks via `[sp-xxxx]` references
+
+Real-time synchronisation
+
+The sparks panel auto-refreshes every 3 seconds, detecting changes made by agents directly in the database. WORKSHOP.md is regenerated on every spark mutation so all Hands see current state.
 
 Workshop-local state
 
-Each workshop gets its own .ryve/ directory for config, data, and local context.
+Each workshop gets its own `.ryve/` directory for config, data, worktrees, and context.
 
 ⸻
 
@@ -193,11 +206,12 @@ Status
 Ryve is in active development.
 
 The project is currently focused on:
-	•	core desktop UX
-	•	terminal and tool session management
-	•	workshop structure
-	•	workgraph foundations
-	•	multi-Hand coordination model
+	•	core desktop UX and light/dark mode support
+	•	terminal and tool session management with worktree isolation
+	•	workshop structure and background customisation
+	•	workgraph: intent tracking, verification contracts, provenance, constraints
+	•	multi-Hand coordination: assignments, heartbeat, handoff, auto-refresh
+	•	agent context injection via system prompt flags and boot file pointers
 
 Expect rapid iteration.
 

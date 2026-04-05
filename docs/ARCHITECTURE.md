@@ -85,8 +85,8 @@ Iced lifecycle methods:
 - `boot()` -- Detects available coding agents, returns initial state
 - `update(Message)` -- Central message dispatcher
 - `view()` -- Renders workshop bar + active workshop (or welcome screen)
-- `subscription()` -- Batches terminal event subscriptions from all workshops
-- `theme()` -- Returns `Theme::Dark`
+- `subscription()` -- Batches terminal event subscriptions + 3-second sparks poll timer
+- `theme()` -- Returns dark or light theme based on system appearance
 
 ### Message Routing
 
@@ -98,6 +98,7 @@ Message
 +-- Initialization        WorkshopReady, SparksLoaded, FilesScanned
 +-- Screen delegation     FileExplorer(_), Agents(_), Bench(_), Sparks(_), Background(_)
 +-- Background system     BackgroundLoaded, UnsplashThumbnailLoaded, UnsplashDownloaded, etc.
++-- Workgraph sync        AgentContextSynced, SparksPoll
 ```
 
 Each screen sub-message is forwarded to the active workshop's corresponding state. Terminal events (`Bench(TerminalEvent(BackendCall(id, cmd)))`) are special-cased: the app searches *all* workshops by terminal ID rather than assuming the active workshop.
@@ -153,12 +154,17 @@ struct Workshop {
 
 ### Terminal Spawning
 
-`spawn_terminal(title, agent, next_terminal_id)`:
+`spawn_terminal(title, agent, next_terminal_id, session_id)`:
 
 1. Creates a `Tab` in the bench (Terminal or CodingAgent kind)
-2. Configures `iced_term::Settings` (font size 14, dark background, working directory)
-3. Wraps the command with the **bottom-pin technique**
-4. Creates an `iced_term::Terminal` and stores it by ID
+2. **If spawning an agent**: creates a git worktree at `.ryve/worktrees/<session-id>/` via `create_hand_worktree()`, sets `working_directory` to the worktree path. Plain terminals use the workshop root.
+3. **If agent supports system prompt injection**: appends the agent's system prompt flag (e.g. `--system-prompt` for Claude Code) with `.ryve/WORKSHOP.md` as the argument. For agents that take inline text (e.g. OpenCode's `--prompt`), reads the file content instead.
+4. Wraps the command with the **bottom-pin technique**
+5. Creates an `iced_term::Terminal` and stores it by ID
+
+**Worktree isolation** -- Every Hand runs in its own git worktree (`hand/<session-id-prefix>` branch) to prevent merge conflicts between concurrent agents.
+
+**System prompt injection** -- The WORKSHOP.md file containing active sparks, constraints, contracts, and workflow rules is injected directly into the agent's system instructions. This is not optional — only agents that support system prompt flags are included in `KNOWN_AGENTS`.
 
 **Bottom-pin technique** -- Prevents the shell prompt from appearing at the top of an empty terminal by prepending 200 newlines before `exec`-ing the actual command:
 
@@ -236,10 +242,14 @@ Lists active `AgentSession` objects (id, name, tab_id). Clicking an agent switch
 
 ### Workgraph Panel (`sparks.rs`)
 
-Read-only display of cached sparks with:
-- Status indicators: open, in_progress, blocked, deferred, closed
+Live management interface for sparks with full CRUD:
+- Status indicators: open (○), in_progress (◔), blocked (■), deferred (◌), closed (●)
+- Clickable status indicators cycle through: open → in_progress → closed
 - Priority badges (P0-P4)
+- "+" button opens inline create form (title input, creates Task at P2)
 - Refresh button to reload from DB
+- **Auto-refresh**: 3-second polling subscription detects external DB changes (e.g. from agents)
+- Every mutation triggers `SparksLoaded` → WORKSHOP.md regeneration
 
 ### Background Picker (`background_picker.rs`)
 
@@ -254,18 +264,18 @@ Modal overlay (rendered via `stack![]` layering) for setting workshop background
 
 ## Coding Agents (`src/coding_agents.rs`)
 
-Auto-detection of CLI coding agents on the system PATH:
+Auto-detection of CLI coding agents on the system PATH. Only agents that support system prompt injection are included — Ryve requires control over Hand instructions to enforce workgraph coordination.
 
-| Agent | Command | Args |
-|---|---|---|
-| Claude Code | `claude` | `["--chat"]` |
-| Codex | `codex` | `[]` |
-| Aider | `aider` | `[]` |
-| Goose | `goose` | `[]` |
-| Continue | `continue` | `[]` |
-| Cline | `cline` | `[]` |
+| Agent | Command | System Prompt Flag | Resume |
+|---|---|---|---|
+| Claude Code | `claude` | `--system-prompt <file>` | `--resume` |
+| Codex | `codex` | `--instructions <file>` | `--resume` |
+| Aider | `aider` | `--read <file>` | — |
+| OpenCode | `opencode` | `--prompt <text>` | — |
 
-Detection uses the `which` crate to check command availability. Custom agents can also be defined per-workshop in `.ryve/agents/*.toml` files.
+Detection uses `which` to check command availability. Custom agents can also be defined per-workshop in `.ryve/agents/*.toml` files.
+
+`system_prompt_flag()` returns `(flag, is_file_path)` — if `is_file_path` is false (OpenCode), the WORKSHOP.md content is read and passed inline rather than as a path.
 
 ---
 
@@ -279,10 +289,12 @@ Each workshop's `.ryve/` directory:
 .ryve/
 +-- config.toml          # WorkshopConfig
 +-- sparks.db            # SQLite database
++-- WORKSHOP.md          # Auto-generated context for Hands (source of truth projection)
 +-- agents/              # Custom agent definitions (*.toml)
 +-- context/
-|   +-- AGENTS.md        # Instructions read by agents
+|   +-- AGENTS.md        # Additional instructions read by agents
 +-- backgrounds/         # Workshop background images
++-- worktrees/           # Git worktrees for active Hand sessions
 ```
 
 **`WorkshopConfig`** (TOML):
@@ -308,6 +320,10 @@ image = "photo.jpg"
 dim_opacity = 0.7
 unsplash_photographer = "Jane Doe"
 unsplash_photographer_url = "https://unsplash.com/@jane"
+
+[agents]
+target_files = ["CLAUDE.md", "OPENCODE.md", ".cursorrules", ".github/copilot-instructions.md"]
+disable_sync = false
 ```
 
 **`AgentDef`** (per `.ryve/agents/*.toml`):
@@ -325,19 +341,26 @@ model = "claude-sonnet-4-20250514"
 
 SQLite with WAL journaling, opened via sqlx. Max 5 connections per pool.
 
-**Schema** (from `migrations/001_create_sparks_tables.sql`):
+**Schema** (from `migrations/001-004`):
 
 | Table | Purpose |
 |---|---|
-| `sparks` | Core work items (status, priority, type, assignee, parent, GitHub link, metadata) |
+| `sparks` | Core work items (status, priority, type, assignee, parent, GitHub link, metadata, risk_level, scope_boundary) |
 | `bonds` | Dependency edges between sparks (with bond type) |
 | `stamps` | Labels/tags on sparks |
 | `comments` | Discussion threads on sparks |
-| `events` | Audit trail of all changes |
-| `embers` | Ephemeral inter-agent signals (TTL-based context passing) |
-| `engravings` | Persistent shared knowledge (key-value, workshop-scoped) |
+| `events` | Audit trail of all changes (with actor_type, change_nature, session_id for provenance) |
+| `embers` | Ephemeral inter-Hand signals (TTL-based context passing) |
+| `engravings` | Persistent shared knowledge + architectural constraints (`constraint:` prefix) |
 | `alloys` | Coordination templates (groups of sparks with execution order) |
 | `alloy_members` | Members of an alloy with bond types and positions |
+| `spark_file_links` | Spark-to-code-region associations (file, line range) |
+| `agent_sessions` | Hand session tracking with resume capability |
+| `contracts` | Verification criteria on sparks (required/advisory, kind, check_command, status) |
+| `commit_links` | Git commit-to-spark linkage (parsed from `[sp-xxxx]` in messages) |
+| `hand_assignments` | Liveness-aware Hand-to-Spark claims (heartbeat, lease, handoff) |
+| `crews` | Optional Hand groupings (schema-only, future use) |
+| `crew_members` | Crew membership (schema-only, future use) |
 
 ### Workgraph System (`sparks/`)
 
@@ -346,16 +369,29 @@ SQLite with WAL journaling, opened via sqlx. Max 5 connections per pool.
 - **SparkStatus**: `open`, `in_progress`, `blocked`, `deferred`, `closed`
 - **SparkPriority**: P0 (critical) through P4 (negligible)
 - **SparkType**: `bug`, `feature`, `task`, `epic`, `chore`, `spike`, `milestone`
+- **RiskLevel**: `trivial`, `normal`, `elevated`, `critical`
+- **SparkIntent**: Structured intent embedded in metadata JSON (`problem_statement`, `invariants`, `non_goals`, `acceptance_criteria`)
 - **BondType**: `blocks`, `parent_child`, `related`, `conditional_blocks`, `waits_for`, `duplicates`, `supersedes`
+- **ContractKind**: `test_pass`, `no_api_break`, `custom_command`, `grep_absent`, `grep_present`
+- **ContractEnforcement**: `advisory`, `required`
+- **ActorType**: `human`, `hand`, `system`, `unknown` (provenance)
+- **ChangeNature**: `code`, `refactor`, `format`, `generated`, `review`, `config`, `documentation`, `test`
+- **AssignmentStatus**: `active`, `completed`, `handed_off`, `abandoned`, `expired`
+- **AssignmentRole**: `owner`, `assistant`, `observer`
+- **ArchConstraint**: Stored as typed engravings with `constraint:` key prefix
 
 **Repositories** (async CRUD via sqlx):
 
-- `spark_repo` -- Create, get, update, close, delete, list with `SparkFilter`
+- `spark_repo` -- Create, get, update, close, delete, list with `SparkFilter` (includes risk_level filter)
 - `bond_repo` -- Create (with cycle detection), delete, list for spark, list blockers
-- `comment_repo`, `event_repo`, `stamp_repo` -- Standard CRUD
+- `comment_repo`, `event_repo`, `stamp_repo` -- Standard CRUD (events include provenance fields)
 - `ember_repo` -- Create, get, expire by TTL, list active
 - `engraving_repo` -- Upsert, get by key, list for workshop
 - `alloy_repo` -- Create, add/remove members, list
+- `contract_repo` -- Create, list for spark, update status, list failing (workshop-wide)
+- `commit_link_repo` -- Create, list for spark, list for commit
+- `assignment_repo` -- Assign, complete, handoff, abandon, heartbeat, expire stale claims
+- `constraint_helpers` -- Thin wrapper over engravings for `constraint:` prefix convention
 
 **Graph** (`graph.rs`):
 
@@ -371,8 +407,25 @@ Wraps the `git` CLI (no library dependency):
 - `file_statuses()` -- `git status --porcelain=v1 -uall`, parses into `HashMap<PathBuf, FileStatus>`
 - `is_repo()` -- Checks `.git` existence
 - `list_worktrees()` -- `git worktree list --porcelain`
+- `create_worktree(branch, target)` -- `git worktree add -b <branch> <target>`
+- `remove_worktree(target)` -- `git worktree remove --force <target>`
+- `parse_spark_refs(message)` -- Extracts `[sp-xxxx]` spark references from commit messages
+- `scan_commits_for_sparks(repo, since)` -- Scans `git log` for commits referencing sparks
 
 File statuses: Modified, Added, Deleted, Renamed, Copied, Untracked, Ignored, Conflicted.
+
+### Agent Context (`agent_context.rs`)
+
+Generates `.ryve/WORKSHOP.md` and injects pointers into agent boot files (`CLAUDE.md`, `OPENCODE.md`, `.cursorrules`, `.github/copilot-instructions.md`).
+
+**WORKSHOP.md** is the generated projection of the workgraph, containing:
+- Active sparks table (with risk level and scope)
+- Architectural constraints (from `constraint:` engravings)
+- Failing verification contracts
+- Active Hand assignments
+- Workflow rules (claim before work, reference spark IDs, check contracts)
+
+Regenerated on every `SparksLoaded` event (including the 3-second poll). The pointer injected into boot files uses `<!-- RYVE:START -->` / `<!-- RYVE:END -->` markers to safely replace content without clobbering user-written instructions.
 
 ### Unsplash Integration (`unsplash.rs`)
 
@@ -463,9 +516,14 @@ The backend's `resize()` method only sends PTY resize notifications when the com
 | **Elm Architecture** | `App` update/view | Iced's core pattern; unidirectional data flow |
 | **Workshop Scoping** | All state per-workshop | Switching workshops = changing an index, not rebuilding state |
 | **Task-based Async** | All I/O operations | Non-blocking via `Task::perform()`, results as messages |
-| **Subscription Streams** | Terminal events | Continuous PTY event polling via Iced subscriptions |
+| **Subscription Streams** | Terminal events + sparks poll | Continuous PTY event polling + 3-second DB refresh via Iced subscriptions |
 | **Stack Layering** | Background + content + modals | `stack![]` for background images, dim overlays, modal dialogs |
 | **Cycle Detection** | Bond creation | petgraph DiGraphMap prevents circular blocking dependencies |
 | **Bottom-pin** | Terminal spawning | Newline padding keeps shell prompt at viewport bottom |
 | **CLI Wrapping** | Git integration | Shell out to `git` rather than linking libgit2 |
 | **Channel Bridge** | PTY to Iced | tokio mpsc channels bridge alacritty's sync EventListener to Iced's async subscriptions |
+| **Worktree Isolation** | Hand spawning | Each Hand gets its own git worktree to prevent merge conflicts |
+| **System Prompt Injection** | Hand spawning | WORKSHOP.md injected via agent-specific CLI flags (`--system-prompt`, etc.) |
+| **Marker Injection** | Agent boot files | `<!-- RYVE:START/END -->` markers safely inject pointers into CLAUDE.md etc. |
+| **Constraint Engravings** | Architectural rules | `constraint:` key prefix on engravings for typed architectural constraints |
+| **Poll-based Refresh** | Sparks panel | 3-second timer detects external DB mutations by agents |
