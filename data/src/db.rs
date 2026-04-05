@@ -8,6 +8,7 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
+use crate::forge_dir::ForgeDir;
 use crate::sparks::error::SparksError;
 
 /// Open (or create) the sparks database for a workshop directory.
@@ -15,12 +16,10 @@ use crate::sparks::error::SparksError;
 /// Creates `.forge/sparks.db` inside `workshop_dir`, runs all pending
 /// migrations, and returns a connection pool.
 pub async fn open_sparks_db(workshop_dir: &Path) -> Result<SqlitePool, SparksError> {
-    let forge_dir = workshop_dir.join(".forge");
-    tokio::fs::create_dir_all(&forge_dir)
-        .await
-        .map_err(SparksError::Io)?;
+    let forge_dir = ForgeDir::new(workshop_dir);
+    forge_dir.ensure_exists().await.map_err(SparksError::Io)?;
 
-    let db_path = forge_dir.join("sparks.db");
+    let db_path = forge_dir.sparks_db_path();
 
     let options = SqliteConnectOptions::new()
         .filename(&db_path)

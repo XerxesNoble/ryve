@@ -8,13 +8,14 @@ mod workshop;
 
 use std::path::PathBuf;
 
+use data::sparks::types::Spark;
 use iced::widget::{button, column, container, row, text, Space};
 use iced::{Element, Length, Subscription, Task, Theme};
 use uuid::Uuid;
 
 use coding_agents::CodingAgent;
 use screen::agents::AgentSession;
-use workshop::Workshop;
+use workshop::{Workshop, WorkshopInit};
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
@@ -36,7 +37,7 @@ struct App {
     next_terminal_id: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Message {
     /// Workshop-level tab bar
     SelectWorkshop(usize),
@@ -44,10 +45,39 @@ enum Message {
     NewWorkshopDialog,
     WorkshopDirPicked(Option<PathBuf>),
 
+    /// Workshop .forge/ initialized
+    WorkshopReady {
+        idx: usize,
+        pool: sqlx::SqlitePool,
+        config: data::forge_dir::WorkshopConfig,
+        custom_agents: Vec<data::forge_dir::AgentDef>,
+        agent_context: Option<String>,
+    },
+    /// Sparks loaded from DB
+    SparksLoaded(usize, Vec<Spark>),
+
     /// Forwarded to the active workshop
     FileExplorer(screen::file_explorer::Message),
     Agents(screen::agents::Message),
     Bench(screen::bench::Message),
+    Sparks(screen::sparks::Message),
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelectWorkshop(i) => write!(f, "SelectWorkshop({i})"),
+            Self::CloseWorkshop(i) => write!(f, "CloseWorkshop({i})"),
+            Self::NewWorkshopDialog => write!(f, "NewWorkshopDialog"),
+            Self::WorkshopDirPicked(p) => write!(f, "WorkshopDirPicked({p:?})"),
+            Self::WorkshopReady { idx, .. } => write!(f, "WorkshopReady({idx})"),
+            Self::SparksLoaded(i, s) => write!(f, "SparksLoaded({i}, {} sparks)", s.len()),
+            Self::FileExplorer(m) => write!(f, "FileExplorer({m:?})"),
+            Self::Agents(m) => write!(f, "Agents({m:?})"),
+            Self::Bench(m) => write!(f, "Bench({m:?})"),
+            Self::Sparks(m) => write!(f, "Sparks({m:?})"),
+        }
+    }
 }
 
 impl App {
@@ -102,12 +132,59 @@ impl App {
                 })
             }
             Message::WorkshopDirPicked(Some(path)) => {
-                let workshop = Workshop::new(path);
+                let workshop = Workshop::new(path.clone());
                 self.workshops.push(workshop);
-                self.active_workshop = Some(self.workshops.len() - 1);
-                Task::none()
+                let idx = self.workshops.len() - 1;
+                self.active_workshop = Some(idx);
+
+                // Async: init .forge/ dir, DB, config, agents, context
+                Task::perform(
+                    workshop::init_workshop(path),
+                    move |result| match result {
+                        Ok(init) => Message::WorkshopReady {
+                            idx,
+                            pool: init.pool,
+                            config: init.config,
+                            custom_agents: init.custom_agents,
+                            agent_context: init.agent_context,
+                        },
+                        Err(e) => {
+                            log::error!("Failed to init workshop: {e}");
+                            Message::WorkshopDirPicked(None)
+                        }
+                    },
+                )
             }
             Message::WorkshopDirPicked(None) => Task::none(),
+
+            Message::WorkshopReady {
+                idx,
+                pool,
+                config,
+                custom_agents,
+                agent_context,
+            } => {
+                if let Some(ws) = self.workshops.get_mut(idx) {
+                    ws.sparks_db = Some(pool.clone());
+                    ws.config = config;
+                    ws.custom_agents = custom_agents;
+                    ws.agent_context = agent_context;
+
+                    // Load sparks from the fresh DB
+                    let ws_id = ws.id.to_string();
+                    return Task::perform(
+                        load_sparks(pool, ws_id),
+                        move |sparks| Message::SparksLoaded(idx, sparks),
+                    );
+                }
+                Task::none()
+            }
+            Message::SparksLoaded(idx, sparks) => {
+                if let Some(ws) = self.workshops.get_mut(idx) {
+                    ws.sparks = sparks;
+                }
+                Task::none()
+            }
 
             // -- Forward to active workshop --
             Message::FileExplorer(_msg) => Task::none(),
@@ -130,6 +207,32 @@ impl App {
                 Task::none()
             }
             Message::Bench(msg) => self.handle_bench_message(msg),
+            Message::Sparks(msg) => {
+                match msg {
+                    screen::sparks::Message::Refresh => {
+                        if let Some(idx) = self.active_workshop {
+                            if let Some(ws) = self.workshops.get(idx) {
+                                if let Some(ref pool) = ws.sparks_db {
+                                    let pool = pool.clone();
+                                    let ws_id = ws.id.to_string();
+                                    return Task::perform(
+                                        load_sparks(pool, ws_id),
+                                        move |sparks| {
+                                            Message::SparksLoaded(
+                                                idx, sparks,
+                                            )
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    screen::sparks::Message::SelectSpark(_id) => {
+                        // TODO: open spark detail view
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -312,7 +415,7 @@ impl App {
         )
         .width(Length::Fill)
         .height(Length::FillPortion(
-            (ws.sidebar_split * 100.0) as u16,
+            (ws.sidebar_split() * 100.0) as u16,
         ))
         .style(container::bordered_box);
 
@@ -320,18 +423,28 @@ impl App {
             container(self.view_agents(ws))
                 .width(Length::Fill)
                 .height(Length::FillPortion(
-                    ((1.0 - ws.sidebar_split) * 100.0) as u16,
+                    ((1.0 - ws.sidebar_split()) * 100.0) as u16,
                 ))
                 .style(container::bordered_box);
 
         let sidebar = column![files_panel, agents_panel]
-            .width(250)
+            .width(ws.sidebar_width())
             .height(Length::Fill);
 
-        // -- Right: bench (tabbed area) --
+        // -- Center: bench (tabbed area) --
         let bench = self.view_bench(ws);
 
-        row![sidebar, bench].height(Length::Fill).into()
+        // -- Right: sparks panel --
+        let sparks_panel = screen::sparks::view(&ws.sparks)
+            .map(Message::Sparks);
+
+        let sparks_col = container(sparks_panel)
+            .width(ws.sparks_width())
+            .height(Length::Fill);
+
+        row![sidebar, bench, sparks_col]
+            .height(Length::Fill)
+            .into()
     }
 
     fn view_agents<'a>(&'a self, ws: &'a Workshop) -> Element<'a, Message> {
@@ -409,4 +522,17 @@ async fn pick_workshop_directory() -> Option<PathBuf> {
         .pick_folder()
         .await
         .map(|handle| handle.path().to_path_buf())
+}
+
+/// Load all sparks for a workshop from the database.
+async fn load_sparks(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Spark> {
+    data::sparks::spark_repo::list(
+        &pool,
+        data::sparks::types::SparkFilter {
+            workshop_id: Some(workshop_id),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_default()
 }

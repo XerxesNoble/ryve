@@ -4,3 +4,4 @@
 pub mod agents;
 pub mod bench;
 pub mod file_explorer;
+pub mod sparks;
