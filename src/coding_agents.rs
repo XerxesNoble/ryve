@@ -44,11 +44,14 @@ impl CodingAgent {
 
 impl CodingAgent {
     /// Return the CLI flag for injecting a system prompt file, if supported.
-    pub fn system_prompt_flag(&self) -> Option<&'static str> {
+    /// Returns `(flag, is_file_path)` — if `is_file_path` is false, the value
+    /// should be inline text rather than a file path.
+    pub fn system_prompt_flag(&self) -> Option<(&'static str, bool)> {
         match self.command.as_str() {
-            "claude" => Some("--system-prompt"),
-            "codex" => Some("--instructions"),
-            "aider" => Some("--read"),
+            "claude" => Some(("--system-prompt", true)),
+            "codex" => Some(("--instructions", true)),
+            "aider" => Some(("--read", true)),
+            "opencode" => Some(("--prompt", false)),
             _ => None,
         }
     }
@@ -79,13 +82,14 @@ struct AgentDef {
     resume: ResumeStrategy,
 }
 
+/// Only agents that support system prompt injection are included.
+/// Ryve requires control over the Hand's instructions — agents without
+/// a system prompt flag cannot be reliably coordinated.
 const KNOWN_AGENTS: &[AgentDef] = &[
     AgentDef { name: "Claude Code", command: "claude", args: &[], resume: ResumeStrategy::ResumeFlag },
     AgentDef { name: "Codex", command: "codex", args: &[], resume: ResumeStrategy::ResumeFlag },
     AgentDef { name: "Aider", command: "aider", args: &[], resume: ResumeStrategy::None },
-    AgentDef { name: "Goose", command: "goose", args: &["session"], resume: ResumeStrategy::SessionResume },
-    AgentDef { name: "Cline", command: "cline", args: &[], resume: ResumeStrategy::None },
-    AgentDef { name: "Continue", command: "continue", args: &[], resume: ResumeStrategy::None },
+    AgentDef { name: "OpenCode", command: "opencode", args: &[], resume: ResumeStrategy::None },
 ];
 
 /// Detect which coding agents are available on PATH.

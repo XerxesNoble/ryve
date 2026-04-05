@@ -24,6 +24,7 @@ const MARKER_END: &str = "<!-- RYVE:END -->";
 /// Each entry is relative to the workshop root.
 const DEFAULT_TARGETS: &[&str] = &[
     "CLAUDE.md",
+    "OPENCODE.md",
     ".cursorrules",
     ".github/copilot-instructions.md",
 ];
@@ -250,4 +251,21 @@ pub fn target_paths(workshop_dir: &Path, config: &WorkshopConfig) -> Vec<PathBuf
         paths.push(workshop_dir.join(rel));
     }
     paths
+}
+
+// ── Hand prompt generation ───────────────────────────
+
+/// Generate the initial prompt text to inject into a Hand's terminal via PTY.
+/// This is the fallback for agents that don't support `--system-prompt` flags.
+pub fn generate_hand_prompt(workshop_dir: &Path) -> String {
+    let ws_md = workshop_dir.join(".ryve/WORKSHOP.md");
+    let ws_md_rel = ".ryve/WORKSHOP.md";
+
+    format!(
+        "You are a Hand in a Ryve Workshop. Before doing ANY work, you MUST read \
+         and follow the rules in `{ws_md_rel}`. It contains active tasks (sparks), \
+         architectural constraints, verification contracts, and coordination rules. \
+         Reference spark IDs in all commits (e.g. `[sp-xxxx]`). \
+         Read {ws_md_rel} now.\n"
+    )
 }

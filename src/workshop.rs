@@ -167,11 +167,18 @@ impl Workshop {
             let mut args = agent.args.clone();
 
             // Inject system prompt flag for agents that support it
-            if let Some(flag) = agent.system_prompt_flag() {
+            if let Some((flag, is_file)) = agent.system_prompt_flag() {
                 let prompt_path = self.ryve_dir.workshop_md_path();
                 if prompt_path.exists() {
                     args.push(flag.to_string());
-                    args.push(prompt_path.to_string_lossy().into_owned());
+                    if is_file {
+                        args.push(prompt_path.to_string_lossy().into_owned());
+                    } else {
+                        // Inline text — read the file content
+                        let content = std::fs::read_to_string(&prompt_path)
+                            .unwrap_or_default();
+                        args.push(content);
+                    }
                 }
             }
 
