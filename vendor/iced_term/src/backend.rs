@@ -441,7 +441,10 @@ impl Backend {
             .floor() as u16;
         let cols = (self.size.layout_width / self.size.cell_width as f32)
             .floor() as u16;
-        if lines > 0 && cols > 0 {
+        if lines > 0
+            && cols > 0
+            && (lines != self.size.num_lines || cols != self.size.num_cols)
+        {
             self.size.num_lines = lines;
             self.size.num_cols = cols;
             self.notifier.on_resize(self.size.into());

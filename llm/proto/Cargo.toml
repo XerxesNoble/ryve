@@ -5,7 +5,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Forge LLM protocol types: messages, threads, and agent definitions"
+description = "Ryve LLM protocol types: messages, threads, and agent definitions"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

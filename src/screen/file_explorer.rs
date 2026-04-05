@@ -6,9 +6,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use data::git::FileStatus;
-use iced::widget::{Space, button, column, container, row, scrollable, text};
-use iced::{Color, Element, Length};
+use data::git::{DiffStat, FileStatus};
+use iced::widget::{Space, button, column, container, row, scrollable, svg, text};
+use iced::{Color, Element, Length, Theme};
+
+use crate::style::{self, Palette};
+
+use crate::icons;
 
 // ── Messages ──────────────────────────────────────────
 
@@ -17,7 +21,7 @@ pub enum Message {
     SelectFile(PathBuf),
     ToggleDirectory(PathBuf),
     Refresh,
-    TreeLoaded(Vec<FileNode>, HashMap<PathBuf, FileStatus>, Option<String>),
+    TreeLoaded(Vec<FileNode>, HashMap<PathBuf, FileStatus>, HashMap<PathBuf, DiffStat>, Option<String>),
     LinkSpark(PathBuf),
 }
 
@@ -47,6 +51,8 @@ pub struct FileExplorerState {
     pub expanded: HashSet<PathBuf>,
     /// Git status per file (repo-relative paths).
     pub git_statuses: HashMap<PathBuf, FileStatus>,
+    /// Per-file diff stats (additions/deletions) keyed by repo-relative path.
+    pub diff_stats: HashMap<PathBuf, DiffStat>,
     /// Current git branch name.
     pub branch: Option<String>,
     /// Currently selected file path.
@@ -59,6 +65,7 @@ impl FileExplorerState {
             tree: Vec::new(),
             expanded: HashSet::new(),
             git_statuses: HashMap::new(),
+            diff_stats: HashMap::new(),
             branch: None,
             selected: None,
         }
@@ -72,22 +79,23 @@ impl FileExplorerState {
 pub async fn scan_directory(
     root: PathBuf,
     ignore: Vec<String>,
-) -> (Vec<FileNode>, HashMap<PathBuf, FileStatus>, Option<String>) {
+) -> (Vec<FileNode>, HashMap<PathBuf, FileStatus>, HashMap<PathBuf, DiffStat>, Option<String>) {
     let ignore = std::sync::Arc::new(ignore);
     let tree = build_tree(root.clone(), 0, ignore).await;
 
     let repo = data::git::Repository::new(&root);
     let is_repo = data::git::Repository::is_repo(&root).await;
 
-    let (statuses, branch) = if is_repo {
+    let (statuses, diff_stats, branch) = if is_repo {
         let statuses = repo.file_statuses().await.unwrap_or_default();
+        let diff_stats = repo.diff_stats().await.unwrap_or_default();
         let branch = repo.current_branch().await.ok();
-        (statuses, branch)
+        (statuses, diff_stats, branch)
     } else {
-        (HashMap::new(), None)
+        (HashMap::new(), HashMap::new(), None)
     };
 
-    (tree, statuses, branch)
+    (tree, statuses, diff_stats, branch)
 }
 
 /// Collected entry info for sorting before recursion.
@@ -170,15 +178,16 @@ fn build_tree(
 // ── View ──────────────────────────────────────────────
 
 /// Render the file explorer panel.
-pub fn view<'a>(state: &'a FileExplorerState, root: &'a Path) -> Element<'a, Message> {
+pub fn view<'a>(state: &'a FileExplorerState, root: &'a Path, pal: &Palette) -> Element<'a, Message> {
+    let pal = *pal;
     let branch_label = state.branch.as_deref().unwrap_or("no branch");
 
     let header = row![
-        text("Files").size(14),
+        text("Files").size(14).color(pal.text_primary),
         Space::new().width(Length::Fill),
         text(branch_label)
             .size(10)
-            .color(Color::from_rgb(0.6, 0.6, 0.7)),
+            .color(pal.text_secondary),
         button(text("\u{21BB}").size(13))
             .style(button::text)
             .padding([2, 6])
@@ -198,7 +207,7 @@ pub fn view<'a>(state: &'a FileExplorerState, root: &'a Path) -> Element<'a, Mes
         );
     } else {
         for node in &state.tree {
-            collect_nodes(node, root, state, 0, &mut items);
+            collect_nodes(node, root, state, 0, &pal, &mut items);
         }
     }
 
@@ -223,6 +232,7 @@ fn collect_nodes<'a>(
     root: &'a Path,
     state: &'a FileExplorerState,
     depth: u16,
+    pal: &Palette,
     items: &mut Vec<Element<'a, Message>>,
 ) {
     let indent = (depth as f32) * 16.0;
@@ -233,45 +243,79 @@ fn collect_nodes<'a>(
     let rel_path = node.path.strip_prefix(root).unwrap_or(&node.path);
     let git_color = file_git_color(rel_path, &node.kind, &state.git_statuses);
 
-    let icon = file_icon(&node.name, &node.kind, is_expanded);
+    let icon_handle = match node.kind {
+        NodeKind::Directory => icons::folder_icon(&node.name, is_expanded),
+        NodeKind::File => icons::file_icon(&node.name),
+    };
+    let icon_widget = svg(icon_handle)
+        .width(16)
+        .height(16);
 
-    let label = row![
+    // Diff stats: for files look up directly, for directories aggregate children
+    let diff = file_diff_stat(rel_path, &node.kind, &state.diff_stats);
+
+    let mut label = row![
         Space::new().width(indent),
-        text(icon).size(13).color(git_color),
+        icon_widget,
         text(&node.name).size(12).color(git_color),
         Space::new().width(Length::Fill),
-        // Spark link button
+    ]
+    .spacing(4)
+    .align_y(iced::Alignment::Center);
+
+    // Show +N / -N badges when there are changes
+    if diff.additions > 0 {
+        label = label.push(
+            text(format!("+{}", diff.additions))
+                .size(10)
+                .color(Color::from_rgb(0.40, 0.85, 0.45)),
+        );
+    }
+    if diff.deletions > 0 {
+        label = label.push(
+            text(format!("-{}", diff.deletions))
+                .size(10)
+                .color(Color::from_rgb(0.90, 0.35, 0.35)),
+        );
+    }
+
+    // Spark link button
+    label = label.push(
         button(text("\u{26A1}").size(9))
             .style(button::text)
             .padding([1, 3])
             .on_press(Message::LinkSpark(node.path.clone())),
-    ]
-    .spacing(4)
-    .align_y(iced::Alignment::Center);
+    );
 
     let msg = match node.kind {
         NodeKind::Directory => Message::ToggleDirectory(node.path.clone()),
         NodeKind::File => Message::SelectFile(node.path.clone()),
     };
 
-    let style = if is_selected {
-        button::primary
+    if is_selected {
+        let pal_copy = *pal;
+        let item = container(
+            button(label)
+                .style(button::text)
+                .width(Length::Fill)
+                .padding([2, 4])
+                .on_press(msg),
+        )
+        .style(move |_theme: &Theme| style::selected_item(&pal_copy));
+        items.push(item.into());
     } else {
-        button::text
-    };
-
-    let btn = button(label)
-        .style(style)
-        .width(Length::Fill)
-        .padding([2, 4])
-        .on_press(msg);
-
-    items.push(btn.into());
+        let btn = button(label)
+            .style(button::text)
+            .width(Length::Fill)
+            .padding([2, 4])
+            .on_press(msg);
+        items.push(btn.into());
+    }
 
     // Render children if directory is expanded
     if node.kind == NodeKind::Directory && is_expanded {
         for child in &node.children {
-            collect_nodes(child, root, state, depth + 1, items);
+            collect_nodes(child, root, state, depth + 1, pal, items);
         }
     }
 }
@@ -313,6 +357,29 @@ fn file_git_color(
     }
 }
 
+/// Get aggregated diff stats for a file or directory.
+fn file_diff_stat(
+    rel_path: &Path,
+    kind: &NodeKind,
+    diff_stats: &HashMap<PathBuf, DiffStat>,
+) -> DiffStat {
+    if *kind == NodeKind::File {
+        return diff_stats.get(rel_path).copied().unwrap_or_default();
+    }
+
+    // Directory: aggregate all children's stats
+    let dir_prefix = rel_path.to_string_lossy();
+    let mut total = DiffStat::default();
+    for (path, stat) in diff_stats {
+        let path_str = path.to_string_lossy();
+        if path_str.starts_with(dir_prefix.as_ref()) && path_str.len() > dir_prefix.len() {
+            total.additions += stat.additions;
+            total.deletions += stat.deletions;
+        }
+    }
+    total
+}
+
 fn status_color(status: FileStatus) -> Color {
     match status {
         FileStatus::Modified => Color::from_rgb(0.90, 0.80, 0.30), // yellow
@@ -342,91 +409,3 @@ fn higher_priority_status(a: FileStatus, b: FileStatus) -> FileStatus {
     if rank(b) > rank(a) { b } else { a }
 }
 
-// ── File icons ────────────────────────────────────────
-
-/// Return an icon string for a file based on its name/extension.
-/// Uses Unicode symbols for a clean, monospace-friendly look.
-/// Branded icons for well-known file types.
-fn file_icon(name: &str, kind: &NodeKind, is_expanded: bool) -> &'static str {
-    if *kind == NodeKind::Directory {
-        return if is_expanded {
-            "\u{25BE} \u{1F4C2}" // ▾ 📂
-        } else {
-            "\u{25B8} \u{1F4C1}" // ▸ 📁
-        };
-    }
-
-    let lower = name.to_ascii_lowercase();
-
-    // Exact filename matches (branded / special)
-    match lower.as_str() {
-        "cargo.toml" | "cargo.lock" => return "\u{1F980}", // 🦀 Rust/Cargo
-        "package.json" | "package-lock.json" => return "\u{1F4E6}", // 📦 npm
-        "tsconfig.json" => return "\u{1F535}",             // 🔵 TypeScript config
-        "dockerfile" | "docker-compose.yml" | "docker-compose.yaml" => return "\u{1F433}", // 🐳 Docker
-        ".gitignore" | ".gitattributes" | ".gitmodules" => return "\u{1F500}",             // 🔀 Git
-        "makefile" | "justfile" => return "\u{2699}\u{FE0F}", // ⚙️ Build
-        "license" | "license.md" | "license.txt" => return "\u{1F4DC}", // 📜 License
-        "readme.md" | "readme.txt" | "readme" => return "\u{1F4D6}", // 📖 Readme
-        ".env" | ".env.local" | ".env.production" => return "\u{1F510}", // 🔐 Env/secrets
-        "flake.nix" | "flake.lock" => return "\u{2744}\u{FE0F}", // ❄️ Nix
-        _ => {}
-    }
-
-    // Extension-based icons
-    let ext = lower.rsplit('.').next().unwrap_or("");
-    match ext {
-        // Rust
-        "rs" => "\u{1F980}", // 🦀
-        // TypeScript / JavaScript
-        "ts" | "tsx" => "\u{1F535}", // 🔵
-        "js" | "jsx" => "\u{1F7E1}", // 🟡
-        // Python
-        "py" => "\u{1F40D}", // 🐍
-        // Go
-        "go" => "\u{1F439}", // 🐹
-        // Swift
-        "swift" => "\u{1F426}", // 🐦
-        // Ruby
-        "rb" => "\u{1F48E}", // 💎
-        // Shell
-        "sh" | "bash" | "zsh" | "fish" => "\u{1F41A}", // 🐚
-        // Markdown
-        "md" | "mdx" => "\u{1F4DD}", // 📝
-        // Config / data
-        "toml" | "yaml" | "yml" | "json" | "json5" | "jsonc" => "\u{2699}\u{FE0F}", // ⚙️
-        // HTML / CSS
-        "html" | "htm" => "\u{1F310}",                   // 🌐
-        "css" | "scss" | "sass" | "less" => "\u{1F3A8}", // 🎨
-        // SQL
-        "sql" => "\u{1F5C3}\u{FE0F}", // 🗃️
-        // Images
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "webp" => "\u{1F5BC}\u{FE0F}", // 🖼️
-        // Fonts
-        "ttf" | "otf" | "woff" | "woff2" => "\u{1F524}", // 🔤
-        // Archives
-        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" => "\u{1F4E6}", // 📦
-        // Lock files
-        "lock" => "\u{1F512}", // 🔒
-        // C / C++
-        "c" | "h" => "\u{1F1E8}",                   // 🇨
-        "cpp" | "cxx" | "cc" | "hpp" => "\u{2795}", // ➕
-        // Java / Kotlin
-        "java" => "\u{2615}",        // ☕
-        "kt" | "kts" => "\u{1F1F0}", // 🇰
-        // XML
-        "xml" | "xsl" | "xslt" => "\u{1F4C4}", // 📄
-        // Text
-        "txt" | "text" | "log" => "\u{1F4C3}", // 📃
-        // PDF
-        "pdf" => "\u{1F4D5}", // 📕
-        // Lua
-        "lua" => "\u{1F319}", // 🌙
-        // Zig
-        "zig" => "\u{26A1}", // ⚡
-        // Elixir
-        "ex" | "exs" => "\u{1F52E}", // 🔮
-        // Default
-        _ => "\u{1F4C4}", // 📄
-    }
-}

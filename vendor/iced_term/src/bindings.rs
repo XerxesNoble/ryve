@@ -228,7 +228,7 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         "r",        Modifiers::CTRL; BindingAction::Char('\x12');
         "s",        Modifiers::CTRL; BindingAction::Char('\x13');
         "t",        Modifiers::CTRL; BindingAction::Char('\x14');
-        "u",        Modifiers::CTRL; BindingAction::Char('\x51');
+        "u",        Modifiers::CTRL; BindingAction::Char('\x15');
         "v",        Modifiers::CTRL; BindingAction::Char('\x16');
         "w",        Modifiers::CTRL; BindingAction::Char('\x17');
         "x",        Modifiers::CTRL; BindingAction::Char('\x18');
@@ -238,6 +238,34 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         "]",        Modifiers::CTRL; BindingAction::Char('\x1d');
         "\'",       Modifiers::CTRL; BindingAction::Char('\x1c');
         "-",        Modifiers::CTRL; BindingAction::Char('\x1f');
+        // ALT + char (meta prefix: ESC + char, for word nav etc.)
+        "a",        Modifiers::ALT; BindingAction::Esc("\x1ba".into());
+        "b",        Modifiers::ALT; BindingAction::Esc("\x1bb".into());
+        "c",        Modifiers::ALT; BindingAction::Esc("\x1bc".into());
+        "d",        Modifiers::ALT; BindingAction::Esc("\x1bd".into());
+        "e",        Modifiers::ALT; BindingAction::Esc("\x1be".into());
+        "f",        Modifiers::ALT; BindingAction::Esc("\x1bf".into());
+        "g",        Modifiers::ALT; BindingAction::Esc("\x1bg".into());
+        "h",        Modifiers::ALT; BindingAction::Esc("\x1bh".into());
+        "i",        Modifiers::ALT; BindingAction::Esc("\x1bi".into());
+        "j",        Modifiers::ALT; BindingAction::Esc("\x1bj".into());
+        "k",        Modifiers::ALT; BindingAction::Esc("\x1bk".into());
+        "l",        Modifiers::ALT; BindingAction::Esc("\x1bl".into());
+        "m",        Modifiers::ALT; BindingAction::Esc("\x1bm".into());
+        "n",        Modifiers::ALT; BindingAction::Esc("\x1bn".into());
+        "o",        Modifiers::ALT; BindingAction::Esc("\x1bo".into());
+        "p",        Modifiers::ALT; BindingAction::Esc("\x1bp".into());
+        "q",        Modifiers::ALT; BindingAction::Esc("\x1bq".into());
+        "r",        Modifiers::ALT; BindingAction::Esc("\x1br".into());
+        "s",        Modifiers::ALT; BindingAction::Esc("\x1bs".into());
+        "t",        Modifiers::ALT; BindingAction::Esc("\x1bt".into());
+        "u",        Modifiers::ALT; BindingAction::Esc("\x1bu".into());
+        "v",        Modifiers::ALT; BindingAction::Esc("\x1bv".into());
+        "w",        Modifiers::ALT; BindingAction::Esc("\x1bw".into());
+        "x",        Modifiers::ALT; BindingAction::Esc("\x1bx".into());
+        "y",        Modifiers::ALT; BindingAction::Esc("\x1by".into());
+        "z",        Modifiers::ALT; BindingAction::Esc("\x1bz".into());
+        ".",        Modifiers::ALT; BindingAction::Esc("\x1b.".into());
         // SHIFT
         Enter,      Modifiers::SHIFT; BindingAction::Char('\x0d');
         Backspace,  Modifiers::SHIFT; BindingAction::Char('\x7f');
@@ -296,7 +324,7 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         "r",        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x12');
         "s",        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x13');
         "t",        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x14');
-        "u",        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x51');
+        "u",        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x15');
         "v",        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x16');
         "w",        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x17');
         "x",        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x18');

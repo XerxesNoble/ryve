@@ -10,7 +10,9 @@ use data::unsplash::Photo;
 use iced::widget::{
     button, column, container, image, row, rule, scrollable, text, text_input, Space,
 };
-use iced::{Color, Element, Length};
+use iced::{Element, Length, Theme};
+
+use crate::style::{self, Palette};
 
 // ── Messages ──────────────────────────────────────────
 
@@ -37,7 +39,7 @@ pub enum Message {
     RemoveBackground,
 }
 
-// ── State ─────────────────────────────────────────────
+// ── State ───────────────────────────────────���─────────
 
 #[derive(Debug, Clone)]
 pub struct PickerState {
@@ -66,9 +68,11 @@ impl PickerState {
 
 // ── View ──────────────────────────────────────────────
 
-pub fn view<'a>(state: &'a PickerState, has_background: bool) -> Element<'a, Message> {
-    let title = text("Workshop Background").size(18);
-    let close_btn = button(text("\u{00D7}").size(18))
+pub fn view<'a>(state: &'a PickerState, pal: &Palette, has_background: bool) -> Element<'a, Message> {
+    let pal = *pal;
+
+    let title = text("Workshop Settings").size(18).color(pal.text_primary);
+    let close_btn = button(text("\u{00D7}").size(18).color(pal.text_secondary))
         .style(button::text)
         .on_press(Message::Close);
 
@@ -117,9 +121,9 @@ pub fn view<'a>(state: &'a PickerState, has_background: bool) -> Element<'a, Mes
         content = content.push(search_row);
 
         if state.loading {
-            content = content.push(text("Searching...").size(12));
+            content = content.push(text("Searching...").size(12).color(pal.text_secondary));
         } else if state.results.is_empty() && !state.query.is_empty() {
-            content = content.push(text("No results").size(12));
+            content = content.push(text("No results").size(12).color(pal.text_secondary));
         }
 
         // Thumbnail grid (3 columns)
@@ -128,7 +132,7 @@ pub fn view<'a>(state: &'a PickerState, has_background: bool) -> Element<'a, Mes
             for chunk in state.results.chunks(3) {
                 let mut grid_row = row![].spacing(8);
                 for photo in chunk {
-                    grid_row = grid_row.push(view_thumbnail(state, photo));
+                    grid_row = grid_row.push(view_thumbnail(state, photo, &pal));
                 }
                 // Fill remaining cells if fewer than 3
                 for _ in chunk.len()..3 {
@@ -142,42 +146,32 @@ pub fn view<'a>(state: &'a PickerState, has_background: bool) -> Element<'a, Mes
             content = content.push(
                 text("Photos provided by Unsplash")
                     .size(10)
-                    .color(Color::from_rgb(0.5, 0.5, 0.55)),
+                    .color(pal.text_tertiary),
             );
         }
     } else {
         content = content.push(
             text("Set UNSPLASH_ACCESS_KEY to search Unsplash")
                 .size(12)
-                .color(Color::from_rgb(0.5, 0.5, 0.55)),
+                .color(pal.text_tertiary),
         );
     }
 
     let inner = container(content.spacing(12).padding(20).width(500).height(500))
-        .style(|_theme: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgb(0.15, 0.15, 0.18))),
-            border: iced::Border {
-                color: Color::from_rgb(0.3, 0.3, 0.35),
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..Default::default()
-        });
+        .style(move |_theme: &Theme| style::modal(&pal));
 
-    // Center the modal
+    // Center the modal with backdrop overlay
     container(inner)
         .width(Length::Fill)
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
-        .style(|_theme: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
-            ..Default::default()
-        })
+        .style(move |_theme: &Theme| style::modal_backdrop(&pal))
         .into()
 }
 
-fn view_thumbnail<'a>(state: &'a PickerState, photo: &'a Photo) -> Element<'a, Message> {
+fn view_thumbnail<'a>(state: &'a PickerState, photo: &'a Photo, pal: &Palette) -> Element<'a, Message> {
+    let pal = *pal;
     let content: Element<'a, Message> = if let Some(handle) = state.thumbnails.get(&photo.id) {
         column![
             image(handle.clone())
@@ -186,12 +180,12 @@ fn view_thumbnail<'a>(state: &'a PickerState, photo: &'a Photo) -> Element<'a, M
                 .content_fit(iced::ContentFit::Cover),
             text(&photo.photographer)
                 .size(9)
-                .color(Color::from_rgb(0.6, 0.6, 0.65)),
+                .color(pal.text_tertiary),
         ]
         .spacing(2)
         .into()
     } else {
-        container(text("...").size(11))
+        container(text("...").size(11).color(pal.text_tertiary))
             .width(Length::Fill)
             .height(100)
             .center(Length::Fill)

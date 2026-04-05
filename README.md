@@ -1,12 +1,12 @@
-# Forge
+# Ryve
 
 A new-era IDE where you manage threads with LLMs, not just code.
 
-Forge reimagines the development environment as an agent orchestration workspace. Instead of tabs of source files, you work with agent conversations attached to git worktrees — each agent has full context of its working tree, and you see the results in real time.
+Ryve reimagines the development environment as an agent orchestration workspace. Instead of tabs of source files, you work with agent conversations attached to git worktrees — each agent has full context of its working tree, and you see the results in real time.
 
 ## Architecture
 
-Forge is built with [Iced](https://iced.rs) for a fast, cross-platform native GUI, [iced_term](https://github.com/Harzu/iced_term) for embedded terminals, and [genai](https://github.com/jeremychone/rust-genai) for multi-provider LLM support.
+Ryve is built with [Iced](https://iced.rs) for a fast, cross-platform native GUI, [iced_term](https://github.com/Harzu/iced_term) for embedded terminals, and [genai](https://github.com/jeremychone/rust-genai) for multi-provider LLM support.
 
 ### Layout
 
@@ -46,8 +46,8 @@ The "+" button auto-detects coding agents on your PATH (Claude Code, Codex, Aide
 
 ```bash
 # Clone
-git clone https://github.com/loomantix/forge.git
-cd forge
+git clone https://github.com/loomantix/ryve.git
+cd ryve
 
 # Build & run
 cargo run

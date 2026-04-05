@@ -5,7 +5,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Forge data layer: persistence, config, and git operations"
+description = "Ryve data layer: persistence, config, and git operations"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

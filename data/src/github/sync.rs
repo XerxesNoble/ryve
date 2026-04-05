@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
-//! Bidirectional sync between Sparks and GitHub Issues.
+//! Bidirectional sync between Workgraph and GitHub Issues.
 
 use octocrab::Octocrab;
 use octocrab::models::issues::Issue;

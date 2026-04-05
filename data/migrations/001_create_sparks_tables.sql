@@ -1,4 +1,4 @@
--- Sparks (core work items)
+-- Workgraph: sparks (core work items)
 CREATE TABLE IF NOT EXISTS sparks (
     id                  TEXT PRIMARY KEY,
     title               TEXT NOT NULL,

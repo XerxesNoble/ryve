@@ -14,6 +14,39 @@ pub struct CodingAgent {
     pub command: String,
     /// Default arguments
     pub args: Vec<String>,
+    /// How this agent supports session resumption
+    pub resume: ResumeStrategy,
+}
+
+impl CodingAgent {
+    /// Build the command + args to resume a previous session.
+    /// Returns None if the agent doesn't support resumption.
+    pub fn resume_args(&self, resume_id: Option<&str>) -> Option<(String, Vec<String>)> {
+        match &self.resume {
+            ResumeStrategy::ResumeFlag => {
+                // `claude --resume` or `codex --resume`
+                let mut args = self.args.clone();
+                args.push("--resume".to_string());
+                if let Some(id) = resume_id {
+                    args.push(id.to_string());
+                }
+                Some((self.command.clone(), args))
+            }
+            ResumeStrategy::ResumeWithId => {
+                let id = resume_id?;
+                let mut args = self.args.clone();
+                args.push("--resume".to_string());
+                args.push(id.to_string());
+                Some((self.command.clone(), args))
+            }
+            ResumeStrategy::SessionResume => {
+                let id = resume_id?;
+                // e.g., `goose session resume <id>`
+                Some((self.command.clone(), vec!["session".into(), "resume".into(), id.to_string()]))
+            }
+            ResumeStrategy::None => None,
+        }
+    }
 }
 
 impl fmt::Display for CodingAgent {
@@ -22,25 +55,46 @@ impl fmt::Display for CodingAgent {
     }
 }
 
+/// Resume strategy for a coding agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeStrategy {
+    /// Pass `--resume` flag (e.g., `claude --resume`)
+    ResumeFlag,
+    /// Pass `--resume <session_id>` (e.g., `codex --resume <id>`)
+    ResumeWithId,
+    /// Resume via session subcommand (e.g., `goose session resume <id>`)
+    SessionResume,
+    /// No built-in resume support
+    None,
+}
+
 /// Known coding agents and their CLI commands.
-const KNOWN_AGENTS: &[(&str, &str, &[&str])] = &[
-    ("Claude Code", "claude", &[]),
-    ("Codex", "codex", &[]),
-    ("Aider", "aider", &[]),
-    ("Goose", "goose", &["session"]),
-    ("Cline", "cline", &[]),
-    ("Continue", "continue", &[]),
+struct AgentDef {
+    name: &'static str,
+    command: &'static str,
+    args: &'static [&'static str],
+    resume: ResumeStrategy,
+}
+
+const KNOWN_AGENTS: &[AgentDef] = &[
+    AgentDef { name: "Claude Code", command: "claude", args: &[], resume: ResumeStrategy::ResumeFlag },
+    AgentDef { name: "Codex", command: "codex", args: &[], resume: ResumeStrategy::ResumeFlag },
+    AgentDef { name: "Aider", command: "aider", args: &[], resume: ResumeStrategy::None },
+    AgentDef { name: "Goose", command: "goose", args: &["session"], resume: ResumeStrategy::SessionResume },
+    AgentDef { name: "Cline", command: "cline", args: &[], resume: ResumeStrategy::None },
+    AgentDef { name: "Continue", command: "continue", args: &[], resume: ResumeStrategy::None },
 ];
 
 /// Detect which coding agents are available on PATH.
 pub fn detect_available() -> Vec<CodingAgent> {
     KNOWN_AGENTS
         .iter()
-        .filter(|(_, cmd, _)| which(cmd))
-        .map(|(name, cmd, args)| CodingAgent {
-            display_name: name.to_string(),
-            command: cmd.to_string(),
-            args: args.iter().map(|a| a.to_string()).collect(),
+        .filter(|def| which(def.command))
+        .map(|def| CodingAgent {
+            display_name: def.name.to_string(),
+            command: def.command.to_string(),
+            args: def.args.iter().map(|a| a.to_string()).collect(),
+            resume: def.resume.clone(),
         })
         .collect()
 }

@@ -2,13 +2,13 @@
 // Copyright 2026 Loomantix
 
 //! A Workshop is a self-contained workspace bound to a directory.
-//! Each workshop has its own `.forge/` directory containing config,
+//! Each workshop has its own `.ryve/` directory containing config,
 //! sparks database, agent definitions, and context files.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use data::forge_dir::{AgentDef, ForgeDir, WorkshopConfig};
+use data::ryve_dir::{AgentDef, RyveDir, WorkshopConfig};
 use data::sparks::types::Spark;
 use iced::Theme;
 use sqlx::SqlitePool;
@@ -19,26 +19,29 @@ use crate::screen::agents::AgentSession;
 use crate::screen::background_picker::PickerState;
 use crate::screen::bench::{BenchState, TabKind};
 use crate::screen::file_explorer::FileExplorerState;
+use crate::screen::file_viewer::FileViewerState;
 
 const BOTTOM_PIN_NEWLINES: usize = 200;
 
 pub struct Workshop {
     pub id: Uuid,
     pub directory: PathBuf,
-    pub forge_dir: ForgeDir,
+    pub ryve_dir: RyveDir,
     pub config: WorkshopConfig,
     pub bench: BenchState,
     pub terminals: HashMap<u64, iced_term::Terminal>,
     pub agent_sessions: Vec<AgentSession>,
+    /// Open file viewer states, keyed by tab ID.
+    pub file_viewers: HashMap<u64, FileViewerState>,
     /// File explorer state for this workshop.
     pub file_explorer: FileExplorerState,
-    /// Sparks database for this workshop.
+    /// Workgraph database for this workshop.
     pub sparks_db: Option<SqlitePool>,
     /// Cached sparks for display (loaded from DB).
     pub sparks: Vec<Spark>,
-    /// Custom agent definitions from `.forge/agents/`.
+    /// Custom agent definitions from `.ryve/agents/`.
     pub custom_agents: Vec<AgentDef>,
-    /// Agent context from `.forge/context/AGENTS.md`.
+    /// Agent context from `.ryve/context/AGENTS.md`.
     pub agent_context: Option<String>,
     /// Loaded background image handle.
     pub background_handle: Option<iced::widget::image::Handle>,
@@ -48,15 +51,16 @@ pub struct Workshop {
 
 impl Workshop {
     pub fn new(directory: PathBuf) -> Self {
-        let forge_dir = ForgeDir::new(&directory);
+        let ryve_dir = RyveDir::new(&directory);
         Self {
             id: Uuid::new_v4(),
             directory,
-            forge_dir,
+            ryve_dir,
             config: WorkshopConfig::default(),
             bench: BenchState::new(),
             terminals: HashMap::new(),
             agent_sessions: Vec::new(),
+            file_viewers: HashMap::new(),
             file_explorer: FileExplorerState::new(),
             sparks_db: None,
             sparks: Vec::new(),
@@ -87,9 +91,38 @@ impl Workshop {
         self.config.layout.sidebar_width
     }
 
-    /// Sparks panel width from config.
+    /// Workgraph panel width from config.
     pub fn sparks_width(&self) -> f32 {
         self.config.layout.sparks_width
+    }
+
+    /// Open a file viewer tab, or switch to it if already open.
+    /// Returns the tab ID and whether it was newly created (true) or reused (false).
+    pub fn open_file_tab(&mut self, path: PathBuf, next_terminal_id: &mut u64) -> (u64, bool) {
+        // Check if this file is already open in an existing tab
+        for (tab_id, viewer) in &self.file_viewers {
+            if viewer.path == path {
+                self.bench.active_tab = Some(*tab_id);
+                return (*tab_id, false);
+            }
+        }
+
+        // Create new tab
+        let tab_id = *next_terminal_id;
+        *next_terminal_id += 1;
+
+        let title = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        self.bench
+            .create_tab(tab_id, title, TabKind::FileViewer(path.clone()));
+        self.file_viewers
+            .insert(tab_id, FileViewerState::new(path));
+
+        (tab_id, true)
     }
 
     /// Spawn a terminal tab, optionally running a coding agent command.
@@ -140,6 +173,7 @@ impl Workshop {
                 display_name: def.name.clone(),
                 command: def.command.clone(),
                 args: def.args.clone(),
+                resume: crate::coding_agents::ResumeStrategy::None,
             }),
         );
 
@@ -165,14 +199,20 @@ impl Workshop {
         match action {
             iced_term::actions::Action::Shutdown => {
                 self.terminals.remove(&id);
-                self.agent_sessions.retain(|s| s.tab_id != id);
+                // Mark agent sessions as ended, keep in history
+                for session in self.agent_sessions.iter_mut() {
+                    if session.tab_id == Some(id) {
+                        session.tab_id = None;
+                        session.active = false;
+                    }
+                }
                 self.bench.close_tab(id);
             }
             iced_term::actions::Action::ChangeTitle(title) => {
                 if let Some(tab) = self.bench.tabs.iter_mut().find(|t| t.id == id) {
                     tab.title = title.clone();
                 }
-                if let Some(session) = self.agent_sessions.iter_mut().find(|s| s.tab_id == id) {
+                if let Some(session) = self.agent_sessions.iter_mut().find(|s| s.tab_id == Some(id)) {
                     session.name = title;
                 }
             }
@@ -218,13 +258,13 @@ pub struct WorkshopInit {
     pub agent_context: Option<String>,
 }
 
-/// Initialize a workshop's `.forge/` directory, DB, and load config.
+/// Initialize a workshop's `.ryve/` directory, DB, and load config.
 /// This is the single async entry point called when a workshop opens.
 pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::sparks::SparksError> {
-    let forge_dir = ForgeDir::new(&directory);
+    let ryve_dir = RyveDir::new(&directory);
 
     // Create directory structure + default files
-    data::forge_dir::init_forge_dir(&forge_dir)
+    data::ryve_dir::init_ryve_dir(&ryve_dir)
         .await
         .map_err(data::sparks::SparksError::Io)?;
 
@@ -232,9 +272,9 @@ pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::spa
     let pool = data::db::open_sparks_db(&directory).await?;
 
     // Load config and agents in parallel
-    let config = data::forge_dir::load_config(&forge_dir).await;
-    let custom_agents = data::forge_dir::load_agent_defs(&forge_dir).await;
-    let agent_context = data::forge_dir::load_agents_context(&forge_dir).await;
+    let config = data::ryve_dir::load_config(&ryve_dir).await;
+    let custom_agents = data::ryve_dir::load_agent_defs(&ryve_dir).await;
+    let agent_context = data::ryve_dir::load_agents_context(&ryve_dir).await;
 
     Ok(WorkshopInit {
         pool,

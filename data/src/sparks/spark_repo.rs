@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
-//! CRUD operations for Sparks.
+//! CRUD operations for Workgraph sparks.
 
 use chrono::Utc;
 use sqlx::SqlitePool;

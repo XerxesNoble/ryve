@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
-//! Sparks — Forge's embedded issue tracker with dependency graph.
+//! Workgraph — Ryve's embedded issue tracker with dependency graph.
 
+pub mod agent_session_repo;
 pub mod alloy_repo;
 pub mod bond_repo;
 pub mod comment_repo;
+pub mod file_link_repo;
 pub mod ember_repo;
 pub mod engraving_repo;
 pub mod error;

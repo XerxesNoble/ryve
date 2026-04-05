@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
-//! Domain types for the Sparks system.
+//! Domain types for the Workgraph system.
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -130,6 +130,27 @@ impl SparkType {
             Self::Milestone => "milestone",
         }
     }
+}
+
+// ── Spark File Link ───────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SparkFileLink {
+    pub id: i64,
+    pub spark_id: String,
+    pub file_path: String,
+    pub line_start: Option<i32>,
+    pub line_end: Option<i32>,
+    pub workshop_id: String,
+    pub created_at: String,
+}
+
+pub struct NewSparkFileLink {
+    pub spark_id: String,
+    pub file_path: String,
+    pub line_start: Option<i32>,
+    pub line_end: Option<i32>,
+    pub workshop_id: String,
 }
 
 // ── Bond ───────────────────────────────────────────────
@@ -343,4 +364,31 @@ impl AlloyBondType {
             Self::Conditional => "conditional",
         }
     }
+}
+
+// ── Agent Session ─────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct PersistedAgentSession {
+    pub id: String,
+    pub workshop_id: String,
+    pub agent_name: String,
+    pub agent_command: String,
+    pub agent_args: String,
+    pub session_label: Option<String>,
+    pub status: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    /// Agent-specific session/conversation ID used for resumption.
+    pub resume_id: Option<String>,
+}
+
+pub struct NewAgentSession {
+    pub id: String,
+    pub workshop_id: String,
+    pub agent_name: String,
+    pub agent_command: String,
+    pub agent_args: Vec<String>,
+    pub session_label: Option<String>,
+    pub resume_id: Option<String>,
 }

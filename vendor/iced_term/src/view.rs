@@ -29,11 +29,24 @@ pub struct TerminalView<'a> {
 
 impl<'a> TerminalView<'a> {
     pub fn show(term: &'a Terminal) -> Element<'a, Event> {
+        Self::show_with_transparent_bg(term, false)
+    }
+
+    pub fn show_with_transparent_bg(term: &'a Terminal, transparent: bool) -> Element<'a, Event> {
+        let style: Box<dyn Fn(&Theme) -> container::Style> = if transparent {
+            Box::new(|_| container::Style {
+                background: None,
+                ..container::Style::default()
+            })
+        } else {
+            Box::new(|_| term.theme.container_style())
+        };
+
         container(Self { term })
             .padding(12)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_| term.theme.container_style())
+            .style(style)
             .into()
     }
 
@@ -333,13 +346,20 @@ impl<'a> TerminalView<'a> {
                 Key::Character(k) => {
                     let lower = k.to_ascii_lowercase();
                     binding_action = self.term.bindings.get_action(
-                        InputKind::Char(lower),
+                        InputKind::Char(lower.clone()),
                         state.keyboard_modifiers,
                         last_content.terminal_mode,
                     );
 
                     // If no binding matched, only write printable text (when provided)
                     if binding_action == BindingAction::Ignore {
+                        // On macOS, Option+key produces special unicode characters.
+                        // For terminal usage, send ESC + key as the meta prefix instead.
+                        if state.keyboard_modifiers.contains(Modifiers::ALT) {
+                            let mut seq = vec![0x1b];
+                            seq.extend_from_slice(lower.as_bytes());
+                            return Some(Command::Write(seq));
+                        }
                         if let Some(c) = text {
                             return Some(Command::Write(c.as_bytes().to_vec()));
                         }

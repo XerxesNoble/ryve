@@ -8,12 +8,12 @@ use genai::chat::{ChatMessage, ChatRequest};
 
 use crate::proto::{Agent, Message, Role};
 
-/// Forge LLM client — thin wrapper over genai.
-pub struct ForgeClient {
+/// Ryve LLM client — thin wrapper over genai.
+pub struct RyveClient {
     inner: Client,
 }
 
-impl ForgeClient {
+impl RyveClient {
     pub fn new() -> Result<Self, ClientError> {
         let inner = Client::default();
         Ok(Self { inner })

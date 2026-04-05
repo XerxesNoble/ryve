@@ -5,7 +5,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Forge LLM integration: multi-provider support via genai"
+description = "Ryve LLM integration: multi-provider support via genai"
 
 [dependencies]
 llm-proto = { path = "proto" }

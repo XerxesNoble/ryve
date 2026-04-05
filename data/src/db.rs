@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
-//! Database connection and migration for the Sparks system.
+//! Database connection and migration for the Workgraph system.
 
 use std::path::Path;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
-use crate::forge_dir::ForgeDir;
+use crate::ryve_dir::RyveDir;
 use crate::sparks::error::SparksError;
 
 /// Open (or create) the sparks database for a workshop directory.
 ///
-/// Creates `.forge/sparks.db` inside `workshop_dir`, runs all pending
+/// Creates `.ryve/sparks.db` inside `workshop_dir`, runs all pending
 /// migrations, and returns a connection pool.
 pub async fn open_sparks_db(workshop_dir: &Path) -> Result<SqlitePool, SparksError> {
-    let forge_dir = ForgeDir::new(workshop_dir);
-    forge_dir.ensure_exists().await.map_err(SparksError::Io)?;
+    let ryve_dir = RyveDir::new(workshop_dir);
+    ryve_dir.ensure_exists().await.map_err(SparksError::Io)?;
 
-    let db_path = forge_dir.sparks_db_path();
+    let db_path = ryve_dir.sparks_db_path();
 
     let options = SqliteConnectOptions::new()
         .filename(&db_path)

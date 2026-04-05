@@ -3,7 +3,7 @@
 
 pub mod config;
 pub mod db;
-pub mod forge_dir;
+pub mod ryve_dir;
 pub mod git;
 pub mod github;
 pub mod sparks;

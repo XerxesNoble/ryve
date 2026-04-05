@@ -33,6 +33,24 @@ pub enum FileStatus {
     Conflicted,
 }
 
+/// Per-file diff statistics (line additions and deletions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiffStat {
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// Per-line diff annotation for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineChange {
+    /// Line was added (not in HEAD).
+    Added,
+    /// Line was modified (differs from HEAD).
+    Modified,
+    /// One or more lines were deleted after this line.
+    Deleted,
+}
+
 impl Repository {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -93,6 +111,63 @@ impl Repository {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(parse_status_porcelain(&stdout))
+    }
+
+    /// Get per-line diff annotations for a file against HEAD.
+    /// Returns a map from 1-based line number to the type of change.
+    pub async fn line_diff(&self, file_path: &Path) -> Result<HashMap<u32, LineChange>, GitError> {
+        let output = Command::new("git")
+            .args(["diff", "HEAD", "--unified=0", "--"])
+            .arg(file_path)
+            .current_dir(&self.path)
+            .output()
+            .await
+            .map_err(GitError::Io)?;
+
+        if !output.status.success() {
+            // Not tracked or no HEAD yet — treat entire file as added
+            return Ok(HashMap::new());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_unified_diff(&stdout))
+    }
+
+    /// Get per-file diff stats (additions, deletions) for the working tree against HEAD.
+    /// Returns a map from repo-relative file path to (additions, deletions).
+    pub async fn diff_stats(&self) -> Result<HashMap<PathBuf, DiffStat>, GitError> {
+        // Staged changes
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--numstat"])
+            .current_dir(&self.path)
+            .output()
+            .await
+            .map_err(GitError::Io)?;
+
+        // Unstaged changes
+        let unstaged = Command::new("git")
+            .args(["diff", "--numstat"])
+            .current_dir(&self.path)
+            .output()
+            .await
+            .map_err(GitError::Io)?;
+
+        let mut stats = HashMap::new();
+
+        for output in [&staged, &unstaged] {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(stat) = parse_numstat_line(line) {
+                        let entry = stats.entry(stat.0).or_insert(DiffStat { additions: 0, deletions: 0 });
+                        entry.additions += stat.1.additions;
+                        entry.deletions += stat.1.deletions;
+                    }
+                }
+            }
+        }
+
+        Ok(stats)
     }
 
     /// Check if a path is inside a git repository.
@@ -172,6 +247,99 @@ fn parse_worktree_list(output: &str) -> Vec<Worktree> {
     }
 
     worktrees
+}
+
+/// Parse `git diff --unified=0` output into per-line change annotations.
+/// Handles @@ hunk headers to determine which lines were added/modified/deleted.
+fn parse_unified_diff(output: &str) -> HashMap<u32, LineChange> {
+    let mut changes = HashMap::new();
+
+    for line in output.lines() {
+        if !line.starts_with("@@") {
+            continue;
+        }
+
+        // Parse "@@ -old_start[,old_count] +new_start[,new_count] @@"
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let old_part = parts[1]; // e.g., "-10,3" or "-10"
+        let new_part = parts[2]; // e.g., "+12,5" or "+12"
+
+        let (old_count,) = parse_hunk_range(old_part);
+        let (new_start, new_count) = parse_hunk_start_and_count(new_part);
+
+        if old_count == 0 && new_count > 0 {
+            // Pure addition
+            for i in 0..new_count {
+                changes.insert(new_start + i, LineChange::Added);
+            }
+        } else if old_count > 0 && new_count == 0 {
+            // Pure deletion — mark the line after which content was removed
+            let marker = if new_start == 0 { 1 } else { new_start };
+            changes.entry(marker).or_insert(LineChange::Deleted);
+        } else {
+            // Modification — lines were changed
+            for i in 0..new_count {
+                changes.insert(new_start + i, LineChange::Modified);
+            }
+            // If old had more lines than new, mark deletion at end of new range
+            if old_count > new_count {
+                let marker = new_start + new_count;
+                changes.entry(marker).or_insert(LineChange::Deleted);
+            }
+        }
+    }
+
+    changes
+}
+
+fn parse_hunk_range(part: &str) -> (u32,) {
+    // "-10,3" → count=3, "-10" → count=1
+    let s = part.trim_start_matches(['-', '+']);
+    if let Some((_start, count)) = s.split_once(',') {
+        (count.parse().unwrap_or(1),)
+    } else {
+        (1,)
+    }
+}
+
+fn parse_hunk_start_and_count(part: &str) -> (u32, u32) {
+    // "+12,5" → (12, 5), "+12" → (12, 1)
+    let s = part.trim_start_matches(['-', '+']);
+    if let Some((start, count)) = s.split_once(',') {
+        (
+            start.parse().unwrap_or(1),
+            count.parse().unwrap_or(1),
+        )
+    } else {
+        (s.parse().unwrap_or(1), 1)
+    }
+}
+
+/// Parse a single line of `git diff --numstat` output.
+/// Format: `<added>\t<deleted>\t<path>` (binary files show `-\t-\t<path>`)
+fn parse_numstat_line(line: &str) -> Option<(PathBuf, DiffStat)> {
+    let mut parts = line.splitn(3, '\t');
+    let added_str = parts.next()?;
+    let deleted_str = parts.next()?;
+    let path_str = parts.next()?;
+
+    // Binary files show "-" for both counts — skip them
+    let additions = added_str.parse::<u32>().ok()?;
+    let deletions = deleted_str.parse::<u32>().ok()?;
+
+    // Handle renames: "old_path => new_path" or "{old => new}/path"
+    let path = if let Some(pos) = path_str.find(" => ") {
+        // Simple rename: take the new path
+        PathBuf::from(&path_str[pos + 4..])
+    } else {
+        PathBuf::from(path_str)
+    };
+
+    Some((path, DiffStat { additions, deletions }))
 }
 
 #[derive(Debug, thiserror::Error)]

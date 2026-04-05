@@ -5,7 +5,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Forge inter-process communication"
+description = "Ryve inter-process communication"
 
 [dependencies]
 dirs = "6"
