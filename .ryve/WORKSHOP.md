@@ -11,6 +11,8 @@ You are working inside a **Ryve Workshop**. Ryve manages tasks (called *sparks*)
 | `sp-ux0003` | P0 | normal | feature | open | src/main.rs | Keyboard shortcuts system |
 | `sp-ux0004` | P0 | elevated | feature | open | src/screen/file_viewer.rs | File viewer text selection and copy |
 | `sp-ux0005` | P0 | normal | feature | open | src/screen/sparks.rs | Spark filtering and search in workgraph panel |
+| `sp-ux0035` | P0 | critical | epic | open | new: src/head.rs, data/src/sparks/, llm/ | Head: orchestrator agent that manages a Crew of Hands |
+| `ryve-35463d5b` | P0 | critical | bug | open | src/cli.rs | ryve-cli missing: intent fields, subcommand --help, ember send doc |
 | `sp-f5e4` | P1 | elevated | spike | open | data/src/sparks/, llm/ | Save conversation history and plans to workgraph |
 | `sp-ux0006` | P1 | elevated | feature | open | src/screen/sparks.rs, data/src/agent_context.rs | Bond/dependency visualization in UI and WORKSHOP.md |
 | `sp-ux0007` | P1 | normal | feature | open | src/screen/sparks.rs, src/main.rs | Contract management UI |
@@ -24,6 +26,7 @@ You are working inside a **Ryve Workshop**. Ryve manages tasks (called *sparks*)
 | `sp-ux0015` | P1 | trivial | feature | open | src/screen/status_bar.rs | Status bar enrichment |
 | `sp-ux0016` | P1 | trivial | feature | open | src/main.rs | Welcome screen with recent workshops and onboarding |
 | `sp-ux0017` | P1 | normal | bug | open | data/src/agent_context.rs | WORKSHOP.md: add bond info and spark intent |
+| `sp-ux0034` | P1 | normal | feature | open | src/screen/agents.rs, src/main.rs | Hand status colors: red for unassigned, green for idle |
 | `sp-ux0018` | P2 | normal | feature | open | src/screen/sparks.rs | Blocked/Deferred status settable from UI |
 | `sp-ux0019` | P2 | normal | bug | open | src/workshop.rs | Terminal background respects appearance mode |
 | `sp-ux0020` | P2 | trivial | feature | open | src/screen/file_viewer.rs | File viewer breadcrumb path |

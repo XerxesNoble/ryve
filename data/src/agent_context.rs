@@ -3,9 +3,11 @@
 
 //! Agent context synchronisation.
 //!
-//! Generates `.ryve/WORKSHOP.md` (the single source of truth for coding agents)
-//! and injects a one-line pointer into each agent's boot file so they discover
-//! and read it automatically.
+//! Generates `.ryve/WORKSHOP.md` — a static operations guide that tells Hands
+//! how to use `ryve-cli` to query the workgraph (the DB is the single source of
+//! truth for spark state). Also injects a pointer into each agent's boot file
+//! so they discover and read it automatically, and propagates both into every
+//! active worktree.
 
 use std::path::{Path, PathBuf};
 

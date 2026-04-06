@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use data::sparks::types::{PersistedAgentSession, Spark};
 use iced::widget::{Space, button, column, container, row, stack, text};
+use iced::keyboard;
 use iced::{Color, Element, Length, Subscription, Task, Theme};
 use uuid::Uuid;
 
@@ -62,6 +63,8 @@ fn main() -> iced::Result {
 struct App {
     /// System appearance (dark/light mode)
     appearance: Appearance,
+    /// Global configuration (~/.config/ryve/config.toml)
+    global_config: data::config::Config,
     /// Available coding agents detected on PATH
     available_agents: Vec<CodingAgent>,
     /// All open workshops
@@ -124,6 +127,8 @@ enum Message {
     AgentContextSynced,
     /// Periodic sparks poll tick
     SparksPoll,
+    /// Spawn a new Hand with the default agent (Cmd+H)
+    NewDefaultHand,
 }
 
 impl std::fmt::Debug for Message {
@@ -153,18 +158,21 @@ impl std::fmt::Debug for Message {
             Self::BackgroundConfigSaved => write!(f, "BackgroundConfigSaved"),
             Self::AgentContextSynced => write!(f, "AgentContextSynced"),
             Self::SparksPoll => write!(f, "SparksPoll"),
+            Self::NewDefaultHand => write!(f, "NewDefaultHand"),
         }
     }
 }
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
+        let global_config = data::config::Config::load();
         let available_agents = coding_agents::detect_available();
         let appearance = Appearance::detect();
 
         (
             Self {
                 appearance,
+                global_config,
                 available_agents,
                 workshops: Vec::new(),
                 active_workshop: None,
@@ -505,11 +513,15 @@ impl App {
                                     resume: session.agent.resume.clone(),
                                 };
                                 let next_id = &mut self.next_terminal_id;
+                                let full_auto = self.global_config.agent_settings
+                                    .get(&resume_agent.command)
+                                    .map_or(false, |s| s.full_auto);
                                 let tab_id = ws.spawn_terminal(
                                     session.name.clone(),
                                     Some(&resume_agent),
                                     next_id,
                                     Some(&session_id),
+                                    full_auto,
                                 );
 
                                 // Update the existing session to active
@@ -821,6 +833,19 @@ impl App {
                 }
                 Task::none()
             }
+            Message::NewDefaultHand => {
+                let Some(_idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                let Some(ref default_cmd) = self.global_config.default_agent else {
+                    return Task::none();
+                };
+                let Some(agent) = self.available_agents.iter().find(|a| &a.command == default_cmd).cloned() else {
+                    return Task::none();
+                };
+                // Delegate to the existing NewCodingAgent flow
+                return self.handle_bench_message(screen::bench::Message::NewCodingAgent(agent));
+            }
         }
     }
 
@@ -920,7 +945,7 @@ impl App {
             screen::bench::Message::NewTerminal => {
                 let next_id = &mut self.next_terminal_id;
                 let tab_id =
-                    self.workshops[idx].spawn_terminal("Terminal".to_string(), None, next_id, None);
+                    self.workshops[idx].spawn_terminal("Terminal".to_string(), None, next_id, None, false);
                 if let Some(term) = self.workshops[idx].terminals.get(&tab_id) {
                     return iced_term::TerminalView::focus(term.widget_id().clone());
                 }
@@ -928,9 +953,12 @@ impl App {
             screen::bench::Message::NewCodingAgent(agent) => {
                 let title = agent.display_name.clone();
                 let session_id = Uuid::new_v4().to_string();
+                let full_auto = self.global_config.agent_settings
+                    .get(&agent.command)
+                    .map_or(false, |s| s.full_auto);
                 let next_id = &mut self.next_terminal_id;
                 let tab_id =
-                    self.workshops[idx].spawn_terminal(title.clone(), Some(&agent), next_id, Some(&session_id));
+                    self.workshops[idx].spawn_terminal(title.clone(), Some(&agent), next_id, Some(&session_id), full_auto);
                 self.workshops[idx].agent_sessions.push(AgentSession {
                     id: session_id.clone(),
                     name: title.clone(),
@@ -1148,6 +1176,29 @@ impl App {
                     |_| Message::BackgroundConfigSaved,
                 )
             }
+
+            // ── Agent Settings ───────────────────────────────
+            screen::background_picker::Message::SetDefaultAgent(cmd) => {
+                self.global_config.default_agent = cmd;
+                let config = self.global_config.clone();
+                Task::perform(
+                    async move { config.save().ok(); },
+                    |_| Message::BackgroundConfigSaved,
+                )
+            }
+            screen::background_picker::Message::ToggleFullAuto(cmd) => {
+                let entry = self
+                    .global_config
+                    .agent_settings
+                    .entry(cmd)
+                    .or_insert(data::config::AgentConfig { full_auto: false });
+                entry.full_auto = !entry.full_auto;
+                let config = self.global_config.clone();
+                Task::perform(
+                    async move { config.save().ok(); },
+                    |_| Message::BackgroundConfigSaved,
+                )
+            }
         }
     }
 
@@ -1165,7 +1216,27 @@ impl App {
         let poll = iced::time::every(std::time::Duration::from_secs(3))
             .map(|_| Message::SparksPoll);
 
-        Subscription::batch(term_subs.into_iter().chain(std::iter::once(poll)))
+        let hotkeys = keyboard::listen().map(|event| {
+            if let keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(c),
+                modifiers,
+                ..
+            } = &event
+            {
+                if modifiers.command() && c.as_str() == "h" {
+                    return Message::NewDefaultHand;
+                }
+            }
+            // Swallow unmatched keyboard events — SparksPoll is a harmless no-op
+            Message::SparksPoll
+        });
+
+        Subscription::batch(
+            term_subs
+                .into_iter()
+                .chain(std::iter::once(poll))
+                .chain(std::iter::once(hotkeys)),
+        )
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1372,7 +1443,72 @@ impl App {
             status_bar,
         ]
         .height(Length::Fill)
-        .into()
+        .into();
+
+        // Layer background image behind content
+        let mut layers: Vec<Element<'a, Message>> = Vec::new();
+
+        if let Some(ref handle) = ws.background_handle {
+            layers.push(
+                iced::widget::image(handle.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(iced::ContentFit::Cover)
+                    .into(),
+            );
+
+            // Dim overlay so UI stays readable
+            let opacity = ws.config.background.dim_opacity;
+            layers.push(
+                container(Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(move |_theme: &Theme| container::Style {
+                        background: Some(iced::Background::Color(Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: opacity,
+                        })),
+                        ..Default::default()
+                    })
+                    .into(),
+            );
+        }
+
+        layers.push(workshop_content);
+
+        // Settings modal overlay
+        if ws.background_picker.open {
+            let has_bg = ws.config.background.image.is_some();
+            let agents: Vec<screen::background_picker::AgentInfo> = self
+                .available_agents
+                .iter()
+                .map(|a| screen::background_picker::AgentInfo {
+                    command: a.command.clone(),
+                    display_name: a.display_name.clone(),
+                    full_auto: self
+                        .global_config
+                        .agent_settings
+                        .get(&a.command)
+                        .map_or(false, |s| s.full_auto),
+                    is_default: self
+                        .global_config
+                        .default_agent
+                        .as_ref()
+                        .map_or(false, |d| d == &a.command),
+                })
+                .collect();
+            layers.push(
+                screen::background_picker::view(&ws.background_picker, &pal, has_bg, agents)
+                    .map(Message::Background),
+            );
+        }
+
+        stack(layers)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn view_agents<'a>(&'a self, ws: &'a Workshop, has_bg: bool, pal: &style::Palette) -> Element<'a, Message> {

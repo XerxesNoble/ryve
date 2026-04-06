@@ -100,7 +100,8 @@ fn print_usage() {
     eprintln!();
     eprintln!("  spark list [--all]                  List sparks (active by default)");
     eprintln!("  spark create <title>                Create a task spark (P2)");
-    eprintln!("  spark create --type bug --priority 0 <title>");
+    eprintln!("  spark create --type bug --priority 0 --problem 'desc' <title>");
+    eprintln!("  spark create --help                 Show all create flags (intent, risk, etc.)");
     eprintln!("  spark show <id>                     Show spark details + intent");
     eprintln!("  spark status <id> <new_status>      Update status");
     eprintln!("  spark close <id> [reason]           Close a spark");
@@ -233,12 +234,29 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
             }
         }
         "create" => {
-            // Parse optional flags before the title
+            if args.iter().any(|a| a == "--help" || a == "-h") {
+                eprintln!("spark create [flags] <title words...>\n");
+                eprintln!("FLAGS:");
+                eprintln!("  --type, -t <type>           bug|feature|task|epic|chore|spike|milestone (default: task)");
+                eprintln!("  --priority, -p <0-4>        P0=critical, P4=negligible (default: 2)");
+                eprintln!("  --risk, -r <level>          trivial|normal|elevated|critical");
+                eprintln!("  --scope, -s <boundary>      Scope boundary (e.g. 'src/auth/')");
+                eprintln!("  --description, -d <text>    Description");
+                eprintln!("  --problem <text>            Intent: problem being solved");
+                eprintln!("  --invariant <text>          Intent: invariant to preserve (repeatable)");
+                eprintln!("  --non-goal <text>           Intent: non-goal (repeatable)");
+                eprintln!("  --acceptance <text>         Intent: acceptance criterion (repeatable)");
+                return;
+            }
             let mut spark_type = SparkType::Task;
             let mut priority = 2i32;
             let mut risk = None;
             let mut scope = None;
             let mut description = String::new();
+            let mut problem: Option<String> = None;
+            let mut invariants: Vec<String> = Vec::new();
+            let mut non_goals: Vec<String> = Vec::new();
+            let mut acceptance: Vec<String> = Vec::new();
             let mut title_parts: Vec<&str> = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -248,14 +266,34 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                     "--risk" | "-r" => { i += 1; if i < args.len() { risk = Some(parse_risk_level(&args[i])); } }
                     "--scope" | "-s" => { i += 1; if i < args.len() { scope = Some(args[i].clone()); } }
                     "--description" | "-d" => { i += 1; if i < args.len() { description = args[i].clone(); } }
+                    "--problem" => { i += 1; if i < args.len() { problem = Some(args[i].clone()); } }
+                    "--invariant" => { i += 1; if i < args.len() { invariants.push(args[i].clone()); } }
+                    "--non-goal" => { i += 1; if i < args.len() { non_goals.push(args[i].clone()); } }
+                    "--acceptance" => { i += 1; if i < args.len() { acceptance.push(args[i].clone()); } }
                     _ => title_parts.push(&args[i]),
                 }
                 i += 1;
             }
             let title = title_parts.join(" ");
             if title.is_empty() {
-                die("spark create requires a title");
+                die("spark create requires a title. Use `spark create --help` for options.");
             }
+
+            // Build metadata JSON with intent if any intent fields provided
+            let metadata = if problem.is_some() || !invariants.is_empty() || !non_goals.is_empty() || !acceptance.is_empty() {
+                let intent = serde_json::json!({
+                    "intent": {
+                        "problem_statement": problem,
+                        "invariants": invariants,
+                        "non_goals": non_goals,
+                        "acceptance_criteria": acceptance,
+                    }
+                });
+                Some(intent.to_string())
+            } else {
+                None
+            };
+
             let new = NewSpark {
                 title: title.clone(),
                 description,
@@ -267,7 +305,7 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                 parent_id: None,
                 due_at: None,
                 estimated_minutes: None,
-                metadata: None,
+                metadata,
                 risk_level: risk,
                 scope_boundary: scope,
             };
