@@ -84,10 +84,7 @@ impl BenchState {
             let (kind_icon, tip_text) = match &tab.kind {
                 TabKind::Terminal => ("\u{25B8}", "Terminal".to_string()),
                 TabKind::CodingAgent(agent) => ("\u{2726}", agent.display_name.clone()),
-                TabKind::FileViewer(path) => (
-                    "\u{25A2}",
-                    path.to_string_lossy().to_string(),
-                ),
+                TabKind::FileViewer(path) => ("\u{25A2}", path.to_string_lossy().to_string()),
             };
 
             let tab_content = row![
@@ -120,9 +117,7 @@ impl BenchState {
             .padding([4, 10])
             .on_press(Message::ToggleDropdown);
 
-        tab_row = tab_row
-            .push(Space::new().width(Length::Fill))
-            .push(new_btn);
+        tab_row = tab_row.push(Space::new().width(Length::Fill)).push(new_btn);
 
         tab_row.padding([4, 8]).into()
     }

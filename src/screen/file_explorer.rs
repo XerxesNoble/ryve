@@ -21,7 +21,12 @@ pub enum Message {
     SelectFile(PathBuf),
     ToggleDirectory(PathBuf),
     Refresh,
-    TreeLoaded(Vec<FileNode>, HashMap<PathBuf, FileStatus>, HashMap<PathBuf, DiffStat>, Option<String>),
+    TreeLoaded(
+        Vec<FileNode>,
+        HashMap<PathBuf, FileStatus>,
+        HashMap<PathBuf, DiffStat>,
+        Option<String>,
+    ),
     LinkSpark(PathBuf),
 }
 
@@ -79,7 +84,12 @@ impl FileExplorerState {
 pub async fn scan_directory(
     root: PathBuf,
     ignore: Vec<String>,
-) -> (Vec<FileNode>, HashMap<PathBuf, FileStatus>, HashMap<PathBuf, DiffStat>, Option<String>) {
+) -> (
+    Vec<FileNode>,
+    HashMap<PathBuf, FileStatus>,
+    HashMap<PathBuf, DiffStat>,
+    Option<String>,
+) {
     let ignore = std::sync::Arc::new(ignore);
     let tree = build_tree(root.clone(), 0, ignore).await;
 
@@ -178,13 +188,15 @@ fn build_tree(
 // ── View ──────────────────────────────────────────────
 
 /// Render the file explorer panel.
-pub fn view<'a>(state: &'a FileExplorerState, root: &'a Path, pal: &Palette) -> Element<'a, Message> {
+pub fn view<'a>(
+    state: &'a FileExplorerState,
+    root: &'a Path,
+    pal: &Palette,
+) -> Element<'a, Message> {
     let pal = *pal;
     let branch_label = state.branch.as_deref().unwrap_or("no branch");
 
-    let root_icon = svg(icons::root_folder_icon(true))
-        .width(16)
-        .height(16);
+    let root_icon = svg(icons::root_folder_icon(true)).width(16).height(16);
 
     let header = row![
         root_icon,
@@ -252,9 +264,7 @@ fn collect_nodes<'a>(
         NodeKind::Directory => icons::folder_icon(&node.name, is_expanded),
         NodeKind::File => icons::file_icon(&node.name),
     };
-    let icon_widget = svg(icon_handle)
-        .width(16)
-        .height(16);
+    let icon_widget = svg(icon_handle).width(16).height(16);
 
     // Diff stats: for files look up directly, for directories aggregate children
     let diff = file_diff_stat(rel_path, &node.kind, &state.diff_stats);
@@ -413,4 +423,3 @@ fn higher_priority_status(a: FileStatus, b: FileStatus) -> FileStatus {
     }
     if rank(b) > rank(a) { b } else { a }
 }
-

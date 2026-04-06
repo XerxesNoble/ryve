@@ -3,7 +3,7 @@
 
 //! Hands panel — lists active and past Hand sessions.
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Element, Length, Theme};
 use uuid::Uuid;
 
@@ -79,11 +79,15 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, has_bg: bool) -> Ele
 
             let label = text(&session.name).size(FONT_BODY).color(pal.text_primary);
 
-            let btn = button(row![indicator, label].spacing(4).align_y(iced::Alignment::Center))
-                .style(button::text)
-                .width(Length::Fill)
-                .padding([4, 8])
-                .on_press(Message::SelectAgent(id));
+            let btn = button(
+                row![indicator, label]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+            )
+            .style(button::text)
+            .width(Length::Fill)
+            .padding([4, 8])
+            .on_press(Message::SelectAgent(id));
 
             let active_item = container(btn)
                 .width(Length::Fill)
@@ -121,9 +125,14 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, has_bg: bool) -> Ele
                 .size(FONT_SMALL)
                 .color(pal.text_tertiary);
 
-            let mut session_row = row![indicator, label, time_label, Space::new().width(Length::Fill)]
-                .spacing(4)
-                .align_y(iced::Alignment::Center);
+            let mut session_row = row![
+                indicator,
+                label,
+                time_label,
+                Space::new().width(Length::Fill)
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
 
             if can_resume {
                 let resume_btn = button(

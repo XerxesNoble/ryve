@@ -28,10 +28,12 @@ pub async fn create(pool: &SqlitePool, new: NewContract) -> Result<Contract, Spa
     .fetch_one(pool)
     .await?;
 
-    Ok(sqlx::query_as::<_, Contract>("SELECT * FROM contracts WHERE id = ?")
-        .bind(id)
-        .fetch_one(pool)
-        .await?)
+    Ok(
+        sqlx::query_as::<_, Contract>("SELECT * FROM contracts WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await?,
+    )
 }
 
 pub async fn list_for_spark(

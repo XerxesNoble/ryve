@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 
 use data::git::LineChange;
 use data::sparks::types::SparkFileLink;
-use iced::widget::{container, row, scrollable, text, Space};
+use iced::widget::{Space, container, row, scrollable, text};
 use iced::{Color, Element, Font, Length, Theme};
 use syntect::highlighting::{self, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -119,9 +119,7 @@ impl FileViewerState {
             .iter()
             .filter(|link| {
                 match (link.line_start, link.line_end) {
-                    (Some(start), Some(end)) => {
-                        line_num >= start as u32 && line_num <= end as u32
-                    }
+                    (Some(start), Some(end)) => line_num >= start as u32 && line_num <= end as u32,
                     (Some(start), None) => line_num == start as u32,
                     // Whole-file link
                     (None, _) => true,
@@ -153,9 +151,7 @@ pub fn highlight_content(content: &str, path: &Path, light_mode: bool) -> Vec<Hi
     let mut result = Vec::new();
 
     for line in content.lines() {
-        let ranges = highlighter
-            .highlight_line(line, ss)
-            .unwrap_or_default();
+        let ranges = highlighter.highlight_line(line, ss).unwrap_or_default();
 
         let spans = ranges
             .into_iter()
@@ -205,8 +201,7 @@ pub fn view<'a>(state: &'a FileViewerState, pal: &Palette, has_bg: bool) -> Elem
 
     // ── Compute visible range ──
     let first_visible = (state.scroll_offset / LINE_HEIGHT).floor().max(0.0) as usize;
-    let lines_in_viewport =
-        (state.viewport_height / LINE_HEIGHT).ceil() as usize + 1;
+    let lines_in_viewport = (state.viewport_height / LINE_HEIGHT).ceil() as usize + 1;
     let range_start = first_visible.saturating_sub(OVERSCAN);
     let range_end = (first_visible + lines_in_viewport + OVERSCAN).min(total_lines);
 
@@ -308,21 +303,16 @@ pub fn view<'a>(state: &'a FileViewerState, pal: &Palette, has_bg: bool) -> Elem
 /// Render the git gutter indicator for a line.
 fn gutter_indicator(change: Option<&LineChange>) -> Element<'_, Message> {
     let (symbol, color) = match change {
-        Some(LineChange::Added) => ("\u{2502}", Color::from_rgb(0.3, 0.85, 0.4)),    // │ green
-        Some(LineChange::Modified) => ("\u{2502}", Color::from_rgb(0.9, 0.8, 0.3)),   // │ yellow
-        Some(LineChange::Deleted) => ("\u{25BC}", Color::from_rgb(0.9, 0.35, 0.35)),  // ▼ red
+        Some(LineChange::Added) => ("\u{2502}", Color::from_rgb(0.3, 0.85, 0.4)), // │ green
+        Some(LineChange::Modified) => ("\u{2502}", Color::from_rgb(0.9, 0.8, 0.3)), // │ yellow
+        Some(LineChange::Deleted) => ("\u{25BC}", Color::from_rgb(0.9, 0.35, 0.35)), // ▼ red
         None => (" ", Color::TRANSPARENT),
     };
 
-    container(
-        text(symbol)
-            .size(FONT_SIZE)
-            .font(MONO_FONT)
-            .color(color),
-    )
-    .width(GUTTER_WIDTH)
-    .center_y(LINE_HEIGHT)
-    .into()
+    container(text(symbol).size(FONT_SIZE).font(MONO_FONT).color(color))
+        .width(GUTTER_WIDTH)
+        .center_y(LINE_HEIGHT)
+        .into()
 }
 
 /// Background color for changed lines.
@@ -344,9 +334,7 @@ fn render_highlighted_line<'a>(line: &'a HighlightedLine) -> Element<'a, Message
     let mut parts: Vec<Element<'a, Message>> = Vec::new();
 
     for span in &line.spans {
-        let mut t = text(&span.text)
-            .size(FONT_SIZE)
-            .color(span.color);
+        let mut t = text(&span.text).size(FONT_SIZE).color(span.color);
 
         let font = if span.bold {
             Font { weight: iced::font::Weight::Bold, ..MONO_FONT }

@@ -35,7 +35,10 @@ impl CodingAgent {
             ResumeStrategy::SessionResume => {
                 let id = resume_id?;
                 // e.g., `goose session resume <id>`
-                Some((self.command.clone(), vec!["session".into(), "resume".into(), id.to_string()]))
+                Some((
+                    self.command.clone(),
+                    vec!["session".into(), "resume".into(), id.to_string()],
+                ))
             }
             ResumeStrategy::None => None,
         }
@@ -103,10 +106,30 @@ struct AgentDef {
 /// Ryve requires control over the Hand's instructions — agents without
 /// a system prompt flag cannot be reliably coordinated.
 const KNOWN_AGENTS: &[AgentDef] = &[
-    AgentDef { name: "Claude Code", command: "claude", args: &[], resume: ResumeStrategy::ResumeFlag },
-    AgentDef { name: "Codex", command: "codex", args: &[], resume: ResumeStrategy::ResumeFlag },
-    AgentDef { name: "Aider", command: "aider", args: &[], resume: ResumeStrategy::None },
-    AgentDef { name: "OpenCode", command: "opencode", args: &[], resume: ResumeStrategy::None },
+    AgentDef {
+        name: "Claude Code",
+        command: "claude",
+        args: &[],
+        resume: ResumeStrategy::ResumeFlag,
+    },
+    AgentDef {
+        name: "Codex",
+        command: "codex",
+        args: &[],
+        resume: ResumeStrategy::ResumeFlag,
+    },
+    AgentDef {
+        name: "Aider",
+        command: "aider",
+        args: &[],
+        resume: ResumeStrategy::None,
+    },
+    AgentDef {
+        name: "OpenCode",
+        command: "opencode",
+        args: &[],
+        resume: ResumeStrategy::None,
+    },
 ];
 
 /// Detect which coding agents are available on PATH.

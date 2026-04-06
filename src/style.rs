@@ -83,43 +83,198 @@ pub struct Palette {
 impl Palette {
     pub fn dark() -> Self {
         Self {
-            window_bg: Color { r: 0.110, g: 0.110, b: 0.118, a: 1.0 },
-            surface: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.05 },
-            surface_hover: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 },
-            surface_active: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.12 },
-            border: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 },
-            border_active: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.18 },
-            text_primary: Color { r: 0.949, g: 0.949, b: 0.969, a: 1.0 },
-            text_secondary: Color { r: 0.557, g: 0.557, b: 0.576, a: 1.0 },
-            text_tertiary: Color { r: 0.388, g: 0.388, b: 0.400, a: 1.0 },
-            accent: Color { r: 0.039, g: 0.518, b: 1.0, a: 1.0 },
-            accent_dim: Color { r: 0.039, g: 0.518, b: 1.0, a: 0.15 },
-            separator: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.06 },
-            danger: Color { r: 1.0, g: 0.271, b: 0.227, a: 1.0 },
-            tab_bg: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.04 },
-            tab_active: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.12 },
-            overlay: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.5 },
+            window_bg: Color {
+                r: 0.110,
+                g: 0.110,
+                b: 0.118,
+                a: 1.0,
+            },
+            surface: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.05,
+            },
+            surface_hover: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.08,
+            },
+            surface_active: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.12,
+            },
+            border: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.08,
+            },
+            border_active: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.18,
+            },
+            text_primary: Color {
+                r: 0.949,
+                g: 0.949,
+                b: 0.969,
+                a: 1.0,
+            },
+            text_secondary: Color {
+                r: 0.557,
+                g: 0.557,
+                b: 0.576,
+                a: 1.0,
+            },
+            text_tertiary: Color {
+                r: 0.388,
+                g: 0.388,
+                b: 0.400,
+                a: 1.0,
+            },
+            accent: Color {
+                r: 0.039,
+                g: 0.518,
+                b: 1.0,
+                a: 1.0,
+            },
+            accent_dim: Color {
+                r: 0.039,
+                g: 0.518,
+                b: 1.0,
+                a: 0.15,
+            },
+            separator: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.06,
+            },
+            danger: Color {
+                r: 1.0,
+                g: 0.271,
+                b: 0.227,
+                a: 1.0,
+            },
+            tab_bg: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.04,
+            },
+            tab_active: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.12,
+            },
+            overlay: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.5,
+            },
         }
     }
 
     pub fn light() -> Self {
         Self {
-            window_bg: Color { r: 0.949, g: 0.949, b: 0.969, a: 1.0 },
-            surface: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.70 },
-            surface_hover: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.80 },
-            surface_active: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.90 },
-            border: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.08 },
-            border_active: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.15 },
+            window_bg: Color {
+                r: 0.949,
+                g: 0.949,
+                b: 0.969,
+                a: 1.0,
+            },
+            surface: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.70,
+            },
+            surface_hover: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.80,
+            },
+            surface_active: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.90,
+            },
+            border: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.08,
+            },
+            border_active: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.15,
+            },
             text_primary: Color::BLACK,
-            text_secondary: Color { r: 0.557, g: 0.557, b: 0.576, a: 1.0 },
-            text_tertiary: Color { r: 0.682, g: 0.682, b: 0.698, a: 1.0 },
-            accent: Color { r: 0.0, g: 0.478, b: 1.0, a: 1.0 },
-            accent_dim: Color { r: 0.0, g: 0.478, b: 1.0, a: 0.12 },
-            separator: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.08 },
-            danger: Color { r: 1.0, g: 0.231, b: 0.188, a: 1.0 },
-            tab_bg: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.04 },
-            tab_active: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.08 },
-            overlay: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.35 },
+            text_secondary: Color {
+                r: 0.557,
+                g: 0.557,
+                b: 0.576,
+                a: 1.0,
+            },
+            text_tertiary: Color {
+                r: 0.682,
+                g: 0.682,
+                b: 0.698,
+                a: 1.0,
+            },
+            accent: Color {
+                r: 0.0,
+                g: 0.478,
+                b: 1.0,
+                a: 1.0,
+            },
+            accent_dim: Color {
+                r: 0.0,
+                g: 0.478,
+                b: 1.0,
+                a: 0.12,
+            },
+            separator: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.08,
+            },
+            danger: Color {
+                r: 1.0,
+                g: 0.231,
+                b: 0.188,
+                a: 1.0,
+            },
+            tab_bg: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.04,
+            },
+            tab_active: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.08,
+            },
+            overlay: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.35,
+            },
         }
     }
 }
@@ -127,19 +282,52 @@ impl Palette {
 // ── Style Builders ───────────────────────────────────
 
 /// Standard glass panel (sidebar, bench, sparks).
+///
+/// When a background image is present, the panel gets a translucent
+/// "liquid glass" fill so the image bleeds through — like looking
+/// through frosted glass.  Without a background the panel is a
+/// simple subtle surface.
 pub fn glass_panel(pal: &Palette, has_bg: bool) -> container::Style {
-    container::Style {
-        background: if has_bg {
-            None
-        } else {
-            Some(Background::Color(pal.surface))
-        },
-        border: Border {
-            color: pal.border,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..Default::default()
+    if has_bg {
+        container::Style {
+            background: Some(Background::Color(Color {
+                r: pal.window_bg.r,
+                g: pal.window_bg.g,
+                b: pal.window_bg.b,
+                a: 0.55,
+            })),
+            border: Border {
+                color: Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.10,
+                },
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            shadow: Shadow {
+                color: Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.18,
+                },
+                offset: Vector::new(0.0, 2.0),
+                blur_radius: 12.0,
+            },
+            ..Default::default()
+        }
+    } else {
+        container::Style {
+            background: Some(Background::Color(pal.surface)),
+            border: Border {
+                color: pal.border,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        }
     }
 }
 
@@ -189,13 +377,19 @@ pub fn tab_pill(pal: &Palette, active: bool) -> container::Style {
 pub fn status_bar_style(pal: &Palette, has_bg: bool) -> container::Style {
     container::Style {
         background: if has_bg {
-            None
+            // Slightly more opaque for readability over background images
+            Some(Background::Color(Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.45,
+            }))
         } else {
             Some(Background::Color(pal.surface))
         },
         border: Border {
             color: pal.separator,
-            width: 0.0,
+            width: 1.0,
             radius: 0.0.into(),
         },
         ..Default::default()
@@ -215,7 +409,12 @@ pub fn dropdown(pal: &Palette) -> container::Style {
             radius: 8.0.into(),
         },
         shadow: Shadow {
-            color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.25 },
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.25,
+            },
             offset: Vector::new(0.0, 4.0),
             blur_radius: 16.0,
         },
@@ -236,7 +435,12 @@ pub fn modal(pal: &Palette) -> container::Style {
             radius: 12.0.into(),
         },
         shadow: Shadow {
-            color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.3 },
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.3,
+            },
             offset: Vector::new(0.0, 8.0),
             blur_radius: 32.0,
         },
@@ -281,7 +485,10 @@ pub fn hovered_item(pal: &Palette) -> container::Style {
 /// Danger/destructive action container.
 pub fn danger_surface(pal: &Palette) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color { a: 0.1, ..pal.danger })),
+        background: Some(Background::Color(Color {
+            a: 0.1,
+            ..pal.danger
+        })),
         border: Border {
             color: pal.danger,
             width: 1.0,
@@ -309,6 +516,9 @@ pub const FONT_ICON: f32 = 14.0;
 pub const FONT_ICON_SM: f32 = 12.0;
 
 // ── Layout Constants ─────────────────────────────────
+
+/// Gap between major panels (sidebar ↔ bench ↔ sparks).
+pub const PANEL_GAP: f32 = 6.0;
 
 /// Height reserved for macOS title bar (traffic lights).
 #[cfg(target_os = "macos")]

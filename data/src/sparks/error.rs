@@ -22,13 +22,19 @@ pub enum SparksError {
     Io(#[from] std::io::Error),
 
     #[error("spark {spark_id} is already claimed by session {session_id}")]
-    AlreadyClaimed { spark_id: String, session_id: String },
+    AlreadyClaimed {
+        spark_id: String,
+        session_id: String,
+    },
 
     #[error("spark {spark_id} has failing required contract {contract_id}")]
     ContractViolation { spark_id: String, contract_id: i64 },
 
     #[error("spark {spark_id} has stale claim from session {session_id}")]
-    StaleClaim { spark_id: String, session_id: String },
+    StaleClaim {
+        spark_id: String,
+        session_id: String,
+    },
 
     #[error("serialization error: {0}")]
     Serialization(String),

@@ -77,19 +77,9 @@ impl Repository {
 
     /// Create a new worktree with a new branch.
     /// Runs `git worktree add -b <branch> <target_path>`.
-    pub async fn create_worktree(
-        &self,
-        branch: &str,
-        target: &Path,
-    ) -> Result<(), GitError> {
+    pub async fn create_worktree(&self, branch: &str, target: &Path) -> Result<(), GitError> {
         let output = Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                &target.to_string_lossy(),
-            ])
+            .args(["worktree", "add", "-b", branch, &target.to_string_lossy()])
             .current_dir(&self.path)
             .output()
             .await
@@ -107,12 +97,7 @@ impl Repository {
     /// Runs `git worktree remove --force <target_path>`.
     pub async fn remove_worktree(&self, target: &Path) -> Result<(), GitError> {
         let output = Command::new("git")
-            .args([
-                "worktree",
-                "remove",
-                "--force",
-                &target.to_string_lossy(),
-            ])
+            .args(["worktree", "remove", "--force", &target.to_string_lossy()])
             .current_dir(&self.path)
             .output()
             .await
@@ -210,7 +195,10 @@ impl Repository {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
                     if let Some(stat) = parse_numstat_line(line) {
-                        let entry = stats.entry(stat.0).or_insert(DiffStat { additions: 0, deletions: 0 });
+                        let entry = stats.entry(stat.0).or_insert(DiffStat {
+                            additions: 0,
+                            deletions: 0,
+                        });
                         entry.additions += stat.1.additions;
                         entry.deletions += stat.1.deletions;
                     }
@@ -361,10 +349,7 @@ fn parse_hunk_start_and_count(part: &str) -> (u32, u32) {
     // "+12,5" → (12, 5), "+12" → (12, 1)
     let s = part.trim_start_matches(['-', '+']);
     if let Some((start, count)) = s.split_once(',') {
-        (
-            start.parse().unwrap_or(1),
-            count.parse().unwrap_or(1),
-        )
+        (start.parse().unwrap_or(1), count.parse().unwrap_or(1))
     } else {
         (s.parse().unwrap_or(1), 1)
     }
@@ -390,7 +375,13 @@ fn parse_numstat_line(line: &str) -> Option<(PathBuf, DiffStat)> {
         PathBuf::from(path_str)
     };
 
-    Some((path, DiffStat { additions, deletions }))
+    Some((
+        path,
+        DiffStat {
+            additions,
+            deletions,
+        },
+    ))
 }
 
 #[derive(Debug, thiserror::Error)]

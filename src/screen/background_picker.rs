@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use data::unsplash::Photo;
 use iced::widget::{
-    button, column, container, image, row, rule, scrollable, text, text_input, Space,
+    Space, button, column, container, image, row, rule, scrollable, text, text_input,
 };
 use iced::{Element, Length, Theme};
 
@@ -95,8 +95,8 @@ pub fn view<'a>(
         .style(button::text)
         .on_press(Message::Close);
 
-    let header = row![title, Space::new().width(Length::Fill), close_btn]
-        .align_y(iced::Alignment::Center);
+    let header =
+        row![title, Space::new().width(Length::Fill), close_btn].align_y(iced::Alignment::Center);
 
     let mut content = column![header, rule::horizontal(1)].spacing(12);
 
@@ -262,7 +262,11 @@ pub fn view<'a>(
         .into()
 }
 
-fn view_thumbnail<'a>(state: &'a PickerState, photo: &'a Photo, pal: &Palette) -> Element<'a, Message> {
+fn view_thumbnail<'a>(
+    state: &'a PickerState,
+    photo: &'a Photo,
+    pal: &Palette,
+) -> Element<'a, Message> {
     let pal = *pal;
     let content: Element<'a, Message> = if let Some(handle) = state.thumbnails.get(&photo.id) {
         column![

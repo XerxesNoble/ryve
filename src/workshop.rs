@@ -139,8 +139,7 @@ impl Workshop {
 
         self.bench
             .create_tab(tab_id, title, TabKind::FileViewer(path.clone()));
-        self.file_viewers
-            .insert(tab_id, FileViewerState::new(path));
+        self.file_viewers.insert(tab_id, FileViewerState::new(path));
 
         (tab_id, true)
     }
@@ -199,8 +198,7 @@ impl Workshop {
                         args.push(prompt_path.to_string_lossy().into_owned());
                     } else {
                         // Inline text — read the file content
-                        let content = std::fs::read_to_string(&prompt_path)
-                            .unwrap_or_default();
+                        let content = std::fs::read_to_string(&prompt_path).unwrap_or_default();
                         args.push(content);
                     }
                 }
@@ -285,7 +283,11 @@ impl Workshop {
                 if let Some(tab) = self.bench.tabs.iter_mut().find(|t| t.id == id) {
                     tab.title = title.clone();
                 }
-                if let Some(session) = self.agent_sessions.iter_mut().find(|s| s.tab_id == Some(id)) {
+                if let Some(session) = self
+                    .agent_sessions
+                    .iter_mut()
+                    .find(|s| s.tab_id == Some(id))
+                {
                     session.name = title;
                 }
             }
@@ -442,13 +444,7 @@ fn create_hand_worktree(
         .map_err(|e| e.to_string())?;
 
     let output = std::process::Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            &wt_dir.to_string_lossy(),
-        ])
+        .args(["worktree", "add", "-b", &branch, &wt_dir.to_string_lossy()])
         .current_dir(workshop_dir)
         .output()
         .map_err(|e| e.to_string())?;

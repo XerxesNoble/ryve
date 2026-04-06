@@ -20,8 +20,8 @@ pub async fn upsert(
     author: Option<&str>,
 ) -> Result<Engraving, SparksError> {
     let key = format!("{PREFIX}{name}");
-    let value = serde_json::to_string(constraint)
-        .map_err(|e| SparksError::Serialization(e.to_string()))?;
+    let value =
+        serde_json::to_string(constraint).map_err(|e| SparksError::Serialization(e.to_string()))?;
 
     engraving_repo::upsert(
         pool,
@@ -56,11 +56,7 @@ pub async fn list(
 }
 
 /// Delete an architectural constraint by name.
-pub async fn delete(
-    pool: &SqlitePool,
-    name: &str,
-    workshop_id: &str,
-) -> Result<(), SparksError> {
+pub async fn delete(pool: &SqlitePool, name: &str, workshop_id: &str) -> Result<(), SparksError> {
     let key = format!("{PREFIX}{name}");
     engraving_repo::delete(pool, &key, workshop_id).await
 }

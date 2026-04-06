@@ -11,7 +11,10 @@ use super::types::*;
 
 /// Assign a Hand to a Spark. Fails if an active owner already exists.
 /// The check and INSERT are wrapped in a transaction to prevent TOCTOU races.
-pub async fn assign(pool: &SqlitePool, new: NewHandAssignment) -> Result<HandAssignment, SparksError> {
+pub async fn assign(
+    pool: &SqlitePool,
+    new: NewHandAssignment,
+) -> Result<HandAssignment, SparksError> {
     let mut tx = pool.begin().await?;
 
     // Check for existing active owner (only enforced for owner role)

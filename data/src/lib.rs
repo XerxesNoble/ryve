@@ -4,9 +4,9 @@
 pub mod agent_context;
 pub mod config;
 pub mod db;
-pub mod ryve_dir;
 pub mod git;
 pub mod github;
+pub mod ryve_dir;
 pub mod sparks;
 pub mod unsplash;
 

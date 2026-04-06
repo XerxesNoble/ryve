@@ -125,7 +125,23 @@ fn generate_workshop_md() -> String {
     md.push_str("ryve-cli spark status <spark-id> in_progress      # claim / update status\n");
     md.push_str("ryve-cli spark close <spark-id> <reason>           # close a spark\n```\n\n");
 
-    md.push_str("Ryve auto-refreshes every 3 seconds. Changes are picked up by the UI and other Hands automatically.\n");
+    md.push_str("Ryve auto-refreshes every 3 seconds. Changes are picked up by the UI and other Hands automatically.\n\n");
+
+    // ── Workflow rules ────────────────────────────────────────────
+    md.push_str("## Workflow\n\n");
+    md.push_str("- **Claim a spark** before starting work to prevent duplicate effort.\n");
+    md.push_str(
+        "- **Reference spark IDs** in commit messages \
+         (e.g. `fix(auth): validate token expiry [sp-a1b2]`).\n",
+    );
+    md.push_str("- **Focus on priority order** — P0 sparks are critical, P4 are negligible.\n");
+    md.push_str("- **Respect architectural constraints** — violations are blocking.\n");
+    md.push_str("- **Check required contracts** before marking a spark as done.\n");
+    md.push_str(
+        "- If you discover a new bug or task while working, mention it so it can be \
+         tracked as a new spark.\n",
+    );
+    md.push_str("- Do not close or modify sparks directly — Ryve manages spark lifecycle.\n");
 
     md
 }
@@ -165,10 +181,9 @@ async fn inject_pointer(workshop_dir: &Path, relative: &str) -> Result<(), std::
 
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(existing) => {
-            if let (Some(start), Some(end)) = (
-                existing.find(MARKER_START),
-                existing.find(MARKER_END),
-            ) {
+            if let (Some(start), Some(end)) =
+                (existing.find(MARKER_START), existing.find(MARKER_END))
+            {
                 // Replace existing block
                 let mut out = String::with_capacity(existing.len());
                 out.push_str(&existing[..start]);
