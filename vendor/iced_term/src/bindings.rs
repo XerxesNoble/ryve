@@ -267,7 +267,7 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         "z",        Modifiers::ALT; BindingAction::Esc("\x1bz".into());
         ".",        Modifiers::ALT; BindingAction::Esc("\x1b.".into());
         // SHIFT
-        Enter,      Modifiers::SHIFT; BindingAction::Char('\x0d');
+        Enter,      Modifiers::SHIFT; BindingAction::Char('\x0a');
         Backspace,  Modifiers::SHIFT; BindingAction::Char('\x7f');
         Tab,        Modifiers::SHIFT; BindingAction::Esc("\x1b[Z".into());
         End,        Modifiers::SHIFT, +TermMode::ALT_SCREEN; BindingAction::Esc("\x1b[1;2F".into());
@@ -358,7 +358,6 @@ fn platform_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         KeyboardBinding;
         "c", Modifiers::COMMAND; BindingAction::Copy;
         "v", Modifiers::COMMAND; BindingAction::Paste;
-        "h", Modifiers::COMMAND; BindingAction::Char('\x7f');
     )
 }
 

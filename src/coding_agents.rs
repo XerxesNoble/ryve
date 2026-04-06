@@ -57,6 +57,23 @@ impl CodingAgent {
     }
 }
 
+impl CodingAgent {
+    /// Return the CLI flags to enable full-auto mode (no confirmation prompts).
+    /// Each agent has its own mechanism:
+    /// - Claude Code: `--dangerously-skip-permissions`
+    /// - Codex: `--full-auto`
+    /// - Aider: `--yes-always`
+    /// - OpenCode: (no known flag)
+    pub fn full_auto_flags(&self) -> Vec<String> {
+        match self.command.as_str() {
+            "claude" => vec!["--dangerously-skip-permissions".to_string()],
+            "codex" => vec!["--full-auto".to_string()],
+            "aider" => vec!["--yes-always".to_string()],
+            _ => vec![],
+        }
+    }
+}
+
 impl fmt::Display for CodingAgent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.display_name)

@@ -129,12 +129,14 @@ impl Workshop {
     }
 
     /// Spawn a terminal tab, optionally running a coding agent command.
+    /// When `full_auto` is true, the agent's auto-accept flags are appended.
     pub fn spawn_terminal(
         &mut self,
         title: String,
         agent: Option<&CodingAgent>,
         next_terminal_id: &mut u64,
         session_id: Option<&str>,
+        full_auto: bool,
     ) -> u64 {
         let kind = match agent {
             Some(a) => TabKind::CodingAgent(a.clone()),
@@ -165,6 +167,11 @@ impl Workshop {
 
         if let Some(agent) = agent {
             let mut args = agent.args.clone();
+
+            // Inject full-auto flags when enabled
+            if full_auto {
+                args.extend(agent.full_auto_flags());
+            }
 
             // Inject system prompt flag for agents that support it
             if let Some((flag, is_file)) = agent.system_prompt_flag() {

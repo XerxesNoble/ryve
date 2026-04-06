@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,23 @@ pub struct Config {
     /// When unset, uses the system default sans-serif font.
     #[serde(default)]
     pub font_family: Option<String>,
+
+    /// Default coding agent to launch with Cmd+H (e.g. "claude", "codex").
+    /// Must match a known agent command name. When unset, Cmd+H does nothing.
+    #[serde(default)]
+    pub default_agent: Option<String>,
+
+    /// Per-agent settings keyed by command name (e.g. "claude", "codex").
+    #[serde(default)]
+    pub agent_settings: HashMap<String, AgentConfig>,
+}
+
+/// Per-agent configuration stored in the global config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Launch this agent in full-auto mode (no confirmation prompts).
+    #[serde(default)]
+    pub full_auto: bool,
 }
 
 impl Config {
@@ -61,6 +79,8 @@ impl Default for Config {
                 .expect("no home directory found")
                 .join("dev"),
             font_family: None,
+            default_agent: None,
+            agent_settings: HashMap::new(),
         }
     }
 }
