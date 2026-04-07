@@ -25,8 +25,13 @@ const BOTTOM_PIN_NEWLINES: usize = 200;
 
 
 /// State for a pending agent spawn waiting for spark selection.
+///
+/// `agent` is `None` when the user opened the picker via "+ → New Hand"
+/// (the agent is chosen *inside* the picker). It is `Some` when the user
+/// picked a custom agent from the dropdown — the agent is already known
+/// at the time the picker opens.
 pub struct PendingAgentSpawn {
-    pub agent: CodingAgent,
+    pub agent: Option<CodingAgent>,
     pub is_custom: bool,
     pub custom_def: Option<AgentDef>,
     pub full_auto: bool,
@@ -71,6 +76,8 @@ pub struct Workshop {
     pub bg_is_dark: Option<bool>,
     /// Pending agent spawn -- shows spark picker before creating terminal.
     pub pending_agent_spawn: Option<PendingAgentSpawn>,
+    /// Pending Head spawn -- shows the Head picker overlay (agent + goal).
+    pub pending_head_spawn: Option<crate::screen::head_picker::PickerState>,
     /// One-shot warning set when the last worktree creation fell back to
     /// the main workshop directory. The UI drains this to surface a toast.
     pub last_worktree_warning: Option<String>,
@@ -102,6 +109,7 @@ impl Workshop {
             contract_create_form: Default::default(),
             bg_is_dark: None,
             pending_agent_spawn: None,
+            pending_head_spawn: None,
             last_worktree_warning: None,
         }
     }
@@ -472,7 +480,10 @@ pub fn compute_image_luminance(bytes: &[u8]) -> Option<f32> {
 
 /// Create a git worktree for a Hand session (blocking).
 /// Returns the worktree path on success.
-fn create_hand_worktree(
+///
+/// Visible to the rest of the crate so the `hand_spawn` CLI helper can call
+/// it without re-implementing the worktree convention.
+pub(crate) fn create_hand_worktree(
     workshop_dir: &Path,
     ryve_dir: &RyveDir,
     session_id: &str,
@@ -529,7 +540,7 @@ fn create_hand_worktree(
 ///   The `ryve` binary reads this to locate `.ryve/sparks.db`.
 /// - `PATH` — prepended with the directory containing the currently
 ///   running Ryve executable so `ryve <cmd>` resolves.
-fn hand_env_vars(workshop_dir: &Path) -> Vec<(String, String)> {
+pub(crate) fn hand_env_vars(workshop_dir: &Path) -> Vec<(String, String)> {
     let mut vars = Vec::new();
 
     vars.push((

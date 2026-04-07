@@ -10,15 +10,18 @@
 //!
 //! Supports `--json` flag on most commands for machine-parseable output.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use data::ryve_dir::RyveDir;
 use data::sparks::types::*;
 use data::sparks::{
     assignment_repo, bond_repo, comment_repo, commit_link_repo, constraint_helpers, contract_repo,
-    ember_repo, event_repo, spark_repo, stamp_repo,
+    crew_repo, ember_repo, event_repo, spark_repo, stamp_repo,
 };
+
+use crate::coding_agents::{self, CodingAgent};
+use crate::hand_spawn::{self, HandKind};
 
 /// Known CLI subcommands. If the first non-flag argument matches one of
 /// these, `main.rs` dispatches to `cli::run` instead of launching the UI.
@@ -26,6 +29,7 @@ pub const CLI_COMMANDS: &[&str] = &[
     "spark", "sparks", "bond", "bonds", "comment", "comments", "stamp", "stamps",
     "contract", "contracts", "constraint", "constraints", "ember", "embers",
     "event", "events", "assign", "assignment", "commit", "commits",
+    "crew", "crews", "hand", "hands",
     "hot", "status", "init", "help", "--help", "-h",
 ];
 
@@ -97,6 +101,10 @@ pub async fn run(args: Vec<String>) {
         "event" | "events" => handle_event(&pool, &args_clean[2..], json_mode).await,
         "assign" | "assignment" => handle_assignment(&pool, &args_clean[2..], json_mode).await,
         "commit" | "commits" => handle_commit(&pool, &args_clean[2..], &ws_id, json_mode).await,
+        "crew" | "crews" => handle_crew(&pool, &args_clean[2..], &ws_id, json_mode).await,
+        "hand" | "hands" => {
+            handle_hand(&pool, &workshop_root, &args_clean[2..], json_mode).await
+        }
         "hot" => handle_hot(&pool, &ws_id, json_mode).await,
         "status" => handle_status(&pool, &ws_id).await,
         other => {
@@ -181,6 +189,17 @@ fn print_usage() {
     eprintln!("  commit link <spark_id> <hash>       Link a commit to a spark");
     eprintln!("  commit list <spark_id>              List commits for a spark");
     eprintln!("  commit scan                         Scan git log for [sp-xxxx] references");
+    eprintln!();
+    eprintln!("  crew create <name> [--purpose <t>] [--parent <spark_id>] [--head-session <id>]");
+    eprintln!("  crew list                           List crews in this workshop");
+    eprintln!("  crew show <crew_id>                 Show a crew + its members");
+    eprintln!("  crew add-member <crew_id> <session_id> [--role hand|merger]");
+    eprintln!("  crew remove-member <crew_id> <session_id>");
+    eprintln!("  crew status <crew_id> active|merging|completed|abandoned");
+    eprintln!();
+    eprintln!("  hand spawn <spark_id> [--agent <name>] [--role owner|merger] [--crew <id>]");
+    eprintln!("                                       Spawn a Hand subprocess on a spark");
+    eprintln!("  hand list                            List active hand assignments");
     eprintln!();
     eprintln!("FLAGS:");
     eprintln!("  --json    Output as JSON (for machine consumption)");
@@ -886,5 +905,295 @@ fn parse_contract_kind(s: &str) -> ContractKind {
         "custom_command" => ContractKind::CustomCommand, "grep_absent" => ContractKind::GrepAbsent,
         "grep_present" => ContractKind::GrepPresent,
         _ => die(&format!("invalid contract kind '{s}' (test_pass, no_api_break, custom_command, grep_absent, grep_present)")),
+    }
+}
+
+// ── Crew ─────────────────────────────────────────────
+
+async fn handle_crew(
+    pool: &sqlx::SqlitePool,
+    args: &[String],
+    ws_id: &str,
+    json_mode: bool,
+) {
+    if args.is_empty() {
+        die("crew subcommand required (create, list, show, add-member, remove-member, status)");
+    }
+    match args[0].as_str() {
+        "create" => {
+            // Parse: create [--purpose <t>] [--parent <id>] [--head-session <id>] <name words...>
+            let mut purpose: Option<String> = None;
+            let mut parent: Option<String> = None;
+            let mut head_session: Option<String> = None;
+            let mut name_parts: Vec<&str> = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--purpose" => {
+                        i += 1;
+                        if i < args.len() { purpose = Some(args[i].clone()); }
+                    }
+                    "--parent" => {
+                        i += 1;
+                        if i < args.len() { parent = Some(args[i].clone()); }
+                    }
+                    "--head-session" => {
+                        i += 1;
+                        if i < args.len() { head_session = Some(args[i].clone()); }
+                    }
+                    other => name_parts.push(other),
+                }
+                i += 1;
+            }
+            let name = name_parts.join(" ");
+            if name.is_empty() {
+                die("crew create requires a <name>");
+            }
+            let new = NewCrew {
+                name,
+                purpose,
+                workshop_id: ws_id.to_string(),
+                head_session_id: head_session,
+                parent_spark_id: parent,
+            };
+            match crew_repo::create(pool, new).await {
+                Ok(c) => {
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&c).unwrap_or_default());
+                    } else {
+                        println!("created {} — {}", c.id, c.name);
+                    }
+                }
+                Err(e) => die(&format!("{e}")),
+            }
+        }
+        "list" | "ls" => match crew_repo::list_for_workshop(pool, ws_id).await {
+            Ok(crews) => {
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&crews).unwrap_or_default());
+                } else if crews.is_empty() {
+                    println!("No crews in this workshop.");
+                } else {
+                    println!("{:<12} {:<10} {:<24} {}", "ID", "STATUS", "NAME", "PURPOSE");
+                    let sep = "-".repeat(72);
+                    println!("{sep}");
+                    for c in &crews {
+                        let purpose = c.purpose.as_deref().unwrap_or("");
+                        println!("{:<12} {:<10} {:<24} {}", c.id, c.status, c.name, purpose);
+                    }
+                }
+            }
+            Err(e) => die(&format!("{e}")),
+        },
+        "show" => {
+            if args.len() < 2 {
+                die("crew show requires <crew_id>");
+            }
+            let crew = match crew_repo::get(pool, &args[1]).await {
+                Ok(c) => c,
+                Err(e) => die(&format!("{e}")),
+            };
+            let members = crew_repo::members(pool, &crew.id).await.unwrap_or_default();
+            if json_mode {
+                let payload = serde_json::json!({ "crew": crew, "members": members });
+                println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+            } else {
+                println!("ID:      {}", crew.id);
+                println!("Name:    {}", crew.name);
+                println!("Status:  {}", crew.status);
+                if let Some(ref p) = crew.purpose {
+                    println!("Purpose: {p}");
+                }
+                if let Some(ref h) = crew.head_session_id {
+                    println!("Head:    {h}");
+                }
+                if let Some(ref s) = crew.parent_spark_id {
+                    println!("Parent:  {s}");
+                }
+                println!("Created: {}", crew.created_at);
+                println!();
+                if members.is_empty() {
+                    println!("No members.");
+                } else {
+                    println!("Members:");
+                    for m in &members {
+                        let role = m.role.as_deref().unwrap_or("hand");
+                        println!("  {} ({}) joined {}", m.session_id, role, m.joined_at);
+                    }
+                }
+            }
+        }
+        "add-member" => {
+            if args.len() < 3 {
+                die("crew add-member requires <crew_id> <session_id> [--role hand|merger]");
+            }
+            let mut role: Option<String> = None;
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--role" {
+                    i += 1;
+                    if i < args.len() {
+                        role = Some(args[i].clone());
+                    }
+                }
+                i += 1;
+            }
+            match crew_repo::add_member(pool, &args[1], &args[2], role.as_deref()).await {
+                Ok(m) => println!("added {} to crew {} ({})", m.session_id, m.crew_id, m.role.as_deref().unwrap_or("hand")),
+                Err(e) => die(&format!("{e}")),
+            }
+        }
+        "remove-member" => {
+            if args.len() < 3 {
+                die("crew remove-member requires <crew_id> <session_id>");
+            }
+            match crew_repo::remove_member(pool, &args[1], &args[2]).await {
+                Ok(()) => println!("removed {} from crew {}", args[2], args[1]),
+                Err(e) => die(&format!("{e}")),
+            }
+        }
+        "status" => {
+            if args.len() < 3 {
+                die("crew status requires <crew_id> <active|merging|completed|abandoned>");
+            }
+            if CrewStatus::from_str(&args[2]).is_none() {
+                die(&format!(
+                    "invalid crew status '{}' (active|merging|completed|abandoned)",
+                    args[2]
+                ));
+            }
+            match crew_repo::set_status(pool, &args[1], &args[2]).await {
+                Ok(()) => println!("crew {} -> {}", args[1], args[2]),
+                Err(e) => die(&format!("{e}")),
+            }
+        }
+        other => die(&format!("unknown crew subcommand '{other}'")),
+    }
+}
+
+// ── Hand ─────────────────────────────────────────────
+
+async fn handle_hand(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    args: &[String],
+    json_mode: bool,
+) {
+    if args.is_empty() {
+        die("hand subcommand required (spawn, list)");
+    }
+    match args[0].as_str() {
+        "spawn" => {
+            if args.len() < 2 {
+                die("hand spawn requires <spark_id> [--agent <name>] [--role owner|merger] [--crew <id>]");
+            }
+            let spark_id = args[1].clone();
+            let mut agent_name: Option<String> = None;
+            let mut role = HandKind::Owner;
+            let mut crew_id: Option<String> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--agent" => {
+                        i += 1;
+                        if i < args.len() {
+                            agent_name = Some(args[i].clone());
+                        }
+                    }
+                    "--role" => {
+                        i += 1;
+                        if i < args.len() {
+                            role = match args[i].as_str() {
+                                "owner" | "hand" => HandKind::Owner,
+                                "merger" => HandKind::Merger,
+                                other => die(&format!("invalid role '{other}' (owner|merger)")),
+                            };
+                        }
+                    }
+                    "--crew" => {
+                        i += 1;
+                        if i < args.len() {
+                            crew_id = Some(args[i].clone());
+                        }
+                    }
+                    other => die(&format!("unknown hand spawn flag '{other}'")),
+                }
+                i += 1;
+            }
+
+            let agent = resolve_agent(agent_name.as_deref());
+
+            match hand_spawn::spawn_hand(
+                workshop_root,
+                pool,
+                &agent,
+                &spark_id,
+                role,
+                crew_id.as_deref(),
+            )
+            .await
+            {
+                Ok(spawned) => {
+                    if json_mode {
+                        let payload = serde_json::json!({
+                            "session_id": spawned.session_id,
+                            "spark_id": spawned.spark_id,
+                            "worktree": spawned.worktree_path,
+                            "log": spawned.log_path,
+                            "pid": spawned.child_pid,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+                    } else {
+                        println!(
+                            "spawned hand {} on spark {} (pid {:?})",
+                            spawned.session_id, spawned.spark_id, spawned.child_pid
+                        );
+                        println!("  worktree: {}", spawned.worktree_path.display());
+                        println!("  log:      {}", spawned.log_path.display());
+                    }
+                }
+                Err(e) => die(&format!("{e}")),
+            }
+        }
+        "list" | "ls" => match assignment_repo::list_active(pool).await {
+            Ok(active) => {
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&active).unwrap_or_default());
+                } else if active.is_empty() {
+                    println!("No active hand assignments.");
+                } else {
+                    println!("{:<12} {:<36} {:<10} {}", "SPARK", "SESSION", "ROLE", "ASSIGNED");
+                    let sep = "-".repeat(80);
+                    println!("{sep}");
+                    for a in &active {
+                        println!("{:<12} {:<36} {:<10} {}", a.spark_id, a.session_id, a.role, a.assigned_at);
+                    }
+                }
+            }
+            Err(e) => die(&format!("{e}")),
+        },
+        other => die(&format!("unknown hand subcommand '{other}'")),
+    }
+}
+
+/// Resolve a coding-agent name (or `None`) to a `CodingAgent` definition.
+/// When the name matches a known agent (`claude`, `codex`, etc.) we use the
+/// canonical definition; otherwise we fall back to a minimal stub so users
+/// can pass arbitrary commands like `echo` for testing.
+fn resolve_agent(name: Option<&str>) -> CodingAgent {
+    let name = name.unwrap_or("claude");
+    if let Some(known) = coding_agents::known_agents()
+        .into_iter()
+        .find(|a| a.command == name || a.display_name.eq_ignore_ascii_case(name))
+    {
+        return known;
+    }
+    // Fallback: build a stub agent for this command. No system-prompt flag,
+    // no resume support — used by tests and for one-off custom commands.
+    CodingAgent {
+        display_name: name.to_string(),
+        command: name.to_string(),
+        args: Vec::new(),
+        resume: crate::coding_agents::ResumeStrategy::None,
     }
 }

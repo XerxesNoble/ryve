@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
+mod agent_prompts;
 mod cli;
 mod coding_agents;
+mod hand_spawn;
 mod icons;
 mod screen;
 mod style;
@@ -156,6 +158,7 @@ enum Message {
     Sparks(screen::sparks::Message),
     SparkDetail(screen::spark_detail::Message),
     SparkPicker(screen::spark_picker::Message),
+    HeadPicker(screen::head_picker::Message),
     Background(screen::background_picker::Message),
     StatusBar(screen::status_bar::Message),
 
@@ -242,6 +245,7 @@ impl std::fmt::Debug for Message {
             Self::Sparks(m) => write!(f, "Sparks({m:?})"),
             Self::SparkDetail(m) => write!(f, "SparkDetail({m:?})"),
             Self::SparkPicker(m) => write!(f, "SparkPicker({m:?})"),
+            Self::HeadPicker(m) => write!(f, "HeadPicker({m:?})"),
             Self::Background(m) => write!(f, "Background({m:?})"),
             Self::StatusBar(m) => write!(f, "StatusBar({m:?})"),
             Self::BackgroundLoaded(id, _) => write!(f, "BackgroundLoaded({id})"),
@@ -1079,6 +1083,7 @@ impl App {
                 Task::none()
             }
             Message::SparkPicker(msg) => self.handle_spark_picker_message(msg),
+            Message::HeadPicker(msg) => self.handle_head_picker_message(msg),
             Message::HandAssignmentSaved => Task::none(),
             Message::SendSparkPrompt { tab_id, prompt } => {
                 // Find the terminal across all workshops and send the prompt as input.
@@ -1673,19 +1678,39 @@ impl App {
                 }
             }
             screen::bench::Message::NewCodingAgent(agent) => {
+                // Legacy direct spawn — preserved for the auto-prompt-default
+                // path used by NewDefaultHand. Goes straight to the spark
+                // picker with the agent already chosen.
                 let full_auto = self.global_config.agent_settings
                     .get(&agent.command)
                     .map_or(false, |s| s.full_auto);
 
-                // Show spark picker before spawning the agent
                 let ws = &mut self.workshops[idx];
                 ws.bench.dropdown_open = false;
                 ws.pending_agent_spawn = Some(workshop::PendingAgentSpawn {
-                    agent,
+                    agent: Some(agent),
                     is_custom: false,
                     custom_def: None,
                     full_auto,
                 });
+            }
+            screen::bench::Message::NewHand => {
+                // "+ → New Hand" — open the spark picker without an agent
+                // pre-selected. The picker now lets the user choose both.
+                let ws = &mut self.workshops[idx];
+                ws.bench.dropdown_open = false;
+                ws.pending_agent_spawn = Some(workshop::PendingAgentSpawn {
+                    agent: None,
+                    is_custom: false,
+                    custom_def: None,
+                    full_auto: false,
+                });
+            }
+            screen::bench::Message::NewHead => {
+                // "+ → New Head" — open the Head picker overlay.
+                let ws = &mut self.workshops[idx];
+                ws.bench.dropdown_open = false;
+                ws.pending_head_spawn = Some(screen::head_picker::PickerState::default());
             }
             screen::bench::Message::NewCustomAgent(agent_idx) => {
                 let ws = &mut self.workshops[idx];
@@ -1703,7 +1728,7 @@ impl App {
                 // Show spark picker before spawning the custom agent
                 ws.bench.dropdown_open = false;
                 ws.pending_agent_spawn = Some(workshop::PendingAgentSpawn {
-                    agent,
+                    agent: Some(agent),
                     is_custom: true,
                     custom_def: Some(def),
                     full_auto: false,
@@ -1724,11 +1749,81 @@ impl App {
         };
 
         match msg {
+            screen::spark_picker::Message::SelectAgent(command) => {
+                let ws = &mut self.workshops[idx];
+                if let Some(pending) = ws.pending_agent_spawn.as_mut() {
+                    if let Some(agent) = self
+                        .available_agents
+                        .iter()
+                        .find(|a| a.command == command)
+                        .cloned()
+                    {
+                        let full_auto = self
+                            .global_config
+                            .agent_settings
+                            .get(&agent.command)
+                            .map_or(false, |s| s.full_auto);
+                        pending.agent = Some(agent);
+                        pending.full_auto = full_auto;
+                    }
+                }
+                Task::none()
+            }
             screen::spark_picker::Message::SelectSpark(spark_id) => {
+                // Refuse to spawn if no agent has been chosen yet — the
+                // picker view greys out spark rows in that case but a
+                // synthetic message could still arrive.
+                let has_agent = self.workshops[idx]
+                    .pending_agent_spawn
+                    .as_ref()
+                    .and_then(|p| p.agent.as_ref())
+                    .is_some();
+                if !has_agent {
+                    return Task::none();
+                }
                 self.spawn_pending_agent(idx, spark_id)
             }
             screen::spark_picker::Message::Cancel => {
                 self.workshops[idx].pending_agent_spawn = None;
+                Task::none()
+            }
+        }
+    }
+
+    fn handle_head_picker_message(
+        &mut self,
+        msg: screen::head_picker::Message,
+    ) -> Task<Message> {
+        let Some(idx) = self.active_workshop else {
+            return Task::none();
+        };
+        match msg {
+            screen::head_picker::Message::GoalChanged(goal) => {
+                if let Some(state) = self.workshops[idx].pending_head_spawn.as_mut() {
+                    state.goal = goal;
+                }
+                Task::none()
+            }
+            screen::head_picker::Message::SelectAgent(command) => {
+                let goal = self.workshops[idx]
+                    .pending_head_spawn
+                    .as_ref()
+                    .map(|s| s.goal.clone())
+                    .unwrap_or_default();
+                self.workshops[idx].pending_head_spawn = None;
+                let agent = match self
+                    .available_agents
+                    .iter()
+                    .find(|a| a.command == command)
+                    .cloned()
+                {
+                    Some(a) => a,
+                    None => return Task::none(),
+                };
+                self.spawn_head(idx, agent, goal)
+            }
+            screen::head_picker::Message::Cancel => {
+                self.workshops[idx].pending_head_spawn = None;
                 Task::none()
             }
         }
@@ -1745,11 +1840,17 @@ impl App {
             Some(p) => p,
             None => return Task::none(),
         };
+        // Spark picker now waits for both spark and agent — bail if for any
+        // reason the agent slot is still empty.
+        let pending_agent = match pending.agent {
+            Some(a) => a,
+            None => return Task::none(),
+        };
 
         let session_id = Uuid::new_v4().to_string();
-        let title = pending.agent.display_name.clone();
-        let agent_command = pending.agent.command.clone();
-        let agent_args = pending.agent.args.clone();
+        let title = pending_agent.display_name.clone();
+        let agent_command = pending_agent.command.clone();
+        let agent_args = pending_agent.args.clone();
 
         let tab_id = if pending.is_custom {
             if let Some(ref def) = pending.custom_def {
@@ -1760,7 +1861,7 @@ impl App {
         } else {
             ws.spawn_terminal(
                 title.clone(),
-                Some(&pending.agent),
+                Some(&pending_agent),
                 &mut self.next_terminal_id,
                 Some(&session_id),
                 pending.full_auto,
@@ -1770,7 +1871,7 @@ impl App {
         ws.agent_sessions.push(AgentSession {
             id: session_id.clone(),
             name: title.clone(),
-            agent: pending.agent,
+            agent: pending_agent,
             tab_id: Some(tab_id),
             active: true,
             resume_id: None,
@@ -1804,7 +1905,7 @@ impl App {
             let pool2 = ws.sparks_db.clone().unwrap();
 
             // Compose the initial prompt: house rules + spark details + DONE checklist
-            let prompt = compose_hand_prompt(&ws.sparks, &spark_id);
+            let prompt = agent_prompts::compose_hand_prompt(&ws.sparks, &spark_id);
 
             let spark_id_clone = spark_id.clone();
             tasks.push(Task::perform(
@@ -1831,6 +1932,89 @@ impl App {
                 },
             ));
         }
+        if let Some(term) = ws.terminals.get(&tab_id) {
+            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Spawn a Head — a coding agent launched with the Head system prompt
+    /// instead of a Hand prompt. The Head has no spark assignment of its
+    /// own; its job is to *create* sparks via the `ryve` CLI.
+    fn spawn_head(
+        &mut self,
+        workshop_idx: usize,
+        agent: CodingAgent,
+        user_goal: String,
+    ) -> Task<Message> {
+        let ws = &mut self.workshops[workshop_idx];
+
+        let session_id = Uuid::new_v4().to_string();
+        let title = format!("Head ({})", agent.display_name);
+        let agent_command = agent.command.clone();
+        let agent_args = agent.args.clone();
+        let full_auto = self
+            .global_config
+            .agent_settings
+            .get(&agent.command)
+            .is_some_and(|s| s.full_auto);
+
+        let tab_id = ws.spawn_terminal(
+            title.clone(),
+            Some(&agent),
+            &mut self.next_terminal_id,
+            Some(&session_id),
+            full_auto,
+        );
+
+        ws.agent_sessions.push(AgentSession {
+            id: session_id.clone(),
+            name: title.clone(),
+            agent: agent.clone(),
+            tab_id: Some(tab_id),
+            active: true,
+            resume_id: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+        });
+
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        if let Some(ref pool) = ws.sparks_db {
+            let pool = pool.clone();
+            let ws_id = ws.workshop_id();
+            let new_session = data::sparks::types::NewAgentSession {
+                id: session_id.clone(),
+                workshop_id: ws_id,
+                agent_name: title,
+                agent_command,
+                agent_args,
+                session_label: Some("head".to_string()),
+                resume_id: None,
+            };
+            tasks.push(Task::perform(
+                async move {
+                    let _ = data::sparks::agent_session_repo::create(&pool, &new_session).await;
+                },
+                |_| Message::AgentSessionSaved,
+            ));
+        }
+
+        // Inject the Head system prompt the same way the Hand flow injects
+        // its prompt: a delayed type-into-terminal so the agent has had time
+        // to boot. Coding agents like claude/codex pick up `--system-prompt`
+        // via flag too, but the existing infra here uses the typed-prompt
+        // path so we stay consistent and avoid having to fork the spawn API.
+        let prompt = agent_prompts::compose_head_prompt(&user_goal);
+        let prompt_tab_id = tab_id;
+        tasks.push(Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            },
+            move |_| Message::SendSparkPrompt {
+                tab_id: prompt_tab_id,
+                prompt,
+            },
+        ));
+
         if let Some(term) = ws.terminals.get(&tab_id) {
             tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
         }
@@ -2438,10 +2622,24 @@ impl App {
         }
 
         // Spark picker modal overlay (shown before spawning a Hand)
-        if ws.pending_agent_spawn.is_some() {
+        if let Some(ref pending) = ws.pending_agent_spawn {
+            let selected = pending.agent.as_ref().map(|a| a.command.as_str());
             layers.push(
-                screen::spark_picker::view(&ws.sparks, &pal)
-                    .map(Message::SparkPicker),
+                screen::spark_picker::view(
+                    &ws.sparks,
+                    &self.available_agents,
+                    selected,
+                    &pal,
+                )
+                .map(Message::SparkPicker),
+            );
+        }
+
+        // Head picker modal overlay (shown before spawning a Head)
+        if let Some(ref state) = ws.pending_head_spawn {
+            layers.push(
+                screen::head_picker::view(state, &self.available_agents, &pal)
+                    .map(Message::HeadPicker),
             );
         }
 
@@ -2518,78 +2716,6 @@ impl App {
     fn theme(&self) -> Theme {
         self.appearance.theme()
     }
-}
-
-/// Compose the initial prompt sent to a newly-spawned Hand.
-///
-/// Always includes the house rules. If the spark exists in the cached list,
-/// also includes its title, description, and intent so the Hand can begin
-/// work immediately without further user input.
-fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
-    let mut prompt = String::new();
-
-    // ── House rules ────────────────────────────────────
-    prompt.push_str(
-        "You are a Hand in a Ryve workshop. Read these rules carefully — they govern \
-         everything you do in this session.\n\n\
-         HOUSE RULES:\n\
-         1. Use `ryve` for ALL workgraph operations: spark list/show/status/close, \
-         bond, contract, comment, stamp. NEVER touch `.ryve/sparks.db` directly with \
-         sqlite3 or any other tool — it bypasses event logging and validation.\n\
-         2. Reference the spark id in every commit message: `[sp-xxxx]`.\n\
-         3. Respect architectural constraints: `ryve constraint list`. \
-         Violations are blocking.\n\
-         4. Before declaring the spark complete, verify your work against \
-         `.ryve/checklists/DONE.md`. Every item must be satisfied.\n\
-         5. When the work is complete and the DONE checklist passes, close the spark: \
-         `ryve spark close <id> completed`. Then exit.\n\n",
-    );
-
-    // ── Spark assignment ───────────────────────────────
-    prompt.push_str(&format!(
-        "ASSIGNMENT: spark {spark_id}. You have been assigned this spark. \
-         Mark it in progress now: `ryve spark status {spark_id} in_progress`\n\n"
-    ));
-
-    if let Some(spark) = sparks.iter().find(|s| s.id == spark_id) {
-        prompt.push_str(&format!("Title: {}\n", spark.title));
-        if !spark.description.is_empty() {
-            prompt.push_str(&format!("\nDescription:\n{}\n", spark.description));
-        }
-        let intent = spark.intent();
-        if let Some(ref ps) = intent.problem_statement {
-            prompt.push_str(&format!("\nProblem statement:\n{ps}\n"));
-        }
-        if !intent.acceptance_criteria.is_empty() {
-            prompt.push_str("\nAcceptance criteria:\n");
-            for ac in &intent.acceptance_criteria {
-                prompt.push_str(&format!("- {ac}\n"));
-            }
-        }
-        if !intent.invariants.is_empty() {
-            prompt.push_str("\nInvariants (must hold):\n");
-            for inv in &intent.invariants {
-                prompt.push_str(&format!("- {inv}\n"));
-            }
-        }
-        if !intent.non_goals.is_empty() {
-            prompt.push_str("\nNon-goals (do NOT do these):\n");
-            for ng in &intent.non_goals {
-                prompt.push_str(&format!("- {ng}\n"));
-            }
-        }
-    } else {
-        prompt.push_str(&format!(
-            "(Spark {spark_id} details not in cache — run `ryve spark show {spark_id}` to load them.)\n"
-        ));
-    }
-
-    prompt.push_str(
-        "\nBegin the work now. Do not wait for further instructions. \
-         When complete, verify against `.ryve/checklists/DONE.md`, close the spark, and exit.\n",
-    );
-
-    prompt
 }
 
 /// Translate global runtime events into splitter messages while a

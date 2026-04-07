@@ -138,13 +138,24 @@ pub fn detect_available() -> Vec<CodingAgent> {
     KNOWN_AGENTS
         .iter()
         .filter(|def| which(def.command))
-        .map(|def| CodingAgent {
-            display_name: def.name.to_string(),
-            command: def.command.to_string(),
-            args: def.args.iter().map(|a| a.to_string()).collect(),
-            resume: def.resume.clone(),
-        })
+        .map(def_to_agent)
         .collect()
+}
+
+/// Return every coding agent Ryve knows about, regardless of whether it is
+/// currently installed. Used by `ryve hand spawn --agent <name>` so the
+/// caller can resolve a name to a definition without first running `which`.
+pub fn known_agents() -> Vec<CodingAgent> {
+    KNOWN_AGENTS.iter().map(def_to_agent).collect()
+}
+
+fn def_to_agent(def: &AgentDef) -> CodingAgent {
+    CodingAgent {
+        display_name: def.name.to_string(),
+        command: def.command.to_string(),
+        args: def.args.iter().map(|a| a.to_string()).collect(),
+        resume: def.resume.clone(),
+    }
 }
 
 /// Check if a command exists on PATH.

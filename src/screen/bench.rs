@@ -42,6 +42,15 @@ pub enum Message {
     CloseTab(u64),
     ToggleDropdown,
     NewTerminal,
+    /// Open the spark+agent picker for spawning a regular Hand on a spark.
+    NewHand,
+    /// Open the agent picker for spawning a Head — a coding agent that
+    /// orchestrates a Crew of Hands. No spark is selected; the Head creates
+    /// its own.
+    NewHead,
+    /// Legacy: directly spawn a coding agent of the given type. Still emitted
+    /// from the Hand picker once the user has chosen both the spark and the
+    /// agent.
     NewCodingAgent(CodingAgent),
     NewCustomAgent(usize),
     TerminalEvent(iced_term::Event),
@@ -149,6 +158,43 @@ impl BenchState {
         let pal = *pal;
         let mut menu = column![].spacing(2).padding(6);
 
+        // Top-level: the three roles a new tab can take on. The agent
+        // picker happens inside the spark picker for Hand / inside its own
+        // tiny picker for Head.
+        let any_agent_available = !available_agents.is_empty();
+
+        let head_button = button(
+            text("New Head...").size(FONT_BODY).color(if any_agent_available {
+                pal.text_primary
+            } else {
+                pal.text_tertiary
+            }),
+        )
+        .style(button::text)
+        .width(Length::Fill);
+        let head_button = if any_agent_available {
+            head_button.on_press(Message::NewHead)
+        } else {
+            head_button
+        };
+        menu = menu.push(head_button);
+
+        let hand_button = button(
+            text("New Hand...").size(FONT_BODY).color(if any_agent_available {
+                pal.text_primary
+            } else {
+                pal.text_tertiary
+            }),
+        )
+        .style(button::text)
+        .width(Length::Fill);
+        let hand_button = if any_agent_available {
+            hand_button.on_press(Message::NewHand)
+        } else {
+            hand_button
+        };
+        menu = menu.push(hand_button);
+
         menu = menu.push(
             button(text("New Terminal...").size(FONT_BODY).color(pal.text_primary))
                 .style(button::text)
@@ -156,16 +202,17 @@ impl BenchState {
                 .on_press(Message::NewTerminal),
         );
 
-        for agent in available_agents {
-            let label = format!("New {}...", agent.display_name);
+        if !any_agent_available {
             menu = menu.push(
-                button(text(label).size(FONT_BODY).color(pal.text_primary))
-                    .style(button::text)
-                    .width(Length::Fill)
-                    .on_press(Message::NewCodingAgent(agent.clone())),
+                text("(install claude/codex/aider/opencode to enable Head & Hand)")
+                    .size(FONT_SMALL)
+                    .color(pal.text_tertiary),
             );
         }
 
+        // Custom agents still get their own quick-launch entries — they
+        // bypass the picker because the user explicitly named the agent
+        // when they registered it under .ryve/agents/.
         if !custom_agents.is_empty() {
             menu = menu.push(
                 text("Custom").size(FONT_LABEL).color(pal.text_tertiary),
@@ -180,6 +227,10 @@ impl BenchState {
                 );
             }
         }
+
+        // Silence "unused parameter" warnings until the legacy direct-spawn
+        // dropdown items are removed in a follow-up spark.
+        let _ = available_agents;
 
         let dropdown = container(menu)
             .style(move |_theme: &Theme| style::dropdown(&pal))

@@ -689,6 +689,10 @@ pub enum AssignmentRole {
     Owner,
     Assistant,
     Observer,
+    /// A Hand whose job is to integrate the Crew's worktree branches into a
+    /// single PR. Created by the Head when every other Crew member has
+    /// closed its spark. See `compose_merger_prompt` in `agent_prompts.rs`.
+    Merger,
 }
 
 impl AssignmentRole {
@@ -697,6 +701,18 @@ impl AssignmentRole {
             Self::Owner => "owner",
             Self::Assistant => "assistant",
             Self::Observer => "observer",
+            Self::Merger => "merger",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "owner" => Some(Self::Owner),
+            "assistant" => Some(Self::Assistant),
+            "observer" => Some(Self::Observer),
+            "merger" => Some(Self::Merger),
+            _ => None,
         }
     }
 }
@@ -720,4 +736,71 @@ pub struct NewHandAssignment {
     pub session_id: String,
     pub spark_id: String,
     pub role: AssignmentRole,
+}
+
+// ── Crew ──────────────────────────────────────────────
+
+/// A Crew is a group of Hands working in parallel on related sparks under
+/// the direction of a Head. The Head and the (eventual) Merger are recorded
+/// here so the workgraph remains the single source of truth for who is
+/// orchestrating whom.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Crew {
+    pub id: String,
+    pub workshop_id: String,
+    pub name: String,
+    pub purpose: Option<String>,
+    pub status: String,
+    pub head_session_id: Option<String>,
+    pub parent_spark_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewCrew {
+    pub name: String,
+    pub purpose: Option<String>,
+    pub workshop_id: String,
+    pub head_session_id: Option<String>,
+    pub parent_spark_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrewStatus {
+    Active,
+    Merging,
+    Completed,
+    Abandoned,
+}
+
+impl CrewStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Merging => "merging",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "merging" => Some(Self::Merging),
+            "completed" => Some(Self::Completed),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct CrewMember {
+    pub id: i64,
+    pub crew_id: String,
+    pub session_id: String,
+    pub role: Option<String>,
+    pub joined_at: String,
 }
