@@ -831,11 +831,61 @@ impl App {
                 };
                 let ws = &mut self.workshops[idx];
                 match msg {
-                    screen::agents::Message::SelectAgent(id) => {
-                        let id_str = id.to_string();
-                        if let Some(session) = ws.agent_sessions.iter().find(|s| s.id == id_str) {
-                            if let Some(tab_id) = session.tab_id {
-                                ws.bench.active_tab = Some(tab_id);
+                    screen::agents::Message::SelectAgent(session_id) => {
+                        // Decide what clicking the row should do based on
+                        // session state. We compute an Outcome first so that
+                        // the mutable borrow of `ws` ends before we call
+                        // `self.push_toast` (which needs `&mut self`).
+                        enum Outcome {
+                            Focused,
+                            Stale { name: String },
+                            Past { name: String, started_at: String, can_resume: bool },
+                            NotFound,
+                        }
+
+                        let outcome = match ws
+                            .agent_sessions
+                            .iter()
+                            .find(|s| s.id == session_id)
+                            .cloned()
+                        {
+                            None => Outcome::NotFound,
+                            Some(session) if session.active => match session.tab_id {
+                                Some(tab_id)
+                                    if ws.bench.tabs.iter().any(|t| t.id == tab_id) =>
+                                {
+                                    ws.bench.active_tab = Some(tab_id);
+                                    Outcome::Focused
+                                }
+                                _ => Outcome::Stale { name: session.name },
+                            },
+                            Some(session) => {
+                                let can_resume = session.can_resume();
+                                Outcome::Past {
+                                    name: session.name,
+                                    started_at: session.started_at,
+                                    can_resume,
+                                }
+                            }
+                        };
+
+                        match outcome {
+                            Outcome::Focused | Outcome::NotFound => {}
+                            Outcome::Stale { name } => {
+                                return self.push_toast(
+                                    format!("{name} is no longer running"),
+                                    "Its terminal tab has closed. Use the resume button to restart it.",
+                                    ToastKind::Warning,
+                                );
+                            }
+                            Outcome::Past { name, started_at, can_resume } => {
+                                let when = screen::agents::format_relative_time(&started_at);
+                                let body = if can_resume {
+                                    format!("Past session started {when}. Click \u{25B6} to resume.")
+                                } else {
+                                    format!("Past session started {when}. Cannot be resumed.")
+                                };
+                                return self.push_toast(name, body, ToastKind::Info);
                             }
                         }
                     }

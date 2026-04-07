@@ -3,17 +3,18 @@
 
 //! Hands panel — lists active and past Hand sessions.
 
-use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text};
 use iced::{Element, Length, Theme};
-use uuid::Uuid;
 
 use crate::coding_agents::{CodingAgent, ResumeStrategy};
 use crate::style::{self, Palette, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL};
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Switch to an active Hand's tab.
-    SelectAgent(Uuid),
+    /// User clicked on a Hand row. The handler decides the action:
+    /// focus the live terminal tab if alive, or surface a detail/error
+    /// view if the session is past or stale.
+    SelectAgent(String),
     /// Resume a past (ended) Hand session.
     ResumeAgent(String),
     /// Delete a past session from history.
@@ -72,7 +73,6 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, has_bg: bool) -> Ele
                 .color(pal.text_secondary),
         );
         for session in &active {
-            let id = Uuid::parse_str(&session.id).unwrap_or_else(|_| Uuid::nil());
             let indicator = text("\u{25CF} ") // ● dot
                 .size(FONT_ICON_SM)
                 .color(pal.accent);
@@ -87,7 +87,7 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, has_bg: bool) -> Ele
             .style(button::text)
             .width(Length::Fill)
             .padding([4, 8])
-            .on_press(Message::SelectAgent(id));
+            .on_press(Message::SelectAgent(session.id.clone()));
 
             let active_item = container(btn)
                 .width(Length::Fill)
@@ -163,7 +163,14 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, has_bg: bool) -> Ele
                 .padding([4, 8])
                 .style(move |_theme: &Theme| style::hovered_item(&pal));
 
-            content = content.push(item);
+            // Wrap the whole row so clicking anywhere outside the
+            // resume/delete buttons surfaces a detail toast. Inner
+            // buttons still capture their own events.
+            let clickable = mouse_area(item)
+                .interaction(iced::mouse::Interaction::Pointer)
+                .on_press(Message::SelectAgent(session.id.clone()));
+
+            content = content.push(clickable);
         }
     }
 
@@ -174,7 +181,7 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, has_bg: bool) -> Ele
 }
 
 /// Format an RFC 3339 timestamp as a short relative time string (e.g. "2h ago", "3d ago").
-fn format_relative_time(rfc3339: &str) -> String {
+pub fn format_relative_time(rfc3339: &str) -> String {
     let Ok(then) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
         return String::new();
     };
@@ -188,5 +195,78 @@ fn format_relative_time(rfc3339: &str) -> String {
         format!("{}h ago", duration.num_hours())
     } else {
         format!("{}d ago", duration.num_days())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding_agents::CodingAgent;
+
+    fn make_session(active: bool, tab_id: Option<u64>, resume: ResumeStrategy) -> AgentSession {
+        AgentSession {
+            id: "session-1".to_string(),
+            name: "Test Hand".to_string(),
+            agent: CodingAgent {
+                display_name: "Test".to_string(),
+                command: "test".to_string(),
+                args: vec![],
+                resume,
+            },
+            tab_id,
+            active,
+            resume_id: None,
+            started_at: "2026-04-07T11:00:00+00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn active_session_with_tab_can_be_focused() {
+        let s = make_session(true, Some(42), ResumeStrategy::ResumeFlag);
+        assert!(s.active);
+        assert_eq!(s.tab_id, Some(42));
+        // can_resume is false for active sessions even when strategy supports it.
+        assert!(!s.can_resume());
+    }
+
+    #[test]
+    fn past_session_with_resume_strategy_is_resumable() {
+        let s = make_session(false, None, ResumeStrategy::ResumeFlag);
+        assert!(s.can_resume());
+    }
+
+    #[test]
+    fn past_session_without_resume_strategy_is_not_resumable() {
+        let s = make_session(false, None, ResumeStrategy::None);
+        assert!(!s.can_resume());
+    }
+
+    #[test]
+    fn format_relative_time_handles_invalid_input() {
+        assert_eq!(format_relative_time("not a date"), "");
+    }
+
+    #[test]
+    fn format_relative_time_returns_now_for_recent() {
+        let now = chrono::Utc::now().to_rfc3339();
+        assert_eq!(format_relative_time(&now), "now");
+    }
+
+    #[test]
+    fn view_renders_with_empty_sessions() {
+        // Smoke test: building the view with no sessions must not panic.
+        let _ = view(&[], Palette::dark(), false);
+    }
+
+    #[test]
+    fn view_renders_with_active_and_past_sessions() {
+        let sessions = vec![
+            make_session(true, Some(1), ResumeStrategy::ResumeFlag),
+            AgentSession {
+                id: "session-2".to_string(),
+                ..make_session(false, None, ResumeStrategy::ResumeFlag)
+            },
+        ];
+        let _ = view(&sessions, Palette::dark(), false);
     }
 }
