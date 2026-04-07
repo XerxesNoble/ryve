@@ -173,16 +173,13 @@ pub async fn spawn_hand(
     tokio::fs::create_dir_all(&logs_dir).await?;
     let log_path = logs_dir.join(format!("hand-{session_id}.log"));
 
-    let mut cmd_args: Vec<String> = agent.args.clone();
-    if let Some((flag, is_file)) = agent.system_prompt_flag() {
-        cmd_args.push(flag.to_string());
-        cmd_args.push(if is_file {
-            prompt_path.to_string_lossy().into_owned()
-        } else {
-            prompt.clone()
-        });
-    }
-    cmd_args.extend(agent.full_auto_flags());
+    // Delegate the agent-specific argv assembly to `CodingAgent`. This
+    // injects headless-mode flags (`--print` / `exec` / `--message` /
+    // `run`), full-auto flags, AND the user prompt itself. The previous
+    // implementation only passed the prompt via `--system-prompt`, which
+    // left every detached agent with no user message and caused them to
+    // exit on the first turn (spark ryve-b3ad7bd1).
+    let cmd_args = agent.build_headless_args(&prompt, &prompt_path);
 
     let env_vars = workshop::hand_env_vars(workshop_dir);
 
@@ -257,4 +254,161 @@ fn workshop_id_for(workshop_dir: &Path) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration test for spark ryve-b3ad7bd1.
+    //!
+    //! Spawns a Hand against a stub agent (a tiny shell script that
+    //! records its arguments) inside a real temporary workshop, then
+    //! asserts that the agent process actually received the user prompt
+    //! containing the spark id. This is the regression: the previous
+    //! implementation passed only `--system-prompt`, leaving the agent
+    //! with no user message, and every Hand exited on its first turn.
+
+    use super::*;
+    use crate::coding_agents::{CodingAgent, ResumeStrategy};
+    use data::sparks::spark_repo;
+    use data::sparks::types::{NewSpark, SparkType};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// Build a throwaway workshop directory: `git init`, an initial empty
+    /// commit (worktree creation requires HEAD), an open sqlite pool, and
+    /// a stub-agent script that writes its argv to `out.txt`.
+    async fn setup_workshop() -> (PathBuf, sqlx::SqlitePool, PathBuf) {
+        let base = std::env::temp_dir().join(format!("ryve-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // git init + empty commit so `git worktree add` has a HEAD.
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_AUTHOR_NAME", "ryve-test")
+                .env("GIT_AUTHOR_EMAIL", "test@ryve.local")
+                .env("GIT_COMMITTER_NAME", "ryve-test")
+                .env("GIT_COMMITTER_EMAIL", "test@ryve.local")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+
+        // Stub agent: prints its argv to a file. We point the file at
+        // `<base>/agent-out.txt` via an env var so the test can poll it.
+        let out_path = base.join("agent-out.txt");
+        let stub_path = base.join("stub-agent.sh");
+        std::fs::write(
+            &stub_path,
+            "#!/bin/sh\n\
+             # Record argv so the test can verify the prompt was delivered.\n\
+             printf '%s\\n' \"$@\" > \"$RYVE_TEST_AGENT_OUT\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub_path, perms).unwrap();
+        }
+
+        let pool = data::db::open_sparks_db(&base).await.unwrap();
+
+        (base, pool, out_path)
+    }
+
+    /// Acceptance criterion (3) for spark ryve-b3ad7bd1: spawning a Hand
+    /// must result in a process that *receives its initial instructions*.
+    /// We assert this end-to-end by reading the stub agent's recorded
+    /// argv after the spawn and confirming the spark id appears in the
+    /// prompt that was passed to it.
+    #[tokio::test]
+    async fn spawned_hand_delivers_prompt_to_agent_process() {
+        let (workshop_dir, pool, out_path) = setup_workshop().await;
+        let stub_path = workshop_dir.join("stub-agent.sh");
+
+        // Create the spark in the same workshop_id the spawn helper uses.
+        let workshop_id = workshop_id_for(&workshop_dir);
+        let spark = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "first turn smoke test".into(),
+                description: "verify the agent receives a user prompt".into(),
+                spark_type: SparkType::Bug,
+                priority: 1,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Make the stub script's output path visible to the child via env.
+        // `launch_detached` inherits the parent env on top of the explicit
+        // pairs from `hand_env_vars`, so setting it here is sufficient.
+        // SAFETY: tests run single-threaded per #[tokio::test] runtime, but
+        // env mutation is process-global. This is a leaf test that doesn't
+        // race with other env consumers.
+        unsafe {
+            std::env::set_var("RYVE_TEST_AGENT_OUT", &out_path);
+        }
+
+        let agent = CodingAgent {
+            display_name: "stub".into(),
+            command: stub_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            resume: ResumeStrategy::None,
+        };
+
+        let spawned = spawn_hand(&workshop_dir, &pool, &agent, &spark.id, HandKind::Owner, None)
+            .await
+            .expect("spawn_hand should succeed against the stub agent");
+
+        assert!(spawned.child_pid.is_some(), "child pid should be reported");
+
+        // Poll for the stub's output for up to 5 seconds. The child runs
+        // detached so we cannot `wait` on it; the file appearing means the
+        // process actually executed and received argv.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let recorded = loop {
+            if out_path.exists() {
+                if let Ok(s) = std::fs::read_to_string(&out_path) {
+                    if !s.is_empty() {
+                        break s;
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "stub agent never wrote {} — Hand failed to launch or process died before exec.\n\
+                     log: {}",
+                    out_path.display(),
+                    std::fs::read_to_string(&spawned.log_path).unwrap_or_default()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        // The fix: the user prompt must be in argv. The spark id is the
+        // most stable substring of the composed prompt.
+        assert!(
+            recorded.contains(&spark.id),
+            "stub agent did not receive a prompt containing the spark id.\n\
+             recorded argv:\n{recorded}"
+        );
+
+        // Cleanup — best effort, don't fail the test on filesystem hiccups.
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
 }
