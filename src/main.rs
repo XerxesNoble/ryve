@@ -554,34 +554,64 @@ impl App {
             }
 
             Message::AgentSessionsLoaded(id, persisted) => {
+                // Merge persisted sessions into the in-memory vec.
+                //
+                // This handler is fired both at workshop init and on every
+                // SparksPoll tick (so CLI-spawned Hands — which write to the
+                // `agent_sessions` table directly via `ryve hand spawn` —
+                // appear in the Hands panel without requiring the workshop
+                // to be reopened).
+                //
+                // Sessions already known in memory keep their `tab_id` and
+                // `active` flags so we don't clobber a live UI tab. New rows
+                // (from the CLI path) are appended with `tab_id = None`
+                // (no UI tab) and `active = ended_at.is_none()`.
                 let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
                 let Some(idx) = ws_idx else { return Task::none(); };
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     let available = &self.available_agents;
-                    ws.agent_sessions = persisted
-                        .into_iter()
-                        .map(|p| {
-                            let agent = available
-                                .iter()
-                                .find(|a| a.command == p.agent_command)
-                                .cloned()
-                                .unwrap_or_else(|| CodingAgent {
-                                    display_name: p.agent_name.clone(),
-                                    command: p.agent_command.clone(),
-                                    args: serde_json::from_str(&p.agent_args).unwrap_or_default(),
-                                    resume: coding_agents::ResumeStrategy::None,
-                                });
-                            AgentSession {
-                                id: p.id,
-                                name: p.agent_name,
-                                agent,
-                                tab_id: None,
-                                active: false,
-                                resume_id: p.resume_id,
-                                started_at: p.started_at,
-                            }
-                        })
+                    let known_ids: std::collections::HashSet<String> = ws
+                        .agent_sessions
+                        .iter()
+                        .map(|s| s.id.clone())
                         .collect();
+
+                    for p in persisted {
+                        if known_ids.contains(&p.id) {
+                            // Already in memory — preserve tab_id/active.
+                            // If the DB says the session ended, reflect it.
+                            if p.ended_at.is_some() {
+                                if let Some(s) =
+                                    ws.agent_sessions.iter_mut().find(|s| s.id == p.id)
+                                {
+                                    s.active = false;
+                                }
+                            }
+                            continue;
+                        }
+                        let agent = available
+                            .iter()
+                            .find(|a| a.command == p.agent_command)
+                            .cloned()
+                            .unwrap_or_else(|| CodingAgent {
+                                display_name: p.agent_name.clone(),
+                                command: p.agent_command.clone(),
+                                args: serde_json::from_str(&p.agent_args).unwrap_or_default(),
+                                resume: coding_agents::ResumeStrategy::None,
+                            });
+                        ws.agent_sessions.push(AgentSession {
+                            id: p.id,
+                            name: p.agent_name,
+                            agent,
+                            tab_id: None,
+                            // Headless / CLI-spawned hands have no UI tab,
+                            // so the only signal that they're still running
+                            // is the absence of an `ended_at` row.
+                            active: p.ended_at.is_none(),
+                            resume_id: p.resume_id,
+                            started_at: p.started_at,
+                        });
+                    }
                 }
                 Task::none()
             }
@@ -1446,13 +1476,35 @@ impl App {
                     }
                 }
 
-                // Poll all workshops that have a sparks_db and at least one active agent session
+                // Reload persisted agent sessions for every workshop with a
+                // DB. This is what surfaces CLI-spawned Hands (`ryve hand
+                // spawn`) in the GUI Hands panel — without this poll the
+                // panel only ever sees what the UI itself launched.
+                let session_tasks: Vec<_> = self
+                    .workshops
+                    .iter()
+                    .filter(|ws| ws.sparks_db.is_some())
+                    .map(|ws| {
+                        let pool = ws.sparks_db.clone().unwrap();
+                        let ws_id = ws.workshop_id();
+                        let id = ws.id;
+                        Task::perform(load_agent_sessions(pool, ws_id), move |sessions| {
+                            Message::AgentSessionsLoaded(id, sessions)
+                        })
+                    })
+                    .collect();
+                tasks.extend(session_tasks);
+
+                // Poll all workshops that have a sparks_db and at least one
+                // agent session in memory (active or not — past CLI Hands
+                // may have left sparks worth refreshing).
                 let spark_tasks: Vec<_> = self
                     .workshops
                     .iter()
                     .filter(|ws| {
                         ws.sparks_db.is_some()
-                            && ws.agent_sessions.iter().any(|s| s.active)
+                            && (ws.agent_sessions.iter().any(|s| s.active)
+                                || !ws.agent_sessions.is_empty())
                     })
                     .map(|ws| {
                         let pool = ws.sparks_db.clone().unwrap();
