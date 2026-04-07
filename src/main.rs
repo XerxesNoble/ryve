@@ -1273,29 +1273,95 @@ impl App {
                     }
                     screen::sparks::Message::ShowCreateForm => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_create_form.reset();
                             ws.spark_create_form.visible = true;
-                            ws.spark_create_form.title.clear();
                         }
                     }
                     screen::sparks::Message::CreateFormTitleChanged(val) => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.spark_create_form.title = val;
+                            ws.spark_create_form.error = None;
+                        }
+                    }
+                    screen::sparks::Message::CreateFormTypeChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            // Switching to epic clears any previously-picked
+                            // parent so the validation rule stays consistent.
+                            if val == "epic" {
+                                ws.spark_create_form.parent_epic_id = None;
+                            }
+                            ws.spark_create_form.spark_type = val;
+                            ws.spark_create_form.error = None;
+                        }
+                    }
+                    screen::sparks::Message::CreateFormPriorityChanged(p) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_create_form.priority = p;
+                        }
+                    }
+                    screen::sparks::Message::CreateFormProblemChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_create_form.problem = val;
+                            ws.spark_create_form.error = None;
+                        }
+                    }
+                    screen::sparks::Message::CreateFormAcceptanceChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_create_form.acceptance = val;
+                            ws.spark_create_form.error = None;
+                        }
+                    }
+                    screen::sparks::Message::CreateFormParentEpicChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_create_form.parent_epic_id = val;
+                            ws.spark_create_form.error = None;
                         }
                     }
                     screen::sparks::Message::CancelCreate => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.spark_create_form.visible = false;
-                            ws.spark_create_form.title.clear();
+                            ws.spark_create_form.reset();
                         }
                     }
                     screen::sparks::Message::SubmitNewSpark => {
                         let ws = &mut self.workshops[idx];
-                        let title = ws.spark_create_form.title.trim().to_string();
-                        if title.is_empty() {
+                        if let Err(e) = ws.spark_create_form.validate() {
+                            ws.spark_create_form.error = Some(e);
                             return Task::none();
                         }
+
+                        let title = ws.spark_create_form.title.trim().to_string();
+                        let problem = ws.spark_create_form.problem.trim().to_string();
+                        let acceptance = ws.spark_create_form.acceptance.trim().to_string();
+                        let spark_type_str = ws.spark_create_form.spark_type.clone();
+                        let priority = ws.spark_create_form.priority;
+                        let parent_id = ws.spark_create_form.parent_epic_id.clone();
+
+                        // Build the structured intent metadata block. The
+                        // CLI's `spark create` writes the same shape so the
+                        // two paths stay interchangeable.
+                        let metadata = serde_json::json!({
+                            "intent": {
+                                "problem_statement": problem,
+                                "invariants": Vec::<String>::new(),
+                                "non_goals": Vec::<String>::new(),
+                                "acceptance_criteria": vec![acceptance],
+                            }
+                        })
+                        .to_string();
+
+                        let spark_type = match spark_type_str.as_str() {
+                            "bug" => data::sparks::types::SparkType::Bug,
+                            "feature" => data::sparks::types::SparkType::Feature,
+                            "epic" => data::sparks::types::SparkType::Epic,
+                            "chore" => data::sparks::types::SparkType::Chore,
+                            "spike" => data::sparks::types::SparkType::Spike,
+                            "milestone" => data::sparks::types::SparkType::Milestone,
+                            _ => data::sparks::types::SparkType::Task,
+                        };
+
                         ws.spark_create_form.visible = false;
-                        ws.spark_create_form.title.clear();
+                        ws.spark_create_form.reset();
 
                         if let Some(ref pool) = ws.sparks_db {
                             let pool = pool.clone();
@@ -1306,15 +1372,15 @@ impl App {
                                     let new = data::sparks::types::NewSpark {
                                         title,
                                         description: String::new(),
-                                        spark_type: data::sparks::types::SparkType::Task,
-                                        priority: 2,
+                                        spark_type,
+                                        priority,
                                         workshop_id: ws_id.clone(),
                                         assignee: None,
                                         owner: None,
-                                        parent_id: None,
+                                        parent_id,
                                         due_at: None,
                                         estimated_minutes: None,
-                                        metadata: None,
+                                        metadata: Some(metadata),
                                         risk_level: None,
                                         scope_boundary: None,
                                     };

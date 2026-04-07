@@ -1,10 +1,12 @@
+workshop_schema_version = 1
+
 [github]
 auto_sync = false
 
 [layout]
-sidebar_width = 250.0
-sparks_width = 280.0
-sidebar_split = 0.65
+sidebar_width = 337.33203
+sparks_width = 350.04688
+sidebar_split = 0.4816501
 
 [explorer]
 ignore = [
