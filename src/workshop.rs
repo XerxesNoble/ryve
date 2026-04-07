@@ -495,16 +495,26 @@ pub struct WorkshopInit {
 pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::sparks::SparksError> {
     let ryve_dir = RyveDir::new(&directory);
 
-    // Create directory structure + default files
-    data::ryve_dir::init_ryve_dir(&ryve_dir)
+    // Run any pending workshop schema migrations. Returns the (now-current)
+    // config plus a log of what ran so the caller can surface it to the user.
+    let (config, migration_log) = data::migrations::migrate_workshop(&ryve_dir)
         .await
         .map_err(data::sparks::SparksError::Io)?;
 
-    // Open/migrate database
+    if migration_log.is_empty() {
+        log::debug!("{}", migration_log.summary());
+    } else {
+        // Acceptance criterion: migration log printed to stdout (or UI toast).
+        // Stdout is the simplest durable surface today; the log is also
+        // returned in WorkshopInit so a UI toast can pick it up.
+        println!("{}", migration_log.summary());
+        log::info!("{}", migration_log.summary());
+    }
+
+    // Open/migrate database (sqlx handles its own schema migrations).
     let pool = data::db::open_sparks_db(&directory).await?;
 
-    // Load config and agents in parallel
-    let config = data::ryve_dir::load_config(&ryve_dir).await;
+    // Load agents in parallel — config already loaded by the migration step.
     let custom_agents = data::ryve_dir::load_agent_defs(&ryve_dir).await;
     let agent_context = data::ryve_dir::load_agents_context(&ryve_dir).await;
 

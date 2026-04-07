@@ -88,6 +88,14 @@ impl RyveDir {
 /// Per-workshop configuration stored in `.ryve/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkshopConfig {
+    /// Workshop schema version. Compared against
+    /// [`crate::migrations::CURRENT_SCHEMA_VERSION`] on workshop open;
+    /// any pending migrations are run and this field is bumped.
+    ///
+    /// Defaults to `0` for workshops created before migrations existed.
+    #[serde(default)]
+    pub workshop_schema_version: u32,
+
     /// Display name for the workshop (defaults to directory name).
     #[serde(default)]
     pub name: Option<String>,
@@ -124,6 +132,7 @@ pub struct WorkshopConfig {
 impl Default for WorkshopConfig {
     fn default() -> Self {
         Self {
+            workshop_schema_version: 0,
             name: None,
             github: GitHubConfig::default(),
             layout: LayoutConfig::default(),
@@ -334,36 +343,17 @@ pub async fn load_agents_context(ryve_dir: &RyveDir) -> Option<String> {
 }
 
 /// Initialize a new `.ryve/` directory with default files.
+///
+/// Backwards-compatible wrapper around [`crate::migrations::migrate_workshop`].
+/// New code should call `migrate_workshop` directly to receive the migration log.
 pub async fn init_ryve_dir(ryve_dir: &RyveDir) -> Result<(), std::io::Error> {
-    ryve_dir.ensure_exists().await?;
-
-    // Write default config if missing
-    if !ryve_dir.config_path().exists() {
-        save_config(ryve_dir, &WorkshopConfig::default()).await?;
-    }
-
-    // Write default AGENTS.md if missing
-    if !ryve_dir.agents_md_path().exists() {
-        tokio::fs::write(
-            ryve_dir.agents_md_path(),
-            "# Agent Instructions\n\nAdd project-specific instructions for coding agents here.\n",
-        )
-        .await?;
-    }
-
-    // Write default DONE.md checklist if missing
-    if !ryve_dir.done_md_path().exists() {
-        tokio::fs::write(
-            ryve_dir.done_md_path(),
-            DEFAULT_DONE_MD,
-        )
-        .await?;
-    }
-
-    Ok(())
+    crate::migrations::migrate_workshop(ryve_dir).await.map(|_| ())
 }
 
-const DEFAULT_DONE_MD: &str = r#"# DONE Checklist
+pub(crate) const DEFAULT_AGENTS_MD: &str =
+    "# Agent Instructions\n\nAdd project-specific instructions for coding agents here.\n";
+
+pub(crate) const DEFAULT_DONE_MD: &str = r#"# DONE Checklist
 
 A spark is only "done" when ALL of the following are true. Verify each item
 before closing the spark with `ryve-cli spark close <id>`.
