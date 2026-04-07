@@ -163,10 +163,9 @@ impl Workshop {
             .filter_map(|(idx, tab)| {
                 let (kind, payload) = match &tab.kind {
                     TabKind::Terminal => ("terminal", None),
-                    TabKind::FileViewer(path) => (
-                        "file_viewer",
-                        Some(path.to_string_lossy().into_owned()),
-                    ),
+                    TabKind::FileViewer(path) => {
+                        ("file_viewer", Some(path.to_string_lossy().into_owned()))
+                    }
                     // Skip coding-agent tabs — see doc comment above.
                     TabKind::CodingAgent(_) => return None,
                     // Home is a singleton dashboard rebuilt from in-memory
@@ -293,11 +292,10 @@ impl Workshop {
             if let TabKind::LogTail {
                 session_id: sid, ..
             } = &tab.kind
+                && sid == session_id
             {
-                if sid == session_id {
-                    self.bench.active_tab = Some(tab.id);
-                    return (tab.id, false);
-                }
+                self.bench.active_tab = Some(tab.id);
+                return (tab.id, false);
             }
         }
 
@@ -320,8 +318,7 @@ impl Workshop {
                 log_path: log_path.clone(),
             },
         );
-        self.log_tails
-            .insert(tab_id, LogTailState::new(log_path));
+        self.log_tails.insert(tab_id, LogTailState::new(log_path));
 
         (tab_id, true)
     }
@@ -539,8 +536,9 @@ impl Workshop {
 
 /// Walk the process tree rooted at `shell_pid` looking for a known coding agent.
 fn detect_agent_in_process_tree(shell_pid: u32) -> Option<CodingAgent> {
-    use crate::coding_agents::ResumeStrategy;
     use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    use crate::coding_agents::ResumeStrategy;
 
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
@@ -677,10 +675,10 @@ pub(crate) fn create_hand_worktree(
     let workshop_md = ryve_dir.workshop_md_path();
     if workshop_md.exists() {
         let agents_md = wt_dir.join("AGENTS.md");
-        if !agents_md.exists() {
-            if let Err(e) = std::fs::copy(&workshop_md, &agents_md) {
-                log::warn!("Failed to write AGENTS.md to worktree: {e}");
-            }
+        if !agents_md.exists()
+            && let Err(e) = std::fs::copy(&workshop_md, &agents_md)
+        {
+            log::warn!("Failed to write AGENTS.md to worktree: {e}");
         }
     }
 
@@ -703,17 +701,17 @@ pub(crate) fn hand_env_vars(workshop_dir: &Path) -> Vec<(String, String)> {
         workshop_dir.to_string_lossy().into_owned(),
     ));
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let exe_dir_str = exe_dir.to_string_lossy().into_owned();
-            let existing_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = if existing_path.is_empty() {
-                exe_dir_str
-            } else {
-                format!("{exe_dir_str}:{existing_path}")
-            };
-            vars.push(("PATH".to_string(), new_path));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        let exe_dir_str = exe_dir.to_string_lossy().into_owned();
+        let existing_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = if existing_path.is_empty() {
+            exe_dir_str
+        } else {
+            format!("{exe_dir_str}:{existing_path}")
+        };
+        vars.push(("PATH".to_string(), new_path));
     }
 
     vars

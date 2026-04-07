@@ -42,10 +42,10 @@ pub fn file_icon(name: &str) -> svg::Handle {
     }
 
     // 3. Try simple extension
-    if let Some(ext) = lower.rsplit('.').next() {
-        if let Some(icon) = file_extension_map().get(ext) {
-            return load_icon(icon);
-        }
+    if let Some(ext) = lower.rsplit('.').next()
+        && let Some(icon) = file_extension_map().get(ext)
+    {
+        return load_icon(icon);
     }
 
     load_icon(DEFAULT_FILE_ICON)
@@ -96,17 +96,17 @@ fn icon_base_path() -> &'static Path {
     static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         // Try relative to executable first, then relative to CWD
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let candidate = dir.join(ICON_DIR);
-                if candidate.exists() {
-                    return candidate;
-                }
-                // macOS .app bundle: exe is in Foo.app/Contents/MacOS/
-                let candidate = dir.join("../Resources").join(ICON_DIR);
-                if candidate.exists() {
-                    return candidate;
-                }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            let candidate = dir.join(ICON_DIR);
+            if candidate.exists() {
+                return candidate;
+            }
+            // macOS .app bundle: exe is in Foo.app/Contents/MacOS/
+            let candidate = dir.join("../Resources").join(ICON_DIR);
+            if candidate.exists() {
+                return candidate;
             }
         }
         // Fallback: relative to CWD (works during `cargo run`)

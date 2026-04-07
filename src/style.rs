@@ -483,6 +483,7 @@ pub fn hovered_item(pal: &Palette) -> container::Style {
 }
 
 /// Danger/destructive action container.
+#[allow(dead_code)]
 pub fn danger_surface(pal: &Palette) -> container::Style {
     container::Style {
         background: Some(Background::Color(Color {

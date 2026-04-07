@@ -218,18 +218,18 @@ pub fn view<'a>(
     // owned strings to avoid lifetime issues with the view tree.
     let intent = spark.intent();
 
-    if let Some(problem) = intent.problem_statement {
-        if !problem.is_empty() {
-            body = body.push(
-                column![
-                    text("Problem Statement")
-                        .size(FONT_LABEL)
-                        .color(pal.text_tertiary),
-                    text(problem).size(FONT_BODY).color(pal.text_primary),
-                ]
-                .spacing(4),
-            );
-        }
+    if let Some(problem) = intent.problem_statement
+        && !problem.is_empty()
+    {
+        body = body.push(
+            column![
+                text("Problem Statement")
+                    .size(FONT_LABEL)
+                    .color(pal.text_tertiary),
+                text(problem).size(FONT_BODY).color(pal.text_primary),
+            ]
+            .spacing(4),
+        );
     }
 
     if !intent.invariants.is_empty() {
@@ -358,13 +358,14 @@ pub fn view<'a>(
 /// downstream blocking ("Blocks"), upstream blocking ("Blocked by"),
 /// and everything else ("Related"). Returns owned data so the view tree
 /// can borrow without lifetime gymnastics.
+#[allow(clippy::type_complexity)]
 fn classify_bonds<'a>(
     spark: &'a Spark,
     bonds: &'a [Bond],
     all_sparks: &'a [Spark],
 ) -> (
-    Vec<(&'a Spark, &'a Bond)>, // blocks (downstream)
-    Vec<(&'a Spark, &'a Bond)>, // blocked by (upstream)
+    Vec<(&'a Spark, &'a Bond)>,                      // blocks (downstream)
+    Vec<(&'a Spark, &'a Bond)>,                      // blocked by (upstream)
     Vec<(&'a Spark, &'a Bond, bool /* outgoing */)>, // related/other
 ) {
     let lookup = |id: &str| all_sparks.iter().find(|s| s.id == id);
@@ -410,24 +411,28 @@ fn view_bonds_section<'a>(
             text("Dependencies")
                 .size(FONT_LABEL)
                 .color(pal.text_tertiary),
-            text("No bonds")
-                .size(FONT_SMALL)
-                .color(pal.text_tertiary),
+            text("No bonds").size(FONT_SMALL).color(pal.text_tertiary),
         ]
         .spacing(2)
         .into();
     }
 
-    let mut col = column![text("Dependencies")
-        .size(FONT_LABEL)
-        .color(pal.text_tertiary),]
+    let mut col = column![
+        text("Dependencies")
+            .size(FONT_LABEL)
+            .color(pal.text_tertiary),
+    ]
     .spacing(4);
 
     if !blocked_by.is_empty() {
         // Highlight if any blocker is still open — that's the "you can't
         // work on this yet" signal the spark says was missing.
         let any_open = blocked_by.iter().any(|(s, _)| s.status != "closed");
-        let header_color = if any_open { pal.danger } else { pal.text_secondary };
+        let header_color = if any_open {
+            pal.danger
+        } else {
+            pal.text_secondary
+        };
         col = col.push(
             text(format!("Blocked by ({})", blocked_by.len()))
                 .size(FONT_SMALL)
@@ -476,8 +481,12 @@ fn view_bond_row<'a>(s: &'a Spark, pal: &Palette) -> Element<'a, Message> {
         text(format!("P{}", s.priority))
             .size(FONT_SMALL)
             .color(pal.text_tertiary),
-        text(s.id.as_str()).size(FONT_SMALL).color(pal.text_tertiary),
-        text(s.title.as_str()).size(FONT_BODY).color(pal.text_primary),
+        text(s.id.as_str())
+            .size(FONT_SMALL)
+            .color(pal.text_tertiary),
+        text(s.title.as_str())
+            .size(FONT_BODY)
+            .color(pal.text_primary),
     ]
     .spacing(6)
     .padding([2, 8])
@@ -499,8 +508,12 @@ fn view_bond_row_typed<'a>(
         text(icon).size(FONT_SMALL).color(color),
         text(arrow).size(FONT_SMALL).color(pal.text_tertiary),
         text(bond_type).size(FONT_SMALL).color(pal.text_tertiary),
-        text(s.id.as_str()).size(FONT_SMALL).color(pal.text_tertiary),
-        text(s.title.as_str()).size(FONT_BODY).color(pal.text_primary),
+        text(s.id.as_str())
+            .size(FONT_SMALL)
+            .color(pal.text_tertiary),
+        text(s.title.as_str())
+            .size(FONT_BODY)
+            .color(pal.text_primary),
     ]
     .spacing(6)
     .padding([2, 8])
@@ -691,14 +704,14 @@ fn view_contract_row<'a>(
 
     let mut col = column![header, desc_text].spacing(2);
 
-    if let Some(cmd) = c.check_command.as_deref() {
-        if !cmd.is_empty() {
-            col = col.push(
-                text(format!("$ {cmd}"))
-                    .size(FONT_SMALL)
-                    .color(pal.text_secondary),
-            );
-        }
+    if let Some(cmd) = c.check_command.as_deref()
+        && !cmd.is_empty()
+    {
+        col = col.push(
+            text(format!("$ {cmd}"))
+                .size(FONT_SMALL)
+                .color(pal.text_secondary),
+        );
     }
 
     if let Some(ref when) = c.last_checked_at {
@@ -894,7 +907,12 @@ mod tests {
         let upstream = make_spark("sp-up", "open");
         let downstream = make_spark("sp-down", "open");
         let related = make_spark("sp-rel", "open");
-        let all = vec![me.clone(), upstream.clone(), downstream.clone(), related.clone()];
+        let all = vec![
+            me.clone(),
+            upstream.clone(),
+            downstream.clone(),
+            related.clone(),
+        ];
 
         let bonds = vec![
             make_bond(1, "sp-up", "sp-me", "blocks"), // upstream blocks me

@@ -61,7 +61,6 @@ impl CompatStatus {
     pub fn is_unsupported(&self) -> bool {
         matches!(self, CompatStatus::Unsupported { .. })
     }
-
 }
 
 impl CodingAgent {
@@ -253,6 +252,7 @@ pub enum ResumeStrategy {
     /// Pass `--resume` flag (e.g., `claude --resume`)
     ResumeFlag,
     /// Resume via session subcommand (e.g., `goose session resume <id>`)
+    #[allow(dead_code)]
     SessionResume,
     /// No built-in resume support
     None,
@@ -273,10 +273,10 @@ impl VersionRange {
         if v < self.min {
             return false;
         }
-        if let Some(max) = self.max_exclusive {
-            if v >= max {
-                return false;
-            }
+        if let Some(max) = self.max_exclusive
+            && v >= max
+        {
+            return false;
         }
         true
     }
@@ -302,10 +302,22 @@ pub fn known_range(command: &str) -> Option<VersionRange> {
     //   * `aider >= 0.50` — `--message` / `--read` flag combo.
     // Bumping these is the canonical way to tell users "your CLI is too old".
     match command {
-        "codex" => Some(VersionRange { min: (0, 118, 0), max_exclusive: None }),
-        "opencode" => Some(VersionRange { min: (1, 2, 0), max_exclusive: None }),
-        "claude" => Some(VersionRange { min: (1, 0, 0), max_exclusive: None }),
-        "aider" => Some(VersionRange { min: (0, 50, 0), max_exclusive: None }),
+        "codex" => Some(VersionRange {
+            min: (0, 118, 0),
+            max_exclusive: None,
+        }),
+        "opencode" => Some(VersionRange {
+            min: (1, 2, 0),
+            max_exclusive: None,
+        }),
+        "claude" => Some(VersionRange {
+            min: (1, 0, 0),
+            max_exclusive: None,
+        }),
+        "aider" => Some(VersionRange {
+            min: (0, 50, 0),
+            max_exclusive: None,
+        }),
         _ => None,
     }
 }
@@ -327,17 +339,17 @@ pub fn parse_first_semver(s: &str) -> Option<(u32, u32, u32)> {
         }
         let candidate = &s[start..i];
         let parts: Vec<&str> = candidate.split('.').collect();
-        if parts.len() >= 3 {
-            if let (Ok(a), Ok(b), Ok(c)) = (
+        if parts.len() >= 3
+            && let (Ok(a), Ok(b), Ok(c)) = (
                 parts[0].parse::<u32>(),
                 parts[1].parse::<u32>(),
                 // Strip any trailing non-digit (e.g. "0-rc1") for the patch.
                 parts[2]
                     .trim_end_matches(|c: char| !c.is_ascii_digit())
                     .parse::<u32>(),
-            ) {
-                return Some((a, b, c));
-            }
+            )
+        {
+            return Some((a, b, c));
         }
         // Skip past this candidate to avoid an infinite loop on malformed
         // input that started with a digit but couldn't be parsed.
@@ -368,10 +380,7 @@ fn run_version_command(command: &str) -> Option<String> {
 
 /// Pure version-comparison helper used by [`check_compatibility`] and tests.
 /// Separated so unit tests can exercise the matrix without forking processes.
-pub fn evaluate_version(
-    command: &str,
-    version_output: &str,
-) -> CompatStatus {
+pub fn evaluate_version(command: &str, version_output: &str) -> CompatStatus {
     let Some(range) = known_range(command) else {
         return CompatStatus::Unknown;
     };
@@ -493,8 +502,9 @@ fn which(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     /// Helper: build a stock agent definition by command name.
     fn agent_for(cmd: &str) -> CodingAgent {
@@ -589,7 +599,10 @@ mod tests {
     fn full_auto_flags_codex_bypasses_sandbox() {
         let agent = agent_for("codex");
         let flags = agent.full_auto_flags();
-        assert_eq!(flags, vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]);
+        assert_eq!(
+            flags,
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        );
     }
 
     #[test]
@@ -679,9 +692,18 @@ mod tests {
         match status {
             CompatStatus::Unsupported { version, reason } => {
                 assert_eq!(version, "0.117.0");
-                assert!(reason.contains("0.117.0"), "reason missing detected version: {reason}");
-                assert!(reason.contains("0.118"), "reason missing required min: {reason}");
-                assert!(reason.contains("codex"), "reason missing agent name: {reason}");
+                assert!(
+                    reason.contains("0.117.0"),
+                    "reason missing detected version: {reason}"
+                );
+                assert!(
+                    reason.contains("0.118"),
+                    "reason missing required min: {reason}"
+                );
+                assert!(
+                    reason.contains("codex"),
+                    "reason missing agent name: {reason}"
+                );
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -724,13 +746,20 @@ mod tests {
 
     #[test]
     fn compat_status_is_unsupported_only_for_unsupported_variant() {
-        assert!(!CompatStatus::Compatible { version: "1.0.0".into() }.is_unsupported());
+        assert!(
+            !CompatStatus::Compatible {
+                version: "1.0.0".into()
+            }
+            .is_unsupported()
+        );
         assert!(!CompatStatus::Unknown.is_unsupported());
-        assert!(CompatStatus::Unsupported {
-            version: "0.1.0".into(),
-            reason: "old".into(),
-        }
-        .is_unsupported());
+        assert!(
+            CompatStatus::Unsupported {
+                version: "0.1.0".into(),
+                reason: "old".into(),
+            }
+            .is_unsupported()
+        );
     }
 
     #[test]

@@ -21,13 +21,11 @@ pub async fn create(
 ) -> Result<Bond, SparksError> {
     let mut tx = pool.begin().await?;
 
-    if bond_type.is_blocking() {
-        if graph::would_create_cycle(pool, from_id, to_id).await? {
-            return Err(SparksError::CycleDetected {
-                from: from_id.to_string(),
-                to: to_id.to_string(),
-            });
-        }
+    if bond_type.is_blocking() && graph::would_create_cycle(pool, from_id, to_id).await? {
+        return Err(SparksError::CycleDetected {
+            from: from_id.to_string(),
+            to: to_id.to_string(),
+        });
     }
 
     sqlx::query("INSERT INTO bonds (from_id, to_id, bond_type) VALUES (?, ?, ?)")

@@ -185,8 +185,9 @@ pub async fn migrate_workshop(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     /// Tiny RAII temp dir — avoids pulling in `tempfile` just for these tests.
     struct TempDir(PathBuf);

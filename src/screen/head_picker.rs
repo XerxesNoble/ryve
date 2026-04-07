@@ -85,9 +85,7 @@ pub fn view<'a>(
                 pal.text_primary
             };
             let row_content = row![
-                text(&agent.display_name)
-                    .size(FONT_BODY)
-                    .color(name_color),
+                text(&agent.display_name).size(FONT_BODY).color(name_color),
                 Space::new().width(Length::Fill),
                 text(&agent.command)
                     .size(FONT_SMALL)

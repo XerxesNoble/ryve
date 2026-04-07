@@ -163,11 +163,8 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, _has_bg: bool) -> El
                 .spacing(4)
                 .align_y(iced::Alignment::Center);
             if is_background {
-                active_row = active_row.push(
-                    text("background")
-                        .size(FONT_SMALL)
-                        .color(pal.text_tertiary),
-                );
+                active_row =
+                    active_row.push(text("background").size(FONT_SMALL).color(pal.text_tertiary));
             }
 
             let btn = button(active_row)

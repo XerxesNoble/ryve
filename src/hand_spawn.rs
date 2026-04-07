@@ -288,12 +288,14 @@ mod tests {
     //! implementation passed only `--system-prompt`, leaving the agent
     //! with no user message, and every Hand exited on its first turn.
 
-    use super::*;
-    use crate::coding_agents::{CodingAgent, ResumeStrategy};
+    use std::time::{Duration, Instant};
+
     use data::sparks::spark_repo;
     use data::sparks::types::{NewSpark, SparkType};
-    use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    use super::*;
+    use crate::coding_agents::{CodingAgent, ResumeStrategy};
 
     /// Build a throwaway workshop directory: `git init`, an initial empty
     /// commit (worktree creation requires HEAD), an open sqlite pool, and
