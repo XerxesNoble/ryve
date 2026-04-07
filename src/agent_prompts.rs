@@ -96,7 +96,15 @@ pub fn compose_head_prompt(user_goal: &str) -> String {
             `ryve hand spawn <child_id> --agent claude --crew <crew_id>`\n\
             (You may pick a different `--agent` per spark — claude, codex, aider, \
             opencode — based on what is appropriate.)\n\
-         6. Poll progress every 60 seconds:\n\
+         6. Poll progress every 60 seconds. **Do not busy-wait by manually re-running \
+            commands in a tight loop** — that burns context and tokens. Instead, use \
+            your host agent's recurring-task primitive to schedule the poll:\n\
+            - In Claude Code: `/loop 60s ryve crew show <crew_id>` (or pass a slash \
+              command that wraps the full poll-and-react step).\n\
+            - In other coding agents (codex, aider, opencode): use the equivalent \
+              built-in (cron / schedule / repeat / watch). If none exists, sleep \
+              between polls rather than spinning.\n\
+            Each poll cycle, check:\n\
             - `ryve crew show <crew_id>` lists members and their sparks.\n\
             - `ryve assign list <spark_id>` shows owner and last heartbeat.\n\
             If a Hand has not heartbeated for >2 minutes and its spark is not closed, \
@@ -190,8 +198,10 @@ pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
 
 // ── helpers ────────────────────────────────────────────
 
-const HOUSE_RULES: &str = "You are a Hand in a Ryve workshop. Read these rules carefully — they govern \
-everything you do in this session.\n\n\
+const HOUSE_RULES: &str = "EXECUTE THE ASSIGNMENT BELOW IMMEDIATELY. Do not acknowledge, summarize, \
+or wait for confirmation — start running tools and editing code right away. \
+You are a Hand in a Ryve workshop and the rules in this section are \
+non-negotiable for every action you take.\n\n\
 HOUSE RULES:\n\
 1. Use `ryve` for ALL workgraph operations: spark list/show/status/close, \
 bond, contract, comment, stamp. NEVER touch `.ryve/sparks.db` directly with \
@@ -245,6 +255,32 @@ mod tests {
         assert!(p.contains("ryve spark status sp-1234 in_progress"));
         // Without spark in cache, should fall back to the cache message.
         assert!(p.contains("Spark sp-1234 details not in cache"));
+    }
+
+    /// Regression for sp-ryve-3eed113f: the prompt must lead with an
+    /// explicit imperative so claude --print does not intermittently reply
+    /// with a one-word acknowledgement ("Understood." / "Acknowledged.")
+    /// and exit. The previous opener was "Read these rules carefully ..."
+    /// which primed claude to treat the whole prompt as a reading exercise.
+    #[test]
+    fn prompts_open_with_execute_directive_not_reading_instruction() {
+        let hand = compose_hand_prompt(&[], "sp-1234");
+        let merger = compose_merger_prompt("cr-aaaa", "sp-merge1");
+
+        assert!(
+            hand.starts_with("EXECUTE"),
+            "hand prompt must lead with EXECUTE directive, got: {:?}",
+            hand.chars().take(80).collect::<String>()
+        );
+        assert!(
+            merger.starts_with("EXECUTE"),
+            "merger prompt must lead with EXECUTE directive, got: {:?}",
+            merger.chars().take(80).collect::<String>()
+        );
+        assert!(
+            !hand.contains("Read these rules carefully"),
+            "obsolete passive framing leaked back into HOUSE_RULES"
+        );
     }
 
     #[test]

@@ -99,12 +99,21 @@ impl CodingAgent {
         match self.command.as_str() {
             "claude" => {
                 // `claude --print` is the documented headless mode. The user
-                // message is the trailing positional. `--system-prompt` keeps
-                // the spark briefing as the system role.
+                // message is the trailing positional.
+                //
+                // Historical bug (sp-ryve-3eed113f): we used to also pass
+                // `--system-prompt <prompt_file>`, but `--system-prompt` takes
+                // an inline string, not a file path. Claude received the
+                // literal path string as its system role, which combined with
+                // the "Read these rules carefully" framing in HOUSE_RULES
+                // made it intermittently reply with a one-word
+                // acknowledgement ("Understood." / "Acknowledged.") and
+                // exit immediately. The full briefing now goes through as
+                // the user message; agent_prompts.rs leads with an explicit
+                // EXECUTE-NOW header so claude does not treat it as a
+                // reading-comprehension exercise.
                 args.push("--print".to_string());
                 args.push("--dangerously-skip-permissions".to_string());
-                args.push("--system-prompt".to_string());
-                args.push(prompt_file);
                 args.push(prompt.to_string());
             }
             "codex" => {
@@ -280,7 +289,12 @@ mod tests {
     }
 
     #[test]
-    fn build_headless_args_claude_uses_print_mode_with_system_prompt_file() {
+    fn build_headless_args_claude_uses_print_mode_without_system_prompt_path() {
+        // Regression for sp-ryve-3eed113f: claude must not be passed
+        // `--system-prompt <prompt_file>` because that flag takes an inline
+        // string, not a file path. Doing so put the literal path string into
+        // claude's system role and made it intermittently exit with a
+        // one-word acknowledgement instead of starting the assignment.
         let agent = agent_for("claude");
         let path = PathBuf::from("/tmp/p.md");
         let args = agent.build_headless_args("hello", &path);
@@ -289,12 +303,17 @@ mod tests {
             "claude needs --print: {args:?}"
         );
         assert!(
-            args.iter().any(|a| a == "--system-prompt"),
-            "claude should still pass --system-prompt: {args:?}"
+            args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "claude needs --dangerously-skip-permissions: {args:?}"
         );
         assert!(
-            args.iter().any(|a| a == "/tmp/p.md"),
-            "claude should reference the prompt file: {args:?}"
+            !args.iter().any(|a| a == "--system-prompt"),
+            "claude must NOT receive --system-prompt: that flag takes an \
+             inline string, not the prompt file path: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/tmp/p.md"),
+            "claude args must not contain the prompt file path literal: {args:?}"
         );
         assert_eq!(
             args.last().map(String::as_str),
