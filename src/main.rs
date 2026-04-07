@@ -11,7 +11,7 @@ mod workshop;
 
 use std::path::PathBuf;
 
-use data::sparks::types::{PersistedAgentSession, Spark};
+use data::sparks::types::{Contract, PersistedAgentSession, Spark};
 use iced::widget::{Space, button, column, container, row, stack, text};
 use iced::{event, keyboard, mouse, window};
 use iced::{Color, Element, Length, Point, Size, Subscription, Task, Theme};
@@ -133,6 +133,14 @@ enum Message {
     SparksLoaded(Uuid, Vec<Spark>),
     /// Failing/pending required contract count loaded from DB
     FailingContractsLoaded(Uuid, usize),
+    /// Contracts for the currently selected spark loaded from DB.
+    ContractsLoaded(Uuid, String, Vec<Contract>),
+    /// A contract check command finished — store the resolved status,
+    /// then trigger a contracts reload for the spark.
+    ContractCheckFinished {
+        ws_id: Uuid,
+        spark_id: String,
+    },
     /// Agent sessions loaded from DB
     AgentSessionsLoaded(Uuid, Vec<PersistedAgentSession>),
     /// Agent session saved to DB
@@ -215,6 +223,12 @@ impl std::fmt::Debug for Message {
             Self::SparksLoaded(id, s) => write!(f, "SparksLoaded({id}, {} sparks)", s.len()),
             Self::FailingContractsLoaded(id, n) => {
                 write!(f, "FailingContractsLoaded({id}, {n})")
+            }
+            Self::ContractsLoaded(id, sid, c) => {
+                write!(f, "ContractsLoaded({id}, {sid}, {} contracts)", c.len())
+            }
+            Self::ContractCheckFinished { ws_id, spark_id } => {
+                write!(f, "ContractCheckFinished({ws_id}, {spark_id})")
             }
             Self::AgentSessionsLoaded(id, s) => {
                 write!(f, "AgentSessionsLoaded({id}, {} sessions)", s.len())
@@ -500,6 +514,39 @@ impl App {
                     ws.failing_contracts = count;
                 }
                 Task::none()
+            }
+            Message::ContractsLoaded(id, spark_id, contracts) => {
+                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
+                    // Only apply if this spark is still selected — avoids
+                    // racing a stale load against a newer selection.
+                    if ws.selected_spark.as_deref() == Some(spark_id.as_str()) {
+                        ws.selected_spark_contracts = contracts;
+                    }
+                }
+                Task::none()
+            }
+            Message::ContractCheckFinished { ws_id, spark_id } => {
+                // Reload contracts for the spark and refresh the failing badge.
+                let Some(ws) = self.workshops.iter().find(|ws| ws.id == ws_id) else {
+                    return Task::none();
+                };
+                let Some(ref pool) = ws.sparks_db else {
+                    return Task::none();
+                };
+                let pool = pool.clone();
+                let workshop_id = ws.workshop_id();
+                let id = ws.id;
+                let pool2 = pool.clone();
+                let workshop_id2 = workshop_id.clone();
+                let load_task = Task::perform(
+                    load_contracts(pool, spark_id.clone()),
+                    move |list| Message::ContractsLoaded(id, spark_id.clone(), list),
+                );
+                let count_task = Task::perform(
+                    load_failing_contract_count(pool2, workshop_id2),
+                    move |n| Message::FailingContractsLoaded(id, n),
+                );
+                Task::batch([load_task, count_task])
             }
 
             Message::AgentSessionsLoaded(id, persisted) => {
@@ -837,7 +884,161 @@ impl App {
                     screen::spark_detail::Message::Back => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.selected_spark = None;
+                            ws.selected_spark_contracts.clear();
+                            ws.contract_create_form.reset();
                         }
+                    }
+                    screen::spark_detail::Message::ShowCreateContract => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.contract_create_form.visible = true;
+                        }
+                    }
+                    screen::spark_detail::Message::CancelCreateContract => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.contract_create_form.reset();
+                        }
+                    }
+                    screen::spark_detail::Message::CycleContractKind => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.contract_create_form.kind =
+                                screen::spark_detail::next_contract_kind(
+                                    ws.contract_create_form.kind,
+                                );
+                        }
+                    }
+                    screen::spark_detail::Message::ToggleContractEnforcement => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.contract_create_form.enforcement =
+                                screen::spark_detail::toggle_enforcement(
+                                    ws.contract_create_form.enforcement,
+                                );
+                        }
+                    }
+                    screen::spark_detail::Message::ContractDescriptionChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.contract_create_form.description = val;
+                        }
+                    }
+                    screen::spark_detail::Message::ContractCheckCommandChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.contract_create_form.check_command = val;
+                        }
+                    }
+                    screen::spark_detail::Message::SubmitContract(spark_id) => {
+                        let ws = &mut self.workshops[idx];
+                        let form = ws.contract_create_form.clone();
+                        if form.description.trim().is_empty() {
+                            return Task::none();
+                        }
+                        let cmd = form.check_command.trim().to_string();
+                        let check_command = if cmd.is_empty() { None } else { Some(cmd) };
+                        ws.contract_create_form.reset();
+                        if let Some(ref pool) = ws.sparks_db {
+                            let pool = pool.clone();
+                            let ws_id = ws.id;
+                            let workshop_id = ws.workshop_id();
+                            let new_contract = data::sparks::types::NewContract {
+                                spark_id: spark_id.clone(),
+                                kind: form.kind,
+                                description: form.description.trim().to_string(),
+                                check_command,
+                                pattern: None,
+                                file_glob: None,
+                                enforcement: form.enforcement,
+                            };
+                            let load_pool = pool.clone();
+                            let count_pool = pool.clone();
+                            let count_ws_id = workshop_id.clone();
+                            let sid = spark_id.clone();
+                            let create_task = Task::perform(
+                                async move {
+                                    let _ = data::sparks::contract_repo::create(
+                                        &pool,
+                                        new_contract,
+                                    )
+                                    .await;
+                                    data::sparks::contract_repo::list_for_spark(
+                                        &load_pool, &sid,
+                                    )
+                                    .await
+                                    .unwrap_or_default()
+                                },
+                                move |list| Message::ContractsLoaded(ws_id, spark_id.clone(), list),
+                            );
+                            let count_task = Task::perform(
+                                load_failing_contract_count(count_pool, count_ws_id),
+                                move |n| Message::FailingContractsLoaded(ws_id, n),
+                            );
+                            return Task::batch([create_task, count_task]);
+                        }
+                    }
+                    screen::spark_detail::Message::DeleteContract {
+                        spark_id,
+                        contract_id,
+                    } => {
+                        let ws = &self.workshops[idx];
+                        if let Some(ref pool) = ws.sparks_db {
+                            let pool = pool.clone();
+                            let ws_id = ws.id;
+                            return Task::perform(
+                                async move {
+                                    let _ = data::sparks::contract_repo::delete(
+                                        &pool,
+                                        contract_id,
+                                    )
+                                    .await;
+                                },
+                                move |_| Message::ContractCheckFinished {
+                                    ws_id,
+                                    spark_id: spark_id.clone(),
+                                },
+                            );
+                        }
+                    }
+                    screen::spark_detail::Message::RunContract {
+                        spark_id,
+                        contract_id,
+                    } => {
+                        let ws = &self.workshops[idx];
+                        let Some(contract) = ws
+                            .selected_spark_contracts
+                            .iter()
+                            .find(|c| c.id == contract_id)
+                            .cloned()
+                        else {
+                            return Task::none();
+                        };
+                        let Some(cmd) = contract
+                            .check_command
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                        else {
+                            return Task::none();
+                        };
+                        let Some(ref pool) = ws.sparks_db else {
+                            return Task::none();
+                        };
+                        let pool = pool.clone();
+                        let ws_id = ws.id;
+                        let cwd = ws.directory.clone();
+                        return Task::perform(
+                            async move {
+                                let status = run_contract_check(&cmd, &cwd).await;
+                                let _ = data::sparks::contract_repo::update_status(
+                                    &pool,
+                                    contract_id,
+                                    status,
+                                    "ui",
+                                )
+                                .await;
+                            },
+                            move |_| Message::ContractCheckFinished {
+                                ws_id,
+                                spark_id: spark_id.clone(),
+                            },
+                        );
                     }
                     screen::spark_detail::Message::CycleStatus(spark_id, new_status) => {
                         if let Some(ws) = self.workshops.get(idx) {
@@ -938,9 +1139,20 @@ impl App {
                             }
                         }
                     }
-                    screen::sparks::Message::SelectSpark(id) => {
+                    screen::sparks::Message::SelectSpark(spark_id) => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
-                            ws.selected_spark = Some(id);
+                            ws.selected_spark = Some(spark_id.clone());
+                            ws.selected_spark_contracts.clear();
+                            ws.contract_create_form.reset();
+                            if let Some(ref pool) = ws.sparks_db {
+                                let pool = pool.clone();
+                                let ws_id = ws.id;
+                                let sid = spark_id.clone();
+                                return Task::perform(
+                                    load_contracts(pool, sid.clone()),
+                                    move |list| Message::ContractsLoaded(ws_id, sid.clone(), list),
+                                );
+                            }
                         }
                     }
                     screen::sparks::Message::ShowCreateForm => {
@@ -2064,7 +2276,14 @@ impl App {
         // -- Right: sparks panel (or detail view) --
         let sparks_panel = if let Some(ref selected_id) = ws.selected_spark {
             if let Some(spark) = ws.sparks.iter().find(|s| s.id == *selected_id) {
-                screen::spark_detail::view(spark, &pal, has_bg).map(Message::SparkDetail)
+                screen::spark_detail::view(
+                    spark,
+                    &ws.selected_spark_contracts,
+                    &ws.contract_create_form,
+                    &pal,
+                    has_bg,
+                )
+                .map(Message::SparkDetail)
             } else {
                 screen::sparks::view(&ws.sparks, &pal, has_bg, &ws.spark_create_form)
                     .map(Message::Sparks)
@@ -2424,6 +2643,38 @@ async fn load_agent_sessions(
     data::sparks::agent_session_repo::list_for_workshop(&pool, &workshop_id)
         .await
         .unwrap_or_default()
+}
+
+/// Load all contracts for a single spark from the database. Errors are
+/// swallowed (treated as empty) since this is a non-critical display value.
+async fn load_contracts(pool: sqlx::SqlitePool, spark_id: String) -> Vec<Contract> {
+    data::sparks::contract_repo::list_for_spark(&pool, &spark_id)
+        .await
+        .unwrap_or_default()
+}
+
+/// Execute a contract check command via the user's shell from the workshop
+/// directory and translate the exit status into a `ContractStatus`.
+///
+/// - `pass` if the command exits 0
+/// - `fail` if the command exits non-zero or fails to spawn
+async fn run_contract_check(
+    command: &str,
+    cwd: &std::path::Path,
+) -> data::sparks::types::ContractStatus {
+    use data::sparks::types::ContractStatus;
+    let result = tokio::process::Command::new("/bin/sh")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    match result {
+        Ok(status) if status.success() => ContractStatus::Pass,
+        _ => ContractStatus::Fail,
+    }
 }
 
 /// Count the failing or pending required contracts for a workshop. Used by

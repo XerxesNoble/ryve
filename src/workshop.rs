@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use data::ryve_dir::{AgentDef, RyveDir, WorkshopConfig};
-use data::sparks::types::Spark;
+use data::sparks::types::{Contract, Spark};
 use iced::Theme;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -62,6 +62,10 @@ pub struct Workshop {
     pub spark_create_form: crate::screen::sparks::CreateForm,
     /// Currently selected spark ID (for detail view).
     pub selected_spark: Option<String>,
+    /// Cached contracts for the currently selected spark.
+    pub selected_spark_contracts: Vec<Contract>,
+    /// Inline contract-create form for the spark detail view.
+    pub contract_create_form: crate::screen::spark_detail::ContractCreateForm,
     /// Whether the background image is dark (for adaptive font color).
     /// `None` means no background or not yet computed.
     pub bg_is_dark: Option<bool>,
@@ -94,6 +98,8 @@ impl Workshop {
             background_picker: PickerState::new(),
             spark_create_form: Default::default(),
             selected_spark: None,
+            selected_spark_contracts: Vec::new(),
+            contract_create_form: Default::default(),
             bg_is_dark: None,
             pending_agent_spawn: None,
             last_worktree_warning: None,
