@@ -26,6 +26,7 @@ use coding_agents::CodingAgent;
 use screen::agents::AgentSession;
 use screen::file_explorer;
 use screen::file_viewer;
+use screen::log_tail;
 use screen::toast::{self, Toast, ToastKind};
 use style::Appearance;
 use widget::splitter::{self, SplitterDrag, SplitterKind};
@@ -188,6 +189,7 @@ enum Message {
     /// Forwarded to the active workshop
     FileExplorer(screen::file_explorer::Message),
     FileViewer(screen::file_viewer::Message),
+    LogTail(screen::log_tail::Message),
     Agents(screen::agents::Message),
     Bench(screen::bench::Message),
     Sparks(screen::sparks::Message),
@@ -295,6 +297,7 @@ impl std::fmt::Debug for Message {
             Self::FilesScanned(id, _) => write!(f, "FilesScanned({id})"),
             Self::FileExplorer(m) => write!(f, "FileExplorer({m:?})"),
             Self::FileViewer(m) => write!(f, "FileViewer({m:?})"),
+            Self::LogTail(m) => write!(f, "LogTail({m:?})"),
             Self::Agents(m) => write!(f, "Agents({m:?})"),
             Self::Bench(m) => write!(f, "Bench({m:?})"),
             Self::Sparks(m) => write!(f, "Sparks({m:?})"),
@@ -800,6 +803,7 @@ impl App {
                             stale: display_state == screen::agents::SessionDisplayState::Stale,
                             resume_id: p.resume_id,
                             started_at: p.started_at,
+                            log_path: p.log_path.map(PathBuf::from),
                         });
                     }
                 }
@@ -1091,6 +1095,40 @@ impl App {
                 }
                 Task::none()
             }
+            Message::LogTail(msg) => {
+                match msg {
+                    log_tail::Message::Loaded {
+                        tab_id,
+                        path,
+                        content,
+                    } => {
+                        for ws in &mut self.workshops {
+                            if let Some(tail) = ws.log_tails.get_mut(&tab_id) {
+                                if tail.path == path {
+                                    tail.content = content;
+                                    tail.error = None;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    log_tail::Message::LoadFailed {
+                        tab_id,
+                        path,
+                        error,
+                    } => {
+                        for ws in &mut self.workshops {
+                            if let Some(tail) = ws.log_tails.get_mut(&tab_id) {
+                                if tail.path == path {
+                                    tail.error = Some(error);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
             Message::Agents(msg) => {
                 let Some(idx) = self.active_workshop else {
                     return Task::none();
@@ -1104,6 +1142,10 @@ impl App {
                         // `self.push_toast` (which needs `&mut self`).
                         enum Outcome {
                             Focused,
+                            /// Background Hand: opened (or focused) a spy view
+                            /// tab tailing the Hand's log file. Carries the
+                            /// new tab id so we can fire the initial load.
+                            Spying { tab_id: u64, log_path: PathBuf },
                             Stale { name: String },
                             Past { name: String, started_at: String, can_resume: bool },
                             NotFound,
@@ -1123,6 +1165,19 @@ impl App {
                                     ws.bench.active_tab = Some(tab_id);
                                     Outcome::Focused
                                 }
+                                // No live terminal tab, but the Hand was
+                                // launched detached and we know where its log
+                                // lives — open a read-only spy view instead
+                                // of erroring. Spark ryve-8c14734a.
+                                _ if session.log_path.is_some() => {
+                                    let log_path = session.log_path.clone().unwrap();
+                                    let (tab_id, _) = ws.open_log_tab(
+                                        &session_id,
+                                        log_path.clone(),
+                                        &mut self.next_terminal_id,
+                                    );
+                                    Outcome::Spying { tab_id, log_path }
+                                }
                                 _ => Outcome::Stale { name: session.name },
                             },
                             Some(session) => {
@@ -1137,6 +1192,12 @@ impl App {
 
                         match outcome {
                             Outcome::Focused | Outcome::NotFound => {}
+                            Outcome::Spying { tab_id, log_path } => {
+                                return Task::perform(
+                                    log_tail::load_tail(tab_id, log_path),
+                                    Message::LogTail,
+                                );
+                            }
                             Outcome::Stale { name } => {
                                 return self.push_toast(
                                     format!("{name} is no longer running"),
@@ -1863,6 +1924,7 @@ impl App {
                             stale: false,
                             resume_id: None,
                             started_at: chrono::Utc::now().to_rfc3339(),
+                            log_path: None,
                         });
 
                         if let Some(ref pool) = ws.sparks_db {
@@ -1877,6 +1939,7 @@ impl App {
                                 session_label: Some("auto-detected".to_string()),
                                 child_pid: None,
                                 resume_id: None,
+                                log_path: None,
                             };
                             tasks.push(Task::perform(
                                 async move {
@@ -1910,6 +1973,19 @@ impl App {
                     })
                     .collect();
                 tasks.extend(session_tasks);
+
+                // Refresh every open spy view (LogTail tab) so background
+                // Hands' output streams in without the user having to
+                // re-click them. Spark ryve-8c14734a.
+                for ws in &self.workshops {
+                    for (&tab_id, tail) in &ws.log_tails {
+                        let path = tail.path.clone();
+                        tasks.push(Task::perform(
+                            log_tail::load_tail(tab_id, path),
+                            Message::LogTail,
+                        ));
+                    }
+                }
 
                 // Poll all workshops that have a sparks_db and at least one
                 // agent session in memory (active or not — past CLI Hands
@@ -2428,6 +2504,7 @@ impl App {
             stale: false,
             resume_id: None,
             started_at: chrono::Utc::now().to_rfc3339(),
+            log_path: None,
         });
 
         // Persist session to DB + optional spark assignment
@@ -2445,6 +2522,7 @@ impl App {
                 session_label: None,
                 child_pid: None,
                 resume_id: None,
+                log_path: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -2528,6 +2606,7 @@ impl App {
             stale: false,
             resume_id: None,
             started_at: chrono::Utc::now().to_rfc3339(),
+            log_path: None,
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
@@ -2543,6 +2622,7 @@ impl App {
                 session_label: Some("head".to_string()),
                 child_pid: None,
                 resume_id: None,
+                log_path: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -3262,6 +3342,8 @@ impl App {
                     .into()
             } else if let Some(viewer) = ws.file_viewers.get(&active_id) {
                 file_viewer::view(viewer, pal, has_bg).map(Message::FileViewer)
+            } else if let Some(tail) = ws.log_tails.get(&active_id) {
+                log_tail::view(tail, pal).map(Message::LogTail)
             } else {
                 container(text("Loading...").size(14))
                     .center(Length::Fill)
