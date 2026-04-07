@@ -1,6 +1,0 @@
-Spark `ryve-0cad6025` complete and closed.
-
-**Summary**
-- `src/screen/agents.rs`: Changed `SelectAgent` to carry the session id as `String` (handles both active + past), and wrapped past Hand rows in a `mouse_area` so clicking anywhere on the row fires the message while inner resume/delete buttons still capture their own clicks. Made `format_relative_time` `pub`. Added 7 unit tests covering can_resume logic, time formatting, and view smoke tests.
-- `src/main.rs`: Rewrote the `SelectAgent` handler to compute an `Outcome` (Focused / Stale / Past / NotFound). Active+live → focuses bench tab. Active but tab gone → warning toast. Past → info toast with started-at and resume hint.
-- All 48 tests pass; no new warnings.

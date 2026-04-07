@@ -77,6 +77,37 @@ async fn test_list_by_type(pool: sqlx::SqlitePool) {
 }
 
 #[sqlx::test]
+async fn test_delete_ember(pool: sqlx::SqlitePool) {
+    // Dismissing a notification in the UI must remove the backing row so
+    // the next 3-second poll does not resurrect it. Spark sp-ux0008.
+    let ember = ember_repo::create(
+        &pool,
+        NewEmber {
+            ember_type: EmberType::Glow,
+            content: "Hand finished".to_string(),
+            source_agent: Some("hands".to_string()),
+            workshop_id: "ws-ember".to_string(),
+            ttl_seconds: Some(3600),
+        },
+    )
+    .await
+    .unwrap();
+
+    let before = ember_repo::list_active(&pool, "ws-ember").await.unwrap();
+    assert_eq!(before.len(), 1);
+
+    let removed = ember_repo::delete(&pool, &ember.id).await.unwrap();
+    assert_eq!(removed, 1);
+
+    let after = ember_repo::list_active(&pool, "ws-ember").await.unwrap();
+    assert!(after.is_empty());
+
+    // Deleting a non-existent id is a no-op and must not error.
+    let noop = ember_repo::delete(&pool, "em-does-not-exist").await.unwrap();
+    assert_eq!(noop, 0);
+}
+
+#[sqlx::test]
 async fn test_sweep_expired(pool: sqlx::SqlitePool) {
     // Insert an ember that's already expired (TTL=0)
     sqlx::query(

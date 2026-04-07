@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod background_picker;
 pub mod bench;
+pub mod ember_bar;
 pub mod file_explorer;
 pub mod file_viewer;
 pub mod head_picker;
