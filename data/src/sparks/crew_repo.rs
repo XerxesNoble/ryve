@@ -197,6 +197,7 @@ mod tests {
                 session_label: None,
                 child_pid: None,
                 resume_id: None,
+                log_path: None,
             },
         )
         .await

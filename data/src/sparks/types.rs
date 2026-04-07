@@ -111,6 +111,7 @@ impl SparkStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "open" => Some(Self::Open),
@@ -405,6 +406,10 @@ pub struct PersistedAgentSession {
     pub child_pid: Option<i64>,
     /// Agent-specific session/conversation ID used for resumption.
     pub resume_id: Option<String>,
+    /// Filesystem path to the detached child's stdout/stderr log file
+    /// (set for CLI-spawned background Hands; `None` for UI-spawned
+    /// sessions whose output flows through their `iced_term` tab).
+    pub log_path: Option<String>,
 }
 
 pub struct NewAgentSession {
@@ -416,6 +421,7 @@ pub struct NewAgentSession {
     pub session_label: Option<String>,
     pub child_pid: Option<i64>,
     pub resume_id: Option<String>,
+    pub log_path: Option<String>,
 }
 
 // ── Structured Intent ────────────────────────────────

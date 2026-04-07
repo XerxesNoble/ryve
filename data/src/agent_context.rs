@@ -124,7 +124,9 @@ fn generate_workshop_md() -> String {
         "Every spark can carry a structured **intent** that spells out what \"done\" \
          actually means. Always read it with `ryve spark show <id>` before writing code.\n\n",
     );
-    md.push_str("- **problem_statement** — the concrete problem the spark is solving (the *why*).\n");
+    md.push_str(
+        "- **problem_statement** — the concrete problem the spark is solving (the *why*).\n",
+    );
     md.push_str(
         "- **invariants** — properties that MUST hold throughout and after your change. \
          Violating an invariant means the spark is not done, even if the feature works.\n",
@@ -169,7 +171,9 @@ fn generate_workshop_md() -> String {
     md.push_str("ryve bond list <spark-id>                 # all bonds touching this spark\n");
     md.push_str("ryve bond create <from> <to> blocks        # add a blocking dependency\n");
     md.push_str("ryve bond delete <bond-id>                 # remove a bond\n");
-    md.push_str("ryve hot                                   # sparks with no unmet blocking bonds\n");
+    md.push_str(
+        "ryve hot                                   # sparks with no unmet blocking bonds\n",
+    );
     md.push_str("```\n\n");
 
     // ── Workgraph commands ───────────────────────────────────────
@@ -181,33 +185,43 @@ fn generate_workshop_md() -> String {
     md.push_str("### Query state\n\n");
     md.push_str("```sh\nryve spark list                       # active sparks\n");
     md.push_str("ryve spark list --all                 # include closed\n");
-    md.push_str("ryve hot                              # sparks unblocked by bonds (ready to work)\n");
+    md.push_str(
+        "ryve hot                              # sparks unblocked by bonds (ready to work)\n",
+    );
     md.push_str("ryve spark show <spark-id>            # spark details + intent\n");
     md.push_str("ryve bond list <spark-id>             # dependency bonds\n");
     md.push_str("ryve constraint list                  # architectural constraints\n");
     md.push_str("ryve contract list <spark-id>         # verification contracts\n");
-    md.push_str("ryve ember list                       # live signals from other Hands / the UI\n```\n\n");
+    md.push_str(
+        "ryve ember list                       # live signals from other Hands / the UI\n```\n\n",
+    );
 
     md.push_str("### Mutate state\n\n");
     md.push_str("```sh\n");
     md.push_str("ryve spark create <title>                           # create a task spark\n");
     md.push_str("ryve spark create --type bug --priority 1 \\\n");
     md.push_str("  --problem '...' --invariant '...' \\\n");
-    md.push_str("  --non-goal '...' --acceptance '...' <title>       # create with structured intent\n");
+    md.push_str(
+        "  --non-goal '...' --acceptance '...' <title>       # create with structured intent\n",
+    );
     md.push_str("ryve spark edit <spark-id> --title <t> \\\n");
     md.push_str("  --priority <0-4> --risk <level> --scope <path>    # edit fields in place\n");
     md.push_str("ryve spark status <spark-id> in_progress            # claim / update status\n");
     md.push_str("ryve spark close <spark-id> <reason>                # close a spark\n");
-    md.push_str("\n");
+    md.push('\n');
     md.push_str("ryve bond create <from> <to> <type>                 # add dependency (blocks, related, ...)\n");
     md.push_str("ryve bond delete <bond-id>                          # remove a bond\n");
-    md.push_str("\n");
+    md.push('\n');
     md.push_str("ryve comment add <spark-id> <body>                  # leave a note on a spark\n");
     md.push_str("ryve stamp add <spark-id> <label>                   # tag a spark\n");
-    md.push_str("ryve contract add <spark-id> <kind> <description>   # add a verification contract\n");
+    md.push_str(
+        "ryve contract add <spark-id> <kind> <description>   # add a verification contract\n",
+    );
     md.push_str("ryve contract check <contract-id> pass|fail         # record a contract result\n");
-    md.push_str("\n");
-    md.push_str("ryve ember send <type> <content>                    # broadcast an ember signal\n");
+    md.push('\n');
+    md.push_str(
+        "ryve ember send <type> <content>                    # broadcast an ember signal\n",
+    );
     md.push_str("ryve ember sweep                                    # clean up expired embers\n");
     md.push_str("```\n\n");
 
@@ -255,8 +269,8 @@ fn generate_workshop_md() -> String {
          problem, invariants, non-goals, and acceptance criteria.\n",
     );
     md.push_str(
-        "- **Inspect bonds** (`ryve bond list <id>` or `ryve hot`) and do not start a \
-         spark that is still blocked by an incomplete upstream.\n",
+        "- **Inspect bonds** (`ryve bond list <id>` or `ryve hot`) — Do not work on a blocked \
+         spark that is still waiting on an incomplete upstream.\n",
     );
     md.push_str(
         "- **Reference spark IDs** in commit messages \
@@ -356,6 +370,19 @@ pub fn target_paths(workshop_dir: &Path, config: &WorkshopConfig) -> Vec<PathBuf
 
 // ── Hand prompt generation ───────────────────────────
 
+/// Generate the initial prompt text to inject into a Hand's terminal via PTY.
+/// This is the fallback for agents that don't support `--system-prompt` flags.
+pub fn generate_hand_prompt(_workshop_dir: &Path) -> String {
+    "You are a Hand in a Ryve Workshop. Before doing ANY work, read `.ryve/WORKSHOP.md` — \
+     it explains how to use `ryve` to query the workgraph for active tasks, constraints, \
+     and contracts. Work ONLY in your current directory (do not navigate to parent directories \
+     or other worktrees). Run `ryve spark list` to see what needs doing. \
+     Reference spark IDs in all commits (e.g. `[sp-xxxx]`).\n"
+        .to_string()
+}
+
+// ── Tests ─────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,24 +404,6 @@ mod tests {
             "must tell agents not to claim blocked sparks"
         );
     }
-}
-
-/// Generate the initial prompt text to inject into a Hand's terminal via PTY.
-/// This is the fallback for agents that don't support `--system-prompt` flags.
-pub fn generate_hand_prompt(_workshop_dir: &Path) -> String {
-    "You are a Hand in a Ryve Workshop. Before doing ANY work, read `.ryve/WORKSHOP.md` — \
-     it explains how to use `ryve` to query the workgraph for active tasks, constraints, \
-     and contracts. Work ONLY in your current directory (do not navigate to parent directories \
-     or other worktrees). Run `ryve spark list` to see what needs doing. \
-     Reference spark IDs in all commits (e.g. `[sp-xxxx]`).\n"
-        .to_string()
-}
-
-// ── Tests ─────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn workshop_md_documents_bonds_and_unblocked_work() {

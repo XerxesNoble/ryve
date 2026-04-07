@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// Returns the path for the IPC socket.
 pub fn socket_path() -> PathBuf {
     let dir = dirs::runtime_dir()
-        .or_else(|| dirs::cache_dir())
+        .or_else(dirs::cache_dir)
         .unwrap_or_else(std::env::temp_dir);
     dir.join("ryve.sock")
 }

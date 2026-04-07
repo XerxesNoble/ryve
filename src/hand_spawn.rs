@@ -107,6 +107,13 @@ pub async fn spawn_hand(
     let worktree_path = workshop::create_hand_worktree(workshop_dir, &ryve_dir, &session_id)
         .map_err(HandSpawnError::Worktree)?;
 
+    // Pre-compute the log path so it can be persisted alongside the
+    // session row. The UI uses this path to drive the read-only spy view
+    // for background Hands (spark ryve-8c14734a).
+    let logs_dir = ryve_dir.root().join("logs");
+    tokio::fs::create_dir_all(&logs_dir).await?;
+    let log_path = logs_dir.join(format!("hand-{session_id}.log"));
+
     // 2. Persist the agent session.
     let new_session = NewAgentSession {
         id: session_id.clone(),
@@ -120,6 +127,7 @@ pub async fn spawn_hand(
         }),
         child_pid: None,
         resume_id: None,
+        log_path: Some(log_path.to_string_lossy().into_owned()),
     };
     agent_session_repo::create(pool, &new_session).await?;
 
@@ -168,9 +176,6 @@ pub async fn spawn_hand(
     tokio::fs::write(&prompt_path, &prompt).await?;
 
     // 7. Build the command line.
-    let logs_dir = ryve_dir.root().join("logs");
-    tokio::fs::create_dir_all(&logs_dir).await?;
-    let log_path = logs_dir.join(format!("hand-{session_id}.log"));
 
     // Delegate the agent-specific argv assembly to `CodingAgent`. This
     // injects headless-mode flags (`--print` / `exec` / `--message` /
@@ -283,12 +288,14 @@ mod tests {
     //! implementation passed only `--system-prompt`, leaving the agent
     //! with no user message, and every Hand exited on its first turn.
 
-    use super::*;
-    use crate::coding_agents::{CodingAgent, ResumeStrategy};
+    use std::time::{Duration, Instant};
+
     use data::sparks::spark_repo;
     use data::sparks::types::{NewSpark, SparkType};
-    use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    use super::*;
+    use crate::coding_agents::{CodingAgent, ResumeStrategy};
 
     /// Build a throwaway workshop directory: `git init`, an initial empty
     /// commit (worktree creation requires HEAD), an open sqlite pool, and

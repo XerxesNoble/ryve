@@ -3,6 +3,8 @@
 
 //! Hands panel — lists active and past Hand sessions.
 
+use std::path::PathBuf;
+
 use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text};
 use iced::{Element, Length, Theme};
 
@@ -43,12 +45,24 @@ pub struct AgentSession {
     pub resume_id: Option<String>,
     /// When the session was started.
     pub started_at: String,
+    /// Path to the detached child's stdout/stderr log file. Set for
+    /// CLI-spawned background Hands so the UI can open a read-only spy
+    /// view; `None` for sessions whose output flows through a terminal tab.
+    pub log_path: Option<PathBuf>,
 }
 
 impl AgentSession {
     /// Can this session be resumed?
     pub fn can_resume(&self) -> bool {
         !self.active && !self.stale && self.agent.resume != ResumeStrategy::None
+    }
+
+    /// Whether this is a CLI-spawned Hand running detached in the background
+    /// (no terminal tab in the bench, but a live process and a log file we
+    /// can tail). The Active panel shows these with a "background" badge and
+    /// clicking one opens a read-only log view.
+    pub fn is_background(&self) -> bool {
+        self.active && self.tab_id.is_none() && self.log_path.is_some()
     }
 }
 
@@ -135,21 +149,29 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, _has_bg: bool) -> El
     if !active.is_empty() {
         content = content.push(text("Active").size(FONT_LABEL).color(pal.text_secondary));
         for session in &active {
+            let is_background = session.is_background();
             let indicator = text("\u{25CF} ") // ● dot
                 .size(FONT_ICON_SM)
                 .color(pal.accent);
 
             let label = text(&session.name).size(FONT_BODY).color(pal.text_primary);
 
-            let btn = button(
-                row![indicator, label]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center),
-            )
-            .style(button::text)
-            .width(Length::Fill)
-            .padding([4, 8])
-            .on_press(Message::SelectAgent(session.id.clone()));
+            // Background Hands (CLI-spawned, no terminal tab) get a tag so
+            // the user knows clicking opens a read-only spy view rather than
+            // a focusable terminal. See spark ryve-8c14734a.
+            let mut active_row = row![indicator, label]
+                .spacing(4)
+                .align_y(iced::Alignment::Center);
+            if is_background {
+                active_row =
+                    active_row.push(text("background").size(FONT_SMALL).color(pal.text_tertiary));
+            }
+
+            let btn = button(active_row)
+                .style(button::text)
+                .width(Length::Fill)
+                .padding([4, 8])
+                .on_press(Message::SelectAgent(session.id.clone()));
 
             let active_item = container(btn)
                 .width(Length::Fill)
@@ -279,6 +301,7 @@ mod tests {
             stale: false,
             resume_id: None,
             started_at: "2026-04-07T11:00:00+00:00".to_string(),
+            log_path: None,
         }
     }
 
@@ -330,6 +353,22 @@ mod tests {
             },
         ];
         let _ = view(&sessions, Palette::dark(), false);
+    }
+
+    #[test]
+    fn background_hand_is_active_without_tab_with_log() {
+        // Spark ryve-8c14734a: a CLI-spawned Hand is "active" (process
+        // running) but has no terminal tab. The presence of a log path is
+        // what distinguishes it from a stale session and lets the UI open
+        // a read-only spy view on click.
+        let mut s = make_session(true, None, ResumeStrategy::None);
+        assert!(!s.is_background(), "needs a log path to be background");
+        s.log_path = Some(PathBuf::from("/tmp/hand-x.log"));
+        assert!(s.is_background());
+
+        // A session with a tab is not background — it has its own terminal.
+        s.tab_id = Some(7);
+        assert!(!s.is_background());
     }
 
     #[test]

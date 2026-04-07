@@ -3,16 +3,14 @@
 
 //! Bench panel — tabbed workspace for terminal sessions and coding agents.
 
+use std::path::PathBuf;
+
+use data::ryve_dir::AgentDef;
 use iced::widget::{Space, button, column, container, row, scrollable, text, tooltip};
 use iced::{Element, Length, Theme};
 
-use std::path::PathBuf;
-
 use crate::coding_agents::CodingAgent;
-use crate::style::{
-    self, FONT_BODY, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette,
-};
-use data::ryve_dir::AgentDef;
+use crate::style::{self, FONT_BODY, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette};
 
 /// A tab in the bench — either a plain terminal, coding agent, or file viewer.
 #[derive(Debug, Clone)]
@@ -31,6 +29,13 @@ pub enum TabKind {
     /// `Workshop::open_home_tab` enforces "at most one" so the dropdown
     /// entry can be pressed repeatedly without spawning duplicates.
     Home,
+    /// Read-only spy view tailing the log file of a CLI-spawned background
+    /// Hand. The string carries the agent_session id so the parent app can
+    /// drive periodic reloads of the right tab. Spark ryve-8c14734a.
+    LogTail {
+        session_id: String,
+        log_path: PathBuf,
+    },
 }
 
 /// State for the bench panel.
@@ -104,6 +109,9 @@ impl BenchState {
                 TabKind::CodingAgent(agent) => ("\u{2726}", agent.display_name.clone()),
                 TabKind::FileViewer(path) => ("\u{25A2}", path.to_string_lossy().to_string()),
                 TabKind::Home => ("\u{2302}", "Home".to_string()),
+                TabKind::LogTail { log_path, .. } => {
+                    ("\u{1F441}", format!("spy: {}", log_path.display()))
+                }
             };
 
             let tab_content = row![

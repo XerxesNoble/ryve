@@ -22,9 +22,7 @@ use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Element, Length, Theme};
 
 use crate::screen::agents::{AgentSession, format_relative_time};
-use crate::style::{
-    self, FONT_BODY, FONT_HEADER, FONT_LABEL, FONT_SMALL, Palette,
-};
+use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_LABEL, FONT_SMALL, Palette};
 
 // ── Messages ─────────────────────────────────────────
 
@@ -252,13 +250,9 @@ fn section_blocked_sparks<'a>(data: &HomeData<'a>, pal: &Palette) -> Element<'a,
     col.into()
 }
 
-fn section_failing_contracts<'a>(
-    failing: &'a [Contract],
-    pal: &Palette,
-) -> Element<'a, Message> {
+fn section_failing_contracts<'a>(failing: &'a [Contract], pal: &Palette) -> Element<'a, Message> {
     let pal = *pal;
-    let mut col =
-        column![section_header("Failing Contracts", failing.len(), &pal)].spacing(4);
+    let mut col = column![section_header("Failing Contracts", failing.len(), &pal)].spacing(4);
 
     if failing.is_empty() {
         col = col.push(empty_hint("All required contracts pass.", &pal));
@@ -271,7 +265,9 @@ fn section_failing_contracts<'a>(
             _ => pal.text_secondary,
         };
         let row_content = row![
-            text(contract.status.clone()).size(FONT_LABEL).color(status_color),
+            text(contract.status.clone())
+                .size(FONT_LABEL)
+                .color(status_color),
             text(contract.spark_id.clone())
                 .size(FONT_LABEL)
                 .color(pal.text_tertiary),
@@ -352,10 +348,7 @@ fn section_header<'a>(label: &'a str, count: usize, pal: &Palette) -> Element<'a
 }
 
 fn empty_hint<'a>(label: &'a str, pal: &Palette) -> Element<'a, Message> {
-    text(label)
-        .size(FONT_SMALL)
-        .color(pal.text_tertiary)
-        .into()
+    text(label).size(FONT_SMALL).color(pal.text_tertiary).into()
 }
 
 #[cfg(test)]
@@ -406,6 +399,7 @@ mod tests {
             stale: false,
             resume_id: None,
             started_at: "2026-04-07T11:00:00+00:00".to_string(),
+            log_path: None,
         }
     }
 
@@ -514,9 +508,9 @@ mod tests {
             .sparks
             .iter()
             .filter(|s| {
-                data.assignments.iter().any(|a| {
-                    a.spark_id == s.id && a.status == "active" && a.role == "owner"
-                })
+                data.assignments
+                    .iter()
+                    .any(|a| a.spark_id == s.id && a.status == "active" && a.role == "owner")
             })
             .collect();
         assert_eq!(matches.len(), 1);

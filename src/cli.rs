@@ -239,7 +239,7 @@ fn print_usage() {
 
 // ── Init ─────────────────────────────────────────────
 
-async fn handle_init(ryve_dir: &RyveDir, cwd: &PathBuf) {
+async fn handle_init(ryve_dir: &RyveDir, cwd: &Path) {
     if let Err(e) = data::ryve_dir::init_ryve_dir(ryve_dir).await {
         die(&format!("failed to initialize: {e}"));
     }
@@ -293,7 +293,7 @@ async fn handle_hot(pool: &sqlx::SqlitePool, ws_id: &str, json_mode: bool) {
             } else if sparks.is_empty() {
                 println!("No hot sparks (all blocked, deferred, or closed).");
             } else {
-                println!("{:<8} {:<3} {:<12} {}", "ID", "P", "TYPE", "TITLE");
+                println!("{:<8} {:<3} {:<12} TITLE", "ID", "P", "TYPE");
                 println!("{}", "-".repeat(60));
                 for s in &sparks {
                     println!(
@@ -340,8 +340,8 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                         println!("No sparks found.");
                     } else {
                         println!(
-                            "{:<8} {:<3} {:<8} {:<12} {:<12} {}",
-                            "ID", "P", "RISK", "TYPE", "STATUS", "TITLE"
+                            "{:<8} {:<3} {:<8} {:<12} {:<12} TITLE",
+                            "ID", "P", "RISK", "TYPE", "STATUS"
                         );
                         println!("{}", "-".repeat(72));
                         for s in &sparks {
@@ -831,8 +831,8 @@ async fn handle_contract(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, 
                         println!("No contracts for {}.", args[1]);
                     } else {
                         println!(
-                            "{:<4} {:<14} {:<10} {:<8} {}",
-                            "ID", "KIND", "ENFORCE", "STATUS", "DESCRIPTION"
+                            "{:<4} {:<14} {:<10} {:<8} DESCRIPTION",
+                            "ID", "KIND", "ENFORCE", "STATUS"
                         );
                         println!("{}", "-".repeat(65));
                         for c in &contracts {
@@ -1329,7 +1329,7 @@ async fn handle_crew(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, json
                 } else if crews.is_empty() {
                     println!("No crews in this workshop.");
                 } else {
-                    println!("{:<12} {:<10} {:<24} {}", "ID", "STATUS", "NAME", "PURPOSE");
+                    println!("{:<12} {:<10} {:<24} PURPOSE", "ID", "STATUS", "NAME");
                     let sep = "-".repeat(72);
                     println!("{sep}");
                     for c in &crews {
@@ -1533,10 +1533,7 @@ async fn handle_hand(
                 } else if active.is_empty() {
                     println!("No active hand assignments.");
                 } else {
-                    println!(
-                        "{:<12} {:<36} {:<10} {}",
-                        "SPARK", "SESSION", "ROLE", "ASSIGNED"
-                    );
+                    println!("{:<12} {:<36} {:<10} ASSIGNED", "SPARK", "SESSION", "ROLE");
                     let sep = "-".repeat(80);
                     println!("{sep}");
                     for a in &active {

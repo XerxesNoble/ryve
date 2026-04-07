@@ -579,8 +579,9 @@ pub async fn load_file(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     #[test]
     fn language_label_known_extensions() {

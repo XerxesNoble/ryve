@@ -17,11 +17,11 @@
 use std::collections::{HashMap, HashSet};
 
 use data::sparks::types::Spark;
-use iced::widget::{button, column, container, row, scrollable, text, Space};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Element, Length, Theme};
 
 use crate::coding_agents::{CodingAgent, CompatStatus};
-use crate::style::{self, Palette, FONT_BODY, FONT_HEADER, FONT_ICON_SM, FONT_LABEL, FONT_SMALL};
+use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette};
 
 // ── Messages ────────────────────────────────────────────
 
@@ -55,11 +55,10 @@ pub fn view<'a>(
     let header =
         row![title, Space::new().width(Length::Fill), close_btn].align_y(iced::Alignment::Center);
 
-    let subtitle = text(
-        "Pick a coding agent and a spark. Both are required before the Hand can launch.",
-    )
-    .size(FONT_SMALL)
-    .color(pal.text_secondary);
+    let subtitle =
+        text("Pick a coding agent and a spark. Both are required before the Hand can launch.")
+            .size(FONT_SMALL)
+            .color(pal.text_secondary);
 
     // Coding-agent chip row.
     let agents_label = text("Coding agent")

@@ -86,7 +86,7 @@ impl RyveDir {
 // ── Workshop Config ────────────────────────────────────
 
 /// Per-workshop configuration stored in `.ryve/config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkshopConfig {
     /// Workshop schema version. Compared against
     /// [`crate::migrations::CURRENT_SCHEMA_VERSION`] on workshop open;
@@ -127,22 +127,6 @@ pub struct WorkshopConfig {
     /// Agent context injection settings.
     #[serde(default)]
     pub agents: AgentsConfig,
-}
-
-impl Default for WorkshopConfig {
-    fn default() -> Self {
-        Self {
-            workshop_schema_version: 0,
-            name: None,
-            github: GitHubConfig::default(),
-            layout: LayoutConfig::default(),
-            default_assignee: None,
-            default_owner: None,
-            explorer: ExplorerConfig::default(),
-            background: BackgroundConfig::default(),
-            agents: AgentsConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -322,12 +306,11 @@ pub async fn load_agent_defs(ryve_dir: &RyveDir) -> Vec<AgentDef> {
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "toml") {
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                if let Ok(def) = toml::from_str::<AgentDef>(&content) {
-                    defs.push(def);
-                }
-            }
+        if path.extension().is_some_and(|ext| ext == "toml")
+            && let Ok(content) = tokio::fs::read_to_string(&path).await
+            && let Ok(def) = toml::from_str::<AgentDef>(&content)
+        {
+            defs.push(def);
         }
     }
 

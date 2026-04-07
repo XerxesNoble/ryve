@@ -45,10 +45,10 @@ pub async fn list(
     let mut constraints = Vec::new();
 
     for eng in all {
-        if let Some(name) = eng.key.strip_prefix(PREFIX) {
-            if let Ok(c) = serde_json::from_str::<ArchConstraint>(&eng.value) {
-                constraints.push((name.to_string(), c));
-            }
+        if let Some(name) = eng.key.strip_prefix(PREFIX)
+            && let Ok(c) = serde_json::from_str::<ArchConstraint>(&eng.value)
+        {
+            constraints.push((name.to_string(), c));
         }
     }
 

@@ -236,12 +236,9 @@ fn view_create_form<'a>(
     let mut prio_chips = row![].spacing(4).align_y(iced::Alignment::Center);
     for p in 0..=4i32 {
         let selected = form.priority == p;
-        prio_chips = prio_chips.push(form_chip(
-            &format!("P{p}"),
-            selected,
-            &pal,
-            move || Message::CreateFormPriorityChanged(p),
-        ));
+        prio_chips = prio_chips.push(form_chip(&format!("P{p}"), selected, &pal, move || {
+            Message::CreateFormPriorityChanged(p)
+        }));
     }
 
     // ── parent epic chips ──
@@ -335,18 +332,10 @@ fn view_create_form<'a>(
 }
 
 fn section_label<'a>(label: &'a str, pal: &Palette) -> Element<'a, Message> {
-    text(label)
-        .size(FONT_LABEL)
-        .color(pal.text_tertiary)
-        .into()
+    text(label).size(FONT_LABEL).color(pal.text_tertiary).into()
 }
 
-fn form_chip<'a, F>(
-    label: &str,
-    selected: bool,
-    pal: &Palette,
-    on_press: F,
-) -> Element<'a, Message>
+fn form_chip<'a, F>(label: &str, selected: bool, pal: &Palette, on_press: F) -> Element<'a, Message>
 where
     F: 'a + Fn() -> Message,
 {
@@ -425,11 +414,7 @@ fn view_spark_row<'a>(
     .align_y(iced::Alignment::Center);
 
     if is_blocked {
-        row_inner = row_inner.push(
-            text("\u{1F512}")
-                .size(FONT_LABEL)
-                .color(pal.text_tertiary),
-        );
+        row_inner = row_inner.push(text("\u{1F512}").size(FONT_LABEL).color(pal.text_tertiary));
     }
 
     let main_row = row![
@@ -464,13 +449,9 @@ fn view_status_menu<'a>(
     let pal = *pal;
 
     let menu_body: Element<Message> = if close_stage {
-        let mut chips = row![
-            text("Close as:")
-                .size(FONT_SMALL)
-                .color(pal.text_tertiary),
-        ]
-        .spacing(6)
-        .align_y(iced::Alignment::Center);
+        let mut chips = row![text("Close as:").size(FONT_SMALL).color(pal.text_tertiary),]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
         for (key, label) in CLOSE_REASONS {
             let sid = spark_id.to_string();
             let key_owned = (*key).to_string();
@@ -524,12 +505,7 @@ fn view_status_menu<'a>(
         .into()
 }
 
-fn menu_chip<'a, F>(
-    label: &str,
-    selected: bool,
-    pal: &Palette,
-    on_press: F,
-) -> Element<'a, Message>
+fn menu_chip<'a, F>(label: &str, selected: bool, pal: &Palette, on_press: F) -> Element<'a, Message>
 where
     F: 'a + Fn() -> Message,
 {

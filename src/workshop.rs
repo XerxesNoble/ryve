@@ -20,6 +20,7 @@ use crate::screen::background_picker::PickerState;
 use crate::screen::bench::{BenchState, TabKind};
 use crate::screen::file_explorer::FileExplorerState;
 use crate::screen::file_viewer::FileViewerState;
+use crate::screen::log_tail::LogTailState;
 
 const BOTTOM_PIN_NEWLINES: usize = 200;
 
@@ -46,6 +47,9 @@ pub struct Workshop {
     pub agent_sessions: Vec<AgentSession>,
     /// Open file viewer states, keyed by tab ID.
     pub file_viewers: HashMap<u64, FileViewerState>,
+    /// Open spy views (read-only log tails for background Hands), keyed by
+    /// tab ID. Spark ryve-8c14734a.
+    pub log_tails: HashMap<u64, LogTailState>,
     /// File explorer state for this workshop.
     pub file_explorer: FileExplorerState,
     /// Workgraph database for this workshop.
@@ -113,6 +117,7 @@ impl Workshop {
             terminals: HashMap::new(),
             agent_sessions: Vec::new(),
             file_viewers: HashMap::new(),
+            log_tails: HashMap::new(),
             file_explorer: FileExplorerState::new(),
             sparks_db: None,
             sparks: Vec::new(),
@@ -158,16 +163,19 @@ impl Workshop {
             .filter_map(|(idx, tab)| {
                 let (kind, payload) = match &tab.kind {
                     TabKind::Terminal => ("terminal", None),
-                    TabKind::FileViewer(path) => (
-                        "file_viewer",
-                        Some(path.to_string_lossy().into_owned()),
-                    ),
+                    TabKind::FileViewer(path) => {
+                        ("file_viewer", Some(path.to_string_lossy().into_owned()))
+                    }
                     // Skip coding-agent tabs — see doc comment above.
                     TabKind::CodingAgent(_) => return None,
                     // Home is a singleton dashboard rebuilt from in-memory
                     // data on demand; persisting it would just create a
                     // duplicate when the user reopens it manually.
                     TabKind::Home => return None,
+                    // Spy views are derived from agent_sessions on each
+                    // app launch (we re-open them when the user clicks a
+                    // background hand). No reason to persist the tab.
+                    TabKind::LogTail { .. } => return None,
                 };
                 Some(data::sparks::open_tab_repo::PersistedTab {
                     workshop_id: workshop_id.clone(),
@@ -264,6 +272,53 @@ impl Workshop {
         self.bench
             .create_tab(tab_id, title, TabKind::FileViewer(path.clone()));
         self.file_viewers.insert(tab_id, FileViewerState::new(path));
+
+        (tab_id, true)
+    }
+
+    /// Open a read-only spy view tailing a Hand's log file. Returns the
+    /// tab id and whether the tab was newly created (`true`) or an existing
+    /// spy tab for the same session was reused (`false`). The caller is
+    /// responsible for kicking off the initial `log_tail::load_tail` task.
+    /// Spark ryve-8c14734a.
+    pub fn open_log_tab(
+        &mut self,
+        session_id: &str,
+        log_path: PathBuf,
+        next_terminal_id: &mut u64,
+    ) -> (u64, bool) {
+        // If a spy view for this session is already open, focus it.
+        for tab in &self.bench.tabs {
+            if let TabKind::LogTail {
+                session_id: sid, ..
+            } = &tab.kind
+                && sid == session_id
+            {
+                self.bench.active_tab = Some(tab.id);
+                return (tab.id, false);
+            }
+        }
+
+        let tab_id = *next_terminal_id;
+        *next_terminal_id += 1;
+
+        let title = format!(
+            "spy: {}",
+            log_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("hand")
+        );
+
+        self.bench.create_tab(
+            tab_id,
+            title,
+            TabKind::LogTail {
+                session_id: session_id.to_string(),
+                log_path: log_path.clone(),
+            },
+        );
+        self.log_tails.insert(tab_id, LogTailState::new(log_path));
 
         (tab_id, true)
     }
@@ -481,8 +536,9 @@ impl Workshop {
 
 /// Walk the process tree rooted at `shell_pid` looking for a known coding agent.
 fn detect_agent_in_process_tree(shell_pid: u32) -> Option<CodingAgent> {
-    use crate::coding_agents::ResumeStrategy;
     use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    use crate::coding_agents::ResumeStrategy;
 
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
@@ -619,10 +675,10 @@ pub(crate) fn create_hand_worktree(
     let workshop_md = ryve_dir.workshop_md_path();
     if workshop_md.exists() {
         let agents_md = wt_dir.join("AGENTS.md");
-        if !agents_md.exists() {
-            if let Err(e) = std::fs::copy(&workshop_md, &agents_md) {
-                log::warn!("Failed to write AGENTS.md to worktree: {e}");
-            }
+        if !agents_md.exists()
+            && let Err(e) = std::fs::copy(&workshop_md, &agents_md)
+        {
+            log::warn!("Failed to write AGENTS.md to worktree: {e}");
         }
     }
 
@@ -645,17 +701,17 @@ pub(crate) fn hand_env_vars(workshop_dir: &Path) -> Vec<(String, String)> {
         workshop_dir.to_string_lossy().into_owned(),
     ));
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let exe_dir_str = exe_dir.to_string_lossy().into_owned();
-            let existing_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = if existing_path.is_empty() {
-                exe_dir_str
-            } else {
-                format!("{exe_dir_str}:{existing_path}")
-            };
-            vars.push(("PATH".to_string(), new_path));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        let exe_dir_str = exe_dir.to_string_lossy().into_owned();
+        let existing_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = if existing_path.is_empty() {
+            exe_dir_str
+        } else {
+            format!("{exe_dir_str}:{existing_path}")
+        };
+        vars.push(("PATH".to_string(), new_path));
     }
 
     vars
@@ -776,6 +832,7 @@ mod tests {
             stale: false,
             resume_id: None,
             started_at: chrono::Utc::now().to_rfc3339(),
+            log_path: None,
         });
 
         let ended = ws.end_agent_sessions_for_tab(7);

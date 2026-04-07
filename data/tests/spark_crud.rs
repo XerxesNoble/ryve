@@ -1,5 +1,5 @@
+use data::sparks::spark_repo;
 use data::sparks::types::*;
-use data::sparks::{spark_repo, stamp_repo};
 
 #[sqlx::test(fixtures("seed_sparks"))]
 async fn test_create_spark(pool: sqlx::SqlitePool) {
@@ -17,12 +17,14 @@ async fn test_create_spark(pool: sqlx::SqlitePool) {
             due_at: None,
             estimated_minutes: Some(60),
             metadata: None,
+            risk_level: None,
+            scope_boundary: None,
         },
     )
     .await
     .unwrap();
 
-    assert!(spark.id.starts_with("sp-"));
+    assert!(spark.id.starts_with("ws-test-"));
     assert_eq!(spark.title, "New feature");
     assert_eq!(spark.status, "open");
     assert_eq!(spark.priority, 1);
