@@ -332,7 +332,7 @@ fn collect_nodes<'a>(
         items.push(item.into());
     } else {
         let btn = button(label)
-            .style(button::text)
+            .style(style::row_button(*pal))
             .width(Length::Fill)
             .padding([2, 4])
             .on_press(msg);

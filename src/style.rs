@@ -5,8 +5,8 @@
 //!
 //! Provides a unified style vocabulary for the Ryve UI across dark and light modes.
 
-use iced::widget::container;
-use iced::{Background, Border, Color, Shadow, Vector};
+use iced::widget::{button, container};
+use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
 /// System appearance mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +482,31 @@ pub fn hovered_item(pal: &Palette) -> container::Style {
     }
 }
 
+/// Button style for list rows (file explorer, etc.): transparent when idle,
+/// painted with [`hovered_item`] on hover. Text color defaults to the palette
+/// primary so inherited glyphs (e.g. the spark-link icon) stay legible in both
+/// light and dark modes; inner `text` widgets that set an explicit color are
+/// unaffected.
+pub fn row_button(pal: Palette) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let base = button::Style {
+            text_color: pal.text_primary,
+            ..button::Style::default()
+        };
+        match status {
+            button::Status::Hovered => {
+                let hov = hovered_item(&pal);
+                button::Style {
+                    background: hov.background,
+                    border: hov.border,
+                    ..base
+                }
+            }
+            _ => base,
+        }
+    }
+}
+
 /// Danger/destructive action container.
 #[allow(dead_code)]
 pub fn danger_surface(pal: &Palette) -> container::Style {
@@ -534,3 +559,31 @@ pub const TRAFFIC_LIGHT_WIDTH: f32 = 72.0;
 
 #[cfg(not(target_os = "macos"))]
 pub const TRAFFIC_LIGHT_WIDTH: f32 = 0.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `row_button` must be transparent when idle and show the `hovered_item`
+    /// background when hovered — this is the wiring that gives file explorer
+    /// rows their hover feedback (sp-ux0024).
+    #[test]
+    fn row_button_highlights_on_hover() {
+        let pal = Palette::dark();
+        let style_fn = row_button(pal);
+        let theme = Theme::Dark;
+
+        let active = style_fn(&theme, button::Status::Active);
+        assert!(
+            active.background.is_none(),
+            "row button should have no background when idle"
+        );
+
+        let hovered = style_fn(&theme, button::Status::Hovered);
+        let expected = hovered_item(&pal).background;
+        assert_eq!(
+            hovered.background, expected,
+            "hovered row must reuse hovered_item's background"
+        );
+    }
+}
