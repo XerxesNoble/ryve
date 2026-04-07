@@ -366,7 +366,7 @@ pub async fn init_ryve_dir(ryve_dir: &RyveDir) -> Result<(), std::io::Error> {
 const DEFAULT_DONE_MD: &str = r#"# DONE Checklist
 
 A spark is only "done" when ALL of the following are true. Verify each item
-before closing the spark with `ryve-cli spark close <id>`.
+before closing the spark with `ryve spark close <id>`.
 
 ## Code
 - [ ] All acceptance criteria from the spark intent are satisfied
@@ -382,9 +382,9 @@ before closing the spark with `ryve-cli spark close <id>`.
 ## Workgraph hygiene
 - [ ] Commit messages reference the spark id: `[sp-xxxx]`
 - [ ] Any new bugs/tasks discovered were created as new sparks
-- [ ] All required contracts on the spark pass (`ryve-cli contract list <id>`)
-- [ ] Architectural constraints respected (`ryve-cli constraint list`)
+- [ ] All required contracts on the spark pass (`ryve contract list <id>`)
+- [ ] Architectural constraints respected (`ryve constraint list`)
 
 ## Done
-- [ ] Spark closed: `ryve-cli spark close <id> completed`
+- [ ] Spark closed: `ryve spark close <id> completed`
 "#;

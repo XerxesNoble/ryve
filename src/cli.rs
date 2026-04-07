@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
-//! `ryve-cli` — command-line interface for workgraph operations.
+//! Command-line interface for workgraph operations.
 //!
-//! Designed for use by Hands (coding agents) and humans from the terminal.
-//! Operates on the `.ryve/sparks.db` in the current directory.
+//! Invoked via `ryve <command>` (dispatched from `main.rs` when the first
+//! argument is a known CLI subcommand). Designed for use by Hands (coding
+//! agents) and humans from the terminal. Operates on the `.ryve/sparks.db`
+//! found by walking up from cwd or honoring `$RYVE_WORKSHOP_ROOT`.
 //!
 //! Supports `--json` flag on most commands for machine-parseable output.
 
@@ -18,10 +20,16 @@ use data::sparks::{
     ember_repo, event_repo, spark_repo, stamp_repo,
 };
 
-#[tokio::main]
-async fn main() {
-    let args: Vec<String> = std::env::args().collect();
+/// Known CLI subcommands. If the first non-flag argument matches one of
+/// these, `main.rs` dispatches to `cli::run` instead of launching the UI.
+pub const CLI_COMMANDS: &[&str] = &[
+    "spark", "sparks", "bond", "bonds", "comment", "comments", "stamp", "stamps",
+    "contract", "contracts", "constraint", "constraints", "ember", "embers",
+    "event", "events", "assign", "assignment", "commit", "commits",
+    "hot", "status", "init", "help", "--help", "-h",
+];
 
+pub async fn run(args: Vec<String>) {
     if args.len() < 2 {
         print_usage();
         process::exit(1);
@@ -41,24 +49,38 @@ async fn main() {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let ryve_dir = RyveDir::new(&cwd);
 
-    // Special: `init` doesn't need an existing DB
+    // Special: `init` doesn't need an existing DB — initialises in cwd
     if args_clean.get(1).map(|s| s.as_str()) == Some("init") {
+        let ryve_dir = RyveDir::new(&cwd);
         handle_init(&ryve_dir, &cwd).await;
         return;
     }
 
+    // Find the workshop root by walking up the directory tree, or honor
+    // $RYVE_WORKSHOP_ROOT if set. This lets Hands run `ryve` from inside
+    // a worktree without needing to cd to the workshop root first.
+    let workshop_root = match std::env::var("RYVE_WORKSHOP_ROOT").ok() {
+        Some(root) => PathBuf::from(root),
+        None => find_workshop_root(&cwd).unwrap_or_else(|| {
+            die("no .ryve/sparks.db found in current directory or any parent. Run `ryve init` or use a Ryve workshop.");
+        }),
+    };
+
+    let ryve_dir = RyveDir::new(&workshop_root);
     if !ryve_dir.sparks_db_path().exists() {
-        die("no .ryve/sparks.db found in current directory. Run `ryve-cli init` or use a Ryve workshop.");
+        die(&format!(
+            "no .ryve/sparks.db at {}",
+            workshop_root.display()
+        ));
     }
 
-    let pool = match data::db::open_sparks_db(&cwd).await {
+    let pool = match data::db::open_sparks_db(&workshop_root).await {
         Ok(p) => p,
         Err(e) => die(&format!("failed to open database: {e}")),
     };
 
-    let ws_id = cwd
+    let ws_id = workshop_root
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
@@ -90,9 +112,30 @@ fn die(msg: &str) -> ! {
     process::exit(1);
 }
 
+/// Walk up the directory tree from `start` looking for a directory
+/// that contains a `.ryve/sparks.db`. Returns the workshop root path.
+///
+/// Special handling: if we're inside a `.ryve/worktrees/<id>/` subtree,
+/// the workshop root is the parent of the `.ryve/` directory, not the
+/// worktree itself (which has no `.ryve/sparks.db` of its own).
+fn find_workshop_root(start: &std::path::Path) -> Option<PathBuf> {
+    let mut current = start.canonicalize().ok()?;
+    loop {
+        let candidate = current.join(".ryve").join("sparks.db");
+        if candidate.exists() {
+            return Some(current);
+        }
+        // If `current` itself is inside a `.ryve/` dir (e.g. a worktree),
+        // jumping to `current.parent()` may still be inside `.ryve/`; keep
+        // walking until we find a real workshop root.
+        current = current.parent()?.to_path_buf();
+    }
+}
+
 fn print_usage() {
-    eprintln!("ryve-cli — workgraph operations for Ryve workshops\n");
-    eprintln!("USAGE: ryve-cli [--json] <command> <subcommand> [args...]\n");
+    eprintln!("ryve — workgraph operations for Ryve workshops\n");
+    eprintln!("USAGE: ryve [--json] <command> <subcommand> [args...]\n");
+    eprintln!("       (with no arguments, launches the Ryve UI)\n");
     eprintln!("COMMANDS:");
     eprintln!("  init                                Initialize .ryve/ in current directory");
     eprintln!("  status                              Show workshop summary");

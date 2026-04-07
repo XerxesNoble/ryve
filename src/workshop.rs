@@ -95,7 +95,7 @@ impl Workshop {
 
     /// Stable workshop identifier for database queries.
     ///
-    /// Derived from the directory name so it matches the CLI (`ryve-cli`)
+    /// Derived from the directory name so it matches the CLI (`ryve`)
     /// and persists across app restarts. The `id` field (UUID) is only
     /// used for internal UI message routing.
     pub fn workshop_id(&self) -> String {
@@ -196,6 +196,14 @@ impl Workshop {
         settings.theme.color_pallete.background = app_background_color();
         settings.backend.working_directory = Some(working_dir);
 
+        // Inject Ryve env vars for Hand sessions so `ryve` CLI works
+        // from inside worktrees without any cwd gymnastics.
+        if agent.is_some() {
+            for (k, v) in hand_env_vars(&self.directory) {
+                settings.backend.env.insert(k, v);
+            }
+        }
+
         if let Some(agent) = agent {
             let mut args = agent.args.clone();
 
@@ -269,6 +277,11 @@ impl Workshop {
         settings.backend.working_directory = Some(working_dir);
         (settings.backend.program, settings.backend.args) =
             wrap_command_with_bottom_pin(&def.command, &def.args);
+
+        // Inject Ryve env vars first, then custom agent env overrides
+        for (k, v) in hand_env_vars(&self.directory) {
+            settings.backend.env.insert(k, v);
+        }
         for (k, v) in &def.env {
             settings.backend.env.insert(k.clone(), v.clone());
         }
@@ -469,6 +482,38 @@ fn create_hand_worktree(
     }
 
     Ok(wt_dir)
+}
+
+/// Env vars to inject into every Hand's terminal so the `ryve` CLI works
+/// from inside the worktree without requiring the user to cd or know
+/// absolute paths.
+///
+/// - `RYVE_WORKSHOP_ROOT` — absolute path to the workshop directory.
+///   The `ryve` binary reads this to locate `.ryve/sparks.db`.
+/// - `PATH` — prepended with the directory containing the currently
+///   running Ryve executable so `ryve <cmd>` resolves.
+fn hand_env_vars(workshop_dir: &Path) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+
+    vars.push((
+        "RYVE_WORKSHOP_ROOT".to_string(),
+        workshop_dir.to_string_lossy().into_owned(),
+    ));
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let exe_dir_str = exe_dir.to_string_lossy().into_owned();
+            let existing_path = std::env::var("PATH").unwrap_or_default();
+            let new_path = if existing_path.is_empty() {
+                exe_dir_str
+            } else {
+                format!("{exe_dir_str}:{existing_path}")
+            };
+            vars.push(("PATH".to_string(), new_path));
+        }
+    }
+
+    vars
 }
 
 fn app_background_color() -> String {

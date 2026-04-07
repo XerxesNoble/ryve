@@ -4,7 +4,7 @@
 //! Agent context synchronisation.
 //!
 //! Generates `.ryve/WORKSHOP.md` — a static operations guide that tells Hands
-//! how to use `ryve-cli` to query the workgraph (the DB is the single source of
+//! how to use `ryve` to query the workgraph (the DB is the single source of
 //! truth for spark state). Also injects a pointer into each agent's boot file
 //! so they discover and read it automatically, and propagates both into every
 //! active worktree.
@@ -96,7 +96,7 @@ fn generate_workshop_md() -> String {
     // ── Getting started ──────────────────────────────────────────
     md.push_str("## Getting Started\n\n");
     md.push_str(
-        "Before doing any work, check the current workgraph state with `ryve-cli spark list` \
+        "Before doing any work, check the current workgraph state with `ryve spark list` \
          to see active sparks, their priorities, and which are already claimed.\n\n",
     );
 
@@ -104,26 +104,26 @@ fn generate_workshop_md() -> String {
     md.push_str("## Rules\n\n");
     md.push_str("1. **Always reference spark IDs** in commit messages: `fix(auth): validate token expiry [sp-a1b2]`\n");
     md.push_str("2. **Work in priority order** — P0 is critical, P4 is negligible.\n");
-    md.push_str("3. **Respect architectural constraints** — run `ryve-cli constraint list` to check. Violations are blocking.\n");
-    md.push_str("4. **Check required contracts** before considering a spark done: `ryve-cli contract list <spark-id>`.\n");
+    md.push_str("3. **Respect architectural constraints** — run `ryve constraint list` to check. Violations are blocking.\n");
+    md.push_str("4. **Check required contracts** before considering a spark done: `ryve contract list <spark-id>`.\n");
     md.push_str("5. **Do not work on a spark that is already claimed** by another Hand.\n");
     md.push_str("6. If you discover a new bug or task, create a spark for it (see commands below).\n\n");
 
     // ── Workgraph commands ───────────────────────────────────────
     md.push_str("## Workgraph Commands\n\n");
-    md.push_str("Use `ryve-cli` to query and update the workgraph. **Always run from the workshop root.**\n\n");
+    md.push_str("Use `ryve` to query and update the workgraph. **Always run from the workshop root.**\n\n");
 
     md.push_str("### Query state\n\n");
-    md.push_str("```sh\nryve-cli spark list              # active sparks\n");
-    md.push_str("ryve-cli spark list --all         # include closed\n");
-    md.push_str("ryve-cli spark show <spark-id>    # spark details\n");
-    md.push_str("ryve-cli constraint list           # architectural constraints\n");
-    md.push_str("ryve-cli contract list <spark-id>  # verification contracts\n```\n\n");
+    md.push_str("```sh\nryve spark list              # active sparks\n");
+    md.push_str("ryve spark list --all         # include closed\n");
+    md.push_str("ryve spark show <spark-id>    # spark details\n");
+    md.push_str("ryve constraint list           # architectural constraints\n");
+    md.push_str("ryve contract list <spark-id>  # verification contracts\n```\n\n");
 
     md.push_str("### Mutate state\n\n");
-    md.push_str("```sh\nryve-cli spark create <title>                    # create a new spark\n");
-    md.push_str("ryve-cli spark status <spark-id> in_progress      # claim / update status\n");
-    md.push_str("ryve-cli spark close <spark-id> <reason>           # close a spark\n```\n\n");
+    md.push_str("```sh\nryve spark create <title>                    # create a new spark\n");
+    md.push_str("ryve spark status <spark-id> in_progress      # claim / update status\n");
+    md.push_str("ryve spark close <spark-id> <reason>           # close a spark\n```\n\n");
 
     md.push_str("Ryve auto-refreshes every 3 seconds. Changes are picked up by the UI and other Hands automatically.\n\n");
 
@@ -158,7 +158,7 @@ fn pointer_line() -> String {
          ANY work — it contains the rules, CLI commands, and coordination protocol you must follow.\n\
          \n\
          **Work in your current directory.** Do not navigate to parent directories or other \
-         worktrees. Run `ryve-cli spark list` to see active tasks and find work to claim.\n\
+         worktrees. Run `ryve spark list` to see active tasks and find work to claim.\n\
          {}",
         MARKER_START, MARKER_END,
     )
@@ -232,9 +232,9 @@ pub fn target_paths(workshop_dir: &Path, config: &WorkshopConfig) -> Vec<PathBuf
 /// This is the fallback for agents that don't support `--system-prompt` flags.
 pub fn generate_hand_prompt(_workshop_dir: &Path) -> String {
     "You are a Hand in a Ryve Workshop. Before doing ANY work, read `.ryve/WORKSHOP.md` — \
-     it explains how to use `ryve-cli` to query the workgraph for active tasks, constraints, \
+     it explains how to use `ryve` to query the workgraph for active tasks, constraints, \
      and contracts. Work ONLY in your current directory (do not navigate to parent directories \
-     or other worktrees). Run `ryve-cli spark list` to see what needs doing. \
+     or other worktrees). Run `ryve spark list` to see what needs doing. \
      Reference spark IDs in all commits (e.g. `[sp-xxxx]`).\n"
         .to_string()
 }

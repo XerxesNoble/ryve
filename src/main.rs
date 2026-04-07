@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
+mod cli;
 mod coding_agents;
 mod icons;
 mod screen;
@@ -24,6 +25,26 @@ use style::Appearance;
 use workshop::Workshop;
 
 fn main() -> iced::Result {
+    // Dispatch: if the first non-flag arg is a known CLI subcommand,
+    // run in CLI mode (tokio runtime). Otherwise launch the UI app.
+    let args: Vec<String> = std::env::args().collect();
+    let first_non_flag = args
+        .iter()
+        .skip(1)
+        .find(|a| a.as_str() != "--json")
+        .map(|s| s.as_str());
+
+    if let Some(cmd) = first_non_flag {
+        if cli::CLI_COMMANDS.contains(&cmd) {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            rt.block_on(cli::run(args));
+            return Ok(());
+        }
+    }
+
     // Load global config for font preferences
     let config = data::config::Config::load();
     let default_font = match config.font_family {
@@ -138,6 +159,8 @@ enum Message {
     ShiftStateChanged(bool),
     /// Send initial spark prompt to a Hand's terminal after agent boots.
     SendSparkPrompt { tab_id: u64, prompt: String },
+    /// Submit the previously-pasted prompt by sending Enter.
+    SubmitSparkPrompt { tab_id: u64 },
 }
 
 impl std::fmt::Debug for Message {
@@ -175,6 +198,7 @@ impl std::fmt::Debug for Message {
             Self::HandAssignmentSaved => write!(f, "HandAssignmentSaved"),
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
             Self::SendSparkPrompt { tab_id, .. } => write!(f, "SendSparkPrompt({tab_id})"),
+            Self::SubmitSparkPrompt { tab_id } => write!(f, "SubmitSparkPrompt({tab_id})"),
         }
     }
 }
@@ -696,17 +720,34 @@ impl App {
             Message::HandAssignmentSaved => Task::none(),
             Message::SendSparkPrompt { tab_id, prompt } => {
                 // Find the terminal across all workshops and send the prompt as input.
-                // Wrap in bracketed paste so TUI agents see it as a single paste,
-                // then send Enter to submit.
+                // Wrap in bracketed paste so TUI agents see it as a single paste.
+                // Enter is sent separately after a delay (some agents need time
+                // to finish processing the paste before accepting the submit key).
                 for ws in &mut self.workshops {
                     if let Some(term) = ws.terminals.get_mut(&tab_id) {
                         let mut bytes = Vec::with_capacity(prompt.len() + 16);
                         bytes.extend_from_slice(b"\x1b[200~");
                         bytes.extend_from_slice(prompt.as_bytes());
                         bytes.extend_from_slice(b"\x1b[201~");
-                        bytes.push(b'\r');
                         term.handle(iced_term::Command::ProxyToBackend(
                             iced_term::BackendCommand::Write(bytes),
+                        ));
+                        break;
+                    }
+                }
+                // Schedule the Enter key to submit the paste
+                Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    },
+                    move |_| Message::SubmitSparkPrompt { tab_id },
+                )
+            }
+            Message::SubmitSparkPrompt { tab_id } => {
+                for ws in &mut self.workshops {
+                    if let Some(term) = ws.terminals.get_mut(&tab_id) {
+                        term.handle(iced_term::Command::ProxyToBackend(
+                            iced_term::BackendCommand::Write(vec![b'\r']),
                         ));
                         break;
                     }
@@ -1929,22 +1970,22 @@ fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
         "You are a Hand in a Ryve workshop. Read these rules carefully — they govern \
          everything you do in this session.\n\n\
          HOUSE RULES:\n\
-         1. Use `ryve-cli` for ALL workgraph operations: spark list/show/status/close, \
+         1. Use `ryve` for ALL workgraph operations: spark list/show/status/close, \
          bond, contract, comment, stamp. NEVER touch `.ryve/sparks.db` directly with \
          sqlite3 or any other tool — it bypasses event logging and validation.\n\
          2. Reference the spark id in every commit message: `[sp-xxxx]`.\n\
-         3. Respect architectural constraints: `ryve-cli constraint list`. \
+         3. Respect architectural constraints: `ryve constraint list`. \
          Violations are blocking.\n\
          4. Before declaring the spark complete, verify your work against \
          `.ryve/checklists/DONE.md`. Every item must be satisfied.\n\
          5. When the work is complete and the DONE checklist passes, close the spark: \
-         `ryve-cli spark close <id> completed`. Then exit.\n\n",
+         `ryve spark close <id> completed`. Then exit.\n\n",
     );
 
     // ── Spark assignment ───────────────────────────────
     prompt.push_str(&format!(
         "ASSIGNMENT: spark {spark_id}. You have been assigned this spark. \
-         Mark it in progress now: `ryve-cli spark status {spark_id} in_progress`\n\n"
+         Mark it in progress now: `ryve spark status {spark_id} in_progress`\n\n"
     ));
 
     if let Some(spark) = sparks.iter().find(|s| s.id == spark_id) {
@@ -1976,7 +2017,7 @@ fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
         }
     } else {
         prompt.push_str(&format!(
-            "(Spark {spark_id} details not in cache — run `ryve-cli spark show {spark_id}` to load them.)\n"
+            "(Spark {spark_id} details not in cache — run `ryve spark show {spark_id}` to load them.)\n"
         ));
     }
 

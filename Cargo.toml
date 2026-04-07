@@ -28,10 +28,6 @@ default-run = "ryve"
 name = "ryve"
 path = "src/main.rs"
 
-[[bin]]
-name = "ryve-cli"
-path = "src/cli.rs"
-
 [dependencies]
 data = { path = "data" }
 ipc = { path = "ipc" }
