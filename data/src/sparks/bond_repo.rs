@@ -3,6 +3,8 @@
 
 //! CRUD operations for Bonds (dependencies between sparks).
 
+use std::collections::HashSet;
+
 use sqlx::SqlitePool;
 
 use super::error::SparksError;
@@ -82,4 +84,27 @@ pub async fn list_blockers(pool: &SqlitePool, spark_id: &str) -> Result<Vec<Bond
     .bind(spark_id)
     .fetch_all(pool)
     .await?)
+}
+
+/// Return the set of spark IDs in the workshop that have at least one
+/// open (non-closed) blocking bond pointing at them. Used by the UI to
+/// surface a "blocked" indicator on the sparks panel and to remind agents
+/// not to claim blocked sparks.
+pub async fn list_blocked_spark_ids(
+    pool: &SqlitePool,
+    workshop_id: &str,
+) -> Result<HashSet<String>, SparksError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT b.to_id
+         FROM bonds b
+         JOIN sparks blocker ON blocker.id = b.from_id
+         JOIN sparks blocked ON blocked.id = b.to_id
+         WHERE b.bond_type IN ('blocks', 'conditional_blocks')
+           AND blocker.status != 'closed'
+           AND blocked.workshop_id = ?",
+    )
+    .bind(workshop_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }

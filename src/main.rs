@@ -13,7 +13,9 @@ mod workshop;
 
 use std::path::PathBuf;
 
-use data::sparks::types::{Contract, PersistedAgentSession, Spark};
+use std::collections::HashSet;
+
+use data::sparks::types::{Bond, Contract, PersistedAgentSession, Spark};
 use iced::widget::{Space, button, column, container, row, stack, text};
 use iced::{Color, Element, Length, Point, Size, Subscription, Task, Theme};
 use iced::{event, keyboard, mouse, window};
@@ -151,6 +153,14 @@ enum Message {
     FailingContractsLoaded(Uuid, usize),
     /// Contracts for the currently selected spark loaded from DB.
     ContractsLoaded(Uuid, String, Vec<Contract>),
+    /// Bonds (dependency edges) for the currently selected spark loaded
+    /// from DB. Includes both incoming and outgoing edges so the detail
+    /// view can render Blocks / Blocked-by lists.
+    BondsLoaded(Uuid, String, Vec<Bond>),
+    /// Set of spark IDs in the workshop that have at least one open
+    /// blocking bond pointing at them. Computed on every sparks reload so
+    /// the panel can show a "blocked" indicator next to each row.
+    BlockedSparkIdsLoaded(Uuid, HashSet<String>),
     /// A contract check command finished — store the resolved status,
     /// then trigger a contracts reload for the spark.
     ContractCheckFinished {
@@ -257,6 +267,12 @@ impl std::fmt::Debug for Message {
             }
             Self::ContractsLoaded(id, sid, c) => {
                 write!(f, "ContractsLoaded({id}, {sid}, {} contracts)", c.len())
+            }
+            Self::BondsLoaded(id, sid, b) => {
+                write!(f, "BondsLoaded({id}, {sid}, {} bonds)", b.len())
+            }
+            Self::BlockedSparkIdsLoaded(id, ids) => {
+                write!(f, "BlockedSparkIdsLoaded({id}, {} ids)", ids.len())
             }
             Self::ContractCheckFinished { ws_id, spark_id } => {
                 write!(f, "ContractCheckFinished({ws_id}, {spark_id})")
@@ -584,33 +600,39 @@ impl App {
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     ws.sparks = sparks;
 
-                    // Refresh failing contract count alongside sparks so the
-                    // status bar warning indicator stays in sync.
-                    let contracts_task = if let Some(ref pool) = ws.sparks_db {
-                        let pool = pool.clone();
-                        let ws_id = ws.workshop_id();
-                        Task::perform(load_failing_contract_count(pool, ws_id), move |n| {
-                            Message::FailingContractsLoaded(id, n)
-                        })
-                    } else {
-                        Task::none()
-                    };
+                    // Refresh failing contract count + blocked-spark set
+                    // alongside sparks so the status bar warning indicator
+                    // and the per-row blocked indicator stay in sync.
+                    let mut tasks: Vec<Task<Message>> = Vec::new();
+                    if let Some(ref pool) = ws.sparks_db {
+                        let pool_c = pool.clone();
+                        let pool_b = pool.clone();
+                        let ws_id_c = ws.workshop_id();
+                        let ws_id_b = ws.workshop_id();
+                        tasks.push(Task::perform(
+                            load_failing_contract_count(pool_c, ws_id_c),
+                            move |n| Message::FailingContractsLoaded(id, n),
+                        ));
+                        tasks.push(Task::perform(
+                            load_blocked_spark_ids(pool_b, ws_id_b),
+                            move |ids| Message::BlockedSparkIdsLoaded(id, ids),
+                        ));
+                    }
 
                     // Sync .ryve/WORKSHOP.md and pointers (including into worktrees)
                     if !ws.config.agents.disable_sync {
                         let dir = ws.directory.clone();
                         let ryve_dir = ws.ryve_dir.clone();
                         let config = ws.config.clone();
-                        let sync_task = Task::perform(
+                        tasks.push(Task::perform(
                             async move {
                                 let _ = data::agent_context::sync(&dir, &ryve_dir, &config).await;
                             },
                             |_| Message::AgentContextSynced,
-                        );
-                        return Task::batch([contracts_task, sync_task]);
+                        ));
                     }
 
-                    return contracts_task;
+                    return Task::batch(tasks);
                 }
                 Task::none()
             }
@@ -627,6 +649,20 @@ impl App {
                     if ws.selected_spark.as_deref() == Some(spark_id.as_str()) {
                         ws.selected_spark_contracts = contracts;
                     }
+                }
+                Task::none()
+            }
+            Message::BondsLoaded(id, spark_id, bonds) => {
+                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
+                    if ws.selected_spark.as_deref() == Some(spark_id.as_str()) {
+                        ws.selected_spark_bonds = bonds;
+                    }
+                }
+                Task::none()
+            }
+            Message::BlockedSparkIdsLoaded(id, ids) => {
+                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
+                    ws.blocked_spark_ids = ids;
                 }
                 Task::none()
             }
@@ -1157,6 +1193,7 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.selected_spark = None;
                             ws.selected_spark_contracts.clear();
+                            ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
                         }
                     }
@@ -1410,15 +1447,25 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.selected_spark = Some(spark_id.clone());
                             ws.selected_spark_contracts.clear();
+                            ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
                             if let Some(ref pool) = ws.sparks_db {
-                                let pool = pool.clone();
+                                let pool_c = pool.clone();
+                                let pool_b = pool.clone();
                                 let ws_id = ws.id;
-                                let sid = spark_id.clone();
-                                return Task::perform(
-                                    load_contracts(pool, sid.clone()),
-                                    move |list| Message::ContractsLoaded(ws_id, sid.clone(), list),
+                                let sid_c = spark_id.clone();
+                                let sid_b = spark_id.clone();
+                                let contracts_task = Task::perform(
+                                    load_contracts(pool_c, sid_c.clone()),
+                                    move |list| {
+                                        Message::ContractsLoaded(ws_id, sid_c.clone(), list)
+                                    },
                                 );
+                                let bonds_task = Task::perform(
+                                    load_bonds(pool_b, sid_b.clone()),
+                                    move |list| Message::BondsLoaded(ws_id, sid_b.clone(), list),
+                                );
+                                return Task::batch([contracts_task, bonds_task]);
                             }
                         }
                     }
@@ -2866,18 +2913,32 @@ impl App {
                 screen::spark_detail::view(
                     spark,
                     &ws.selected_spark_contracts,
+                    &ws.selected_spark_bonds,
+                    &ws.sparks,
                     &ws.contract_create_form,
                     &pal,
                     has_bg,
                 )
                 .map(Message::SparkDetail)
             } else {
-                screen::sparks::view(&ws.sparks, &pal, has_bg, &ws.spark_create_form)
-                    .map(Message::Sparks)
+                screen::sparks::view(
+                    &ws.sparks,
+                    &ws.blocked_spark_ids,
+                    &pal,
+                    has_bg,
+                    &ws.spark_create_form,
+                )
+                .map(Message::Sparks)
             }
         } else {
-            screen::sparks::view(&ws.sparks, &pal, has_bg, &ws.spark_create_form)
-                .map(Message::Sparks)
+            screen::sparks::view(
+                &ws.sparks,
+                &ws.blocked_spark_ids,
+                &pal,
+                has_bg,
+                &ws.spark_create_form,
+            )
+            .map(Message::Sparks)
         };
 
         let sparks_col = container(sparks_panel)
@@ -3186,6 +3247,25 @@ async fn load_open_tabs(
 /// swallowed (treated as empty) since this is a non-critical display value.
 async fn load_contracts(pool: sqlx::SqlitePool, spark_id: String) -> Vec<Contract> {
     data::sparks::contract_repo::list_for_spark(&pool, &spark_id)
+        .await
+        .unwrap_or_default()
+}
+
+/// Load all bonds touching a single spark (incoming + outgoing). Errors
+/// are swallowed since this is a non-critical display value.
+async fn load_bonds(pool: sqlx::SqlitePool, spark_id: String) -> Vec<Bond> {
+    data::sparks::bond_repo::list_for_spark(&pool, &spark_id)
+        .await
+        .unwrap_or_default()
+}
+
+/// Load the set of spark IDs that have at least one open blocking bond
+/// pointing at them, scoped to the given workshop. Errors are swallowed.
+async fn load_blocked_spark_ids(
+    pool: sqlx::SqlitePool,
+    workshop_id: String,
+) -> HashSet<String> {
+    data::sparks::bond_repo::list_blocked_spark_ids(&pool, &workshop_id)
         .await
         .unwrap_or_default()
 }

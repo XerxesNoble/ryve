@@ -108,7 +108,13 @@ fn generate_workshop_md() -> String {
     md.push_str("4. **Check required contracts** before considering a spark done: `ryve contract list <spark-id>`.\n");
     md.push_str("5. **Do not work on a spark that is already claimed** by another Hand.\n");
     md.push_str(
-        "6. If you discover a new bug or task, create a spark for it (see commands below).\n\n",
+        "6. **Do not work on a blocked spark.** Before claiming a spark, run \
+         `ryve bond list <spark-id>` and check that none of its incoming \
+         `blocks`/`conditional_blocks` bonds reference an open (non-closed) spark. \
+         Pick a different spark and come back later.\n",
+    );
+    md.push_str(
+        "7. If you discover a new bug or task, create a spark for it (see commands below).\n\n",
     );
 
     // ── Workgraph commands ───────────────────────────────────────
@@ -121,15 +127,45 @@ fn generate_workshop_md() -> String {
     md.push_str("```sh\nryve spark list              # active sparks\n");
     md.push_str("ryve spark list --all         # include closed\n");
     md.push_str("ryve spark show <spark-id>    # spark details\n");
+    md.push_str("ryve bond list <spark-id>     # dependencies (blocks / blocked-by)\n");
     md.push_str("ryve constraint list           # architectural constraints\n");
     md.push_str("ryve contract list <spark-id>  # verification contracts\n```\n\n");
 
     md.push_str("### Mutate state\n\n");
     md.push_str("```sh\nryve spark create <title>                    # create a new spark\n");
     md.push_str("ryve spark status <spark-id> in_progress      # claim / update status\n");
-    md.push_str("ryve spark close <spark-id> <reason>           # close a spark\n```\n\n");
+    md.push_str("ryve spark close <spark-id> <reason>           # close a spark\n");
+    md.push_str("ryve bond create <from-id> <to-id> <type>      # add dependency edge\n");
+    md.push_str("ryve bond delete <bond-id>                     # remove dependency edge\n```\n\n");
 
     md.push_str("Ryve auto-refreshes every 3 seconds. Changes are picked up by the UI and other Hands automatically.\n\n");
+
+    // ── Dependencies ─────────────────────────────────────────────
+    md.push_str("## Dependencies (Bonds)\n\n");
+    md.push_str(
+        "Sparks form a directed graph through *bonds*. The two bond types you must respect are:\n\n",
+    );
+    md.push_str(
+        "- **`blocks`** — `A blocks B` means B cannot start until A is `closed`. \
+         The UI marks B with a 🔒 in the workgraph panel and a red \"Blocked by\" \
+         banner in its detail view.\n",
+    );
+    md.push_str(
+        "- **`conditional_blocks`** — same semantics for the purpose of claiming work; \
+         treat as a hard block until reviewed.\n\n",
+    );
+    md.push_str(
+        "Other bond types (`parent_child`, `related`, `waits_for`, `duplicates`, \
+         `supersedes`) are informational and do not gate work.\n\n",
+    );
+    md.push_str("**Before claiming a spark, always check its bonds:**\n\n");
+    md.push_str("```sh\nryve bond list <spark-id>\n```\n\n");
+    md.push_str(
+        "If any incoming `blocks`/`conditional_blocks` bond points at a spark whose \
+         status is not `closed`, the spark is blocked — pick a different one. The \
+         workgraph panel and `ryve spark show` will surface the same information.\n",
+    );
+    md.push_str("\n");
 
     // ── Workflow rules ────────────────────────────────────────────
     md.push_str("## Workflow\n\n");
@@ -231,6 +267,29 @@ pub fn target_paths(workshop_dir: &Path, config: &WorkshopConfig) -> Vec<PathBuf
 }
 
 // ── Hand prompt generation ───────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workshop_md_mentions_bond_dependencies() {
+        // sp-ux0006: WORKSHOP.md must teach Hands about bonds and how to
+        // avoid claiming a blocked spark. Bonds are otherwise invisible to
+        // anyone not running raw SQL.
+        let md = generate_workshop_md();
+        assert!(md.contains("ryve bond list"), "must document bond list cmd");
+        assert!(md.contains("blocks"), "must mention 'blocks' bond type");
+        assert!(
+            md.contains("Dependencies"),
+            "must have a Dependencies section"
+        );
+        assert!(
+            md.contains("blocked spark") || md.contains("Do not work on a blocked"),
+            "must tell agents not to claim blocked sparks"
+        );
+    }
+}
 
 /// Generate the initial prompt text to inject into a Hand's terminal via PTY.
 /// This is the fallback for agents that don't support `--system-prompt` flags.
