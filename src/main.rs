@@ -12,7 +12,7 @@ mod widget;
 mod workshop;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use coding_agents::CodingAgent;
 use data::sparks::types::{Bond, Contract, Ember, HandAssignment, PersistedAgentSession, Spark};
@@ -1042,6 +1042,29 @@ impl App {
                                 && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
                             {
                                 viewer.clear_selection();
+                            }
+                        }
+                    }
+                    file_viewer::Message::NavigateToDir(target) => {
+                        // Reveal the target directory in the file explorer:
+                        // expand every ancestor between the workshop root
+                        // and the target (inclusive) and select the target.
+                        // Clicking the workshop-root segment just clears
+                        // the selection — there's nothing to expand above it.
+                        if let Some(ws_idx) = self.active_workshop {
+                            let ws = &mut self.workshops[ws_idx];
+                            if target == ws.directory {
+                                ws.file_explorer.selected = None;
+                            } else if target.starts_with(&ws.directory) {
+                                let mut cur: Option<&Path> = Some(target.as_path());
+                                while let Some(p) = cur {
+                                    if p == ws.directory.as_path() {
+                                        break;
+                                    }
+                                    ws.file_explorer.expanded.insert(p.to_path_buf());
+                                    cur = p.parent();
+                                }
+                                ws.file_explorer.selected = Some(target);
                             }
                         }
                     }
@@ -3316,7 +3339,7 @@ impl App {
                 iced_term::TerminalView::show_with_transparent_bg(term, has_bg)
                     .map(|e| Message::Bench(screen::bench::Message::TerminalEvent(e)))
             } else if let Some(viewer) = ws.file_viewers.get(&active_id) {
-                file_viewer::view(viewer, pal, has_bg).map(Message::FileViewer)
+                file_viewer::view(viewer, &ws.directory, pal, has_bg).map(Message::FileViewer)
             } else if let Some(tail) = ws.log_tails.get(&active_id) {
                 log_tail::view(tail, pal).map(Message::LogTail)
             } else {

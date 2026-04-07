@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 
 use data::git::LineChange;
 use data::sparks::types::SparkFileLink;
-use iced::widget::{Space, container, mouse_area, row, scrollable, text};
+use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text};
 use iced::{Color, Element, Font, Length, Theme};
 use syntect::highlighting::{self, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -64,6 +64,10 @@ pub enum Message {
     CopySelection,
     /// Clear the current selection (Escape or click with no shift on already-selected).
     ClearSelection,
+    /// Navigate the file explorer to the given directory (clicked breadcrumb
+    /// segment). The path is absolute. Passing the workshop root collapses
+    /// the explorer selection back to the root.
+    NavigateToDir(PathBuf),
 }
 
 // ── State ─────────────────────────────────────────────
@@ -318,21 +322,145 @@ pub fn language_label(path: &Path) -> &'static str {
     "Plain Text"
 }
 
+// ── Breadcrumb path ──────────────────────────────────
+
+/// One segment of the breadcrumb path. The label is what gets rendered;
+/// `path` is the absolute filesystem path that segment refers to (used as
+/// the navigation target when the segment is clicked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreadcrumbSegment {
+    pub label: String,
+    pub path: PathBuf,
+    /// True for the final segment (the file itself), which should not be
+    /// rendered as an interactive button.
+    pub is_file: bool,
+}
+
+/// Build the breadcrumb segments from the workshop root down to the file.
+///
+/// The first segment is the workshop root (using its directory name as the
+/// label, falling back to the full path string when the root has no file
+/// name component). Each intermediate segment is a parent directory, and
+/// the final segment is the file itself. When `file_path` is not under
+/// `workshop_root` the function falls back to the file's own ancestors so
+/// the user still gets a sensible breadcrumb.
+pub fn breadcrumb_segments(workshop_root: &Path, file_path: &Path) -> Vec<BreadcrumbSegment> {
+    let root_label = workshop_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workshop_root.to_string_lossy().into_owned());
+
+    let mut segments = vec![BreadcrumbSegment {
+        label: root_label,
+        path: workshop_root.to_path_buf(),
+        is_file: false,
+    }];
+
+    let rel = match file_path.strip_prefix(workshop_root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => return segments,
+    };
+
+    let components: Vec<_> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+
+    let mut cumulative = workshop_root.to_path_buf();
+    let last = components.len().saturating_sub(1);
+    for (i, name) in components.iter().enumerate() {
+        cumulative.push(name);
+        segments.push(BreadcrumbSegment {
+            label: name.clone(),
+            path: cumulative.clone(),
+            is_file: i == last,
+        });
+    }
+
+    segments
+}
+
 // ── View (viewport-culled) ───────────────────────────
 
 const MONO_FONT: Font = Font::MONOSPACE;
 const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT: f32 = 22.0;
 const GUTTER_WIDTH: f32 = 16.0;
+const BREADCRUMB_SIZE: f32 = 12.0;
 /// Extra lines rendered above/below the visible window to reduce flicker.
 const OVERSCAN: usize = 20;
 
+/// Render the breadcrumb bar shown above the file content. Each directory
+/// segment is a clickable button that navigates the file explorer to that
+/// directory; the final file segment is rendered as plain text.
+fn breadcrumb_bar<'a>(
+    workshop_root: &Path,
+    file_path: &Path,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let segments = breadcrumb_segments(workshop_root, file_path);
+    let mut row_items: Vec<Element<'a, Message>> = Vec::with_capacity(segments.len() * 2);
+
+    for (i, seg) in segments.into_iter().enumerate() {
+        if i > 0 {
+            row_items.push(
+                text(" \u{203A} ")
+                    .size(BREADCRUMB_SIZE)
+                    .color(pal.text_tertiary)
+                    .into(),
+            );
+        }
+
+        if seg.is_file {
+            row_items.push(
+                text(seg.label)
+                    .size(BREADCRUMB_SIZE)
+                    .color(pal.text_primary)
+                    .into(),
+            );
+        } else {
+            let label = text(seg.label)
+                .size(BREADCRUMB_SIZE)
+                .color(pal.text_secondary);
+            row_items.push(
+                button(label)
+                    .style(button::text)
+                    .padding([0, 2])
+                    .on_press(Message::NavigateToDir(seg.path))
+                    .into(),
+            );
+        }
+    }
+
+    container(
+        iced::widget::Row::with_children(row_items)
+            .spacing(0)
+            .align_y(iced::Alignment::Center),
+    )
+    .padding([4, 10])
+    .width(Length::Fill)
+    .into()
+}
+
 /// Render the file viewer for a tab. Only the visible slice of lines is
 /// materialised as widgets; the rest is represented by spacers.
-pub fn view<'a>(state: &'a FileViewerState, pal: &Palette, has_bg: bool) -> Element<'a, Message> {
+pub fn view<'a>(
+    state: &'a FileViewerState,
+    workshop_root: &Path,
+    pal: &Palette,
+    has_bg: bool,
+) -> Element<'a, Message> {
+    let breadcrumb = breadcrumb_bar(workshop_root, &state.path, pal);
+
     if state.lines.is_empty() {
-        return container(text("Loading...").size(14).color(pal.text_secondary))
-            .center(Length::Fill)
+        let loading = container(text("Loading...").size(14).color(pal.text_secondary))
+            .center(Length::Fill);
+        return column![breadcrumb, loading]
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into();
     }
 
@@ -438,7 +566,7 @@ pub fn view<'a>(state: &'a FileViewerState, pal: &Palette, has_bg: bool) -> Elem
         .spacing(0)
         .width(Length::Fill);
 
-    scrollable(code_column)
+    let scroll = scrollable(code_column)
         .height(Length::Fill)
         .width(Length::Fill)
         .on_scroll(|viewport| {
@@ -447,7 +575,11 @@ pub fn view<'a>(state: &'a FileViewerState, pal: &Palette, has_bg: bool) -> Elem
                 offset_y: offset.y,
                 viewport_height: viewport.bounds().height,
             }
-        })
+        });
+
+    column![breadcrumb, scroll]
+        .width(Length::Fill)
+        .height(Length::Fill)
         .into()
 }
 
@@ -613,6 +745,54 @@ mod tests {
         state.selection_anchor = Some(11); // 0-indexed line 11
         state.selection_end = Some(15);
         assert_eq!(state.cursor_position(), (12, 1));
+    }
+
+    #[test]
+    fn breadcrumb_segments_within_workshop() {
+        let root = PathBuf::from("/home/dev/workshop");
+        let file = PathBuf::from("/home/dev/workshop/src/screen/file_viewer.rs");
+        let segs = breadcrumb_segments(&root, &file);
+        assert_eq!(segs.len(), 4);
+        assert_eq!(segs[0].label, "workshop");
+        assert_eq!(segs[0].path, PathBuf::from("/home/dev/workshop"));
+        assert!(!segs[0].is_file);
+        assert_eq!(segs[1].label, "src");
+        assert_eq!(segs[1].path, PathBuf::from("/home/dev/workshop/src"));
+        assert!(!segs[1].is_file);
+        assert_eq!(segs[2].label, "screen");
+        assert_eq!(
+            segs[2].path,
+            PathBuf::from("/home/dev/workshop/src/screen")
+        );
+        assert!(!segs[2].is_file);
+        assert_eq!(segs[3].label, "file_viewer.rs");
+        assert_eq!(
+            segs[3].path,
+            PathBuf::from("/home/dev/workshop/src/screen/file_viewer.rs")
+        );
+        assert!(segs[3].is_file);
+    }
+
+    #[test]
+    fn breadcrumb_segments_root_only_when_outside_workshop() {
+        let root = PathBuf::from("/home/dev/workshop");
+        let file = PathBuf::from("/tmp/loose.txt");
+        let segs = breadcrumb_segments(&root, &file);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].label, "workshop");
+        assert!(!segs[0].is_file);
+    }
+
+    #[test]
+    fn breadcrumb_segments_file_at_workshop_root() {
+        let root = PathBuf::from("/home/dev/workshop");
+        let file = PathBuf::from("/home/dev/workshop/README.md");
+        let segs = breadcrumb_segments(&root, &file);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].label, "workshop");
+        assert!(!segs[0].is_file);
+        assert_eq!(segs[1].label, "README.md");
+        assert!(segs[1].is_file);
     }
 
     #[test]
