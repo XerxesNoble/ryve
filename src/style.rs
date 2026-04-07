@@ -72,6 +72,8 @@ pub struct Palette {
     pub separator: Color,
     /// Danger/destructive action color.
     pub danger: Color,
+    /// Success/idle indicator color (green).
+    pub success: Color,
     /// Tab background (inactive).
     pub tab_bg: Color,
     /// Tab background (active).
@@ -159,6 +161,12 @@ impl Palette {
                 r: 1.0,
                 g: 0.271,
                 b: 0.227,
+                a: 1.0,
+            },
+            success: Color {
+                r: 0.196,
+                g: 0.843,
+                b: 0.294,
                 a: 1.0,
             },
             tab_bg: Color {
@@ -255,6 +263,12 @@ impl Palette {
                 r: 1.0,
                 g: 0.231,
                 b: 0.188,
+                a: 1.0,
+            },
+            success: Color {
+                r: 0.204,
+                g: 0.780,
+                b: 0.349,
                 a: 1.0,
             },
             tab_bg: Color {

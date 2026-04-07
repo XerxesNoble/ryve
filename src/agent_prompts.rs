@@ -53,16 +53,18 @@ pub fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
 /// Compose the initial system prompt for a Head — a coding agent that
 /// orchestrates a Crew of Hands.
 ///
-/// `user_goal` is the high-level direction from the user. If empty, the
-/// Head waits for direction interactively.
-pub fn compose_head_prompt(user_goal: &str) -> String {
-    let goal = user_goal.trim();
-    let goal_block = if goal.is_empty() {
-        "(no goal yet — wait for the user to type one in this terminal before \
-         creating any sparks or spawning any Hands)"
-            .to_string()
-    } else {
-        format!("\"{goal}\"")
+/// If `epic_id` is provided, the Head is told to decompose that existing
+/// epic into child sparks instead of creating a new one. Otherwise it
+/// waits for the user to type a goal in the terminal.
+pub fn compose_head_prompt(epic_id: Option<&str>, epic_title: Option<&str>) -> String {
+    let goal_block = match (epic_id, epic_title) {
+        (Some(id), Some(title)) => {
+            format!("decompose existing epic `{id}` — \"{title}\" — into child sparks")
+        }
+        (Some(id), None) => format!("decompose existing epic `{id}` into child sparks"),
+        _ => "(no epic selected — wait for the user to type a goal in this terminal \
+              before creating any sparks or spawning any Hands)"
+            .to_string(),
     };
 
     let mut prompt = String::new();
@@ -76,6 +78,15 @@ pub fn compose_head_prompt(user_goal: &str) -> String {
     );
 
     prompt.push_str(&format!("USER GOAL:\n{goal_block}\n\n"));
+
+    if let Some(id) = epic_id {
+        prompt.push_str(&format!(
+            "PARENT EPIC: `{id}` is already created. Skip step 2 below and use \
+             `{id}` as the parent for every child spark and for the Crew. Start \
+             by running `ryve spark show {id}` to read its problem statement and \
+             acceptance criteria before decomposing.\n\n"
+        ));
+    }
 
     prompt.push_str(
         "TOOLS — use the `ryve` CLI for everything. NEVER touch `.ryve/sparks.db` \
@@ -285,9 +296,11 @@ mod tests {
 
     #[test]
     fn head_prompt_explains_workflow() {
-        let p = compose_head_prompt("build user profile editing");
+        let p = compose_head_prompt(Some("sp-abcd"), Some("User profile editing"));
         assert!(p.contains("You are the **Head**"));
-        assert!(p.contains("\"build user profile editing\""));
+        assert!(p.contains("sp-abcd"));
+        assert!(p.contains("User profile editing"));
+        assert!(p.contains("PARENT EPIC"));
         assert!(p.contains("ryve hand spawn"));
         assert!(p.contains("ryve crew create"));
         assert!(p.contains("--role merger"));
@@ -295,10 +308,11 @@ mod tests {
     }
 
     #[test]
-    fn head_prompt_handles_empty_goal() {
-        let p = compose_head_prompt("   ");
-        assert!(p.contains("no goal yet"));
+    fn head_prompt_handles_no_epic() {
+        let p = compose_head_prompt(None, None);
+        assert!(p.contains("no epic selected"));
         assert!(p.contains("wait for the user"));
+        assert!(!p.contains("PARENT EPIC"));
     }
 
     #[test]

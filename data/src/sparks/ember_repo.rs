@@ -68,6 +68,17 @@ pub async fn list_by_type(
     .await?)
 }
 
+/// Delete a single ember by id. Used by the UI dismiss-button flow —
+/// when a user dismisses a notification it is removed from the backing
+/// store so it does not reappear on the next poll.
+pub async fn delete(pool: &SqlitePool, id: &str) -> Result<u64, SparksError> {
+    let result = sqlx::query("DELETE FROM embers WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Delete all expired embers. Returns number removed.
 pub async fn sweep_expired(pool: &SqlitePool) -> Result<u64, SparksError> {
     let now = Utc::now().to_rfc3339();

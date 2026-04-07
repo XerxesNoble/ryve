@@ -400,6 +400,7 @@ mod tests {
             resume_id: None,
             started_at: "2026-04-07T11:00:00+00:00".to_string(),
             log_path: None,
+            last_output_at: None,
         }
     }
 
