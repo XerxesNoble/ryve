@@ -48,6 +48,8 @@ pub struct Workshop {
     pub sparks_db: Option<SqlitePool>,
     /// Cached sparks for display (loaded from DB).
     pub sparks: Vec<Spark>,
+    /// Cached count of failing or pending required contracts (loaded from DB).
+    pub failing_contracts: usize,
     /// Custom agent definitions from `.ryve/agents/`.
     pub custom_agents: Vec<AgentDef>,
     /// Agent context from `.ryve/context/AGENTS.md`.
@@ -82,6 +84,7 @@ impl Workshop {
             file_explorer: FileExplorerState::new(),
             sparks_db: None,
             sparks: Vec::new(),
+            failing_contracts: 0,
             custom_agents: Vec::new(),
             agent_context: None,
             background_handle: None,

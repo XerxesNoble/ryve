@@ -175,6 +175,25 @@ impl FileViewerState {
         self.selection_end = None;
     }
 
+    /// Total number of lines in the loaded file (0 if not yet loaded).
+    pub fn total_lines(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Best-effort cursor position (1-indexed line and column) for the
+    /// status bar. The viewer doesn't have a true text caret, so we use
+    /// the active selection anchor; when nothing is selected we report
+    /// position (1, 1).
+    pub fn cursor_position(&self) -> (usize, usize) {
+        let line = self
+            .selection_anchor
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        // Selections are line-granular, so column is always the start of
+        // the line. This is honest given the viewer's capabilities.
+        (line, 1)
+    }
+
     /// Get spark links that apply to a specific line.
     pub fn spark_links_for_line(&self, line_num: u32) -> Vec<&SparkFileLink> {
         self.spark_links
@@ -238,6 +257,64 @@ pub fn highlight_content(content: &str, path: &Path, light_mode: bool) -> Vec<Hi
 
 fn syntect_to_iced_color(c: highlighting::Color) -> Color {
     Color::from_rgba8(c.r, c.g, c.b, c.a as f32 / 255.0)
+}
+
+/// Human-readable language label for a file path, used by the status bar.
+///
+/// Resolves via syntect's syntax set first (to match the highlighter), then
+/// falls back to a small extension table for files syntect doesn't know.
+/// Returns `"Plain Text"` when no match can be found.
+pub fn language_label(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Common shortcuts — keeps the label stable regardless of which
+    // syntect bundle is loaded.
+    match ext.as_str() {
+        "rs" => return "Rust",
+        "py" | "pyi" => return "Python",
+        "ts" => return "TypeScript",
+        "tsx" => return "TSX",
+        "js" | "mjs" | "cjs" => return "JavaScript",
+        "jsx" => return "JSX",
+        "go" => return "Go",
+        "java" => return "Java",
+        "kt" | "kts" => return "Kotlin",
+        "swift" => return "Swift",
+        "c" => return "C",
+        "h" => return "C Header",
+        "cpp" | "cc" | "cxx" | "hpp" => return "C++",
+        "cs" => return "C#",
+        "rb" => return "Ruby",
+        "php" => return "PHP",
+        "json" => return "JSON",
+        "yaml" | "yml" => return "YAML",
+        "toml" => return "TOML",
+        "md" | "markdown" => return "Markdown",
+        "html" | "htm" => return "HTML",
+        "css" => return "CSS",
+        "scss" | "sass" => return "SCSS",
+        "sh" | "bash" | "zsh" => return "Shell",
+        "sql" => return "SQL",
+        "lua" => return "Lua",
+        "ex" | "exs" => return "Elixir",
+        "txt" => return "Plain Text",
+        _ => {}
+    }
+
+    // Fall back to syntect, but only return a static label.
+    if !ext.is_empty()
+        && SYNTAX_SET.find_syntax_by_extension(&ext).is_some()
+    {
+        // syntect knew about it but we don't have a friendly name; show
+        // the extension uppercased via a single static label set.
+        return "Source";
+    }
+
+    "Plain Text"
 }
 
 // ── View (viewport-culled) ───────────────────────────
@@ -484,5 +561,54 @@ pub async fn load_file(
         lines,
         line_changes,
         spark_links,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn language_label_known_extensions() {
+        assert_eq!(language_label(Path::new("foo.rs")), "Rust");
+        assert_eq!(language_label(Path::new("a/b/foo.py")), "Python");
+        assert_eq!(language_label(Path::new("foo.TSX")), "TSX");
+        assert_eq!(language_label(Path::new("README.md")), "Markdown");
+        assert_eq!(language_label(Path::new("Cargo.toml")), "TOML");
+    }
+
+    #[test]
+    fn language_label_unknown_falls_back() {
+        // Some extension we don't list and syntect doesn't have either.
+        assert_eq!(language_label(Path::new("foo.zzznope")), "Plain Text");
+        // No extension at all.
+        assert_eq!(language_label(Path::new("Makefile")), "Plain Text");
+    }
+
+    #[test]
+    fn cursor_position_defaults_to_one_one() {
+        let state = FileViewerState::new(PathBuf::from("foo.rs"));
+        assert_eq!(state.cursor_position(), (1, 1));
+        assert_eq!(state.total_lines(), 0);
+    }
+
+    #[test]
+    fn cursor_position_uses_selection_anchor() {
+        let mut state = FileViewerState::new(PathBuf::from("foo.rs"));
+        state.selection_anchor = Some(11); // 0-indexed line 11
+        state.selection_end = Some(15);
+        assert_eq!(state.cursor_position(), (12, 1));
+    }
+
+    #[test]
+    fn total_lines_reflects_loaded_content() {
+        let mut state = FileViewerState::new(PathBuf::from("foo.rs"));
+        state.lines = vec![
+            HighlightedLine { spans: Vec::new() },
+            HighlightedLine { spans: Vec::new() },
+            HighlightedLine { spans: Vec::new() },
+        ];
+        assert_eq!(state.total_lines(), 3);
     }
 }

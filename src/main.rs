@@ -124,6 +124,8 @@ enum Message {
     },
     /// Workgraph sparks loaded from DB
     SparksLoaded(Uuid, Vec<Spark>),
+    /// Failing/pending required contract count loaded from DB
+    FailingContractsLoaded(Uuid, usize),
     /// Agent sessions loaded from DB
     AgentSessionsLoaded(Uuid, Vec<PersistedAgentSession>),
     /// Agent session saved to DB
@@ -189,6 +191,9 @@ impl std::fmt::Debug for Message {
             Self::WorkshopDirPicked(p) => write!(f, "WorkshopDirPicked({p:?})"),
             Self::WorkshopReady { id, .. } => write!(f, "WorkshopReady({id})"),
             Self::SparksLoaded(id, s) => write!(f, "SparksLoaded({id}, {} sparks)", s.len()),
+            Self::FailingContractsLoaded(id, n) => {
+                write!(f, "FailingContractsLoaded({id}, {n})")
+            }
             Self::AgentSessionsLoaded(id, s) => {
                 write!(f, "AgentSessionsLoaded({id}, {} sessions)", s.len())
             }
@@ -369,12 +374,25 @@ impl App {
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     ws.sparks = sparks;
 
+                    // Refresh failing contract count alongside sparks so the
+                    // status bar warning indicator stays in sync.
+                    let contracts_task = if let Some(ref pool) = ws.sparks_db {
+                        let pool = pool.clone();
+                        let ws_id = ws.workshop_id();
+                        Task::perform(
+                            load_failing_contract_count(pool, ws_id),
+                            move |n| Message::FailingContractsLoaded(id, n),
+                        )
+                    } else {
+                        Task::none()
+                    };
+
                     // Sync .ryve/WORKSHOP.md and pointers (including into worktrees)
                     if !ws.config.agents.disable_sync {
                         let dir = ws.directory.clone();
                         let ryve_dir = ws.ryve_dir.clone();
                         let config = ws.config.clone();
-                        return Task::perform(
+                        let sync_task = Task::perform(
                             async move {
                                 let _ = data::agent_context::sync(
                                     &dir, &ryve_dir, &config,
@@ -383,7 +401,16 @@ impl App {
                             },
                             |_| Message::AgentContextSynced,
                         );
+                        return Task::batch([contracts_task, sync_task]);
                     }
+
+                    return contracts_task;
+                }
+                Task::none()
+            }
+            Message::FailingContractsLoaded(id, count) => {
+                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
+                    ws.failing_contracts = count;
                 }
                 Task::none()
             }
@@ -1908,15 +1935,30 @@ impl App {
             gs.changed_files = ws.file_explorer.git_statuses.len();
             gs
         };
-        let active_agents = ws.agent_sessions.iter().filter(|a| a.active).count();
-        let total_agents = ws.agent_sessions.len();
+        let active_hands = ws.agent_sessions.iter().filter(|a| a.active).count();
+        let total_hands = ws.agent_sessions.len();
+
+        // Build file viewer info if the active bench tab is a file viewer.
+        let file_info = ws.bench.active_tab.and_then(|tab_id| {
+            let viewer = ws.file_viewers.get(&tab_id)?;
+            let (line, column) = viewer.cursor_position();
+            Some(screen::status_bar::FileViewerInfo {
+                line,
+                column,
+                total_lines: viewer.total_lines(),
+                language: screen::file_viewer::language_label(&viewer.path),
+            })
+        });
+
         let status_bar = screen::status_bar::view(
             ws.file_explorer.branch.as_deref(),
             &ws.directory,
             &spark_summary,
             &git_stats,
-            active_agents,
-            total_agents,
+            active_hands,
+            total_hands,
+            ws.failing_contracts,
+            file_info,
             &pal,
             has_bg,
         )
@@ -2192,6 +2234,19 @@ async fn load_agent_sessions(
     data::sparks::agent_session_repo::list_for_workshop(&pool, &workshop_id)
         .await
         .unwrap_or_default()
+}
+
+/// Count the failing or pending required contracts for a workshop. Used by
+/// the status bar warning indicator. Errors are swallowed (treated as zero)
+/// since this is a non-critical display value.
+async fn load_failing_contract_count(
+    pool: sqlx::SqlitePool,
+    workshop_id: String,
+) -> usize {
+    data::sparks::contract_repo::list_failing(&pool, &workshop_id)
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0)
 }
 
 /// Load all sparks for a workshop from the database.
