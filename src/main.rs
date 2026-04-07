@@ -2418,18 +2418,26 @@ impl App {
             return Task::none();
         };
         match msg {
-            screen::head_picker::Message::GoalChanged(goal) => {
+            screen::head_picker::Message::SelectEpic(epic_id) => {
                 if let Some(state) = self.workshops[idx].pending_head_spawn.as_mut() {
-                    state.goal = goal;
+                    state.selected_epic_id = epic_id;
                 }
                 Task::none()
             }
             screen::head_picker::Message::SelectAgent(command) => {
-                let goal = self.workshops[idx]
+                let epic_id = self.workshops[idx]
                     .pending_head_spawn
                     .as_ref()
-                    .map(|s| s.goal.clone())
-                    .unwrap_or_default();
+                    .and_then(|s| s.selected_epic_id.clone());
+                // Resolve the epic's title from the workshop's cached sparks
+                // so the Head prompt can reference it without a round-trip.
+                let epic_title = epic_id.as_ref().and_then(|id| {
+                    self.workshops[idx]
+                        .sparks
+                        .iter()
+                        .find(|s| &s.id == id)
+                        .map(|s| s.title.clone())
+                });
                 self.workshops[idx].pending_head_spawn = None;
                 let agent = match self
                     .available_agents
@@ -2440,7 +2448,7 @@ impl App {
                     Some(a) => a,
                     None => return Task::none(),
                 };
-                self.spawn_head(idx, agent, goal)
+                self.spawn_head(idx, agent, epic_id, epic_title)
             }
             screen::head_picker::Message::Cancel => {
                 self.workshops[idx].pending_head_spawn = None;
@@ -2564,7 +2572,8 @@ impl App {
         &mut self,
         workshop_idx: usize,
         agent: CodingAgent,
-        user_goal: String,
+        epic_id: Option<String>,
+        epic_title: Option<String>,
     ) -> Task<Message> {
         let ws = &mut self.workshops[workshop_idx];
 
@@ -2626,7 +2635,7 @@ impl App {
         // to boot. Coding agents like claude/codex pick up `--system-prompt`
         // via flag too, but the existing infra here uses the typed-prompt
         // path so we stay consistent and avoid having to fork the spawn API.
-        let prompt = agent_prompts::compose_head_prompt(&user_goal);
+        let prompt = agent_prompts::compose_head_prompt(epic_id.as_deref(), epic_title.as_deref());
         let prompt_tab_id = tab_id;
         tasks.push(Task::perform(
             async move {
@@ -3264,7 +3273,7 @@ impl App {
         // Head picker modal overlay (shown before spawning a Head)
         if let Some(ref state) = ws.pending_head_spawn {
             layers.push(
-                screen::head_picker::view(state, &self.available_agents, &pal)
+                screen::head_picker::view(state, &ws.sparks, &self.available_agents, &pal)
                     .map(Message::HeadPicker),
             );
         }
@@ -3536,7 +3545,7 @@ async fn load_embers(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Ember> 
 
 /// Load all sparks for a workshop from the database.
 async fn load_sparks(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Spark> {
-    data::sparks::spark_repo::list(
+    let mut sparks = data::sparks::spark_repo::list(
         &pool,
         data::sparks::types::SparkFilter {
             workshop_id: Some(workshop_id),
@@ -3544,5 +3553,32 @@ async fn load_sparks(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Spark> 
         },
     )
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+
+    // Spark ryve-dc66e998: parent-child relationships may live in the
+    // `bonds` table (the CLI/Head path uses `ryve bond create ... parent_child`)
+    // instead of the `sparks.parent_id` column. Fold bonds back onto each
+    // spark's `parent_id` so the UI groupers (spark_picker) see a consistent
+    // view regardless of which path created the edge.
+    if let Ok(rows) = sqlx::query_as::<_, (String, String)>(
+        "SELECT from_id, to_id FROM bonds WHERE bond_type = 'parent_child'",
+    )
+    .fetch_all(&pool)
+    .await
+    {
+        use std::collections::HashMap;
+        let mut child_to_parent: HashMap<String, String> = HashMap::new();
+        for (parent, child) in rows {
+            child_to_parent.entry(child).or_insert(parent);
+        }
+        for s in sparks.iter_mut() {
+            if s.parent_id.is_none() {
+                if let Some(pid) = child_to_parent.get(&s.id) {
+                    s.parent_id = Some(pid.clone());
+                }
+            }
+        }
+    }
+
+    sparks
 }
