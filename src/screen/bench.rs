@@ -3,7 +3,9 @@
 
 //! Bench panel — tabbed workspace for terminal sessions and coding agents.
 
-use iced::widget::{Space, button, column, container, row, text, tooltip};
+use iced::widget::{
+    Space, button, column, container, row, scrollable, text, tooltip,
+};
 use iced::{Element, Length, Theme};
 
 use std::path::PathBuf;
@@ -117,9 +119,20 @@ impl BenchState {
             .padding([4, 10])
             .on_press(Message::ToggleDropdown);
 
-        tab_row = tab_row.push(Space::new().width(Length::Fill)).push(new_btn);
+        // Wrap the tabs in a horizontal scrollable so long tab lists don't push
+        // the "+" button offscreen. The scrollable fills the available width;
+        // the "+" button stays pinned on the right, always reachable.
+        let scrollable_tabs = scrollable(tab_row)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(4).scroller_width(4),
+            ))
+            .width(Length::Fill);
 
-        tab_row.padding([4, 8]).into()
+        row![scrollable_tabs, new_btn]
+            .align_y(iced::Alignment::Center)
+            .spacing(4)
+            .padding([4, 8])
+            .into()
     }
 
     /// Render the dropdown menu (meant to be overlaid, not in flow).
@@ -177,5 +190,33 @@ impl BenchState {
                 .width(Length::Fill)
                 .into(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::Palette;
+
+    #[test]
+    fn tab_bar_handles_many_tabs_without_panic() {
+        // Regression test for sp-ux0010: with many tabs the row used to push
+        // the "+" button offscreen. The fix wraps the tabs in a horizontal
+        // scrollable. This test ensures view_tab_bar still constructs cleanly
+        // for a tab count well beyond the previous overflow threshold (~8).
+        let mut bench = BenchState::new();
+        for i in 0..50 {
+            bench.create_tab(i, format!("tab-{i}"), TabKind::Terminal);
+        }
+        assert_eq!(bench.tabs.len(), 50);
+        let pal = Palette::dark();
+        let _element = bench.view_tab_bar(&pal);
+    }
+
+    #[test]
+    fn tab_bar_renders_with_zero_tabs() {
+        let bench = BenchState::new();
+        let pal = Palette::dark();
+        let _element = bench.view_tab_bar(&pal);
     }
 }
