@@ -19,7 +19,8 @@ use data::sparks::types::SparkFileLink;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path as CanvasPath};
 use iced::widget::{
-    Canvas, Space, button, column, container, mouse_area, row, scrollable, text,
+    Canvas, Column, Space, button, column, container, mouse_area, row, scrollable, text,
+    text_input,
 };
 use iced::{Color, Element, Font, Length, Point, Rectangle, Size, Theme};
 use syntect::highlighting::{self, ThemeSet};
@@ -39,6 +40,28 @@ const SELECTION_BG: Color = Color {
     b: 0.80,
     a: 0.28,
 };
+
+/// Background color for lines matching the active search query.
+const SEARCH_MATCH_BG: Color = Color {
+    r: 0.95,
+    g: 0.80,
+    b: 0.20,
+    a: 0.18,
+};
+
+/// Background color for the currently focused search match.
+const SEARCH_CURRENT_BG: Color = Color {
+    r: 0.95,
+    g: 0.65,
+    b: 0.10,
+    a: 0.40,
+};
+
+/// Stable widget id for the search text input — only one viewer is active at a time.
+pub const SEARCH_INPUT_ID: &str = "file-viewer-search-input";
+
+/// Stable widget id for the file viewer's scrollable, used by search-jump.
+pub const SCROLLABLE_ID: &str = "file-viewer-scrollable";
 
 // ── Messages ──────────────────────────────────────────
 
@@ -72,6 +95,16 @@ pub enum Message {
     /// segment). The path is absolute. Passing the workshop root collapses
     /// the explorer selection back to the root.
     NavigateToDir(PathBuf),
+    /// Open the find-in-file search bar (Cmd+F).
+    OpenSearch,
+    /// Close the find-in-file search bar (Escape while search is open).
+    CloseSearch,
+    /// User typed in the search input.
+    SearchQueryChanged(String),
+    /// Jump to the next match (Enter / F3 / button).
+    SearchNext,
+    /// Jump to the previous match (Shift+Enter / Shift+F3 / button).
+    SearchPrev,
 }
 
 // ── State ─────────────────────────────────────────────
@@ -93,6 +126,14 @@ pub struct FileViewerState {
     pub selection_anchor: Option<usize>,
     /// Selection end line (0-indexed). Set on shift-click or same as anchor.
     pub selection_end: Option<usize>,
+    /// Whether the find-in-file bar is visible.
+    pub search_open: bool,
+    /// Current search query.
+    pub search_query: String,
+    /// 0-indexed line numbers that contain the current query (sorted ascending).
+    pub search_matches: Vec<usize>,
+    /// Index into `search_matches` for the currently focused match.
+    pub current_match: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +161,10 @@ impl FileViewerState {
             viewport_height: 900.0, // reasonable default until first scroll event
             selection_anchor: None,
             selection_end: None,
+            search_open: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match: None,
         }
     }
 
@@ -135,6 +180,10 @@ impl FileViewerState {
         self.lines = lines;
         self.line_changes = line_changes;
         self.spark_links = spark_links;
+        // Re-run any active search against the freshly loaded content.
+        if !self.search_query.is_empty() {
+            self.recompute_search_matches();
+        }
     }
 
     /// Evict heavy data for a background tab. Preserves path + scroll state.
@@ -143,6 +192,8 @@ impl FileViewerState {
         self.lines = Vec::new();
         self.line_changes = HashMap::new();
         self.spark_links = Vec::new();
+        self.search_matches.clear();
+        self.current_match = None;
     }
 
     /// Whether this viewer has content loaded.
@@ -187,6 +238,88 @@ impl FileViewerState {
     pub fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.selection_end = None;
+    }
+
+    /// Show the find-in-file bar. Idempotent.
+    pub fn open_search(&mut self) {
+        self.search_open = true;
+    }
+
+    /// Hide the find-in-file bar and drop any matches.
+    pub fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_match = None;
+    }
+
+    /// Replace the search query and recompute the match list. Selects the
+    /// first match (if any) so the next/prev controls have a starting point.
+    pub fn set_search_query(&mut self, query: String) {
+        self.search_query = query;
+        self.recompute_search_matches();
+    }
+
+    fn recompute_search_matches(&mut self) {
+        self.search_matches.clear();
+        let needle = self.search_query.to_lowercase();
+        if needle.is_empty() {
+            self.current_match = None;
+            return;
+        }
+        for (idx, line) in self.content.lines().enumerate() {
+            if line.to_lowercase().contains(&needle) {
+                self.search_matches.push(idx);
+            }
+        }
+        self.current_match = if self.search_matches.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+
+    /// Advance to the next match (wraps to the start). Returns the new
+    /// current line, if any.
+    pub fn next_match(&mut self) -> Option<usize> {
+        if self.search_matches.is_empty() {
+            return None;
+        }
+        let next = match self.current_match {
+            Some(i) => (i + 1) % self.search_matches.len(),
+            None => 0,
+        };
+        self.current_match = Some(next);
+        Some(self.search_matches[next])
+    }
+
+    /// Step back to the previous match (wraps to the end). Returns the new
+    /// current line, if any.
+    pub fn prev_match(&mut self) -> Option<usize> {
+        if self.search_matches.is_empty() {
+            return None;
+        }
+        let prev = match self.current_match {
+            Some(0) | None => self.search_matches.len() - 1,
+            Some(i) => i - 1,
+        };
+        self.current_match = Some(prev);
+        Some(self.search_matches[prev])
+    }
+
+    /// 0-indexed line number of the currently focused match.
+    pub fn current_match_line(&self) -> Option<usize> {
+        self.current_match.map(|i| self.search_matches[i])
+    }
+
+    /// Pixel offset that would scroll the currently focused match into view.
+    /// Returns `None` if there's no active match.
+    pub fn scroll_offset_for_current_match(&self) -> Option<f32> {
+        let line = self.current_match_line()?;
+        // Aim for the match to land roughly a third of the way down the
+        // viewport so the user has surrounding context.
+        let target = line as f32 * LINE_HEIGHT - self.viewport_height / 3.0;
+        Some(target.max(0.0))
     }
 
     /// Total number of lines in the loaded file (0 if not yet loaded).
@@ -484,6 +617,8 @@ pub fn view<'a>(
             .into();
     }
 
+    let current_match_line = state.current_match_line();
+
     let total_lines = state.lines.len();
     let line_num_chars = total_lines.to_string().len().max(3);
 
@@ -543,8 +678,14 @@ pub fn view<'a>(
         // ── Assemble the line row ──
         // Selection highlight takes priority over git diff background.
         let is_selected = state.is_line_selected(idx);
+        let is_current_match = current_match_line == Some(idx);
+        let is_search_match = !is_current_match && state.search_matches.binary_search(&idx).is_ok();
         let line_bg = if is_selected {
             Some(SELECTION_BG)
+        } else if is_current_match {
+            Some(SEARCH_CURRENT_BG)
+        } else if is_search_match {
+            Some(SEARCH_MATCH_BG)
         } else {
             line_background_color(state.line_changes.get(&line_num), has_bg)
         };
@@ -587,6 +728,7 @@ pub fn view<'a>(
         .width(Length::Fill);
 
     let code_scrollable = scrollable(code_column)
+        .id(iced::widget::Id::new(SCROLLABLE_ID))
         .height(Length::Fill)
         .width(Length::Fill)
         .on_scroll(|viewport| {
@@ -615,9 +757,72 @@ pub fn view<'a>(
         .width(Length::Fill)
         .height(Length::Fill);
 
-    column![breadcrumb, code_area]
+    let mut stack = Column::new().push(breadcrumb);
+    if state.search_open {
+        stack = stack.push(view_search_bar(state, pal));
+    }
+    stack
+        .push(code_area)
         .width(Length::Fill)
         .height(Length::Fill)
+        .into()
+}
+
+/// Render the find-in-file bar above the viewer.
+fn view_search_bar<'a>(state: &'a FileViewerState, pal: &Palette) -> Element<'a, Message> {
+    let input = text_input("Find in file", &state.search_query)
+        .id(iced::widget::Id::new(SEARCH_INPUT_ID))
+        .size(13)
+        .padding([4, 8])
+        .on_input(Message::SearchQueryChanged)
+        .on_submit(Message::SearchNext);
+
+    let count_label: String = if state.search_query.is_empty() {
+        String::new()
+    } else if state.search_matches.is_empty() {
+        "no matches".to_string()
+    } else {
+        let cur = state.current_match.map(|i| i + 1).unwrap_or(0);
+        format!("{} / {}", cur, state.search_matches.len())
+    };
+
+    let prev_btn = button(text("\u{2191}").size(12))
+        .style(button::text)
+        .padding([2, 6])
+        .on_press(Message::SearchPrev);
+
+    let next_btn = button(text("\u{2193}").size(12))
+        .style(button::text)
+        .padding([2, 6])
+        .on_press(Message::SearchNext);
+
+    let close_btn = button(text("\u{2715}").size(12))
+        .style(button::text)
+        .padding([2, 6])
+        .on_press(Message::CloseSearch);
+
+    let bar = row![
+        input,
+        text(count_label).size(12).color(pal.text_secondary),
+        prev_btn,
+        next_btn,
+        close_btn,
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
+
+    container(bar)
+        .padding([4, 8])
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.18,
+            })),
+            ..Default::default()
+        })
         .into()
 }
 
@@ -915,6 +1120,90 @@ mod tests {
         state.selection_anchor = Some(11); // 0-indexed line 11
         state.selection_end = Some(15);
         assert_eq!(state.cursor_position(), (12, 1));
+    }
+
+    fn viewer_with_content(content: &str) -> FileViewerState {
+        let mut state = FileViewerState::new(PathBuf::from("foo.rs"));
+        state.content = content.to_string();
+        state.lines = content
+            .lines()
+            .map(|_| HighlightedLine { spans: Vec::new() })
+            .collect();
+        state
+    }
+
+    #[test]
+    fn search_finds_case_insensitive_matches() {
+        let mut v = viewer_with_content("alpha\nBeta\nGamma\nbeta-two\n");
+        v.set_search_query("beta".to_string());
+        assert_eq!(v.search_matches, vec![1, 3]);
+        assert_eq!(v.current_match, Some(0));
+        assert_eq!(v.current_match_line(), Some(1));
+    }
+
+    #[test]
+    fn search_empty_query_clears_matches() {
+        let mut v = viewer_with_content("alpha\nbeta\n");
+        v.set_search_query("alpha".to_string());
+        assert_eq!(v.search_matches.len(), 1);
+        v.set_search_query(String::new());
+        assert!(v.search_matches.is_empty());
+        assert_eq!(v.current_match, None);
+    }
+
+    #[test]
+    fn next_prev_match_wraps() {
+        let mut v = viewer_with_content("x\nx\nx\n");
+        v.set_search_query("x".to_string());
+        assert_eq!(v.current_match_line(), Some(0));
+        assert_eq!(v.next_match(), Some(1));
+        assert_eq!(v.next_match(), Some(2));
+        // wrap forward
+        assert_eq!(v.next_match(), Some(0));
+        // wrap backward
+        assert_eq!(v.prev_match(), Some(2));
+    }
+
+    #[test]
+    fn next_prev_no_matches_returns_none() {
+        let mut v = viewer_with_content("alpha\nbeta\n");
+        v.set_search_query("zzz".to_string());
+        assert!(v.search_matches.is_empty());
+        assert_eq!(v.next_match(), None);
+        assert_eq!(v.prev_match(), None);
+        assert_eq!(v.current_match_line(), None);
+    }
+
+    #[test]
+    fn open_then_close_search_resets_state() {
+        let mut v = viewer_with_content("alpha\nbeta\n");
+        v.open_search();
+        v.set_search_query("alpha".to_string());
+        assert!(v.search_open);
+        assert_eq!(v.search_matches, vec![0]);
+        v.close_search();
+        assert!(!v.search_open);
+        assert!(v.search_query.is_empty());
+        assert!(v.search_matches.is_empty());
+        assert_eq!(v.current_match, None);
+    }
+
+    #[test]
+    fn scroll_offset_is_none_without_match() {
+        let mut v = viewer_with_content("alpha\nbeta\n");
+        assert_eq!(v.scroll_offset_for_current_match(), None);
+        v.set_search_query("zzz".to_string());
+        assert_eq!(v.scroll_offset_for_current_match(), None);
+    }
+
+    #[test]
+    fn evict_clears_search_matches() {
+        let mut v = viewer_with_content("alpha\nalpha\n");
+        v.set_search_query("alpha".to_string());
+        assert!(!v.search_matches.is_empty());
+        v.evict();
+        assert!(v.search_matches.is_empty());
+        assert_eq!(v.current_match, None);
     }
 
     #[test]

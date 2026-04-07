@@ -1041,7 +1041,79 @@ impl App {
                             if let Some(active_id) = ws.bench.active_tab
                                 && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
                             {
-                                viewer.clear_selection();
+                                // Escape closes search first if it's open;
+                                // otherwise it clears the line selection.
+                                if viewer.search_open {
+                                    viewer.close_search();
+                                } else {
+                                    viewer.clear_selection();
+                                }
+                            }
+                        }
+                    }
+                    file_viewer::Message::OpenSearch => {
+                        if let Some(ws_idx) = self.active_workshop
+                            && let Some(active_id) = self.workshops[ws_idx].bench.active_tab
+                            && let Some(viewer) =
+                                self.workshops[ws_idx].file_viewers.get_mut(&active_id)
+                        {
+                            viewer.open_search();
+                            return iced::widget::operation::focus(iced::widget::Id::new(
+                                file_viewer::SEARCH_INPUT_ID,
+                            ));
+                        }
+                    }
+                    file_viewer::Message::CloseSearch => {
+                        if let Some(ws_idx) = self.active_workshop
+                            && let Some(active_id) = self.workshops[ws_idx].bench.active_tab
+                            && let Some(viewer) =
+                                self.workshops[ws_idx].file_viewers.get_mut(&active_id)
+                        {
+                            viewer.close_search();
+                        }
+                    }
+                    file_viewer::Message::SearchQueryChanged(q) => {
+                        if let Some(ws_idx) = self.active_workshop
+                            && let Some(active_id) = self.workshops[ws_idx].bench.active_tab
+                            && let Some(viewer) =
+                                self.workshops[ws_idx].file_viewers.get_mut(&active_id)
+                        {
+                            viewer.set_search_query(q);
+                            if let Some(target) = viewer.scroll_offset_for_current_match() {
+                                return iced::widget::operation::scroll_to(
+                                    iced::widget::Id::new(file_viewer::SCROLLABLE_ID),
+                                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
+                                );
+                            }
+                        }
+                    }
+                    file_viewer::Message::SearchNext => {
+                        if let Some(ws_idx) = self.active_workshop
+                            && let Some(active_id) = self.workshops[ws_idx].bench.active_tab
+                            && let Some(viewer) =
+                                self.workshops[ws_idx].file_viewers.get_mut(&active_id)
+                        {
+                            viewer.next_match();
+                            if let Some(target) = viewer.scroll_offset_for_current_match() {
+                                return iced::widget::operation::scroll_to(
+                                    iced::widget::Id::new(file_viewer::SCROLLABLE_ID),
+                                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
+                                );
+                            }
+                        }
+                    }
+                    file_viewer::Message::SearchPrev => {
+                        if let Some(ws_idx) = self.active_workshop
+                            && let Some(active_id) = self.workshops[ws_idx].bench.active_tab
+                            && let Some(viewer) =
+                                self.workshops[ws_idx].file_viewers.get_mut(&active_id)
+                        {
+                            viewer.prev_match();
+                            if let Some(target) = viewer.scroll_offset_for_current_match() {
+                                return iced::widget::operation::scroll_to(
+                                    iced::widget::Id::new(file_viewer::SCROLLABLE_ID),
+                                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
+                                );
                             }
                         }
                     }
@@ -2853,6 +2925,9 @@ impl App {
                     }
                     if modifiers.command() && c.as_str() == "c" {
                         return Message::FileViewer(file_viewer::Message::CopySelection);
+                    }
+                    if modifiers.command() && c.as_str() == "f" {
+                        return Message::FileViewer(file_viewer::Message::OpenSearch);
                     }
                 }
                 keyboard::Event::KeyPressed {
