@@ -67,6 +67,26 @@ pub struct Workshop {
     /// Active embers (Hand → Hand notifications) for this workshop. Refreshed
     /// on every sparks poll so the Home overview reflects current activity.
     pub embers: Vec<Ember>,
+    /// Spark IDs seen as `blocked` at the last poll. Used to detect
+    /// transitions into the blocked state so a Flash ember can be
+    /// auto-created. Spark sp-ux0008.
+    pub prev_blocked_spark_ids: HashSet<String>,
+    /// Contract row IDs seen as failing at the last poll. Used to detect
+    /// new contract failures so a Flare ember can be auto-created.
+    /// Spark sp-ux0008.
+    pub prev_failing_contract_ids: HashSet<i64>,
+    /// Hand assignment row IDs seen as active at the last poll. Used to
+    /// detect Hand-finish transitions so a Glow ember can be auto-created.
+    /// Spark sp-ux0008.
+    pub prev_active_assignment_ids: HashSet<i64>,
+    /// Baseline-seen flags per ember source. Without these, the initial
+    /// load of each source would emit a Flash/Flare/Glow ember for every
+    /// pre-existing blocked spark, failing contract, and finished Hand.
+    /// Only transitions observed *after* each baseline is captured should
+    /// fire embers. Spark sp-ux0008.
+    pub sparks_baseline_seen: bool,
+    pub contracts_baseline_seen: bool,
+    pub assignments_baseline_seen: bool,
     /// Custom agent definitions from `.ryve/agents/`.
     pub custom_agents: Vec<AgentDef>,
     /// Agent context from `.ryve/context/AGENTS.md`.
@@ -125,6 +145,12 @@ impl Workshop {
             failing_contracts_list: Vec::new(),
             hand_assignments: Vec::new(),
             embers: Vec::new(),
+            prev_blocked_spark_ids: HashSet::new(),
+            prev_failing_contract_ids: HashSet::new(),
+            prev_active_assignment_ids: HashSet::new(),
+            sparks_baseline_seen: false,
+            contracts_baseline_seen: false,
+            assignments_baseline_seen: false,
             custom_agents: Vec::new(),
             agent_context: None,
             background_handle: None,

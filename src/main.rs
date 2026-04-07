@@ -15,7 +15,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use coding_agents::CodingAgent;
-use data::sparks::types::{Bond, Contract, Ember, HandAssignment, PersistedAgentSession, Spark};
+use data::sparks::types::{
+    Bond, Contract, Ember, EmberType, HandAssignment, NewEmber, PersistedAgentSession, Spark,
+};
 use iced::widget::{Space, button, column, container, row, stack, text};
 use iced::{
     Color, Element, Length, Point, Size, Subscription, Task, Theme, event, keyboard, mouse, window,
@@ -255,6 +257,14 @@ enum Message {
     },
     /// A toast's lifetime elapsed — remove it if still present.
     ToastExpired(u64),
+
+    /// User interacted with the ember notification bar (dismiss button).
+    EmberBar(screen::ember_bar::Message),
+    /// Async result from `ember_repo::delete`. The ember row (if any) is
+    /// already gone from the DB by the time this lands; we drop it locally
+    /// too so the UI reflects the dismiss immediately rather than waiting
+    /// for the next 3-second poll. Spark sp-ux0008.
+    EmberDismissed { workshop_id: Uuid, ember_id: String },
 }
 
 impl std::fmt::Debug for Message {
@@ -337,6 +347,8 @@ impl std::fmt::Debug for Message {
             Self::Toast(m) => write!(f, "Toast({m:?})"),
             Self::ShowToast { title, kind, .. } => write!(f, "ShowToast({title}, {kind:?})"),
             Self::ToastExpired(id) => write!(f, "ToastExpired({id})"),
+            Self::EmberBar(m) => write!(f, "EmberBar({m:?})"),
+            Self::EmberDismissed { ember_id, .. } => write!(f, "EmberDismissed({ember_id})"),
         }
     }
 }
@@ -606,6 +618,39 @@ impl App {
                     return Task::none();
                 };
                 if let Some(ws) = self.workshops.get_mut(idx) {
+                    // Detect sparks that transitioned into the `blocked`
+                    // status since the last poll and fire a Flash ember
+                    // for each one. Spark sp-ux0008.
+                    let mut ember_tasks: Vec<Task<Message>> = Vec::new();
+                    let current_blocked: HashSet<String> = sparks
+                        .iter()
+                        .filter(|s| s.status == "blocked")
+                        .map(|s| s.id.clone())
+                        .collect();
+                    if ws.sparks_baseline_seen
+                        && let Some(ref pool) = ws.sparks_db
+                    {
+                        let ws_id_str = ws.workshop_id();
+                        for sp in sparks.iter().filter(|s| s.status == "blocked") {
+                            if !ws.prev_blocked_spark_ids.contains(&sp.id) {
+                                let pool = pool.clone();
+                                let ws_id_str = ws_id_str.clone();
+                                let content = format!("Spark {} blocked: {}", sp.id, sp.title);
+                                ember_tasks.push(Task::perform(
+                                    create_ember_fire_and_forget(
+                                        pool,
+                                        ws_id_str,
+                                        EmberType::Flash,
+                                        content,
+                                        Some("workgraph".to_string()),
+                                    ),
+                                    |_| Message::AgentContextSynced,
+                                ));
+                            }
+                        }
+                    }
+                    ws.prev_blocked_spark_ids = current_blocked;
+                    ws.sparks_baseline_seen = true;
                     ws.sparks = sparks;
 
                     // Refresh failing contract count + blocked-spark set +
@@ -614,7 +659,7 @@ impl App {
                     // the status bar, per-row blocked indicator, and Home
                     // dashboard all stay in sync with the workgraph panel —
                     // there is no separate Home poll.
-                    let mut tasks: Vec<Task<Message>> = Vec::new();
+                    let mut tasks: Vec<Task<Message>> = ember_tasks;
                     if let Some(ref pool) = ws.sparks_db {
                         let ws_id = ws.workshop_id();
                         tasks.push(Task::perform(
@@ -663,16 +708,82 @@ impl App {
                 Task::none()
             }
             Message::FailingContractsListLoaded(id, list) => {
-                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
-                    ws.failing_contracts_list = list;
+                let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) else {
+                    return Task::none();
+                };
+                // Fire a Flare ember for any contract that is newly in the
+                // failing set since the last poll. Spark sp-ux0008.
+                let mut ember_tasks: Vec<Task<Message>> = Vec::new();
+                let current_ids: HashSet<i64> = list.iter().map(|c| c.id).collect();
+                if ws.contracts_baseline_seen
+                    && let Some(ref pool) = ws.sparks_db
+                {
+                    let ws_id_str = ws.workshop_id();
+                    for c in &list {
+                        if !ws.prev_failing_contract_ids.contains(&c.id) {
+                            let pool = pool.clone();
+                            let ws_id_str = ws_id_str.clone();
+                            let content = format!(
+                                "Contract failed on {}: {}",
+                                c.spark_id, c.description
+                            );
+                            ember_tasks.push(Task::perform(
+                                create_ember_fire_and_forget(
+                                    pool,
+                                    ws_id_str,
+                                    EmberType::Flare,
+                                    content,
+                                    Some("contracts".to_string()),
+                                ),
+                                |_| Message::AgentContextSynced,
+                            ));
+                        }
+                    }
                 }
-                Task::none()
+                ws.prev_failing_contract_ids = current_ids;
+                ws.contracts_baseline_seen = true;
+                ws.failing_contracts_list = list;
+                Task::batch(ember_tasks)
             }
             Message::HandAssignmentsLoaded(id, list) => {
-                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
-                    ws.hand_assignments = list;
+                let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) else {
+                    return Task::none();
+                };
+                // Fire a Glow ember for any assignment that was active at
+                // the previous poll but is no longer active — i.e. the
+                // Hand finished its spark. Spark sp-ux0008.
+                let mut ember_tasks: Vec<Task<Message>> = Vec::new();
+                let current_active_ids: HashSet<i64> = list.iter().map(|a| a.id).collect();
+                if ws.assignments_baseline_seen
+                    && let Some(ref pool) = ws.sparks_db
+                {
+                    let ws_id_str = ws.workshop_id();
+                    // Anything in `prev_active_assignment_ids` that is no
+                    // longer in `current_active_ids` transitioned out of
+                    // the active set — that's a Hand finish.
+                    for prev_id in &ws.prev_active_assignment_ids {
+                        if !current_active_ids.contains(prev_id) {
+                            let pool = pool.clone();
+                            let ws_id_str = ws_id_str.clone();
+                            let content =
+                                format!("Hand finished (assignment #{prev_id})");
+                            ember_tasks.push(Task::perform(
+                                create_ember_fire_and_forget(
+                                    pool,
+                                    ws_id_str,
+                                    EmberType::Glow,
+                                    content,
+                                    Some("hands".to_string()),
+                                ),
+                                |_| Message::AgentContextSynced,
+                            ));
+                        }
+                    }
                 }
-                Task::none()
+                ws.prev_active_assignment_ids = current_active_ids;
+                ws.assignments_baseline_seen = true;
+                ws.hand_assignments = list;
+                Task::batch(ember_tasks)
             }
             Message::EmbersLoaded(id, list) => {
                 if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
@@ -2106,7 +2217,56 @@ impl App {
                 self.toasts.retain(|t| t.id != id);
                 Task::none()
             }
+
+            // ── Ember notification bar ───────────────────
+            Message::EmberBar(screen::ember_bar::Message::Dismiss(ember_id)) => {
+                // Drop from the DB so the next poll doesn't resurrect it.
+                let Some(ws) = self.active_workshop_mut() else {
+                    return Task::none();
+                };
+                let ws_uuid = ws.id;
+                let Some(pool) = ws.sparks_db.clone() else {
+                    // No DB yet — just drop it locally.
+                    ws.embers.retain(|e| e.id != ember_id);
+                    return Task::none();
+                };
+                // Optimistic: remove from the cached list immediately so the
+                // bar collapses without waiting for the delete to round-trip.
+                ws.embers.retain(|e| e.id != ember_id);
+                let id_for_async = ember_id.clone();
+                Task::perform(
+                    async move {
+                        if let Err(e) = data::sparks::ember_repo::delete(&pool, &id_for_async).await
+                        {
+                            log::warn!("Failed to delete ember {id_for_async}: {e}");
+                        }
+                        id_for_async
+                    },
+                    move |ember_id| Message::EmberDismissed {
+                        workshop_id: ws_uuid,
+                        ember_id,
+                    },
+                )
+            }
+            Message::EmberDismissed {
+                workshop_id,
+                ember_id,
+            } => {
+                // DB delete finished; make sure the local cache matches. No-op
+                // most of the time because `EmberBar::Dismiss` already pruned.
+                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == workshop_id) {
+                    ws.embers.retain(|e| e.id != ember_id);
+                }
+                Task::none()
+            }
         }
+    }
+
+    /// Mutable accessor for the currently selected workshop, if any. Used by
+    /// handlers that need to mutate workshop state and kick off an async task.
+    fn active_workshop_mut(&mut self) -> Option<&mut Workshop> {
+        let idx = self.active_workshop?;
+        self.workshops.get_mut(idx)
     }
 
     /// Route Home dashboard interactions: clicking a spark surfaces it in
@@ -3193,8 +3353,17 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let workshop_content: Element<'a, Message> =
-            column![main_row, status_bar,].height(Length::Fill).into();
+        // Ember notification bar — sits above the main row so dismissible
+        // Hand-to-Hand signals are visible without blocking the workgraph
+        // panel. When there are no active embers the bar is skipped so it
+        // costs zero vertical space. Spark sp-ux0008.
+        let ember_bar = screen::ember_bar::view(&ws.embers, &pal)
+            .map(|e| e.map(Message::EmberBar));
+
+        let workshop_content: Element<'a, Message> = match ember_bar {
+            Some(bar) => column![bar, main_row, status_bar,].height(Length::Fill).into(),
+            None => column![main_row, status_bar,].height(Length::Fill).into(),
+        };
 
         // Layer background image behind content
         let mut layers: Vec<Element<'a, Message>> = Vec::new();
@@ -3532,6 +3701,32 @@ async fn load_embers(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Ember> 
     data::sparks::ember_repo::list_active(&pool, &workshop_id)
         .await
         .unwrap_or_default()
+}
+
+/// Auto-create an ember in response to a state transition detected during
+/// the 3-second poll. Failures are logged but swallowed — missing a
+/// notification must never break the poll loop. Spark sp-ux0008.
+async fn create_ember_fire_and_forget(
+    pool: sqlx::SqlitePool,
+    workshop_id: String,
+    ember_type: EmberType,
+    content: String,
+    source_agent: Option<String>,
+) {
+    if let Err(e) = data::sparks::ember_repo::create(
+        &pool,
+        NewEmber {
+            ember_type,
+            content,
+            source_agent,
+            workshop_id,
+            ttl_seconds: Some(3600),
+        },
+    )
+    .await
+    {
+        log::warn!("Failed to auto-create ember: {e}");
+    }
 }
 
 /// Load all sparks for a workshop from the database.
