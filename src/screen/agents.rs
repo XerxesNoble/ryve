@@ -4,7 +4,9 @@
 //! Hands panel — lists active and past Hand sessions.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+use data::sparks::types::HandAssignment;
 use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text};
 use iced::{Element, Length, Theme};
 
@@ -12,6 +14,11 @@ use crate::coding_agents::{CodingAgent, ResumeStrategy};
 use crate::style::{
     self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette,
 };
+
+/// How long a Hand's terminal must be silent before it is considered idle
+/// (waiting on the user). Chosen to be a bit longer than the 3s sparks-poll
+/// tick so the idle dot doesn't flicker between keystrokes from the agent.
+pub const IDLE_THRESHOLD: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -49,6 +56,54 @@ pub struct AgentSession {
     /// CLI-spawned background Hands so the UI can open a read-only spy
     /// view; `None` for sessions whose output flows through a terminal tab.
     pub log_path: Option<PathBuf>,
+    /// Last time the terminal for this session produced PTY output.
+    /// Used to distinguish "actively working" from "idle/waiting on user".
+    /// `None` means we haven't observed any output yet — treated as working
+    /// so freshly-spawned Hands don't immediately flash green. Not persisted.
+    pub last_output_at: Option<Instant>,
+}
+
+/// High-level display state for an active Hand, used to pick its indicator color.
+/// Red = no spark claimed, Green = idle/waiting, Blue = actively working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandStatus {
+    /// No active owner assignment — the Hand has no spark to work on.
+    Unassigned,
+    /// Assigned to a spark but the terminal has been silent for `idle_after`.
+    Idle,
+    /// Assigned to a spark and recently producing output.
+    Working,
+}
+
+/// Decide a Hand's status from its assignment state and recent PTY activity.
+///
+/// This is a pure function so it can be unit-tested without spinning up a UI.
+pub fn hand_status(
+    session_id: &str,
+    assignments: &[HandAssignment],
+    last_output_at: Option<Instant>,
+    now: Instant,
+    idle_after: Duration,
+) -> HandStatus {
+    let has_owner = assignments
+        .iter()
+        .any(|a| a.session_id == session_id && a.role == "owner" && a.status == "active");
+    if !has_owner {
+        return HandStatus::Unassigned;
+    }
+    match last_output_at {
+        Some(t) if now.saturating_duration_since(t) >= idle_after => HandStatus::Idle,
+        _ => HandStatus::Working,
+    }
+}
+
+/// Pick the palette color for a given Hand status.
+pub fn hand_status_color(status: HandStatus, pal: &Palette) -> iced::Color {
+    match status {
+        HandStatus::Unassigned => pal.danger,
+        HandStatus::Idle => pal.success,
+        HandStatus::Working => pal.accent,
+    }
 }
 
 impl AgentSession {
@@ -88,7 +143,13 @@ pub fn classify_session(
 }
 
 /// Render the Hands panel.
-pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, _has_bg: bool) -> Element<'a, Message> {
+pub fn view<'a>(
+    sessions: &'a [AgentSession],
+    assignments: &'a [HandAssignment],
+    pal: Palette,
+    _has_bg: bool,
+) -> Element<'a, Message> {
+    let now = Instant::now();
     let header = text("Hands").size(FONT_HEADER).color(pal.text_primary);
 
     let mut content = column![header].spacing(6).padding(10);
@@ -150,9 +211,17 @@ pub fn view<'a>(sessions: &'a [AgentSession], pal: Palette, _has_bg: bool) -> El
         content = content.push(text("Active").size(FONT_LABEL).color(pal.text_secondary));
         for session in &active {
             let is_background = session.is_background();
+            let status = hand_status(
+                &session.id,
+                assignments,
+                session.last_output_at,
+                now,
+                IDLE_THRESHOLD,
+            );
+            let dot_color = hand_status_color(status, &pal);
             let indicator = text("\u{25CF} ") // ● dot
                 .size(FONT_ICON_SM)
-                .color(pal.accent);
+                .color(dot_color);
 
             let label = text(&session.name).size(FONT_BODY).color(pal.text_primary);
 
@@ -302,6 +371,23 @@ mod tests {
             resume_id: None,
             started_at: "2026-04-07T11:00:00+00:00".to_string(),
             log_path: None,
+            last_output_at: None,
+        }
+    }
+
+    fn make_assignment(session: &str, spark: &str) -> HandAssignment {
+        HandAssignment {
+            id: 1,
+            session_id: session.to_string(),
+            spark_id: spark.to_string(),
+            status: "active".to_string(),
+            role: "owner".to_string(),
+            assigned_at: "2026-04-07T11:00:00+00:00".to_string(),
+            last_heartbeat_at: None,
+            lease_expires_at: None,
+            completed_at: None,
+            handoff_to: None,
+            handoff_reason: None,
         }
     }
 
@@ -340,7 +426,7 @@ mod tests {
     #[test]
     fn view_renders_with_empty_sessions() {
         // Smoke test: building the view with no sessions must not panic.
-        let _ = view(&[], Palette::dark(), false);
+        let _ = view(&[], &[], Palette::dark(), false);
     }
 
     #[test]
@@ -352,7 +438,97 @@ mod tests {
                 ..make_session(false, None, ResumeStrategy::ResumeFlag)
             },
         ];
-        let _ = view(&sessions, Palette::dark(), false);
+        let _ = view(&sessions, &[], Palette::dark(), false);
+    }
+
+    #[test]
+    fn hand_status_unassigned_when_no_owner_assignment() {
+        // No assignments → any session is Unassigned (red).
+        let now = Instant::now();
+        assert_eq!(
+            hand_status("session-1", &[], None, now, IDLE_THRESHOLD),
+            HandStatus::Unassigned
+        );
+    }
+
+    #[test]
+    fn hand_status_ignores_non_owner_and_inactive_assignments() {
+        // Owner-active is the only row that counts; observers and
+        // completed assignments must not flip the dot to blue.
+        let now = Instant::now();
+        let mut observer = make_assignment("session-1", "sp-aaaa");
+        observer.role = "observer".to_string();
+        let mut completed = make_assignment("session-1", "sp-bbbb");
+        completed.status = "completed".to_string();
+        assert_eq!(
+            hand_status(
+                "session-1",
+                &[observer, completed],
+                Some(now),
+                now,
+                IDLE_THRESHOLD
+            ),
+            HandStatus::Unassigned
+        );
+    }
+
+    #[test]
+    fn hand_status_working_when_recent_output() {
+        let now = Instant::now();
+        let just_now = now - Duration::from_millis(500);
+        assert_eq!(
+            hand_status(
+                "session-1",
+                &[make_assignment("session-1", "sp-aaaa")],
+                Some(just_now),
+                now,
+                IDLE_THRESHOLD
+            ),
+            HandStatus::Working
+        );
+    }
+
+    #[test]
+    fn hand_status_idle_after_silence_threshold() {
+        let now = Instant::now();
+        let long_ago = now - Duration::from_secs(30);
+        assert_eq!(
+            hand_status(
+                "session-1",
+                &[make_assignment("session-1", "sp-aaaa")],
+                Some(long_ago),
+                now,
+                IDLE_THRESHOLD
+            ),
+            HandStatus::Idle
+        );
+    }
+
+    #[test]
+    fn hand_status_working_when_no_output_yet() {
+        // A freshly spawned Hand (no output seen yet) must not immediately
+        // show as idle — it shows as Working until proven silent.
+        let now = Instant::now();
+        assert_eq!(
+            hand_status(
+                "session-1",
+                &[make_assignment("session-1", "sp-aaaa")],
+                None,
+                now,
+                IDLE_THRESHOLD
+            ),
+            HandStatus::Working
+        );
+    }
+
+    #[test]
+    fn hand_status_color_matches_invariants() {
+        // Invariants from sp-ux0034: Red = unassigned, Green = idle,
+        // Blue = working. Verify each maps to the palette slot we expect.
+        let pal = Palette::dark();
+        assert_eq!(hand_status_color(HandStatus::Unassigned, &pal), pal.danger);
+        assert_eq!(hand_status_color(HandStatus::Idle, &pal), pal.success);
+        assert_eq!(hand_status_color(HandStatus::Working, &pal), pal.accent);
     }
 
     #[test]

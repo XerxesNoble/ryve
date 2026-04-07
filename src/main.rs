@@ -794,6 +794,7 @@ impl App {
                             resume_id: p.resume_id,
                             started_at: p.started_at,
                             log_path: p.log_path.map(PathBuf::from),
+                            last_output_at: None,
                         });
                     }
                 }
@@ -1918,6 +1919,7 @@ impl App {
                             resume_id: None,
                             started_at: chrono::Utc::now().to_rfc3339(),
                             log_path: None,
+                            last_output_at: None,
                         });
 
                         if let Some(ref pool) = ws.sparks_db {
@@ -2157,6 +2159,21 @@ impl App {
 
             if let Some(idx) = ws_idx {
                 let ws = &mut self.workshops[idx];
+                // A ProcessAlacrittyEvent is how iced_term delivers any PTY
+                // activity (the alacritty event loop wakes up on new output,
+                // title changes, bells, etc.). Treating any of these as
+                // "recent activity" is what lets us later flip an idle Hand
+                // back to blue the moment its agent starts speaking again.
+                let is_pty_activity =
+                    matches!(cmd, iced_term::BackendCommand::ProcessAlacrittyEvent(_));
+                if is_pty_activity {
+                    let now = std::time::Instant::now();
+                    for session in ws.agent_sessions.iter_mut() {
+                        if session.tab_id == Some(id) {
+                            session.last_output_at = Some(now);
+                        }
+                    }
+                }
                 let mut tab_closed = false;
                 if let Some(term) = ws.terminals.get_mut(&id) {
                     let action = term.handle(iced_term::Command::ProxyToBackend(cmd.clone()));
@@ -2502,6 +2519,7 @@ impl App {
             resume_id: None,
             started_at: chrono::Utc::now().to_rfc3339(),
             log_path: None,
+            last_output_at: None,
         });
 
         // Persist session to DB + optional spark assignment
@@ -2605,6 +2623,7 @@ impl App {
             resume_id: None,
             started_at: chrono::Utc::now().to_rfc3339(),
             log_path: None,
+            last_output_at: None,
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
@@ -3290,7 +3309,8 @@ impl App {
         has_bg: bool,
         pal: &style::Palette,
     ) -> Element<'a, Message> {
-        screen::agents::view(&ws.agent_sessions, *pal, has_bg).map(Message::Agents)
+        screen::agents::view(&ws.agent_sessions, &ws.hand_assignments, *pal, has_bg)
+            .map(Message::Agents)
     }
 
     fn view_bench<'a>(

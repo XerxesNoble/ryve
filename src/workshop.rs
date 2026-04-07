@@ -833,6 +833,7 @@ mod tests {
             resume_id: None,
             started_at: chrono::Utc::now().to_rfc3339(),
             log_path: None,
+            last_output_at: None,
         });
 
         let ended = ws.end_agent_sessions_for_tab(7);
