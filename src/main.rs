@@ -13,8 +13,8 @@ use std::path::PathBuf;
 
 use data::sparks::types::{PersistedAgentSession, Spark};
 use iced::widget::{Space, button, column, container, row, stack, text};
-use iced::keyboard;
-use iced::{Color, Element, Length, Subscription, Task, Theme};
+use iced::{event, keyboard, mouse, window};
+use iced::{Color, Element, Length, Point, Size, Subscription, Task, Theme};
 use uuid::Uuid;
 
 use coding_agents::CodingAgent;
@@ -22,6 +22,7 @@ use screen::agents::AgentSession;
 use screen::file_explorer;
 use screen::file_viewer;
 use style::Appearance;
+use widget::splitter::{self, SplitterDrag, SplitterKind};
 use workshop::Workshop;
 
 fn main() -> iced::Result {
@@ -98,6 +99,11 @@ struct App {
     poll_in_flight: bool,
     /// Whether the Shift key is currently held (for shift-click line selection).
     shift_held: bool,
+    /// Active drag-to-resize state, if any.
+    splitter_drag: Option<SplitterDrag>,
+    /// Last known window size — used to convert vertical splitter
+    /// drag deltas into a sidebar split ratio.
+    window_size: Size,
 }
 
 #[derive(Clone)]
@@ -161,6 +167,17 @@ enum Message {
     SendSparkPrompt { tab_id: u64, prompt: String },
     /// Submit the previously-pasted prompt by sending Enter.
     SubmitSparkPrompt { tab_id: u64 },
+
+    /// User pressed a layout splitter handle.
+    SplitterPressed(SplitterKind),
+    /// Cursor moved while a splitter drag is active.
+    SplitterMoved(Point),
+    /// Mouse button released while a splitter drag is active.
+    SplitterReleased,
+    /// Layout config persisted to disk after a drag.
+    LayoutSaved,
+    /// Window was resized.
+    WindowResized(Size),
 }
 
 impl std::fmt::Debug for Message {
@@ -199,6 +216,11 @@ impl std::fmt::Debug for Message {
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
             Self::SendSparkPrompt { tab_id, .. } => write!(f, "SendSparkPrompt({tab_id})"),
             Self::SubmitSparkPrompt { tab_id } => write!(f, "SubmitSparkPrompt({tab_id})"),
+            Self::SplitterPressed(k) => write!(f, "SplitterPressed({k:?})"),
+            Self::SplitterMoved(p) => write!(f, "SplitterMoved({:.0},{:.0})", p.x, p.y),
+            Self::SplitterReleased => write!(f, "SplitterReleased"),
+            Self::LayoutSaved => write!(f, "LayoutSaved"),
+            Self::WindowResized(s) => write!(f, "WindowResized({:.0}x{:.0})", s.width, s.height),
         }
     }
 }
@@ -219,6 +241,8 @@ impl App {
                 next_terminal_id: 1,
                 poll_in_flight: false,
                 shift_held: false,
+                splitter_drag: None,
+                window_size: Size::new(1400.0, 900.0),
             },
             Task::none(),
         )
@@ -1056,6 +1080,75 @@ impl App {
                 // Delegate to the existing NewCodingAgent flow
                 return self.handle_bench_message(screen::bench::Message::NewCodingAgent(agent));
             }
+
+            // ── Layout splitters ─────────────────────────────
+            Message::SplitterPressed(kind) => {
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                let ws = &self.workshops[idx];
+                let start_value = match kind {
+                    SplitterKind::SidebarRight => ws.config.layout.sidebar_width,
+                    SplitterKind::SparksLeft => ws.config.layout.sparks_width,
+                    SplitterKind::SidebarFilesHands => ws.config.layout.sidebar_split,
+                };
+                self.splitter_drag = Some(SplitterDrag::new(kind, start_value));
+                Task::none()
+            }
+            Message::SplitterMoved(point) => {
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                let Some(drag) = self.splitter_drag.as_mut() else {
+                    return Task::none();
+                };
+                let cursor = if drag.kind.is_horizontal_drag() {
+                    point.x
+                } else {
+                    point.y
+                };
+                if drag.start_cursor.is_none() {
+                    drag.start_cursor = Some(cursor);
+                    return Task::none();
+                }
+                // Approximate sidebar height — only used for the
+                // files↕hands ratio. Subtract title bar + status bar
+                // + paddings so the ratio feels right under the cursor.
+                let sidebar_height = (self.window_size.height - 80.0).max(1.0);
+                let new_value = splitter::compute_new_value(drag, cursor, sidebar_height);
+                let kind = drag.kind;
+                let ws = &mut self.workshops[idx];
+                match kind {
+                    SplitterKind::SidebarRight => ws.config.layout.sidebar_width = new_value,
+                    SplitterKind::SparksLeft => ws.config.layout.sparks_width = new_value,
+                    SplitterKind::SidebarFilesHands => ws.config.layout.sidebar_split = new_value,
+                }
+                Task::none()
+            }
+            Message::SplitterReleased => {
+                if self.splitter_drag.take().is_none() {
+                    return Task::none();
+                }
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                let ws = &self.workshops[idx];
+                let ryve_dir = ws.ryve_dir.clone();
+                let config = ws.config.clone();
+                Task::perform(
+                    async move {
+                        if let Err(e) = data::ryve_dir::save_config(&ryve_dir, &config).await {
+                            log::warn!("Failed to save layout config: {e}");
+                        }
+                    },
+                    |_| Message::LayoutSaved,
+                )
+            }
+            Message::LayoutSaved => Task::none(),
+            Message::WindowResized(size) => {
+                self.window_size = size;
+                Task::none()
+            }
         }
     }
 
@@ -1538,12 +1631,25 @@ impl App {
             Message::SparksPoll
         });
 
-        Subscription::batch(
-            term_subs
-                .into_iter()
-                .chain(std::iter::once(poll))
-                .chain(std::iter::once(hotkeys)),
-        )
+        // Track window resizes so the splitter can convert vertical
+        // drag deltas into a sensible sidebar split ratio.
+        let resizes = window::resize_events().map(|(_, size)| Message::WindowResized(size));
+
+        let mut subs: Vec<Subscription<Message>> = term_subs
+            .into_iter()
+            .chain(std::iter::once(poll))
+            .chain(std::iter::once(hotkeys))
+            .chain(std::iter::once(resizes))
+            .collect();
+
+        // Only listen to global mouse events while a splitter drag is
+        // in progress — otherwise we'd waste cycles on every cursor
+        // move when nothing cares about them.
+        if self.splitter_drag.is_some() {
+            subs.push(event::listen_with(splitter_event_filter));
+        }
+
+        Subscription::batch(subs)
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1739,8 +1845,13 @@ impl App {
             ))
             .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg));
 
-        let sidebar = column![files_panel, agents_panel]
-            .spacing(style::PANEL_GAP)
+        let sidebar_files_hands_splitter = widget::splitter::horizontal(
+            Message::SplitterPressed(SplitterKind::SidebarFilesHands),
+            &pal,
+        );
+
+        let sidebar = column![files_panel, sidebar_files_hands_splitter, agents_panel]
+            .spacing(0)
             .width(ws.sidebar_width())
             .height(Length::Fill);
 
@@ -1763,6 +1874,15 @@ impl App {
         let sparks_col = container(sparks_panel)
             .width(ws.sparks_width())
             .height(Length::Fill);
+
+        let sidebar_bench_splitter = widget::splitter::vertical(
+            Message::SplitterPressed(SplitterKind::SidebarRight),
+            &pal,
+        );
+        let bench_sparks_splitter = widget::splitter::vertical(
+            Message::SplitterPressed(SplitterKind::SparksLeft),
+            &pal,
+        );
 
         // -- Bottom: status bar --
         let spark_summary = {
@@ -1803,9 +1923,15 @@ impl App {
         .map(Message::StatusBar);
 
         let main_row = container(
-            row![sidebar, bench, sparks_col]
-                .spacing(style::PANEL_GAP)
-                .height(Length::Fill),
+            row![
+                sidebar,
+                sidebar_bench_splitter,
+                bench,
+                bench_sparks_splitter,
+                sparks_col
+            ]
+            .spacing(0)
+            .height(Length::Fill),
         )
         .padding(style::PANEL_GAP)
         .width(Length::Fill)
@@ -2027,6 +2153,26 @@ fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
     );
 
     prompt
+}
+
+/// Translate global runtime events into splitter messages while a
+/// drag is in progress. `listen_with` requires a `fn` (no closures),
+/// so we always emit messages and let the `update` function decide
+/// what to do based on `splitter_drag` state.
+fn splitter_event_filter(
+    event: iced::Event,
+    _status: event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            Some(Message::SplitterMoved(position))
+        }
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+            Some(Message::SplitterReleased)
+        }
+        _ => None,
+    }
 }
 
 /// Open a native directory picker dialog.
