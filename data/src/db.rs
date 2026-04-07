@@ -27,16 +27,33 @@ pub async fn open_sparks_db(workshop_dir: &Path) -> Result<SqlitePool, SparksErr
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true);
 
+    // Run migrations on a throwaway single-connection pool, then drop it
+    // before opening the real pool. SQLite connections cache prepared-
+    // statement column metadata; if a `SELECT *` is prepared on the same
+    // connection that later runs `ALTER TABLE ADD COLUMN`, the cached
+    // metadata becomes stale and `SqliteRow::new` panics with an index
+    // out-of-bounds when the next row is decoded. Using a fresh pool for
+    // queries guarantees no such cached statements exist.
+    {
+        let migration_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .map_err(SparksError::Database)?;
+
+        sqlx::migrate!("./migrations")
+            .run(&migration_pool)
+            .await
+            .map_err(|e| SparksError::Database(e.into()))?;
+
+        migration_pool.close().await;
+    }
+
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
         .await
         .map_err(SparksError::Database)?;
-
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .map_err(|e| SparksError::Database(e.into()))?;
 
     Ok(pool)
 }

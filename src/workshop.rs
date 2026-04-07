@@ -119,6 +119,38 @@ impl Workshop {
         self.last_worktree_warning.take()
     }
 
+    /// Take a snapshot of the bench's open tabs in a form suitable for
+    /// persistence. Coding-agent tabs are intentionally excluded — they're
+    /// already tracked via `agent_sessions` and re-launched through the
+    /// Hand panel's resume button. The returned vec preserves left-to-right
+    /// tab order via the `position` field.
+    pub fn snapshot_open_tabs(&self) -> Vec<data::sparks::open_tab_repo::PersistedTab> {
+        let workshop_id = self.workshop_id();
+        self.bench
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tab)| {
+                let (kind, payload) = match &tab.kind {
+                    TabKind::Terminal => ("terminal", None),
+                    TabKind::FileViewer(path) => (
+                        "file_viewer",
+                        Some(path.to_string_lossy().into_owned()),
+                    ),
+                    // Skip coding-agent tabs — see doc comment above.
+                    TabKind::CodingAgent(_) => return None,
+                };
+                Some(data::sparks::open_tab_repo::PersistedTab {
+                    workshop_id: workshop_id.clone(),
+                    position: idx as i64,
+                    tab_kind: kind.to_string(),
+                    title: tab.title.clone(),
+                    payload,
+                })
+            })
+            .collect()
+    }
+
     /// Stable workshop identifier for database queries.
     ///
     /// Derived from the directory name so it matches the CLI (`ryve`)

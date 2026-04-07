@@ -71,11 +71,16 @@ impl CodingAgent {
         match &self.resume {
             ResumeStrategy::ResumeFlag => {
                 // `claude --resume` or `codex --resume`
+                //
+                // We deliberately do NOT pass the previous session id as a
+                // positional argument here. With just `--resume`, claude/codex
+                // launch their own interactive session picker so the user
+                // can confirm which conversation to resume — that's what we
+                // want from the Hand panel's "▶ resume" button. Passing the
+                // id would auto-resume silently and bypass the picker.
+                let _ = resume_id;
                 let mut args = self.args.clone();
                 args.push("--resume".to_string());
-                if let Some(id) = resume_id {
-                    args.push(id.to_string());
-                }
                 Some((self.command.clone(), args))
             }
             ResumeStrategy::SessionResume => {

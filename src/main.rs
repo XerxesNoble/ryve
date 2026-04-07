@@ -161,6 +161,11 @@ enum Message {
     AgentSessionsLoaded(Uuid, Vec<PersistedAgentSession>),
     /// Agent session saved to DB
     AgentSessionSaved,
+    /// Persisted open-tabs snapshot loaded from DB. Each entry is replayed
+    /// against the bench to restore the user's prior tab list.
+    OpenTabsLoaded(Uuid, Vec<data::sparks::open_tab_repo::PersistedTab>),
+    /// Open-tabs snapshot persisted to DB.
+    OpenTabsSaved,
     /// File tree scanned for a workshop
     FilesScanned(Uuid, file_explorer::Message),
 
@@ -260,6 +265,10 @@ impl std::fmt::Debug for Message {
                 write!(f, "AgentSessionsLoaded({id}, {} sessions)", s.len())
             }
             Self::AgentSessionSaved => write!(f, "AgentSessionSaved"),
+            Self::OpenTabsLoaded(id, t) => {
+                write!(f, "OpenTabsLoaded({id}, {} tabs)", t.len())
+            }
+            Self::OpenTabsSaved => write!(f, "OpenTabsSaved"),
             Self::FilesScanned(id, _) => write!(f, "FilesScanned({id})"),
             Self::FileExplorer(m) => write!(f, "FileExplorer({m:?})"),
             Self::FileViewer(m) => write!(f, "FileViewer({m:?})"),
@@ -353,6 +362,38 @@ impl App {
 
     /// Push a new toast onto the stack and return a `Task` that will
     /// emit `ToastExpired` after the toast's lifetime.
+    /// Persist the open-tabs snapshot for `workshop_idx`. Returns a Task
+    /// that writes the new snapshot to the database; returns `Task::none()`
+    /// if the workshop has no DB pool yet (e.g., during init).
+    ///
+    /// This is invoked on every tab create/close so the database stays in
+    /// sync with the bench. Coding-agent tabs are filtered out by
+    /// `Workshop::snapshot_open_tabs`.
+    fn persist_open_tabs(&self, workshop_idx: usize) -> Task<Message> {
+        let Some(ws) = self.workshops.get(workshop_idx) else {
+            return Task::none();
+        };
+        let Some(pool) = ws.sparks_db.clone() else {
+            return Task::none();
+        };
+        let workshop_id = ws.workshop_id();
+        let snapshot = ws.snapshot_open_tabs();
+        Task::perform(
+            async move {
+                if let Err(e) = data::sparks::open_tab_repo::save_snapshot(
+                    &pool,
+                    &workshop_id,
+                    &snapshot,
+                )
+                .await
+                {
+                    log::warn!("Failed to persist open tabs for {workshop_id}: {e}");
+                }
+            },
+            |_| Message::OpenTabsSaved,
+        )
+    }
+
     fn push_toast(
         &mut self,
         title: impl Into<String>,
@@ -491,9 +532,15 @@ impl App {
                     let sparks_task = Task::perform(load_sparks(pool, ws_id), move |sparks| {
                         Message::SparksLoaded(id, sparks)
                     });
+                    let pool3 = ws.sparks_db.clone().unwrap();
+                    let ws_id3 = ws.workshop_id();
                     let sessions_task =
                         Task::perform(load_agent_sessions(pool2, ws_id2), move |sessions| {
                             Message::AgentSessionsLoaded(id, sessions)
+                        });
+                    let open_tabs_task =
+                        Task::perform(load_open_tabs(pool3, ws_id3), move |tabs| {
+                            Message::OpenTabsLoaded(id, tabs)
                         });
                     let ignore = ws.config.explorer.ignore.clone();
                     let scan_task = Task::perform(
@@ -518,7 +565,13 @@ impl App {
                         Task::none()
                     };
 
-                    return Task::batch([sparks_task, sessions_task, scan_task, bg_task]);
+                    return Task::batch([
+                        sparks_task,
+                        sessions_task,
+                        open_tabs_task,
+                        scan_task,
+                        bg_task,
+                    ]);
                 }
                 Task::none()
             }
@@ -673,6 +726,72 @@ impl App {
 
             Message::AgentSessionSaved => Task::none(),
 
+            Message::OpenTabsLoaded(id, persisted) => {
+                // Replay the persisted snapshot against the bench. Each
+                // entry becomes a fresh tab — terminals re-spawn an empty
+                // shell, file viewers re-open their path. Coding-agent
+                // tabs aren't persisted, so we never recreate one here.
+                let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
+                let Some(idx) = ws_idx else {
+                    return Task::none();
+                };
+
+                let mut follow_up: Vec<Task<Message>> = Vec::new();
+                for tab in persisted {
+                    match tab.tab_kind.as_str() {
+                        "terminal" => {
+                            let next_id = &mut self.next_terminal_id;
+                            self.workshops[idx].spawn_terminal(
+                                tab.title,
+                                None,
+                                next_id,
+                                None,
+                                false,
+                            );
+                        }
+                        "file_viewer" => {
+                            let Some(payload) = tab.payload else { continue };
+                            let path = std::path::PathBuf::from(payload);
+                            // Skip files that no longer exist on disk so a
+                            // restored snapshot from a stale workshop doesn't
+                            // pop a wall of failure toasts.
+                            if !path.exists() {
+                                continue;
+                            }
+                            let ws = &mut self.workshops[idx];
+                            let (tab_id, is_new) =
+                                ws.open_file_tab(path.clone(), &mut self.next_terminal_id);
+                            if is_new {
+                                let repo_root = ws.directory.clone();
+                                let pool = ws.sparks_db.clone();
+                                let ws_id = ws.workshop_id();
+                                follow_up.push(Task::perform(
+                                    file_viewer::load_file(
+                                        tab_id,
+                                        path,
+                                        repo_root,
+                                        pool,
+                                        ws_id,
+                                        self.appearance == style::Appearance::Light,
+                                    ),
+                                    Message::FileViewer,
+                                ));
+                            }
+                        }
+                        other => {
+                            log::warn!("Unknown persisted tab kind: {other}");
+                        }
+                    }
+                }
+
+                if follow_up.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(follow_up)
+                }
+            }
+            Message::OpenTabsSaved => Task::none(),
+
             Message::FilesScanned(id, msg) => {
                 let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
                 let Some(idx) = ws_idx else {
@@ -711,7 +830,7 @@ impl App {
                             let repo_root = ws.directory.clone();
                             let pool = ws.sparks_db.clone();
                             let ws_id = ws.workshop_id();
-                            return Task::perform(
+                            let load = Task::perform(
                                 file_viewer::load_file(
                                     tab_id,
                                     file_path,
@@ -722,6 +841,8 @@ impl App {
                                 ),
                                 Message::FileViewer,
                             );
+                            let persist = self.persist_open_tabs(idx);
+                            return Task::batch([load, persist]);
                         }
                     }
                     file_explorer::Message::ToggleDirectory(ref path) => {
@@ -863,9 +984,11 @@ impl App {
                     } => {
                         // Close the empty viewer tab since there's nothing to show,
                         // then toast the failure so it doesn't vanish.
-                        for ws in &mut self.workshops {
+                        let mut closed_in: Option<usize> = None;
+                        for (idx, ws) in self.workshops.iter_mut().enumerate() {
                             if ws.file_viewers.remove(&tab_id).is_some() {
                                 ws.bench.close_tab(tab_id);
+                                closed_in = Some(idx);
                                 break;
                             }
                         }
@@ -873,11 +996,15 @@ impl App {
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                        return self.push_toast(
+                        let toast = self.push_toast(
                             format!("Failed to open {name}"),
                             error,
                             ToastKind::Error,
                         );
+                        if let Some(idx) = closed_in {
+                            return Task::batch([toast, self.persist_open_tabs(idx)]);
+                        }
+                        return toast;
                     }
                 }
                 Task::none()
@@ -1809,27 +1936,43 @@ impl App {
 
             if let Some(idx) = ws_idx {
                 let ws = &mut self.workshops[idx];
+                let mut tab_closed = false;
                 if let Some(term) = ws.terminals.get_mut(&id) {
                     let action = term.handle(iced_term::Command::ProxyToBackend(cmd.clone()));
+                    let was_shutdown =
+                        matches!(action, iced_term::actions::Action::Shutdown);
                     let ended_sessions = ws.handle_terminal_action(id, action);
+                    if was_shutdown {
+                        tab_closed = true;
+                    }
                     if !ended_sessions.is_empty() {
                         if let Some(ref pool) = ws.sparks_db {
                             let pool = pool.clone();
-                            let tasks = ended_sessions.into_iter().map(|sid| {
-                                let pool = pool.clone();
-                                Task::perform(
-                                    async move {
-                                        let _ = data::sparks::agent_session_repo::end_session(
-                                            &pool, &sid,
-                                        )
-                                        .await;
-                                    },
-                                    |_| Message::AgentSessionSaved,
-                                )
-                            });
-                            return Task::batch(tasks.collect::<Vec<_>>());
+                            let mut tasks: Vec<Task<Message>> = ended_sessions
+                                .into_iter()
+                                .map(|sid| {
+                                    let pool = pool.clone();
+                                    Task::perform(
+                                        async move {
+                                            let _ =
+                                                data::sparks::agent_session_repo::end_session(
+                                                    &pool, &sid,
+                                                )
+                                                .await;
+                                        },
+                                        |_| Message::AgentSessionSaved,
+                                    )
+                                })
+                                .collect();
+                            if tab_closed {
+                                tasks.push(self.persist_open_tabs(idx));
+                            }
+                            return Task::batch(tasks);
                         }
                     }
+                }
+                if tab_closed {
+                    return self.persist_open_tabs(idx);
                 }
             }
             return Task::none();
@@ -1909,9 +2052,9 @@ impl App {
                 }
 
                 ws.bench.close_tab(id);
-                if !end_tasks.is_empty() {
-                    return Task::batch(end_tasks);
-                }
+                let persist = self.persist_open_tabs(idx);
+                end_tasks.push(persist);
+                return Task::batch(end_tasks);
             }
             screen::bench::Message::ToggleDropdown => {
                 self.workshops[idx].bench.dropdown_open = !self.workshops[idx].bench.dropdown_open;
@@ -1925,9 +2068,12 @@ impl App {
                     None,
                     false,
                 );
+                let persist = self.persist_open_tabs(idx);
                 if let Some(term) = self.workshops[idx].terminals.get(&tab_id) {
-                    return iced_term::TerminalView::focus(term.widget_id().clone());
+                    let focus = iced_term::TerminalView::focus(term.widget_id().clone());
+                    return Task::batch([focus, persist]);
                 }
+                return persist;
             }
             screen::bench::Message::NewCodingAgent(agent) => {
                 // Legacy direct spawn — preserved for the auto-prompt-default
@@ -3020,6 +3166,18 @@ async fn load_agent_sessions(
     workshop_id: String,
 ) -> Vec<PersistedAgentSession> {
     data::sparks::agent_session_repo::list_for_workshop(&pool, &workshop_id)
+        .await
+        .unwrap_or_default()
+}
+
+/// Load the persisted open-tabs snapshot for a workshop. Errors are
+/// swallowed since failing to restore tabs is non-fatal — the user just
+/// gets an empty bench.
+async fn load_open_tabs(
+    pool: sqlx::SqlitePool,
+    workshop_id: String,
+) -> Vec<data::sparks::open_tab_repo::PersistedTab> {
+    data::sparks::open_tab_repo::list_for_workshop(&pool, &workshop_id)
         .await
         .unwrap_or_default()
 }
