@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use crate::coding_agents::CodingAgent;
 use crate::style::{
-    self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette,
+    self, FONT_BODY, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette,
 };
 use data::ryve_dir::AgentDef;
 
@@ -27,6 +27,10 @@ pub enum TabKind {
     Terminal,
     CodingAgent(CodingAgent),
     FileViewer(PathBuf),
+    /// Multi-Hand coordination dashboard. Singleton per workshop —
+    /// `Workshop::open_home_tab` enforces "at most one" so the dropdown
+    /// entry can be pressed repeatedly without spawning duplicates.
+    Home,
 }
 
 /// State for the bench panel.
@@ -42,6 +46,9 @@ pub enum Message {
     CloseTab(u64),
     ToggleDropdown,
     NewTerminal,
+    /// Open (or focus) the Home / multi-Hand coordination dashboard tab.
+    /// Singleton per workshop.
+    OpenHome,
     /// Open the spark+agent picker for spawning a regular Hand on a spark.
     NewHand,
     /// Open the agent picker for spawning a Head — a coding agent that
@@ -96,6 +103,7 @@ impl BenchState {
                 TabKind::Terminal => ("\u{25B8}", "Terminal".to_string()),
                 TabKind::CodingAgent(agent) => ("\u{2726}", agent.display_name.clone()),
                 TabKind::FileViewer(path) => ("\u{25A2}", path.to_string_lossy().to_string()),
+                TabKind::Home => ("\u{2302}", "Home".to_string()),
             };
 
             let tab_content = row![
@@ -165,6 +173,17 @@ impl BenchState {
 
         let pal = *pal;
         let mut menu = column![].spacing(2).padding(6);
+
+        // Home/overview is its own tab kind — single click opens or focuses
+        // the existing instance. Always available; lives above the agent
+        // entries because it's the first thing a user reaches for when they
+        // want to see the big picture across many Hands.
+        menu = menu.push(
+            button(text("Open Home").size(FONT_BODY).color(pal.text_primary))
+                .style(button::text)
+                .width(Length::Fill)
+                .on_press(Message::OpenHome),
+        );
 
         // Top-level: the three roles a new tab can take on. The agent
         // picker happens inside the spark picker for Hand / inside its own
