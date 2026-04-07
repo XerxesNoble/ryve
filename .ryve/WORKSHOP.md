@@ -6,37 +6,37 @@ You are a **Hand** working inside a **Ryve Workshop**. Ryve manages tasks (calle
 
 ## Getting Started
 
-Before doing any work, check the current workgraph state with `ryve-cli spark list` to see active sparks, their priorities, and which are already claimed.
+Before doing any work, check the current workgraph state with `ryve spark list` to see active sparks, their priorities, and which are already claimed.
 
 ## Rules
 
 1. **Always reference spark IDs** in commit messages: `fix(auth): validate token expiry [sp-a1b2]`
 2. **Work in priority order** — P0 is critical, P4 is negligible.
-3. **Respect architectural constraints** — run `ryve-cli constraint list` to check. Violations are blocking.
-4. **Check required contracts** before considering a spark done: `ryve-cli contract list <spark-id>`.
+3. **Respect architectural constraints** — run `ryve constraint list` to check. Violations are blocking.
+4. **Check required contracts** before considering a spark done: `ryve contract list <spark-id>`.
 5. **Do not work on a spark that is already claimed** by another Hand.
 6. If you discover a new bug or task, create a spark for it (see commands below).
 
 ## Workgraph Commands
 
-Use `ryve-cli` to query and update the workgraph. **Always run from the workshop root.**
+Use `ryve` to query and update the workgraph. **Always run from the workshop root.**
 
 ### Query state
 
 ```sh
-ryve-cli spark list              # active sparks
-ryve-cli spark list --all         # include closed
-ryve-cli spark show <spark-id>    # spark details
-ryve-cli constraint list           # architectural constraints
-ryve-cli contract list <spark-id>  # verification contracts
+ryve spark list              # active sparks
+ryve spark list --all         # include closed
+ryve spark show <spark-id>    # spark details
+ryve constraint list           # architectural constraints
+ryve contract list <spark-id>  # verification contracts
 ```
 
 ### Mutate state
 
 ```sh
-ryve-cli spark create <title>                    # create a new spark
-ryve-cli spark status <spark-id> in_progress      # claim / update status
-ryve-cli spark close <spark-id> <reason>           # close a spark
+ryve spark create <title>                    # create a new spark
+ryve spark status <spark-id> in_progress      # claim / update status
+ryve spark close <spark-id> <reason>           # close a spark
 ```
 
 Ryve auto-refreshes every 3 seconds. Changes are picked up by the UI and other Hands automatically.

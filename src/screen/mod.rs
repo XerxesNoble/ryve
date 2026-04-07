@@ -10,3 +10,4 @@ pub mod spark_detail;
 pub mod spark_picker;
 pub mod sparks;
 pub mod status_bar;
+pub mod toast;

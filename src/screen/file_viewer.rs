@@ -48,6 +48,12 @@ pub enum Message {
         line_changes: HashMap<u32, LineChange>,
         spark_links: Vec<SparkFileLink>,
     },
+    /// File could not be read from disk.
+    FileLoadFailed {
+        tab_id: u64,
+        path: PathBuf,
+        error: String,
+    },
     /// Navigate to a linked spark.
     GoToSpark(String),
     /// Viewport changed — carries scroll-y offset and viewport height.
@@ -441,9 +447,16 @@ pub async fn load_file(
     light_mode: bool,
 ) -> Message {
     // Read file content
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .unwrap_or_else(|e| format!("Error reading file: {e}"));
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Message::FileLoadFailed {
+                tab_id,
+                path,
+                error: e.to_string(),
+            };
+        }
+    };
 
     // Get line-level git diff
     let is_repo = data::git::Repository::is_repo(&repo_root).await;

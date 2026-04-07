@@ -65,6 +65,9 @@ pub struct Workshop {
     pub bg_is_dark: Option<bool>,
     /// Pending agent spawn -- shows spark picker before creating terminal.
     pub pending_agent_spawn: Option<PendingAgentSpawn>,
+    /// One-shot warning set when the last worktree creation fell back to
+    /// the main workshop directory. The UI drains this to surface a toast.
+    pub last_worktree_warning: Option<String>,
 }
 
 impl Workshop {
@@ -90,7 +93,14 @@ impl Workshop {
             selected_spark: None,
             bg_is_dark: None,
             pending_agent_spawn: None,
+            last_worktree_warning: None,
         }
+    }
+
+    /// Drain a pending worktree warning, if any. Returns the message so the
+    /// caller can surface it as a toast.
+    pub fn take_worktree_warning(&mut self) -> Option<String> {
+        self.last_worktree_warning.take()
     }
 
     /// Stable workshop identifier for database queries.
@@ -179,11 +189,14 @@ impl Workshop {
         self.bench.create_tab(tab_id, title, kind);
 
         // Create a worktree for agent sessions (not plain terminals)
-        let working_dir = if let (Some(agent), Some(sid)) = (agent, session_id) {
+        let working_dir = if let (Some(_), Some(sid)) = (agent, session_id) {
             match create_hand_worktree(&self.directory, &self.ryve_dir, sid) {
                 Ok(wt_path) => wt_path,
                 Err(e) => {
                     log::warn!("Failed to create worktree for hand {sid}: {e}");
+                    self.last_worktree_warning = Some(format!(
+                        "Failed to create worktree for hand {sid}: {e}. Falling back to workshop root."
+                    ));
                     self.directory.clone()
                 }
             }
@@ -267,6 +280,9 @@ impl Workshop {
             Ok(wt_path) => wt_path,
             Err(e) => {
                 log::warn!("Failed to create worktree for hand {session_id}: {e}");
+                self.last_worktree_warning = Some(format!(
+                    "Failed to create worktree for hand {session_id}: {e}. Falling back to workshop root."
+                ));
                 self.directory.clone()
             }
         };
