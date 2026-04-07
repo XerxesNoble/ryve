@@ -3,7 +3,7 @@
 
 //! Spark detail view — shown when a spark is selected in the workgraph panel.
 
-use data::sparks::types::{Contract, ContractEnforcement, ContractKind, Spark};
+use data::sparks::types::{Bond, Contract, ContractEnforcement, ContractKind, Spark};
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Theme};
 
@@ -117,6 +117,8 @@ pub enum Message {
 pub fn view<'a>(
     spark: &'a Spark,
     contracts: &'a [Contract],
+    bonds: &'a [Bond],
+    all_sparks: &'a [Spark],
     create_form: &'a ContractCreateForm,
     pal: &Palette,
     has_bg: bool,
@@ -273,6 +275,13 @@ pub fn view<'a>(
         body = body.push(items);
     }
 
+    // ── Dependencies section ─────────────────────────
+    // Surface bonds in both directions so a Hand can immediately see what
+    // a spark blocks (downstream work) and what's blocking it (upstream
+    // work that must close first). Without this, bonds were invisible to
+    // anyone not running raw SQL — see sp-ux0006.
+    body = body.push(view_bonds_section(spark, bonds, all_sparks, &pal));
+
     // ── Contracts section ────────────────────────────
     body = body.push(view_contracts_section(
         &spark.id,
@@ -341,6 +350,162 @@ pub fn view<'a>(
         .height(Length::Fill)
         .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg))
         .into()
+}
+
+// ── Bonds section ────────────────────────────────────
+
+/// Classify bonds for the spark into three groups for display:
+/// downstream blocking ("Blocks"), upstream blocking ("Blocked by"),
+/// and everything else ("Related"). Returns owned data so the view tree
+/// can borrow without lifetime gymnastics.
+fn classify_bonds<'a>(
+    spark: &'a Spark,
+    bonds: &'a [Bond],
+    all_sparks: &'a [Spark],
+) -> (
+    Vec<(&'a Spark, &'a Bond)>, // blocks (downstream)
+    Vec<(&'a Spark, &'a Bond)>, // blocked by (upstream)
+    Vec<(&'a Spark, &'a Bond, bool /* outgoing */)>, // related/other
+) {
+    let lookup = |id: &str| all_sparks.iter().find(|s| s.id == id);
+    let mut blocks = Vec::new();
+    let mut blocked_by = Vec::new();
+    let mut other = Vec::new();
+    for b in bonds {
+        let blocking = matches!(b.bond_type.as_str(), "blocks" | "conditional_blocks");
+        if b.from_id == spark.id {
+            // outgoing
+            if let Some(other_s) = lookup(&b.to_id) {
+                if blocking {
+                    blocks.push((other_s, b));
+                } else {
+                    other.push((other_s, b, true));
+                }
+            }
+        } else if b.to_id == spark.id {
+            // incoming
+            if let Some(other_s) = lookup(&b.from_id) {
+                if blocking {
+                    blocked_by.push((other_s, b));
+                } else {
+                    other.push((other_s, b, false));
+                }
+            }
+        }
+    }
+    (blocks, blocked_by, other)
+}
+
+fn view_bonds_section<'a>(
+    spark: &'a Spark,
+    bonds: &'a [Bond],
+    all_sparks: &'a [Spark],
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+    let (blocks, blocked_by, other) = classify_bonds(spark, bonds, all_sparks);
+
+    if blocks.is_empty() && blocked_by.is_empty() && other.is_empty() {
+        return column![
+            text("Dependencies")
+                .size(FONT_LABEL)
+                .color(pal.text_tertiary),
+            text("No bonds")
+                .size(FONT_SMALL)
+                .color(pal.text_tertiary),
+        ]
+        .spacing(2)
+        .into();
+    }
+
+    let mut col = column![text("Dependencies")
+        .size(FONT_LABEL)
+        .color(pal.text_tertiary),]
+    .spacing(4);
+
+    if !blocked_by.is_empty() {
+        // Highlight if any blocker is still open — that's the "you can't
+        // work on this yet" signal the spark says was missing.
+        let any_open = blocked_by.iter().any(|(s, _)| s.status != "closed");
+        let header_color = if any_open { pal.danger } else { pal.text_secondary };
+        col = col.push(
+            text(format!("Blocked by ({})", blocked_by.len()))
+                .size(FONT_SMALL)
+                .color(header_color),
+        );
+        for (s, _b) in &blocked_by {
+            col = col.push(view_bond_row(s, &pal));
+        }
+    }
+
+    if !blocks.is_empty() {
+        col = col.push(
+            text(format!("Blocks ({})", blocks.len()))
+                .size(FONT_SMALL)
+                .color(pal.text_secondary),
+        );
+        for (s, _b) in &blocks {
+            col = col.push(view_bond_row(s, &pal));
+        }
+    }
+
+    if !other.is_empty() {
+        col = col.push(
+            text(format!("Related ({})", other.len()))
+                .size(FONT_SMALL)
+                .color(pal.text_tertiary),
+        );
+        for (s, b, outgoing) in &other {
+            col = col.push(view_bond_row_typed(s, &b.bond_type, *outgoing, &pal));
+        }
+    }
+
+    col.into()
+}
+
+fn bond_status_symbol(status: &str) -> &'static str {
+    status_symbol(status)
+}
+
+fn view_bond_row<'a>(s: &'a Spark, pal: &Palette) -> Element<'a, Message> {
+    let pal = *pal;
+    let icon = bond_status_symbol(&s.status);
+    let color = status_color(&s.status, &pal);
+    row![
+        text(icon).size(FONT_SMALL).color(color),
+        text(format!("P{}", s.priority))
+            .size(FONT_SMALL)
+            .color(pal.text_tertiary),
+        text(s.id.as_str()).size(FONT_SMALL).color(pal.text_tertiary),
+        text(s.title.as_str()).size(FONT_BODY).color(pal.text_primary),
+    ]
+    .spacing(6)
+    .padding([2, 8])
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+fn view_bond_row_typed<'a>(
+    s: &'a Spark,
+    bond_type: &'a str,
+    outgoing: bool,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+    let icon = bond_status_symbol(&s.status);
+    let color = status_color(&s.status, &pal);
+    let arrow = if outgoing { "\u{2192}" } else { "\u{2190}" };
+    row![
+        text(icon).size(FONT_SMALL).color(color),
+        text(arrow).size(FONT_SMALL).color(pal.text_tertiary),
+        text(bond_type).size(FONT_SMALL).color(pal.text_tertiary),
+        text(s.id.as_str()).size(FONT_SMALL).color(pal.text_tertiary),
+        text(s.title.as_str()).size(FONT_BODY).color(pal.text_primary),
+    ]
+    .spacing(6)
+    .padding([2, 8])
+    .align_y(iced::Alignment::Center)
+    .into()
 }
 
 // ── Contracts section ────────────────────────────────
@@ -685,6 +850,77 @@ mod tests {
         assert!(f.description.is_empty());
         assert!(f.check_command.is_empty());
         assert_eq!(f.enforcement, ContractEnforcement::Required);
+    }
+
+    fn make_spark(id: &str, status: &str) -> Spark {
+        Spark {
+            id: id.to_string(),
+            title: format!("title {id}"),
+            description: String::new(),
+            status: status.to_string(),
+            priority: 2,
+            spark_type: "task".to_string(),
+            assignee: None,
+            owner: None,
+            parent_id: None,
+            workshop_id: "ws".to_string(),
+            estimated_minutes: None,
+            github_issue_number: None,
+            github_repo: None,
+            metadata: "{}".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            closed_reason: None,
+            due_at: None,
+            defer_until: None,
+            risk_level: None,
+            scope_boundary: None,
+        }
+    }
+
+    fn make_bond(id: i64, from: &str, to: &str, ty: &str) -> Bond {
+        Bond {
+            id,
+            from_id: from.to_string(),
+            to_id: to.to_string(),
+            bond_type: ty.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_bonds_splits_blocks_blocked_by_and_other() {
+        let me = make_spark("sp-me", "open");
+        let upstream = make_spark("sp-up", "open");
+        let downstream = make_spark("sp-down", "open");
+        let related = make_spark("sp-rel", "open");
+        let all = vec![me.clone(), upstream.clone(), downstream.clone(), related.clone()];
+
+        let bonds = vec![
+            make_bond(1, "sp-up", "sp-me", "blocks"), // upstream blocks me
+            make_bond(2, "sp-me", "sp-down", "blocks"), // me blocks downstream
+            make_bond(3, "sp-me", "sp-rel", "related"),
+            make_bond(4, "sp-other", "sp-me", "blocks"), // unknown spark — should be skipped
+        ];
+
+        let (blocks, blocked_by, other) = classify_bonds(&me, &bonds, &all);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0.id, "sp-down");
+        assert_eq!(blocked_by.len(), 1);
+        assert_eq!(blocked_by[0].0.id, "sp-up");
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].0.id, "sp-rel");
+        assert!(other[0].2, "related bond from me is outgoing");
+    }
+
+    #[test]
+    fn classify_bonds_treats_conditional_blocks_as_blocking() {
+        let me = make_spark("sp-me", "open");
+        let blocker = make_spark("sp-b", "open");
+        let all = vec![me.clone(), blocker.clone()];
+        let bonds = vec![make_bond(1, "sp-b", "sp-me", "conditional_blocks")];
+        let (_, blocked_by, _) = classify_bonds(&me, &bonds, &all);
+        assert_eq!(blocked_by.len(), 1);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use data::ryve_dir::{AgentDef, RyveDir, WorkshopConfig};
-use data::sparks::types::{Contract, Spark};
+use data::sparks::types::{Bond, Contract, Spark};
 use iced::Theme;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -70,6 +70,14 @@ pub struct Workshop {
     pub selected_spark: Option<String>,
     /// Cached contracts for the currently selected spark.
     pub selected_spark_contracts: Vec<Contract>,
+    /// Cached bonds (dependency edges) for the currently selected spark.
+    /// Includes bonds in both directions so the detail view can render
+    /// "Blocks" and "Blocked by" lists.
+    pub selected_spark_bonds: Vec<Bond>,
+    /// Set of spark IDs that have at least one open blocking bond pointing
+    /// at them. Recomputed alongside `sparks` so the panel can show a
+    /// blocked indicator without re-querying per row.
+    pub blocked_spark_ids: HashSet<String>,
     /// Inline contract-create form for the spark detail view.
     pub contract_create_form: crate::screen::spark_detail::ContractCreateForm,
     /// Whether the background image is dark (for adaptive font color).
@@ -108,6 +116,8 @@ impl Workshop {
             spark_status_menu: Default::default(),
             selected_spark: None,
             selected_spark_contracts: Vec::new(),
+            selected_spark_bonds: Vec::new(),
+            blocked_spark_ids: HashSet::new(),
             contract_create_form: Default::default(),
             bg_is_dark: None,
             pending_agent_spawn: None,

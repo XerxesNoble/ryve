@@ -3,6 +3,8 @@
 
 //! Workgraph panel — displays and manages sparks for the active workshop.
 
+use std::collections::HashSet;
+
 use data::sparks::types::Spark;
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Theme};
@@ -147,6 +149,7 @@ pub enum Message {
 
 pub fn view<'a>(
     sparks: &'a [Spark],
+    blocked_ids: &'a HashSet<String>,
     pal: &Palette,
     has_bg: bool,
     create_form: &'a CreateForm,
@@ -184,7 +187,8 @@ pub fn view<'a>(
         );
     } else {
         for spark in sparks {
-            list = list.push(view_spark_row(spark, &pal, status_menu));
+            let is_blocked = blocked_ids.contains(&spark.id);
+            list = list.push(view_spark_row(spark, is_blocked, &pal, status_menu));
         }
     }
 
@@ -385,6 +389,7 @@ fn status_symbol(status: &str) -> &'static str {
 
 fn view_spark_row<'a>(
     spark: &'a Spark,
+    is_blocked: bool,
     pal: &Palette,
     status_menu: &'a StatusMenu,
 ) -> Element<'a, Message> {
@@ -402,22 +407,38 @@ fn view_spark_row<'a>(
     .padding([2, 4])
     .on_press(Message::OpenStatusMenu(id.clone()));
 
+    // When a spark has open blockers, dim the title and surface a 🔒-style
+    // padlock so agents glance-read "don't claim this" without opening detail.
+    let title_color = if is_blocked {
+        pal.text_tertiary
+    } else {
+        pal.text_primary
+    };
+
+    let mut row_inner = row![
+        text(priority_label)
+            .size(FONT_LABEL)
+            .color(pal.text_tertiary),
+        text(&spark.title).size(FONT_BODY).color(title_color),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
+
+    if is_blocked {
+        row_inner = row_inner.push(
+            text("\u{1F512}")
+                .size(FONT_LABEL)
+                .color(pal.text_tertiary),
+        );
+    }
+
     let main_row = row![
         status_btn,
-        button(
-            row![
-                text(priority_label)
-                    .size(FONT_LABEL)
-                    .color(pal.text_tertiary),
-                text(&spark.title).size(FONT_BODY).color(pal.text_primary),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-        )
-        .style(button::text)
-        .width(Length::Fill)
-        .padding([5, 6])
-        .on_press(Message::SelectSpark(id.clone()))
+        button(row_inner)
+            .style(button::text)
+            .width(Length::Fill)
+            .padding([5, 6])
+            .on_press(Message::SelectSpark(id.clone()))
     ]
     .spacing(2)
     .align_y(iced::Alignment::Center);

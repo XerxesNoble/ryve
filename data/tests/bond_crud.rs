@@ -39,6 +39,27 @@ async fn test_delete_bond(pool: sqlx::SqlitePool) {
 }
 
 #[sqlx::test(fixtures("seed_sparks"))]
+async fn test_list_blocked_spark_ids(pool: sqlx::SqlitePool) {
+    // sp-0003 is blocked by sp-0002 (open) → should appear.
+    let blocked = bond_repo::list_blocked_spark_ids(&pool, "ws-test")
+        .await
+        .unwrap();
+    assert!(blocked.contains("sp-0003"));
+    assert!(!blocked.contains("sp-0002"));
+    assert!(!blocked.contains("sp-0001"));
+
+    // Once the blocker closes, the blocked spark must drop out of the set.
+    sqlx::query("UPDATE sparks SET status = 'closed' WHERE id = 'sp-0002'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let blocked = bond_repo::list_blocked_spark_ids(&pool, "ws-test")
+        .await
+        .unwrap();
+    assert!(!blocked.contains("sp-0003"));
+}
+
+#[sqlx::test(fixtures("seed_sparks"))]
 async fn test_cascade_delete_on_spark(pool: sqlx::SqlitePool) {
     // Deleting sp-0002 should cascade-delete its bonds
     data::sparks::spark_repo::delete(&pool, "sp-0002")

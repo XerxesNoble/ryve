@@ -356,6 +356,29 @@ pub fn target_paths(workshop_dir: &Path, config: &WorkshopConfig) -> Vec<PathBuf
 
 // ── Hand prompt generation ───────────────────────────
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workshop_md_mentions_bond_dependencies() {
+        // sp-ux0006: WORKSHOP.md must teach Hands about bonds and how to
+        // avoid claiming a blocked spark. Bonds are otherwise invisible to
+        // anyone not running raw SQL.
+        let md = generate_workshop_md();
+        assert!(md.contains("ryve bond list"), "must document bond list cmd");
+        assert!(md.contains("blocks"), "must mention 'blocks' bond type");
+        assert!(
+            md.contains("Dependencies"),
+            "must have a Dependencies section"
+        );
+        assert!(
+            md.contains("blocked spark") || md.contains("Do not work on a blocked"),
+            "must tell agents not to claim blocked sparks"
+        );
+    }
+}
+
 /// Generate the initial prompt text to inject into a Hand's terminal via PTY.
 /// This is the fallback for agents that don't support `--system-prompt` flags.
 pub fn generate_hand_prompt(_workshop_dir: &Path) -> String {
