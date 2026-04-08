@@ -41,6 +41,70 @@ pub struct Config {
     /// one-click reopen. Capped at `MAX_RECENT_WORKSHOPS` entries.
     #[serde(default)]
     pub recent_workshops: Vec<PathBuf>,
+
+    /// How much delegation detail Atlas (the Director agent) should
+    /// surface in user-facing responses. Spark sp-7252755d.
+    #[serde(default)]
+    pub delegation_visibility: DelegationVisibility,
+}
+
+/// User-controlled transparency level for Atlas delegation chains.
+///
+/// Atlas (the Director) routes work to Heads, who in turn dispatch Hands.
+/// Some users want a clean conversational surface; others want to see every
+/// hop. This enum is the single source of truth that any agent transcript
+/// renderer should consult before deciding how much of the delegation graph
+/// to expose.
+///
+/// The variants form an ordered ladder of disclosure:
+/// `Invisible` < `Summary` < `FullTrace`. New variants should preserve the
+/// "less reveal first, more reveal later" ordering so call sites that compare
+/// levels keep working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationVisibility {
+    /// Hide all delegation entirely. Responses look as if Atlas wrote
+    /// everything itself; Heads/Hands are not mentioned.
+    Invisible,
+    /// Show a short, human-readable summary of which Heads were consulted
+    /// and what they returned, without expanding the full call tree. This
+    /// is the friendly default — visible enough to build trust, terse
+    /// enough not to drown the conversation.
+    #[default]
+    Summary,
+    /// Surface the entire delegation trace: every Head invocation, every
+    /// Hand spawn, with arguments and intermediate outputs. Intended for
+    /// debugging and power users who want to audit Atlas end-to-end.
+    FullTrace,
+}
+
+impl DelegationVisibility {
+    /// All variants in display order. Used by the settings modal to render
+    /// a stable button row without hand-listing variants at the call site.
+    pub const ALL: [DelegationVisibility; 3] = [
+        DelegationVisibility::Invisible,
+        DelegationVisibility::Summary,
+        DelegationVisibility::FullTrace,
+    ];
+
+    /// Short label suitable for a button in the settings UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            DelegationVisibility::Invisible => "Invisible",
+            DelegationVisibility::Summary => "Summary",
+            DelegationVisibility::FullTrace => "Full trace",
+        }
+    }
+
+    /// Whether any delegation information at all should be rendered.
+    pub fn shows_anything(self) -> bool {
+        !matches!(self, DelegationVisibility::Invisible)
+    }
+
+    /// Whether the full per-step delegation trace should be rendered.
+    pub fn shows_full_trace(self) -> bool {
+        matches!(self, DelegationVisibility::FullTrace)
+    }
 }
 
 /// Maximum number of recent workshop entries to retain in the global config.
@@ -179,6 +243,7 @@ impl Default for Config {
             default_agent: None,
             agent_settings: HashMap::new(),
             recent_workshops: Vec::new(),
+            delegation_visibility: DelegationVisibility::default(),
         }
     }
 }
@@ -211,6 +276,63 @@ mod tests {
             .filter(|p| **p == target)
             .count();
         assert_eq!(occurrences, 1);
+    }
+
+    #[test]
+    fn delegation_visibility_defaults_to_summary() {
+        let cfg = Config::default();
+        assert_eq!(cfg.delegation_visibility, DelegationVisibility::Summary);
+        assert!(cfg.delegation_visibility.shows_anything());
+        assert!(!cfg.delegation_visibility.shows_full_trace());
+    }
+
+    #[test]
+    fn delegation_visibility_invisible_hides_everything() {
+        let v = DelegationVisibility::Invisible;
+        assert!(!v.shows_anything());
+        assert!(!v.shows_full_trace());
+    }
+
+    #[test]
+    fn delegation_visibility_full_trace_shows_everything() {
+        let v = DelegationVisibility::FullTrace;
+        assert!(v.shows_anything());
+        assert!(v.shows_full_trace());
+    }
+
+    #[test]
+    fn delegation_visibility_round_trips_through_toml() {
+        // Persistence is the whole point — make sure the snake_case
+        // serde representation survives a save/load cycle.
+        let mut cfg = Config::default();
+        cfg.delegation_visibility = DelegationVisibility::FullTrace;
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        assert!(serialized.contains("delegation_visibility = \"full_trace\""));
+        let restored: Config = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(restored.delegation_visibility, DelegationVisibility::FullTrace);
+    }
+
+    #[test]
+    fn delegation_visibility_missing_field_defaults_to_summary() {
+        // Existing configs on disk won't have the new field. They must
+        // load successfully and pick up the friendly default.
+        let toml_without_field = r#"
+            database_path = "/tmp/ryve.db"
+            workspace_dir = "/tmp"
+        "#;
+        let cfg: Config = toml::from_str(toml_without_field).expect("legacy config loads");
+        assert_eq!(cfg.delegation_visibility, DelegationVisibility::Summary);
+    }
+
+    #[test]
+    fn delegation_visibility_all_constant_lists_each_variant_once() {
+        // Settings UI iterates ALL — guard against accidental duplicates
+        // or omissions when new variants are added.
+        let all = DelegationVisibility::ALL;
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&DelegationVisibility::Invisible));
+        assert!(all.contains(&DelegationVisibility::Summary));
+        assert!(all.contains(&DelegationVisibility::FullTrace));
     }
 
     #[test]

@@ -3641,6 +3641,16 @@ impl App {
             screen::background_picker::Message::StepTerminalFontSize(_)
             | screen::background_picker::Message::SetTerminalFontFamily(_)
             | screen::background_picker::Message::ClearTerminalFontFamily => Task::none(),
+            screen::background_picker::Message::SetDelegationVisibility(level) => {
+                self.global_config.delegation_visibility = level;
+                let config = self.global_config.clone();
+                Task::perform(
+                    async move {
+                        config.save().ok();
+                    },
+                    |_| Message::BackgroundConfigSaved,
+                )
+            }
             screen::background_picker::Message::ToggleFullAuto(cmd) => {
                 let entry = self
                     .global_config
@@ -3880,6 +3890,7 @@ impl App {
                         dim_opacity,
                         agents,
                         terminal_font,
+                        self.global_config.delegation_visibility,
                     )
                     .map(Message::Background),
                 );
@@ -4337,6 +4348,7 @@ impl App {
                     dim_opacity,
                     agents,
                     terminal_font,
+                    self.global_config.delegation_visibility,
                 )
                 .map(Message::Background),
             );
