@@ -254,6 +254,15 @@ enum Message {
     /// Escape pressed. Dispatched globally; handlers close any open
     /// search overlay or selection on the active tab.
     HotkeyEscape,
+    /// Result of an async `create_hand_worktree` task. Spark ryve-885ed3eb:
+    /// Hand terminal spawns are a two-step Task — stage 1 allocates the
+    /// tab and stores pending params, stage 2 (this message) finalizes the
+    /// `iced_term::Terminal` once the worktree is ready.
+    HandWorktreeReady {
+        workshop_id: Uuid,
+        tab_id: u64,
+        result: Result<PathBuf, String>,
+    },
     /// Send initial spark prompt to a Hand's terminal after agent boots.
     SendSparkPrompt {
         tab_id: u64,
@@ -384,6 +393,15 @@ impl std::fmt::Debug for Message {
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
             Self::HotkeyCmdF => write!(f, "HotkeyCmdF"),
             Self::HotkeyEscape => write!(f, "HotkeyEscape"),
+            Self::HandWorktreeReady {
+                workshop_id,
+                tab_id,
+                result,
+            } => write!(
+                f,
+                "HandWorktreeReady({workshop_id}, {tab_id}, ok={})",
+                result.is_ok()
+            ),
             Self::SendSparkPrompt { tab_id, .. } => write!(f, "SendSparkPrompt({tab_id})"),
             Self::SubmitSparkPrompt { tab_id } => write!(f, "SubmitSparkPrompt({tab_id})"),
             Self::SplitterPressed(k) => write!(f, "SplitterPressed({k:?})"),
@@ -1059,8 +1077,7 @@ impl App {
                     match tab.tab_kind.as_str() {
                         "terminal" => {
                             let next_id = &mut self.next_terminal_id;
-                            self.workshops[idx]
-                                .spawn_terminal(tab.title, None, next_id, None, false);
+                            self.workshops[idx].spawn_plain_terminal(tab.title, next_id);
                         }
                         "file_viewer" => {
                             let Some(payload) = tab.payload else { continue };
@@ -1130,13 +1147,18 @@ impl App {
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
                             let next_id = &mut self.next_terminal_id;
-                            let tab_id = ws.spawn_terminal(
+                            let tab_id = ws.begin_hand_terminal(
                                 session.name.clone(),
-                                Some(&resume_agent),
+                                workshop::PendingTerminalKind::Agent(resume_agent.clone()),
                                 next_id,
-                                Some(&session_id),
+                                session_id.clone(),
                                 full_auto,
                             );
+                            follow_up.push(Self::dispatch_worktree_task(
+                                ws,
+                                tab_id,
+                                session_id.clone(),
+                            ));
                             if let Some(s) =
                                 ws.agent_sessions.iter_mut().find(|s| s.id == session_id)
                             {
@@ -1660,13 +1682,15 @@ impl App {
                                 .agent_settings
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
-                            let tab_id = ws.spawn_terminal(
+                            let tab_id = ws.begin_hand_terminal(
                                 session.name.clone(),
-                                Some(&resume_agent),
+                                workshop::PendingTerminalKind::Agent(resume_agent.clone()),
                                 next_id,
-                                Some(&session_id),
+                                session_id.clone(),
                                 full_auto,
                             );
+                            let worktree_task =
+                                Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
                             // Update the existing session to active
                             if let Some(s) =
@@ -1681,7 +1705,7 @@ impl App {
                             if let Some(ref pool) = ws.sparks_db {
                                 let pool = pool.clone();
                                 let sid = session_id.clone();
-                                return Task::perform(
+                                let reactivate = Task::perform(
                                     async move {
                                         let _ = data::sparks::agent_session_repo::reactivate(
                                             &pool, &sid,
@@ -1690,7 +1714,9 @@ impl App {
                                     },
                                     |_| Message::AgentSessionSaved,
                                 );
+                                return Task::batch([worktree_task, reactivate]);
                             }
+                            return worktree_task;
                         }
                     }
                     screen::agents::Message::DeleteSession(session_id) => {
@@ -1958,6 +1984,34 @@ impl App {
             Message::SparkPicker(msg) => self.handle_spark_picker_message(msg),
             Message::HeadPicker(msg) => self.handle_head_picker_message(msg),
             Message::HandAssignmentSaved => Task::none(),
+            Message::HandWorktreeReady {
+                workshop_id,
+                tab_id,
+                result,
+            } => {
+                // Stage 2 of the Hand spawn flow (spark ryve-885ed3eb):
+                // the async `create_hand_worktree` task has reported back.
+                // Finalize the terminal and, if successful, focus it so
+                // the user's next keystrokes land in the new Hand.
+                let Some(idx) = self.workshops.iter().position(|ws| ws.id == workshop_id) else {
+                    return Task::none();
+                };
+                let ws = &mut self.workshops[idx];
+                let created = ws.finalize_hand_terminal(tab_id, result);
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if created && let Some(term) = ws.terminals.get(&tab_id) {
+                    tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
+                }
+                // Surface any fallback-to-workshop-root warning as a toast.
+                if let Some(msg) = ws.take_worktree_warning() {
+                    tasks.push(self.push_toast("Worktree fallback", msg, ToastKind::Warning));
+                }
+                if tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(tasks)
+                }
+            }
             Message::SendSparkPrompt { tab_id, prompt } => {
                 // Find the terminal across all workshops and send the prompt as input.
                 // Wrap in bracketed paste so TUI agents see it as a single paste.
@@ -2961,13 +3015,8 @@ impl App {
             }
             screen::bench::Message::NewTerminal => {
                 let next_id = &mut self.next_terminal_id;
-                let tab_id = self.workshops[idx].spawn_terminal(
-                    "Terminal".to_string(),
-                    None,
-                    next_id,
-                    None,
-                    false,
-                );
+                let tab_id =
+                    self.workshops[idx].spawn_plain_terminal("Terminal".to_string(), next_id);
                 let persist = self.persist_open_tabs(idx);
                 if let Some(term) = self.workshops[idx].terminals.get(&tab_id) {
                     let focus = iced_term::TerminalView::focus(term.widget_id().clone());
@@ -3242,6 +3291,25 @@ impl App {
         }
     }
 
+    /// Build a `Task` that drives the async `create_hand_worktree` call for
+    /// a Hand terminal and dispatches `HandWorktreeReady` back to `update`.
+    /// Spark ryve-885ed3eb: callers that begin a Hand spawn via
+    /// `Workshop::begin_hand_terminal` use this to kick off stage 2 without
+    /// blocking the UI thread on `git worktree add`.
+    fn dispatch_worktree_task(ws: &Workshop, tab_id: u64, session_id: String) -> Task<Message> {
+        let workshop_dir = ws.directory.clone();
+        let ryve_dir = ws.ryve_dir.clone();
+        let workshop_id = ws.id;
+        Task::perform(
+            async move { workshop::create_hand_worktree(&workshop_dir, &ryve_dir, &session_id).await },
+            move |result| Message::HandWorktreeReady {
+                workshop_id,
+                tab_id,
+                result,
+            },
+        )
+    }
+
     /// Proceed with spawning the pending agent and assigning a spark.
     fn spawn_pending_agent(&mut self, workshop_idx: usize, spark_id: String) -> Task<Message> {
         let ws = &mut self.workshops[workshop_idx];
@@ -3263,19 +3331,28 @@ impl App {
 
         let tab_id = if pending.is_custom {
             if let Some(ref def) = pending.custom_def {
-                ws.spawn_custom_agent(def, &mut self.next_terminal_id, &session_id)
+                ws.begin_hand_terminal(
+                    def.name.clone(),
+                    workshop::PendingTerminalKind::CustomAgent(def.clone()),
+                    &mut self.next_terminal_id,
+                    session_id.clone(),
+                    pending.full_auto,
+                )
             } else {
                 return Task::none();
             }
         } else {
-            ws.spawn_terminal(
+            ws.begin_hand_terminal(
                 title.clone(),
-                Some(&pending_agent),
+                workshop::PendingTerminalKind::Agent(pending_agent.clone()),
                 &mut self.next_terminal_id,
-                Some(&session_id),
+                session_id.clone(),
                 pending.full_auto,
             )
         };
+        // Stage 2: drive the async worktree creation. `HandWorktreeReady`
+        // will finalize the `iced_term::Terminal` and focus it.
+        let worktree_task = Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
         ws.agent_sessions.push(AgentSession {
             id: session_id.clone(),
@@ -3348,9 +3425,10 @@ impl App {
                 },
             ));
         }
-        if let Some(term) = ws.terminals.get(&tab_id) {
-            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
-        }
+        // Kick off the async worktree creation last so it is chained after
+        // the DB persistence tasks in the batch — finalization + focus fire
+        // when `HandWorktreeReady` lands, not synchronously here.
+        tasks.push(worktree_task);
         Task::batch(tasks)
     }
 
@@ -3376,13 +3454,14 @@ impl App {
             .get(&agent.command)
             .is_some_and(|s| s.full_auto);
 
-        let tab_id = ws.spawn_terminal(
+        let tab_id = ws.begin_hand_terminal(
             title.clone(),
-            Some(&agent),
+            workshop::PendingTerminalKind::Agent(agent.clone()),
             &mut self.next_terminal_id,
-            Some(&session_id),
+            session_id.clone(),
             full_auto,
         );
+        let worktree_task = Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
         ws.agent_sessions.push(AgentSession {
             id: session_id.clone(),
@@ -3399,6 +3478,7 @@ impl App {
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
+        tasks.push(worktree_task);
         if let Some(ref pool) = ws.sparks_db {
             let pool = pool.clone();
             let ws_id = ws.workshop_id();
@@ -3440,9 +3520,8 @@ impl App {
             },
         ));
 
-        if let Some(term) = ws.terminals.get(&tab_id) {
-            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
-        }
+        // Focus is handled by the `HandWorktreeReady` handler once the
+        // terminal widget actually exists.
         Task::batch(tasks)
     }
 
@@ -3468,13 +3547,14 @@ impl App {
             .get(&agent.command)
             .is_some_and(|s| s.full_auto);
 
-        let tab_id = ws.spawn_terminal(
+        let tab_id = ws.begin_hand_terminal(
             title.clone(),
-            Some(&agent),
+            workshop::PendingTerminalKind::Agent(agent.clone()),
             &mut self.next_terminal_id,
-            Some(&session_id),
+            session_id.clone(),
             full_auto,
         );
+        let worktree_task = Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
         ws.agent_sessions.push(AgentSession {
             id: session_id.clone(),
@@ -3492,6 +3572,7 @@ impl App {
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
+        tasks.push(worktree_task);
         if let Some(ref pool) = ws.sparks_db {
             let pool = pool.clone();
             let ws_id = ws.workshop_id();
@@ -3532,9 +3613,8 @@ impl App {
             },
         ));
 
-        if let Some(term) = ws.terminals.get(&tab_id) {
-            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
-        }
+        // Focus is handled by the `HandWorktreeReady` handler once the
+        // terminal widget actually exists.
         Task::batch(tasks)
     }
 

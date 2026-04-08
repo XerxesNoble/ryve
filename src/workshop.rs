@@ -37,6 +37,30 @@ pub struct PendingAgentSpawn {
     pub full_auto: bool,
 }
 
+/// Parameters captured when a Hand spawn begins (stage 1) so the terminal
+/// can be constructed later, once the async worktree-creation task reports
+/// back via `HandWorktreeReady`. Spark ryve-885ed3eb: deferring the
+/// `iced_term::Terminal::new` call lets `App::update` return immediately
+/// instead of blocking on `git worktree add`.
+pub struct PendingTerminalSpawn {
+    pub session_id: String,
+    pub kind: PendingTerminalKind,
+    pub full_auto: bool,
+    /// Resolved system-prompt flag + value for the coding agent, if any.
+    /// `(flag, value)` — e.g. `("--system-prompt", "/path/to/WORKSHOP.md")`
+    /// for file-based agents or `("--system-prompt", "<inline text>")`
+    /// for agents that want the prompt body on the command line. Computed
+    /// at stage 1 so stage 2 doesn't have to touch the filesystem.
+    pub system_prompt: Option<(String, String)>,
+}
+
+pub enum PendingTerminalKind {
+    /// Regular built-in coding agent (claude/codex/aider/opencode).
+    Agent(CodingAgent),
+    /// Custom agent defined under `.ryve/agents/`.
+    CustomAgent(AgentDef),
+}
+
 pub struct Workshop {
     pub id: Uuid,
     pub directory: PathBuf,
@@ -44,6 +68,11 @@ pub struct Workshop {
     pub config: WorkshopConfig,
     pub bench: BenchState,
     pub terminals: HashMap<u64, iced_term::Terminal>,
+    /// Hand terminals whose worktree is being created asynchronously. Keyed
+    /// by `tab_id`; the entry is consumed when the worktree task reports
+    /// back and the real `iced_term::Terminal` can be constructed.
+    /// Spark ryve-885ed3eb.
+    pub pending_terminal_spawns: HashMap<u64, PendingTerminalSpawn>,
     pub agent_sessions: Vec<AgentSession>,
     /// Open file viewer states, keyed by tab ID.
     pub file_viewers: HashMap<u64, FileViewerState>,
@@ -164,6 +193,7 @@ impl Workshop {
             config: WorkshopConfig::default(),
             bench: BenchState::new(),
             terminals: HashMap::new(),
+            pending_terminal_spawns: HashMap::new(),
             agent_sessions: Vec::new(),
             file_viewers: HashMap::new(),
             log_tails: HashMap::new(),
@@ -474,96 +504,24 @@ impl Workshop {
         (tab_id, true)
     }
 
-    /// Spawn a terminal tab, optionally running a coding agent command.
-    /// When `full_auto` is true, the agent's auto-accept flags are appended.
-    pub fn spawn_terminal(
-        &mut self,
-        title: String,
-        agent: Option<&CodingAgent>,
-        next_terminal_id: &mut u64,
-        session_id: Option<&str>,
-        full_auto: bool,
-    ) -> u64 {
-        let kind = match agent {
-            Some(a) => TabKind::CodingAgent(a.clone()),
-            None => TabKind::Terminal,
-        };
-
+    /// Spawn a plain (no coding agent) shell terminal. Synchronous — plain
+    /// terminals run in the workshop root, so there is no worktree to
+    /// create and no need to defer. Spark ryve-885ed3eb.
+    pub fn spawn_plain_terminal(&mut self, title: String, next_terminal_id: &mut u64) -> u64 {
         let tab_id = *next_terminal_id;
         *next_terminal_id += 1;
-        self.bench.create_tab(tab_id, title, kind);
-
-        // Create a worktree for agent sessions (not plain terminals)
-        let working_dir = if let (Some(_), Some(sid)) = (agent, session_id) {
-            match create_hand_worktree(&self.directory, &self.ryve_dir, sid) {
-                Ok(wt_path) => wt_path,
-                Err(e) => {
-                    log::warn!("Failed to create worktree for hand {sid}: {e}");
-                    self.last_worktree_warning = Some(format!(
-                        "Failed to create worktree for hand {sid}: {e}. Falling back to workshop root."
-                    ));
-                    self.directory.clone()
-                }
-            }
-        } else {
-            self.directory.clone()
-        };
+        self.bench.create_tab(tab_id, title, TabKind::Terminal);
 
         let mut settings = iced_term::settings::Settings {
             font: self.terminal_font_settings(),
             ..iced_term::settings::Settings::default()
         };
         settings.theme.color_pallete.background = self.terminal_bg_hex();
-        settings.backend.working_directory = Some(working_dir);
+        settings.backend.working_directory = Some(self.directory.clone());
 
-        // Inject Ryve env vars for Hand sessions so `ryve` CLI works
-        // from inside worktrees without any cwd gymnastics.
-        if agent.is_some() {
-            for (k, v) in hand_env_vars(&self.directory) {
-                settings.backend.env.insert(k, v);
-            }
-            // Tell the running agent its own session id. The CLI handler
-            // for `ryve hand spawn` reads this env var and uses it as the
-            // new child's `parent_session_id`, so children appear under
-            // their parent in the Hands panel hierarchy.
-            if let Some(sid) = session_id {
-                settings
-                    .backend
-                    .env
-                    .insert("RYVE_HAND_SESSION_ID".to_string(), sid.to_string());
-            }
-        }
-
-        if let Some(agent) = agent {
-            let mut args = agent.args.clone();
-
-            // Inject full-auto flags when enabled
-            if full_auto {
-                args.extend(agent.full_auto_flags());
-            }
-
-            // Inject system prompt flag for agents that support it
-            if let Some((flag, is_file)) = agent.system_prompt_flag() {
-                let prompt_path = self.ryve_dir.workshop_md_path();
-                if prompt_path.exists() {
-                    args.push(flag.to_string());
-                    if is_file {
-                        args.push(prompt_path.to_string_lossy().into_owned());
-                    } else {
-                        // Inline text — read the file content
-                        let content = std::fs::read_to_string(&prompt_path).unwrap_or_default();
-                        args.push(content);
-                    }
-                }
-            }
-
-            (settings.backend.program, settings.backend.args) =
-                wrap_command_with_bottom_pin(&agent.command, &args);
-        } else {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-            (settings.backend.program, settings.backend.args) =
-                wrap_command_with_bottom_pin(&shell, &[]);
-        }
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        (settings.backend.program, settings.backend.args) =
+            wrap_command_with_bottom_pin(&shell, &[]);
 
         if let Ok(term) = iced_term::Terminal::new(tab_id, settings) {
             self.terminals.insert(tab_id, term);
@@ -572,34 +530,96 @@ impl Workshop {
         tab_id
     }
 
-    /// Spawn a terminal for a custom agent definition.
-    pub fn spawn_custom_agent(
+    /// Stage 1 of a two-step Hand terminal spawn (spark ryve-885ed3eb):
+    /// allocate the tab id, create the bench tab placeholder, and store the
+    /// parameters needed to build the real `iced_term::Terminal` once the
+    /// async worktree-creation task reports back via `HandWorktreeReady`.
+    ///
+    /// Never touches `git worktree add` or the filesystem — completes in
+    /// microseconds so `App::update` can return immediately. The tab shows
+    /// the bench's "Loading..." placeholder until `finalize_hand_terminal`
+    /// is called with the resolved working directory.
+    pub fn begin_hand_terminal(
         &mut self,
-        def: &AgentDef,
+        title: String,
+        kind: PendingTerminalKind,
         next_terminal_id: &mut u64,
-        session_id: &str,
+        session_id: String,
+        full_auto: bool,
     ) -> u64 {
-        let tab_id = *next_terminal_id;
-        *next_terminal_id += 1;
-        self.bench.create_tab(
-            tab_id,
-            def.name.clone(),
-            TabKind::CodingAgent(CodingAgent {
+        let tab_kind = match &kind {
+            PendingTerminalKind::Agent(a) => TabKind::CodingAgent(a.clone()),
+            PendingTerminalKind::CustomAgent(def) => TabKind::CodingAgent(CodingAgent {
                 display_name: def.name.clone(),
                 command: def.command.clone(),
                 args: def.args.clone(),
                 resume: crate::coding_agents::ResumeStrategy::None,
                 compatibility: crate::coding_agents::CompatStatus::Unknown,
             }),
+        };
+
+        let tab_id = *next_terminal_id;
+        *next_terminal_id += 1;
+        self.bench.create_tab(tab_id, title, tab_kind);
+
+        // Pre-resolve the system-prompt file (for built-in agents that
+        // support `--system-prompt`). Reading it now lets stage 2 stay
+        // trivially synchronous and keeps the behavior identical to the
+        // previous blocking implementation.
+        let system_prompt = if let PendingTerminalKind::Agent(agent) = &kind {
+            agent.system_prompt_flag().and_then(|(flag, is_file)| {
+                let prompt_path = self.ryve_dir.workshop_md_path();
+                if !prompt_path.exists() {
+                    return None;
+                }
+                let value = if is_file {
+                    prompt_path.to_string_lossy().into_owned()
+                } else {
+                    std::fs::read_to_string(&prompt_path).unwrap_or_default()
+                };
+                Some((flag.to_string(), value))
+            })
+        } else {
+            None
+        };
+
+        self.pending_terminal_spawns.insert(
+            tab_id,
+            PendingTerminalSpawn {
+                session_id,
+                kind,
+                full_auto,
+                system_prompt,
+            },
         );
 
-        // Create a worktree for this hand
-        let working_dir = match create_hand_worktree(&self.directory, &self.ryve_dir, session_id) {
-            Ok(wt_path) => wt_path,
+        tab_id
+    }
+
+    /// Stage 2 of a two-step Hand terminal spawn (spark ryve-885ed3eb):
+    /// given the outcome of the async `create_hand_worktree` task, finish
+    /// wiring up the terminal for `tab_id`. Returns `true` if the terminal
+    /// was successfully created so the caller can dispatch a focus task.
+    ///
+    /// If the worktree task failed, the terminal falls back to the workshop
+    /// root and records a warning via `last_worktree_warning` so the UI can
+    /// surface a toast.
+    pub fn finalize_hand_terminal(
+        &mut self,
+        tab_id: u64,
+        worktree_result: Result<PathBuf, String>,
+    ) -> bool {
+        let Some(pending) = self.pending_terminal_spawns.remove(&tab_id) else {
+            return false;
+        };
+
+        let working_dir = match worktree_result {
+            Ok(path) => path,
             Err(e) => {
-                log::warn!("Failed to create worktree for hand {session_id}: {e}");
+                let sid = &pending.session_id;
+                log::warn!("Failed to create worktree for hand {sid}: {e}");
                 self.last_worktree_warning = Some(format!(
-                    "Failed to create worktree for hand {session_id}: {e}. Falling back to workshop root."
+                    "Failed to create worktree for hand {sid}: {e}. Falling back to workshop root."
                 ));
                 self.directory.clone()
             }
@@ -611,29 +631,46 @@ impl Workshop {
         };
         settings.theme.color_pallete.background = self.terminal_bg_hex();
         settings.backend.working_directory = Some(working_dir);
-        (settings.backend.program, settings.backend.args) =
-            wrap_command_with_bottom_pin(&def.command, &def.args);
 
-        // Inject Ryve env vars first, then custom agent env overrides.
+        // Ryve env vars + session id so any nested `ryve hand spawn` in
+        // this Hand is correctly attributed as its own parent.
         for (k, v) in hand_env_vars(&self.directory) {
             settings.backend.env.insert(k, v);
         }
-        // Tell the running custom agent its own session id so any
-        // `ryve hand spawn` it issues is correctly attributed to itself
-        // as the parent.
         settings
             .backend
             .env
-            .insert("RYVE_HAND_SESSION_ID".to_string(), session_id.to_string());
-        for (k, v) in &def.env {
-            settings.backend.env.insert(k.clone(), v.clone());
+            .insert("RYVE_HAND_SESSION_ID".to_string(), pending.session_id);
+
+        match pending.kind {
+            PendingTerminalKind::Agent(agent) => {
+                let mut args = agent.args.clone();
+                if pending.full_auto {
+                    args.extend(agent.full_auto_flags());
+                }
+                if let Some((flag, value)) = pending.system_prompt {
+                    args.push(flag);
+                    args.push(value);
+                }
+                (settings.backend.program, settings.backend.args) =
+                    wrap_command_with_bottom_pin(&agent.command, &args);
+            }
+            PendingTerminalKind::CustomAgent(def) => {
+                (settings.backend.program, settings.backend.args) =
+                    wrap_command_with_bottom_pin(&def.command, &def.args);
+                // Custom agent env overrides layer on top of the Ryve vars.
+                for (k, v) in &def.env {
+                    settings.backend.env.insert(k.clone(), v.clone());
+                }
+            }
         }
 
         if let Ok(term) = iced_term::Terminal::new(tab_id, settings) {
             self.terminals.insert(tab_id, term);
+            true
+        } else {
+            false
         }
-
-        tab_id
     }
 
     /// Handle terminal shutdown/title-change for a given terminal id.
@@ -803,19 +840,22 @@ pub fn compute_image_luminance(bytes: &[u8]) -> Option<f32> {
     Some((total / count as f64) as f32)
 }
 
-/// Create a git worktree for a Hand session (blocking).
-/// Returns the worktree path on success.
+/// Create a git worktree for a Hand session. Async: uses `tokio::process`
+/// and `tokio::fs` so callers in the UI thread can drive this via
+/// `Task::perform` without freezing the iced runtime. On large repos
+/// `git worktree add` takes 500ms-2s and must not block `App::update`.
+/// Spark ryve-885ed3eb.
 ///
 /// Visible to the rest of the crate so the `hand_spawn` CLI helper can call
 /// it without re-implementing the worktree convention.
-pub(crate) fn create_hand_worktree(
+pub(crate) async fn create_hand_worktree(
     workshop_dir: &Path,
     ryve_dir: &RyveDir,
     session_id: &str,
 ) -> Result<PathBuf, String> {
     // Only create worktrees for git repos
     let git_dir = workshop_dir.join(".git");
-    if !git_dir.exists() {
+    if !tokio::fs::try_exists(&git_dir).await.unwrap_or(false) {
         return Err("not a git repository".to_string());
     }
 
@@ -824,18 +864,20 @@ pub(crate) fn create_hand_worktree(
     let wt_dir = ryve_dir.root().join("worktrees").join(short_id);
 
     // Skip if worktree already exists
-    if wt_dir.exists() {
+    if tokio::fs::try_exists(&wt_dir).await.unwrap_or(false) {
         return Ok(wt_dir);
     }
 
     // Create parent dir
-    std::fs::create_dir_all(wt_dir.parent().unwrap_or(ryve_dir.root()))
+    tokio::fs::create_dir_all(wt_dir.parent().unwrap_or(ryve_dir.root()))
+        .await
         .map_err(|e| e.to_string())?;
 
-    let output = std::process::Command::new("git")
+    let output = tokio::process::Command::new("git")
         .args(["worktree", "add", "-b", &branch, &wt_dir.to_string_lossy()])
         .current_dir(workshop_dir)
         .output()
+        .await
         .map_err(|e| e.to_string())?;
 
     if !output.status.success() {
@@ -845,10 +887,10 @@ pub(crate) fn create_hand_worktree(
     // Drop AGENTS.md into the worktree so agents without a system-prompt
     // CLI flag (codex, opencode) still see WORKSHOP.md instructions.
     let workshop_md = ryve_dir.workshop_md_path();
-    if workshop_md.exists() {
+    if tokio::fs::try_exists(&workshop_md).await.unwrap_or(false) {
         let agents_md = wt_dir.join("AGENTS.md");
-        if !agents_md.exists()
-            && let Err(e) = std::fs::copy(&workshop_md, &agents_md)
+        if !tokio::fs::try_exists(&agents_md).await.unwrap_or(false)
+            && let Err(e) = tokio::fs::copy(&workshop_md, &agents_md).await
         {
             log::warn!("Failed to write AGENTS.md to worktree: {e}");
         }
