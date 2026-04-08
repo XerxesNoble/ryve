@@ -11,8 +11,14 @@ use std::sync::OnceLock;
 
 use iced::widget::svg;
 
-/// Directory where icon SVGs are stored, relative to the binary.
+/// Directory where Material file/folder icon SVGs are stored, relative to the binary.
 const ICON_DIR: &str = "assets/icons/material";
+
+/// Directory where general-purpose UI icons (chevrons, agents, search, etc.)
+/// are stored, relative to the binary. These are stroke-based monochrome SVGs
+/// using `currentColor` so they can be tinted at render time via Iced's
+/// `svg::Style::color`.
+const UI_ICON_DIR: &str = "assets/icons/ui";
 
 const DEFAULT_FILE_ICON: &str = "file";
 const DEFAULT_FOLDER_ICON: &str = "folder";
@@ -78,6 +84,97 @@ pub fn root_folder_icon(is_expanded: bool) -> svg::Handle {
     } else {
         load_icon(ROOT_FOLDER_ICON)
     }
+}
+
+// ── General-purpose UI icons ─────────────────────────
+
+/// Named UI icon. Add new variants here when other panels need a glyph;
+/// the corresponding `<name>.svg` must live under `assets/icons/ui/`.
+///
+/// All UI icons are monochrome stroke SVGs using `currentColor` so callers
+/// can tint them via `iced::widget::svg::Style::color` (see `ui_icon_styled`
+/// for the default themed helper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiIcon {
+    ChevronRight,
+    ChevronDown,
+    Search,
+    /// Generic Head (orchestrator) glyph.
+    Head,
+    /// Crew (group of Hands) glyph.
+    Crew,
+    /// Agent type icons. The picker maps agent_command → variant.
+    AgentClaude,
+    AgentCodex,
+    AgentAider,
+    AgentOpencode,
+    /// Fallback for custom/unknown agents.
+    AgentGeneric,
+}
+
+impl UiIcon {
+    /// File-stem under `assets/icons/ui/`.
+    pub fn file_stem(self) -> &'static str {
+        match self {
+            UiIcon::ChevronRight => "chevron-right",
+            UiIcon::ChevronDown => "chevron-down",
+            UiIcon::Search => "search",
+            UiIcon::Head => "head",
+            UiIcon::Crew => "crew",
+            UiIcon::AgentClaude => "agent-claude",
+            UiIcon::AgentCodex => "agent-codex",
+            UiIcon::AgentAider => "agent-aider",
+            UiIcon::AgentOpencode => "agent-opencode",
+            UiIcon::AgentGeneric => "agent-generic",
+        }
+    }
+}
+
+/// Map an agent command (e.g. `claude`, `codex`) to its UI icon. Falls back
+/// to `AgentGeneric` for custom or unknown agents so the row still renders.
+pub fn agent_icon_for_command(command: &str) -> UiIcon {
+    match command.to_ascii_lowercase().as_str() {
+        "claude" => UiIcon::AgentClaude,
+        "codex" => UiIcon::AgentCodex,
+        "aider" => UiIcon::AgentAider,
+        "opencode" => UiIcon::AgentOpencode,
+        _ => UiIcon::AgentGeneric,
+    }
+}
+
+/// Resolve an SVG handle for a named UI icon. Loads from `assets/icons/ui/`.
+pub fn ui_icon(icon: UiIcon) -> svg::Handle {
+    let path = ui_icon_base_path().join(format!("{}.svg", icon.file_stem()));
+    svg::Handle::from_path(path)
+}
+
+/// Build a tinted SVG style function for the Iced `svg` widget. Use like:
+/// `svg(ui_icon(UiIcon::Search)).style(ui_icon_color(pal.text_secondary))`.
+///
+/// The closure ignores theme/status (we already have a `Palette`) and just
+/// emits the requested color in every state, which is what panel chrome
+/// wants — no hover/focus state to worry about.
+pub fn ui_icon_color(color: iced::Color) -> impl Fn(&iced::Theme, svg::Status) -> svg::Style {
+    move |_theme, _status| svg::Style { color: Some(color) }
+}
+
+fn ui_icon_base_path() -> &'static Path {
+    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            let candidate = dir.join(UI_ICON_DIR);
+            if candidate.exists() {
+                return candidate;
+            }
+            let candidate = dir.join("../Resources").join(UI_ICON_DIR);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        std::path::PathBuf::from(UI_ICON_DIR)
+    })
 }
 
 // ── Internals ────────────────────────────────────────

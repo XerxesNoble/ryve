@@ -410,6 +410,12 @@ pub struct PersistedAgentSession {
     /// (set for CLI-spawned background Hands; `None` for UI-spawned
     /// sessions whose output flows through their `iced_term` tab).
     pub log_path: Option<String>,
+    /// `agent_sessions.id` of the Hand that spawned this one — typically a
+    /// Head when a child Hand is dispatched via `ryve hand spawn`. `None`
+    /// for sessions started directly by the user from the UI. Used by the
+    /// Hands panel to attribute solo Hands to their parent Head when the
+    /// child is not in any of the Head's crews.
+    pub parent_session_id: Option<String>,
 }
 
 pub struct NewAgentSession {
@@ -422,6 +428,7 @@ pub struct NewAgentSession {
     pub child_pid: Option<i64>,
     pub resume_id: Option<String>,
     pub log_path: Option<String>,
+    pub parent_session_id: Option<String>,
 }
 
 // ── Structured Intent ────────────────────────────────

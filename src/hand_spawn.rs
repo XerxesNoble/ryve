@@ -87,6 +87,10 @@ pub enum HandSpawnError {
 /// or any custom agent registered in the future).
 /// `kind` decides Owner vs Merger.
 /// `crew_id` attaches the new Hand to a Crew via `crew_repo::add_member`.
+/// `parent_session_id` is the `agent_sessions.id` of the Hand that
+/// dispatched this spawn — typically a Head when invoked from a Head's
+/// `ryve hand spawn` call. Persisted on the row so the UI can render
+/// Head → solo-hand attribution. `None` for direct user spawns.
 pub async fn spawn_hand(
     workshop_dir: &Path,
     pool: &SqlitePool,
@@ -94,6 +98,7 @@ pub async fn spawn_hand(
     spark_id: &str,
     kind: HandKind,
     crew_id: Option<&str>,
+    parent_session_id: Option<&str>,
 ) -> Result<SpawnedHand, HandSpawnError> {
     if matches!(kind, HandKind::Merger) && crew_id.is_none() {
         return Err(HandSpawnError::MergerNeedsCrew);
@@ -128,6 +133,7 @@ pub async fn spawn_hand(
         child_pid: None,
         resume_id: None,
         log_path: Some(log_path.to_string_lossy().into_owned()),
+        parent_session_id: parent_session_id.map(|s| s.to_string()),
     };
     agent_session_repo::create(pool, &new_session).await?;
 
@@ -185,7 +191,12 @@ pub async fn spawn_hand(
     // exit on the first turn (spark ryve-b3ad7bd1).
     let cmd_args = agent.build_headless_args(&prompt, &prompt_path);
 
-    let env_vars = workshop::hand_env_vars(workshop_dir);
+    // Build env for the detached child. We layer the new session id on
+    // top of the standard `RYVE_WORKSHOP_ROOT` + `PATH` set so any nested
+    // `ryve hand spawn` invocation made by *this* Hand correctly attributes
+    // its child to itself.
+    let mut env_vars = workshop::hand_env_vars(workshop_dir);
+    env_vars.push(("RYVE_HAND_SESSION_ID".to_string(), session_id.clone()));
 
     // 8. Spawn detached.
     let child_pid = match launch_detached(
@@ -401,6 +412,7 @@ mod tests {
             &agent,
             &spark.id,
             HandKind::Owner,
+            None,
             None,
         )
         .await

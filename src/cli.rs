@@ -1488,6 +1488,13 @@ async fn handle_hand(
 
             let agent = resolve_agent(agent_name.as_deref());
 
+            // The spawning Hand (typically a Head) had its own session id
+            // injected into env at spawn time as `RYVE_HAND_SESSION_ID`.
+            // Pass it through so the new row's `parent_session_id` records
+            // the lineage. Direct CLI use by a human will simply have no
+            // env var set and the column will be NULL.
+            let parent_session_id = std::env::var("RYVE_HAND_SESSION_ID").ok();
+
             match hand_spawn::spawn_hand(
                 workshop_root,
                 pool,
@@ -1495,6 +1502,7 @@ async fn handle_hand(
                 &spark_id,
                 role,
                 crew_id.as_deref(),
+                parent_session_id.as_deref(),
             )
             .await
             {

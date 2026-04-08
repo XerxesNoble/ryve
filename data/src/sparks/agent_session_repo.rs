@@ -14,8 +14,8 @@ pub async fn create(pool: &SqlitePool, session: &NewAgentSession) -> Result<(), 
     let args_json = serde_json::to_string(&session.agent_args).unwrap_or_else(|_| "[]".into());
 
     sqlx::query(
-        "INSERT INTO agent_sessions (id, workshop_id, agent_name, agent_command, agent_args, session_label, status, started_at, child_pid, resume_id, log_path)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+        "INSERT INTO agent_sessions (id, workshop_id, agent_name, agent_command, agent_args, session_label, status, started_at, child_pid, resume_id, log_path, parent_session_id)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
     )
     .bind(&session.id)
     .bind(&session.workshop_id)
@@ -27,6 +27,7 @@ pub async fn create(pool: &SqlitePool, session: &NewAgentSession) -> Result<(), 
     .bind(session.child_pid)
     .bind(&session.resume_id)
     .bind(&session.log_path)
+    .bind(&session.parent_session_id)
     .execute(pool)
     .await?;
 

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use data::ryve_dir::{AgentDef, RyveDir, WorkshopConfig};
-use data::sparks::types::{Bond, Contract, Ember, HandAssignment, Spark};
+use data::sparks::types::{Bond, Contract, Crew, CrewMember, Ember, HandAssignment, Spark};
 use iced::Theme;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -64,6 +64,15 @@ pub struct Workshop {
     /// Active hand assignments across all sparks in this workshop. Loaded
     /// alongside sparks so the Home overview can join sparks ↔ Hands.
     pub hand_assignments: Vec<HandAssignment>,
+    /// All crews owned by this workshop. Used by the Hands panel to render
+    /// the Head → Crew → Hand hierarchy. Refreshed alongside sparks.
+    pub crews: Vec<Crew>,
+    /// Membership join for `crews`. Refreshed alongside sparks.
+    pub crew_members: Vec<CrewMember>,
+    /// UI state for the Hands panel (search query, history pagination,
+    /// collapse flags). Held here so it survives panel re-renders without
+    /// agents.rs needing to manage its own state.
+    pub agents_panel: crate::screen::agents::AgentsPanelState,
     /// Active embers (Hand → Hand notifications) for this workshop. Refreshed
     /// on every sparks poll so the Home overview reflects current activity.
     pub embers: Vec<Ember>,
@@ -123,6 +132,11 @@ pub struct Workshop {
     /// One-shot warning set when the last worktree creation fell back to
     /// the main workshop directory. The UI drains this to surface a toast.
     pub last_worktree_warning: Option<String>,
+    /// True once the persisted open-tabs snapshot has been restored for
+    /// this workshop. Guards the boot-time `load_open_tabs` chain so it
+    /// only fires once per workshop session, not on every SparksPoll tick
+    /// that happens to refresh `agent_sessions`.
+    pub tabs_restored: bool,
 }
 
 impl Workshop {
@@ -144,6 +158,9 @@ impl Workshop {
             failing_contracts: 0,
             failing_contracts_list: Vec::new(),
             hand_assignments: Vec::new(),
+            crews: Vec::new(),
+            crew_members: Vec::new(),
+            agents_panel: crate::screen::agents::AgentsPanelState::default(),
             embers: Vec::new(),
             prev_blocked_spark_ids: HashSet::new(),
             prev_failing_contract_ids: HashSet::new(),
@@ -166,6 +183,7 @@ impl Workshop {
             pending_agent_spawn: None,
             pending_head_spawn: None,
             last_worktree_warning: None,
+            tabs_restored: false,
         }
     }
 
@@ -176,12 +194,34 @@ impl Workshop {
     }
 
     /// Take a snapshot of the bench's open tabs in a form suitable for
-    /// persistence. Coding-agent tabs are intentionally excluded — they're
-    /// already tracked via `agent_sessions` and re-launched through the
-    /// Hand panel's resume button. The returned vec preserves left-to-right
-    /// tab order via the `position` field.
+    /// persistence. The returned vec preserves left-to-right tab order via
+    /// the `position` field.
+    ///
+    /// Tab kinds persisted:
+    /// - `terminal`     — plain shell, restored as a fresh shell on boot
+    /// - `file_viewer`  — payload is absolute file path
+    /// - `coding_agent` — payload is `agent_sessions.id`. Only restored on
+    ///   boot if the underlying session row still exists; ended sessions
+    ///   are dropped (per product decision: "users should not be able to
+    ///   reopen ended sessions").
+    /// - `log_tail`     — payload is `agent_sessions.id` (spy view for a
+    ///   background Hand). Restored only if the session is still active.
+    ///
+    /// `Home` is intentionally excluded — it's a singleton dashboard rebuilt
+    /// from in-memory data on demand; persisting it would create a duplicate
+    /// when the user reopens it manually.
     pub fn snapshot_open_tabs(&self) -> Vec<data::sparks::open_tab_repo::PersistedTab> {
         let workshop_id = self.workshop_id();
+        // Look up the session id this tab belongs to, by walking
+        // `agent_sessions` for a matching `tab_id`. Used by both
+        // CodingAgent and LogTail tabs.
+        let session_id_for_tab = |tab_id: u64| -> Option<String> {
+            self.agent_sessions
+                .iter()
+                .find(|s| s.tab_id == Some(tab_id))
+                .map(|s| s.id.clone())
+        };
+
         self.bench
             .tabs
             .iter()
@@ -192,16 +232,19 @@ impl Workshop {
                     TabKind::FileViewer(path) => {
                         ("file_viewer", Some(path.to_string_lossy().into_owned()))
                     }
-                    // Skip coding-agent tabs — see doc comment above.
-                    TabKind::CodingAgent(_) => return None,
+                    TabKind::CodingAgent(_) => {
+                        // We need the session id to be able to revive this
+                        // tab on boot. If the tab somehow has no matching
+                        // session row (shouldn't happen, but defensive),
+                        // skip it.
+                        let sid = session_id_for_tab(tab.id)?;
+                        ("coding_agent", Some(sid))
+                    }
+                    TabKind::LogTail { session_id, .. } => ("log_tail", Some(session_id.clone())),
                     // Home is a singleton dashboard rebuilt from in-memory
                     // data on demand; persisting it would just create a
                     // duplicate when the user reopens it manually.
                     TabKind::Home => return None,
-                    // Spy views are derived from agent_sessions on each
-                    // app launch (we re-open them when the user clicks a
-                    // background hand). No reason to persist the tab.
-                    TabKind::LogTail { .. } => return None,
                 };
                 Some(data::sparks::open_tab_repo::PersistedTab {
                     workshop_id: workshop_id.clone(),
@@ -395,6 +438,16 @@ impl Workshop {
             for (k, v) in hand_env_vars(&self.directory) {
                 settings.backend.env.insert(k, v);
             }
+            // Tell the running agent its own session id. The CLI handler
+            // for `ryve hand spawn` reads this env var and uses it as the
+            // new child's `parent_session_id`, so children appear under
+            // their parent in the Hands panel hierarchy.
+            if let Some(sid) = session_id {
+                settings
+                    .backend
+                    .env
+                    .insert("RYVE_HAND_SESSION_ID".to_string(), sid.to_string());
+            }
         }
 
         if let Some(agent) = agent {
@@ -475,10 +528,17 @@ impl Workshop {
         (settings.backend.program, settings.backend.args) =
             wrap_command_with_bottom_pin(&def.command, &def.args);
 
-        // Inject Ryve env vars first, then custom agent env overrides
+        // Inject Ryve env vars first, then custom agent env overrides.
         for (k, v) in hand_env_vars(&self.directory) {
             settings.backend.env.insert(k, v);
         }
+        // Tell the running custom agent its own session id so any
+        // `ryve hand spawn` it issues is correctly attributed to itself
+        // as the parent.
+        settings
+            .backend
+            .env
+            .insert("RYVE_HAND_SESSION_ID".to_string(), session_id.to_string());
         for (k, v) in &def.env {
             settings.backend.env.insert(k.clone(), v.clone());
         }
@@ -860,6 +920,7 @@ mod tests {
             started_at: chrono::Utc::now().to_rfc3339(),
             log_path: None,
             last_output_at: None,
+            parent_session_id: None,
         });
 
         let ended = ws.end_agent_sessions_for_tab(7);

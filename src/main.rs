@@ -156,6 +156,11 @@ enum Message {
     FailingContractsListLoaded(Uuid, Vec<Contract>),
     /// Active hand assignments loaded from DB (for Home overview)
     HandAssignmentsLoaded(Uuid, Vec<HandAssignment>),
+    CrewsLoaded(
+        Uuid,
+        Vec<data::sparks::types::Crew>,
+        Vec<data::sparks::types::CrewMember>,
+    ),
     /// Active embers loaded from DB (for Home overview)
     EmbersLoaded(Uuid, Vec<Ember>),
     /// Contracts for the currently selected spark loaded from DB.
@@ -319,6 +324,12 @@ impl std::fmt::Debug for Message {
             Self::HandAssignmentsLoaded(id, a) => {
                 write!(f, "HandAssignmentsLoaded({id}, {} assignments)", a.len())
             }
+            Self::CrewsLoaded(id, c, m) => write!(
+                f,
+                "CrewsLoaded({id}, {} crews, {} memberships)",
+                c.len(),
+                m.len()
+            ),
             Self::EmbersLoaded(id, e) => write!(f, "EmbersLoaded({id}, {} embers)", e.len()),
             Self::SparkDetail(m) => write!(f, "SparkDetail({m:?})"),
             Self::SparkPicker(m) => write!(f, "SparkPicker({m:?})"),
@@ -571,16 +582,15 @@ impl App {
                     let sparks_task = Task::perform(load_sparks(pool, ws_id), move |sparks| {
                         Message::SparksLoaded(id, sparks)
                     });
-                    let pool3 = ws.sparks_db.clone().unwrap();
-                    let ws_id3 = ws.workshop_id();
                     let sessions_task =
                         Task::perform(load_agent_sessions(pool2, ws_id2), move |sessions| {
                             Message::AgentSessionsLoaded(id, sessions)
                         });
-                    let open_tabs_task =
-                        Task::perform(load_open_tabs(pool3, ws_id3), move |tabs| {
-                            Message::OpenTabsLoaded(id, tabs)
-                        });
+                    // NOTE: open_tabs is NOT loaded here. It is dispatched
+                    // from the `AgentSessionsLoaded` handler so that any
+                    // persisted `coding_agent` / `log_tail` tab can be
+                    // resolved against the freshly-populated `agent_sessions`
+                    // vec when it is restored.
                     let ignore = ws.config.explorer.ignore.clone();
                     let scan_task = Task::perform(
                         file_explorer::scan_directory(dir, ignore),
@@ -604,13 +614,7 @@ impl App {
                         Task::none()
                     };
 
-                    return Task::batch([
-                        sparks_task,
-                        sessions_task,
-                        open_tabs_task,
-                        scan_task,
-                        bg_task,
-                    ]);
+                    return Task::batch([sparks_task, sessions_task, scan_task, bg_task]);
                 }
                 Task::none()
             }
@@ -680,6 +684,10 @@ impl App {
                         tasks.push(Task::perform(
                             load_hand_assignments(pool.clone(), ws_id.clone()),
                             move |list| Message::HandAssignmentsLoaded(id, list),
+                        ));
+                        tasks.push(Task::perform(
+                            load_crews(pool.clone(), ws_id.clone()),
+                            move |(crews, members)| Message::CrewsLoaded(id, crews, members),
                         ));
                         tasks.push(Task::perform(
                             load_embers(pool.clone(), ws_id),
@@ -857,6 +865,7 @@ impl App {
                 let Some(idx) = ws_idx else {
                     return Task::none();
                 };
+                let mut chain_open_tabs: Option<Task<Message>> = None;
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     let available = &self.available_agents;
                     let known_ids: std::collections::HashSet<String> =
@@ -906,8 +915,33 @@ impl App {
                             started_at: p.started_at,
                             log_path: p.log_path.map(PathBuf::from),
                             last_output_at: None,
+                            parent_session_id: p.parent_session_id,
                         });
                     }
+
+                    // First time we see agent_sessions for this workshop:
+                    // chain into load_open_tabs so the persisted snapshot
+                    // can resolve `coding_agent` / `log_tail` tabs against
+                    // the just-populated session vec.
+                    if !ws.tabs_restored
+                        && let Some(ref pool) = ws.sparks_db
+                    {
+                        let pool = pool.clone();
+                        let ws_id = ws.workshop_id();
+                        let id_copy = id;
+                        chain_open_tabs =
+                            Some(Task::perform(load_open_tabs(pool, ws_id), move |tabs| {
+                                Message::OpenTabsLoaded(id_copy, tabs)
+                            }));
+                    }
+                }
+                chain_open_tabs.unwrap_or_else(Task::none)
+            }
+
+            Message::CrewsLoaded(id, crews, members) => {
+                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
+                    ws.crews = crews;
+                    ws.crew_members = members;
                 }
                 Task::none()
             }
@@ -915,10 +949,12 @@ impl App {
             Message::AgentSessionSaved => Task::none(),
 
             Message::OpenTabsLoaded(id, persisted) => {
-                // Replay the persisted snapshot against the bench. Each
-                // entry becomes a fresh tab — terminals re-spawn an empty
-                // shell, file viewers re-open their path. Coding-agent
-                // tabs aren't persisted, so we never recreate one here.
+                // Replay the persisted snapshot against the bench. Tabs are
+                // restored in the original left-to-right order. Tabs whose
+                // backing state has gone (file deleted, agent session ended)
+                // are silently dropped — restoring them would either pop
+                // failure toasts or surface tabs the user can't usefully
+                // interact with.
                 let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
                 let Some(idx) = ws_idx else {
                     return Task::none();
@@ -961,10 +997,98 @@ impl App {
                                 ));
                             }
                         }
+                        "coding_agent" => {
+                            // Per product decision: ended sessions are NOT
+                            // restorable. Only revive the tab if the session
+                            // is still active in the loaded session vec.
+                            let Some(session_id) = tab.payload else {
+                                continue;
+                            };
+                            let ws = &mut self.workshops[idx];
+                            let session = ws
+                                .agent_sessions
+                                .iter()
+                                .find(|s| s.id == session_id)
+                                .cloned();
+                            let Some(session) = session else { continue };
+                            if !session.active {
+                                continue;
+                            }
+                            // Reuse the resume flow: build a fresh terminal
+                            // tab using the agent's --resume command. If the
+                            // agent has no resume strategy we drop the tab
+                            // (we can't safely re-attach to the old PTY).
+                            let Some((cmd, args)) =
+                                session.agent.resume_args(session.resume_id.as_deref())
+                            else {
+                                continue;
+                            };
+                            let resume_agent = CodingAgent {
+                                display_name: session.agent.display_name.clone(),
+                                command: cmd,
+                                args,
+                                resume: session.agent.resume.clone(),
+                                compatibility: session.agent.compatibility.clone(),
+                            };
+                            let full_auto = self
+                                .global_config
+                                .agent_settings
+                                .get(&resume_agent.command)
+                                .is_some_and(|s| s.full_auto);
+                            let next_id = &mut self.next_terminal_id;
+                            let tab_id = ws.spawn_terminal(
+                                session.name.clone(),
+                                Some(&resume_agent),
+                                next_id,
+                                Some(&session_id),
+                                full_auto,
+                            );
+                            if let Some(s) =
+                                ws.agent_sessions.iter_mut().find(|s| s.id == session_id)
+                            {
+                                s.tab_id = Some(tab_id);
+                            }
+                        }
+                        "log_tail" => {
+                            // Spy view for a background Hand. Only restore
+                            // if the session is still active and has a log
+                            // path on disk.
+                            let Some(session_id) = tab.payload else {
+                                continue;
+                            };
+                            let ws = &mut self.workshops[idx];
+                            let log_path = ws
+                                .agent_sessions
+                                .iter()
+                                .find(|s| s.id == session_id && s.active)
+                                .and_then(|s| s.log_path.clone());
+                            let Some(log_path) = log_path else { continue };
+                            if !log_path.exists() {
+                                continue;
+                            }
+                            let (tab_id, is_new) = ws.open_log_tab(
+                                &session_id,
+                                log_path.clone(),
+                                &mut self.next_terminal_id,
+                            );
+                            if is_new {
+                                follow_up.push(Task::perform(
+                                    log_tail::load_tail(tab_id, log_path),
+                                    Message::LogTail,
+                                ));
+                            }
+                        }
                         other => {
                             log::warn!("Unknown persisted tab kind: {other}");
                         }
                     }
+                }
+
+                // Mark this workshop as restored so we don't replay tabs
+                // again on the next AgentSessionsLoaded (which fires every
+                // SparksPoll tick).
+                if let Some(ws) = self.workshops.get_mut(idx) {
+                    ws.tabs_restored = true;
                 }
 
                 if follow_up.is_empty() {
@@ -1487,6 +1611,54 @@ impl App {
                                 },
                                 |_| Message::AgentSessionSaved,
                             );
+                        }
+                    }
+                    screen::agents::Message::OpenSpark(spark_id) => {
+                        // Mirror screen::sparks::Message::SelectSpark — set the
+                        // selected spark and load its contracts + bonds so the
+                        // right panel hydrates immediately.
+                        ws.selected_spark = Some(spark_id.clone());
+                        ws.selected_spark_contracts.clear();
+                        ws.selected_spark_bonds.clear();
+                        ws.contract_create_form.reset();
+                        if let Some(ref pool) = ws.sparks_db {
+                            let pool_c = pool.clone();
+                            let pool_b = pool.clone();
+                            let ws_id = ws.id;
+                            let sid_c = spark_id.clone();
+                            let sid_b = spark_id.clone();
+                            let contracts_task =
+                                Task::perform(load_contracts(pool_c, sid_c.clone()), move |list| {
+                                    Message::ContractsLoaded(ws_id, sid_c.clone(), list)
+                                });
+                            let bonds_task =
+                                Task::perform(load_bonds(pool_b, sid_b.clone()), move |list| {
+                                    Message::BondsLoaded(ws_id, sid_b.clone(), list)
+                                });
+                            return Task::batch([contracts_task, bonds_task]);
+                        }
+                    }
+                    screen::agents::Message::SearchChanged(query) => {
+                        ws.agents_panel.search = query;
+                        // Reset history pagination when the query changes —
+                        // otherwise a previous "Load more" leaks visible rows
+                        // into a narrower filtered set.
+                        ws.agents_panel.history_limit = screen::agents::HISTORY_PAGE_SIZE;
+                    }
+                    screen::agents::Message::LoadMoreHistory => {
+                        ws.agents_panel.history_limit += screen::agents::HISTORY_PAGE_SIZE;
+                    }
+                    screen::agents::Message::ToggleStaleCollapsed => {
+                        ws.agents_panel.stale_collapsed = !ws.agents_panel.stale_collapsed;
+                    }
+                    screen::agents::Message::ToggleHeadExpanded(session_id) => {
+                        if !ws.agents_panel.collapsed_heads.remove(&session_id) {
+                            ws.agents_panel.collapsed_heads.insert(session_id);
+                        }
+                    }
+                    screen::agents::Message::ToggleCrewExpanded(crew_id) => {
+                        if !ws.agents_panel.collapsed_crews.remove(&crew_id) {
+                            ws.agents_panel.collapsed_crews.insert(crew_id);
                         }
                     }
                 }
@@ -2126,6 +2298,7 @@ impl App {
                             started_at: chrono::Utc::now().to_rfc3339(),
                             log_path: None,
                             last_output_at: None,
+                            parent_session_id: None,
                         });
 
                         if let Some(ref pool) = ws.sparks_db {
@@ -2141,6 +2314,8 @@ impl App {
                                 child_pid: None,
                                 resume_id: None,
                                 log_path: None,
+                                // UI-spawned: no parent Hand.
+                                parent_session_id: None,
                             };
                             tasks.push(Task::perform(
                                 async move {
@@ -2775,6 +2950,7 @@ impl App {
             started_at: chrono::Utc::now().to_rfc3339(),
             log_path: None,
             last_output_at: None,
+            parent_session_id: None,
         });
 
         // Persist session to DB + optional spark assignment
@@ -2793,6 +2969,8 @@ impl App {
                 child_pid: None,
                 resume_id: None,
                 log_path: None,
+                // UI-spawned Hand: no orchestrator parent.
+                parent_session_id: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -2879,6 +3057,7 @@ impl App {
             started_at: chrono::Utc::now().to_rfc3339(),
             log_path: None,
             last_output_at: None,
+            parent_session_id: None,
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
@@ -2895,6 +3074,8 @@ impl App {
                 child_pid: None,
                 resume_id: None,
                 log_path: None,
+                // A Head is itself a top-level orchestrator — no parent.
+                parent_session_id: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -3574,11 +3755,19 @@ impl App {
     fn view_agents<'a>(
         &'a self,
         ws: &'a Workshop,
-        has_bg: bool,
+        _has_bg: bool,
         pal: &style::Palette,
     ) -> Element<'a, Message> {
-        screen::agents::view(&ws.agent_sessions, &ws.hand_assignments, *pal, has_bg)
-            .map(Message::Agents)
+        screen::agents::view(
+            &ws.agent_sessions,
+            &ws.hand_assignments,
+            &ws.crews,
+            &ws.crew_members,
+            &ws.sparks,
+            &ws.agents_panel,
+            *pal,
+        )
+        .map(Message::Agents)
     }
 
     fn view_bench<'a>(
@@ -3795,6 +3984,28 @@ async fn load_failing_contract_list(pool: sqlx::SqlitePool, workshop_id: String)
     data::sparks::contract_repo::list_failing(&pool, &workshop_id)
         .await
         .unwrap_or_default()
+}
+
+/// Load all crews and their full membership join for a workshop. Used by
+/// the Hands panel to render the Head → Crew → Hand hierarchy. Errors are
+/// swallowed (treated as empty) since this is non-critical display data.
+async fn load_crews(
+    pool: sqlx::SqlitePool,
+    workshop_id: String,
+) -> (
+    Vec<data::sparks::types::Crew>,
+    Vec<data::sparks::types::CrewMember>,
+) {
+    let crews = data::sparks::crew_repo::list_for_workshop(&pool, &workshop_id)
+        .await
+        .unwrap_or_default();
+    let mut all_members: Vec<data::sparks::types::CrewMember> = Vec::new();
+    for c in &crews {
+        if let Ok(mut members) = data::sparks::crew_repo::members(&pool, &c.id).await {
+            all_members.append(&mut members);
+        }
+    }
+    (crews, all_members)
 }
 
 /// Load all active hand assignments for the workshop, used by the Home
