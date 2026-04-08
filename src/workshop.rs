@@ -363,6 +363,20 @@ impl Workshop {
         self.config.layout.sparks_width
     }
 
+    /// Decide which side panels are visible at a given window width.
+    /// Returns `(show_sidebar, show_sparks)`.
+    ///
+    /// Below ~880px the workgraph (right) panel collapses so the bench
+    /// keeps a usable width. Below ~600px the file/agents sidebar (left)
+    /// also collapses, leaving the bench to fill the window. The bench
+    /// itself is never hidden — it's always the primary surface.
+    /// sp-ux0025.
+    pub fn responsive_panels(window_width: f32) -> (bool, bool) {
+        let show_sparks = window_width >= 880.0;
+        let show_sidebar = window_width >= 600.0;
+        (show_sidebar, show_sparks)
+    }
+
     /// Open the Home overview tab, or focus the existing one if it's
     /// already open. Singleton — repeated invocations are no-ops beyond
     /// activating the tab. Returns the tab id.
@@ -1073,6 +1087,47 @@ mod tests {
         assert_eq!(ws.agent_sessions[0].tab_id, None);
         assert!(!ws.agent_sessions[0].active);
         assert!(!ws.agent_sessions[0].stale);
+    }
+
+    // sp-ux0025: responsive panel collapse at small window sizes.
+    #[test]
+    fn responsive_panels_wide_shows_everything() {
+        // Comfortable desktop width — sidebar + bench + sparks all visible.
+        let (sidebar, sparks) = Workshop::responsive_panels(1400.0);
+        assert!(sidebar);
+        assert!(sparks);
+    }
+
+    #[test]
+    fn responsive_panels_medium_collapses_sparks() {
+        // ~800px (the threshold called out in the spark): sparks panel
+        // hides so the bench has room, sidebar still visible.
+        let (sidebar, sparks) = Workshop::responsive_panels(800.0);
+        assert!(sidebar);
+        assert!(!sparks);
+    }
+
+    #[test]
+    fn responsive_panels_narrow_collapses_both() {
+        // Below 600px nothing but the bench fits comfortably.
+        let (sidebar, sparks) = Workshop::responsive_panels(560.0);
+        assert!(!sidebar);
+        assert!(!sparks);
+    }
+
+    #[test]
+    fn responsive_panels_thresholds_are_monotonic() {
+        // Sanity: as the window grows, panels can only appear, never
+        // disappear. Walk a range of widths and assert no flicker.
+        let mut prev = (false, false);
+        for w in (300..1600).step_by(20) {
+            let cur = Workshop::responsive_panels(w as f32);
+            assert!(
+                cur.0 >= prev.0 && cur.1 >= prev.1,
+                "panels regressed at width {w}: prev={prev:?} cur={cur:?}"
+            );
+            prev = cur;
+        }
     }
 
     #[test]

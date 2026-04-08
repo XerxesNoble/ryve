@@ -80,6 +80,10 @@ fn main() -> iced::Result {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut window = iced::window::Settings {
         size: iced::Size::new(1400.0, 900.0),
+        // Floor below which the layout cannot collapse any further. Picked
+        // so that even a single pane plus the title bar remains usable.
+        // sp-ux0025.
+        min_size: Some(iced::Size::new(480.0, 400.0)),
         transparent: true,
         ..Default::default()
     };
@@ -126,6 +130,9 @@ struct App {
     toasts: Vec<Toast>,
     /// Monotonic counter for toast ids.
     next_toast_id: u64,
+    /// If set, a "close workshop" confirmation dialog is open for the
+    /// workshop at this index. Spark sp-ux0021.
+    pending_close_workshop: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -133,8 +140,17 @@ enum Message {
     /// Workshop-level tab bar
     SelectWorkshop(usize),
     CloseWorkshop(usize),
+    /// User clicked "Close anyway" in the confirmation dialog. Spark sp-ux0021.
+    ConfirmCloseWorkshop(usize),
+    /// User dismissed the close-workshop confirmation dialog. Spark sp-ux0021.
+    CancelCloseWorkshop,
     NewWorkshopDialog,
     WorkshopDirPicked(Option<PathBuf>),
+    /// Open a workshop at a known path (recent-list click, drag-drop, etc.).
+    /// Equivalent to picking the directory in a file dialog. If the path
+    /// no longer exists, the entry is dropped from the recent list and a
+    /// toast is shown.
+    OpenWorkshopPath(PathBuf),
     /// `workshop::init_workshop` failed (bad db, unreadable config, etc.).
     WorkshopInitFailed {
         id: Uuid,
@@ -280,6 +296,10 @@ enum Message {
         workshop_id: Uuid,
         ember_id: String,
     },
+
+    /// Open a URL in the user's default browser. Used by the Unsplash
+    /// attribution chip (spark sp-ux0033) to credit the photographer.
+    OpenUrl(String),
 }
 
 impl std::fmt::Debug for Message {
@@ -287,8 +307,11 @@ impl std::fmt::Debug for Message {
         match self {
             Self::SelectWorkshop(i) => write!(f, "SelectWorkshop({i})"),
             Self::CloseWorkshop(i) => write!(f, "CloseWorkshop({i})"),
+            Self::ConfirmCloseWorkshop(i) => write!(f, "ConfirmCloseWorkshop({i})"),
+            Self::CancelCloseWorkshop => write!(f, "CancelCloseWorkshop"),
             Self::NewWorkshopDialog => write!(f, "NewWorkshopDialog"),
             Self::WorkshopDirPicked(p) => write!(f, "WorkshopDirPicked({p:?})"),
+            Self::OpenWorkshopPath(p) => write!(f, "OpenWorkshopPath({p:?})"),
             Self::WorkshopInitFailed { id, error } => {
                 write!(f, "WorkshopInitFailed({id}, {error})")
             }
@@ -372,6 +395,7 @@ impl std::fmt::Debug for Message {
             Self::ToastExpired(id) => write!(f, "ToastExpired({id})"),
             Self::EmberBar(m) => write!(f, "EmberBar({m:?})"),
             Self::EmberDismissed { ember_id, .. } => write!(f, "EmberDismissed({ember_id})"),
+            Self::OpenUrl(url) => write!(f, "OpenUrl({url})"),
         }
     }
 }
@@ -395,6 +419,7 @@ impl App {
             window_size: Size::new(1400.0, 900.0),
             toasts: Vec::new(),
             next_toast_id: 1,
+            pending_close_workshop: None,
         };
 
         // Surface an upgrade toast for any detected CLI whose version is
@@ -421,6 +446,25 @@ impl App {
 
     fn active_workshop(&self) -> Option<&Workshop> {
         self.active_workshop.and_then(|i| self.workshops.get(i))
+    }
+
+    /// Tear down the workshop at `idx` and fix up `active_workshop` so the
+    /// tab bar still points at a valid index. Spark sp-ux0021: extracted so
+    /// the no-confirm fast path and the confirmed-close path stay in sync.
+    fn do_close_workshop(&mut self, idx: usize) {
+        if idx >= self.workshops.len() {
+            return;
+        }
+        self.workshops.remove(idx);
+        if self.workshops.is_empty() {
+            self.active_workshop = None;
+        } else if let Some(active) = self.active_workshop {
+            if active > idx {
+                self.active_workshop = Some(active - 1);
+            } else if active == idx {
+                self.active_workshop = Some(idx.min(self.workshops.len() - 1));
+            }
+        }
     }
 
     /// Push a new toast onto the stack and return a `Task` that will
@@ -499,29 +543,67 @@ impl App {
                 Task::none()
             }
             Message::CloseWorkshop(idx) => {
-                if idx < self.workshops.len() {
-                    self.workshops.remove(idx);
-                    // Adjust active index
-                    if self.workshops.is_empty() {
-                        self.active_workshop = None;
-                    } else if let Some(active) = self.active_workshop {
-                        if active > idx {
-                            self.active_workshop = Some(active - 1);
-                        } else if active == idx {
-                            self.active_workshop = if self.workshops.is_empty() {
-                                None
-                            } else {
-                                Some(idx.min(self.workshops.len() - 1))
-                            };
-                        }
+                // Spark sp-ux0021: if any Hands are still active, prompt the
+                // user before tearing down the workshop instead of killing
+                // their terminals/agents instantly.
+                if let Some(ws) = self.workshops.get(idx) {
+                    let active_hands =
+                        ws.agent_sessions.iter().filter(|s| s.active).count();
+                    if active_hands > 0 {
+                        self.pending_close_workshop = Some(idx);
+                        return Task::none();
                     }
                 }
+                self.do_close_workshop(idx);
+                Task::none()
+            }
+            Message::ConfirmCloseWorkshop(idx) => {
+                self.pending_close_workshop = None;
+                self.do_close_workshop(idx);
+                Task::none()
+            }
+            Message::CancelCloseWorkshop => {
+                self.pending_close_workshop = None;
                 Task::none()
             }
             Message::NewWorkshopDialog => Task::perform(pick_workshop_directory(), |path| {
                 Message::WorkshopDirPicked(path)
             }),
             Message::WorkshopDirPicked(Some(path)) => {
+                self.update(Message::OpenWorkshopPath(path))
+            }
+            Message::WorkshopDirPicked(None) => Task::none(),
+            Message::OpenWorkshopPath(path) => {
+                // If the user clicks a stale recent entry, surface a toast
+                // and prune the dead path so the welcome list doesn't keep
+                // dangling references.
+                if !path.is_dir() {
+                    self.global_config.remove_recent_workshop(&path);
+                    let cfg = self.global_config.clone();
+                    std::thread::spawn(move || {
+                        let _ = cfg.save();
+                    });
+                    return self.push_toast(
+                        "Workshop not found",
+                        format!("Path no longer exists: {}", path.display()),
+                        ToastKind::Error,
+                    );
+                }
+
+                // If this workshop is already open, just focus it instead
+                // of duplicating the tab.
+                if let Some(existing) = self.workshops.iter().position(|ws| ws.directory == path) {
+                    self.active_workshop = Some(existing);
+                    return Task::none();
+                }
+
+                // Record as most-recently opened.
+                self.global_config.add_recent_workshop(path.clone());
+                let cfg = self.global_config.clone();
+                std::thread::spawn(move || {
+                    let _ = cfg.save();
+                });
+
                 let mut workshop = Workshop::new(path.clone());
                 workshop.set_appearance(self.appearance);
                 // Inherit the user's currently-effective terminal font
@@ -549,7 +631,6 @@ impl App {
                     },
                 })
             }
-            Message::WorkshopDirPicked(None) => Task::none(),
             Message::WorkshopInitFailed { id, error } => {
                 // Remove the half-initialized workshop so we don't leave a
                 // ghost tab pointing at a broken directory.
@@ -2598,6 +2679,18 @@ impl App {
                 }
                 Task::none()
             }
+            Message::OpenUrl(url) => {
+                // Best-effort: if the OS can't open the URL we surface a toast
+                // rather than crashing the workspace.
+                if let Err(e) = open::that(&url) {
+                    return self.push_toast(
+                        "Could not open link",
+                        format!("{url}: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+                Task::none()
+            }
         }
     }
 
@@ -2861,6 +2954,10 @@ impl App {
             screen::bench::Message::ToggleDropdown => {
                 self.workshops[idx].bench.dropdown_open = !self.workshops[idx].bench.dropdown_open;
             }
+            screen::bench::Message::CloseDropdown => {
+                self.workshops[idx].bench.dropdown_open = false;
+            }
+            screen::bench::Message::NoOp => {}
             screen::bench::Message::OpenHome => {
                 self.workshops[idx].bench.dropdown_open = false;
                 let next_id = &mut self.next_terminal_id;
@@ -3381,6 +3478,7 @@ impl App {
         match msg {
             screen::background_picker::Message::Close => {
                 ws.background_picker.open = false;
+                ws.background_picker.clear_preview();
                 Task::none()
             }
             screen::background_picker::Message::PickLocalFile => {
@@ -3500,6 +3598,32 @@ impl App {
                 )
             }
 
+            // ── Dim opacity ──────────────────────────────────
+            screen::background_picker::Message::DimOpacityChanged(value) => {
+                ws.config.background.dim_opacity = value.clamp(0.0, 1.0);
+                Task::none()
+            }
+            screen::background_picker::Message::DimOpacityCommitted => {
+                let ryve_dir = ws.ryve_dir.clone();
+                let config = ws.config.clone();
+                Task::perform(
+                    async move {
+                        data::ryve_dir::save_config(&ryve_dir, &config).await.ok();
+                    },
+                    |_| Message::BackgroundConfigSaved,
+                )
+            }
+
+            // ── Preview ──────────────────────────────────────
+            screen::background_picker::Message::PreviewPhoto(id) => {
+                ws.background_picker.set_preview(&id);
+                Task::none()
+            }
+            screen::background_picker::Message::ClearPreview => {
+                ws.background_picker.clear_preview();
+                Task::none()
+            }
+
             // ── Agent Settings ───────────────────────────────
             screen::background_picker::Message::SetDefaultAgent(cmd) => {
                 self.global_config.default_agent = cmd;
@@ -3565,6 +3689,13 @@ impl App {
                     if modifiers.command() && c.as_str() == "f" {
                         return Message::HotkeyCmdF;
                     }
+                    // Cmd+O — open workshop directory picker. Advertised on
+                    // the welcome screen so first-time users have a way in
+                    // beyond clicking the button. Active everywhere so the
+                    // shortcut works once a workshop is already loaded too.
+                    if modifiers.command() && c.as_str() == "o" {
+                        return Message::NewWorkshopDialog;
+                    }
                 }
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
@@ -3585,11 +3716,23 @@ impl App {
         // drag deltas into a sensible sidebar split ratio.
         let resizes = window::resize_events().map(|(_, size)| Message::WindowResized(size));
 
+        // Drag-and-drop a folder onto the window to open it as a workshop.
+        // We accept drops regardless of which screen is showing — the open
+        // handler dedupes against already-open workshops and rejects files
+        // that aren't directories. Welcome-screen onboarding for sp-ux0016.
+        let file_drops = event::listen_with(|event, _status, _id| match event {
+            iced::Event::Window(window::Event::FileDropped(path)) if path.is_dir() => {
+                Some(Message::OpenWorkshopPath(path))
+            }
+            _ => None,
+        });
+
         let mut subs: Vec<Subscription<Message>> = term_subs
             .into_iter()
             .chain(std::iter::once(poll))
             .chain(std::iter::once(hotkeys))
             .chain(std::iter::once(resizes))
+            .chain(std::iter::once(file_drops))
             .collect();
 
         // Only listen to global mouse events while a splitter drag is
@@ -3627,13 +3770,51 @@ impl App {
             .unwrap_or_else(|| self.appearance.palette());
         let toast_overlay = toast::view(&self.toasts, &toast_pal).map(|e| e.map(Message::Toast));
 
+        // Spark sp-ux0021: confirmation dialog when closing a workshop
+        // with active Hands. Built once here and layered onto whichever
+        // render path runs below.
+        let close_dialog: Option<Element<'_, Message>> =
+            self.pending_close_workshop.and_then(|idx| {
+                let target = self.workshops.get(idx)?;
+                let active_hands =
+                    target.agent_sessions.iter().filter(|s| s.active).count();
+                let pal = match target.bg_is_dark {
+                    Some(true) => style::Palette::dark(),
+                    Some(false) => style::Palette::light(),
+                    None => self.appearance.palette(),
+                };
+                Some(
+                    screen::close_workshop_dialog::view(
+                        idx,
+                        target.name(),
+                        active_hands,
+                        &pal,
+                    )
+                    .map(|m| match m {
+                        screen::close_workshop_dialog::Message::Confirm(i) => {
+                            Message::ConfirmCloseWorkshop(i)
+                        }
+                        screen::close_workshop_dialog::Message::Cancel => {
+                            Message::CancelCloseWorkshop
+                        }
+                    }),
+                )
+            });
+
         // Layer background image behind everything (including tab bar)
         if let Some(ws) = ws
             && (ws.background_handle.is_some() || ws.background_picker.open)
         {
             let mut layers: Vec<Element<'_, Message>> = Vec::new();
 
-            if let Some(ref handle) = ws.background_handle {
+            // Prefer the picker preview thumbnail when the user is hovering
+            // a candidate; otherwise show the committed background.
+            let active_bg = ws
+                .background_picker
+                .preview_handle
+                .as_ref()
+                .or(ws.background_handle.as_ref());
+            if let Some(handle) = active_bg {
                 layers.push(
                     iced::widget::image(handle.clone())
                         .width(Length::Fill)
@@ -3662,9 +3843,16 @@ impl App {
 
             layers.push(main_content);
 
+            // Unsplash attribution chip — bottom-right, click opens the
+            // photographer's profile. Spark sp-ux0033.
+            if let Some(chip) = unsplash_attribution_overlay(ws) {
+                layers.push(chip);
+            }
+
             // Settings modal overlay
             if ws.background_picker.open {
                 let has_bg = ws.config.background.image.is_some();
+                let dim_opacity = ws.config.background.dim_opacity;
                 let pal = self.appearance.palette();
                 let agents: Vec<screen::background_picker::AgentInfo> = self
                     .available_agents
@@ -3689,6 +3877,7 @@ impl App {
                         &ws.background_picker,
                         &pal,
                         has_bg,
+                        dim_opacity,
                         agents,
                         terminal_font,
                     )
@@ -3696,7 +3885,19 @@ impl App {
                 );
             }
 
+            if let Some(dialog) = close_dialog {
+                layers.push(dialog);
+            }
+
             let stacked: Element<'_, Message> = stack(layers)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+            return overlay_with_toasts(stacked, toast_overlay);
+        }
+
+        if let Some(dialog) = close_dialog {
+            let stacked: Element<'_, Message> = stack(vec![main_content, dialog])
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
@@ -3763,22 +3964,137 @@ impl App {
             .into()
     }
 
-    /// Welcome screen when no workshops are open.
+    /// Welcome screen when no workshops are open. Onboards new users with a
+    /// concept primer, recent-workshops list, drag-folder affordance and the
+    /// keyboard shortcut for opening a workshop. Spark sp-ux0016.
     fn view_welcome(&self) -> Element<'_, Message> {
         let pal = self.appearance.palette();
-        container(
-            column![
-                text("Ryve").size(40).color(pal.text_primary),
-                text("Open a workshop to get started")
-                    .size(16)
-                    .color(pal.text_secondary),
-                button(text("Open Workshop...").size(14))
-                    .style(button::primary)
-                    .padding([8, 20])
-                    .on_press(Message::NewWorkshopDialog),
+
+        // ── Hero ────────────────────────────────────────────
+        let hero = column![
+            text("Ryve").size(48).color(pal.text_primary),
+            text("A workshop for orchestrating coding agents.")
+                .size(15)
+                .color(pal.text_secondary),
+        ]
+        .spacing(6)
+        .align_x(iced::Alignment::Center);
+
+        // ── Concept primer ──────────────────────────────────
+        // Three-line glossary so first-time users can map our vocabulary
+        // ("Workshop / Hand / Spark") onto familiar concepts before they
+        // open anything.
+        let concept_row = |label: &'static str, body: &'static str| -> Element<'_, Message> {
+            row![
+                container(text(label).size(13).color(pal.text_primary))
+                    .width(Length::Fixed(96.0)),
+                text(body).size(13).color(pal.text_secondary),
             ]
-            .spacing(16)
+            .spacing(12)
+            .into()
+        };
+        let concepts = container(
+            column![
+                concept_row("Workshop", "A project directory managed by Ryve."),
+                concept_row("Spark", "A unit of work — feature, bug, or task."),
+                concept_row("Hand", "A coding agent assigned to a spark."),
+            ]
+            .spacing(8),
+        )
+        .padding(16)
+        .width(Length::Fixed(420.0))
+        .style(move |_theme: &Theme| style::glass_panel(&pal, false));
+
+        // ── Recent workshops ────────────────────────────────
+        let recent_section: Element<'_, Message> = if self.global_config.recent_workshops.is_empty()
+        {
+            container(
+                text("No recent workshops yet — open one to get started.")
+                    .size(13)
+                    .color(pal.text_secondary),
+            )
+            .padding(16)
+            .width(Length::Fixed(420.0))
+            .style(move |_theme: &Theme| style::glass_panel(&pal, false))
+            .into()
+        } else {
+            let mut list = column![
+                text("Recent workshops")
+                    .size(12)
+                    .color(pal.text_secondary),
+            ]
+            .spacing(8);
+            for path in self.global_config.recent_workshops.iter().take(8) {
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let parent = path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let row_content = column![
+                    text(label).size(14).color(pal.text_primary),
+                    text(parent).size(11).color(pal.text_secondary),
+                ]
+                .spacing(2);
+                let entry = button(row_content)
+                    .width(Length::Fill)
+                    .padding([8, 12])
+                    .style(button::text)
+                    .on_press(Message::OpenWorkshopPath(path.clone()));
+                list = list.push(entry);
+            }
+            container(list)
+                .padding(12)
+                .width(Length::Fixed(420.0))
+                .style(move |_theme: &Theme| style::glass_panel(&pal, false))
+                .into()
+        };
+
+        // ── Drag-folder affordance ──────────────────────────
+        let drop_zone = container(
+            column![
+                text("Drop a folder here").size(14).color(pal.text_primary),
+                text("…or use the button below to pick one.")
+                    .size(12)
+                    .color(pal.text_secondary),
+            ]
+            .spacing(4)
             .align_x(iced::Alignment::Center),
+        )
+        .padding(20)
+        .width(Length::Fixed(420.0))
+        .center_x(Length::Fill)
+        .style(move |_theme: &Theme| {
+            let mut s = style::glass_panel(&pal, false);
+            s.border.width = 1.5;
+            s.border.color = pal.text_secondary;
+            s
+        });
+
+        // ── Open button + shortcut hint ─────────────────────
+        let shortcut_hint = if cfg!(target_os = "macos") {
+            "⌘O"
+        } else {
+            "Ctrl+O"
+        };
+        let actions = row![
+            button(text("Open Workshop...").size(14))
+                .style(button::primary)
+                .padding([8, 20])
+                .on_press(Message::NewWorkshopDialog),
+            text(format!("or press {shortcut_hint}"))
+                .size(12)
+                .color(pal.text_secondary),
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center);
+
+        container(
+            column![hero, concepts, recent_section, drop_zone, actions]
+                .spacing(20)
+                .align_x(iced::Alignment::Center),
         )
         .center(Length::Fill)
         .into()
@@ -3922,20 +4238,23 @@ impl App {
         )
         .map(Message::StatusBar);
 
-        let main_row = container(
-            row![
-                sidebar,
-                sidebar_bench_splitter,
-                bench,
-                bench_sparks_splitter,
-                sparks_col
-            ]
-            .spacing(0)
-            .height(Length::Fill),
-        )
-        .padding(style::PANEL_GAP)
-        .width(Length::Fill)
-        .height(Length::Fill);
+        // Responsive layout: collapse side panels at small window widths
+        // so the bench remains usable. sp-ux0025.
+        let (show_sidebar, show_sparks) = Workshop::responsive_panels(self.window_size.width);
+
+        let mut main_row_inner = row![].spacing(0).height(Length::Fill);
+        if show_sidebar {
+            main_row_inner = main_row_inner.push(sidebar).push(sidebar_bench_splitter);
+        }
+        main_row_inner = main_row_inner.push(bench);
+        if show_sparks {
+            main_row_inner = main_row_inner.push(bench_sparks_splitter).push(sparks_col);
+        }
+
+        let main_row = container(main_row_inner)
+            .padding(style::PANEL_GAP)
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         // Ember notification bar — sits above the main row so dismissible
         // Hand-to-Hand signals are visible without blocking the workgraph
@@ -3953,7 +4272,12 @@ impl App {
         // Layer background image behind content
         let mut layers: Vec<Element<'a, Message>> = Vec::new();
 
-        if let Some(ref handle) = ws.background_handle {
+        let active_bg = ws
+            .background_picker
+            .preview_handle
+            .as_ref()
+            .or(ws.background_handle.as_ref());
+        if let Some(handle) = active_bg {
             layers.push(
                 iced::widget::image(handle.clone())
                     .width(Length::Fill)
@@ -3986,6 +4310,7 @@ impl App {
         // Background picker modal overlay
         if ws.background_picker.open {
             let has_bg = ws.config.background.image.is_some();
+            let dim_opacity = ws.config.background.dim_opacity;
             let agents: Vec<_> = self
                 .available_agents
                 .iter()
@@ -4009,6 +4334,7 @@ impl App {
                     &ws.background_picker,
                     &pal,
                     has_bg,
+                    dim_opacity,
                     agents,
                     terminal_font,
                 )
@@ -4124,13 +4450,21 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        // Overlay the dropdown menu on top of the content area
+        // Overlay the dropdown menu on top of the content area. When it's
+        // open, a full-size transparent backdrop sits between body and
+        // menu so any click outside the menu dismisses it (sp-ux0022).
         if let Some(dropdown) =
             ws.bench
                 .view_dropdown(&self.available_agents, &ws.custom_agents, pal)
         {
+            let backdrop = ws
+                .bench
+                .view_dropdown_backdrop()
+                .map(|b| b.map(Message::Bench))
+                .unwrap_or_else(|| Space::new().width(Length::Fill).height(Length::Fill).into());
             stack![
                 body,
+                backdrop,
                 // Position the dropdown just below the tab bar
                 column![
                     Space::new().height(30), // approximate tab bar height
@@ -4168,6 +4502,59 @@ fn splitter_event_filter(
         }
         _ => None,
     }
+}
+
+/// Format the chip label for an Unsplash attribution. Pure helper so the
+/// rendering decision can be unit-tested without standing up an iced view.
+/// Spark sp-ux0033.
+fn unsplash_attribution_label(bg: &data::ryve_dir::BackgroundConfig) -> Option<String> {
+    let photographer = bg.unsplash_photographer.as_deref()?.trim();
+    if photographer.is_empty() {
+        return None;
+    }
+    Some(format!("Photo by {photographer} on Unsplash"))
+}
+
+/// Render the translucent attribution chip in the bottom-right of the
+/// workspace when an Unsplash image is the active background. Returns
+/// `None` when there is no photographer credit on file (e.g. local
+/// uploads), so the caller can skip pushing a layer entirely. Spark
+/// sp-ux0033.
+fn unsplash_attribution_overlay(ws: &Workshop) -> Option<Element<'_, Message>> {
+    ws.background_handle.as_ref()?;
+    let label = unsplash_attribution_label(&ws.config.background)?;
+    let url = ws
+        .config
+        .background
+        .unsplash_photographer_url
+        .clone()
+        .unwrap_or_else(|| "https://unsplash.com".to_string());
+
+    let chip_text = text(label).size(11).color(Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 0.92,
+    });
+
+    let chip_button = button(chip_text)
+        .style(button::text)
+        .padding([4, 10])
+        .on_press(Message::OpenUrl(url));
+
+    let chip = container(chip_button)
+        .padding(0)
+        .style(|_theme: &Theme| style::attribution_chip());
+
+    Some(
+        container(chip)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .padding(12)
+            .into(),
+    )
 }
 
 /// Stack toast notifications on top of an existing view, if any are active.
@@ -4401,4 +4788,46 @@ async fn load_sparks(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Spark> 
     }
 
     sparks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data::ryve_dir::BackgroundConfig;
+
+    #[test]
+    fn attribution_label_present_when_photographer_set() {
+        let bg = BackgroundConfig {
+            image: Some("photo.jpg".into()),
+            dim_opacity: 0.7,
+            unsplash_photographer: Some("Jane Doe".into()),
+            unsplash_photographer_url: Some("https://unsplash.com/@jane".into()),
+        };
+        assert_eq!(
+            unsplash_attribution_label(&bg).as_deref(),
+            Some("Photo by Jane Doe on Unsplash"),
+        );
+    }
+
+    #[test]
+    fn attribution_label_absent_for_local_upload() {
+        let bg = BackgroundConfig {
+            image: Some("local.jpg".into()),
+            dim_opacity: 0.7,
+            unsplash_photographer: None,
+            unsplash_photographer_url: None,
+        };
+        assert!(unsplash_attribution_label(&bg).is_none());
+    }
+
+    #[test]
+    fn attribution_label_absent_for_blank_photographer() {
+        let bg = BackgroundConfig {
+            image: Some("photo.jpg".into()),
+            dim_opacity: 0.7,
+            unsplash_photographer: Some("   ".into()),
+            unsplash_photographer_url: None,
+        };
+        assert!(unsplash_attribution_label(&bg).is_none());
+    }
 }
