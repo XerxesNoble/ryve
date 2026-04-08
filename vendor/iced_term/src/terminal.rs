@@ -70,6 +70,25 @@ impl Terminal {
         self.backend.child_pid()
     }
 
+    /// Run a regex search across this terminal's scrollback + viewport.
+    /// Used by the Cmd+F overlay (sp-ux0030).
+    pub fn search(&self, query: &str) -> Vec<crate::backend::Match> {
+        self.backend.search(query)
+    }
+
+    /// Scroll a search match into view and highlight it via the
+    /// existing selection rendering path.
+    pub fn focus_match(&mut self, m: &crate::backend::Match) {
+        self.backend.focus_match(m);
+        self.sync_and_redraw();
+    }
+
+    /// Drop any highlight set by [`Terminal::focus_match`].
+    pub fn clear_search_selection(&mut self) {
+        self.backend.clear_search_selection();
+        self.sync_and_redraw();
+    }
+
     pub fn subscription(&self) -> Subscription<Event> {
         let data = TerminalSubscriptionData {
             id: self.id,

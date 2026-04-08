@@ -230,6 +230,12 @@ enum Message {
     HandAssignmentSaved,
     /// Shift key state changed (for shift-click line selection).
     ShiftStateChanged(bool),
+    /// Cmd+F pressed. The handler routes to the active tab — file
+    /// viewer search or terminal search overlay (sp-ux0030).
+    HotkeyCmdF,
+    /// Escape pressed. Dispatched globally; handlers close any open
+    /// search overlay or selection on the active tab.
+    HotkeyEscape,
     /// Send initial spark prompt to a Hand's terminal after agent boots.
     SendSparkPrompt {
         tab_id: u64,
@@ -351,6 +357,8 @@ impl std::fmt::Debug for Message {
             Self::NewDefaultHand => write!(f, "NewDefaultHand"),
             Self::HandAssignmentSaved => write!(f, "HandAssignmentSaved"),
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
+            Self::HotkeyCmdF => write!(f, "HotkeyCmdF"),
+            Self::HotkeyEscape => write!(f, "HotkeyEscape"),
             Self::SendSparkPrompt { tab_id, .. } => write!(f, "SendSparkPrompt({tab_id})"),
             Self::SubmitSparkPrompt { tab_id } => write!(f, "SubmitSparkPrompt({tab_id})"),
             Self::SplitterPressed(k) => write!(f, "SplitterPressed({k:?})"),
@@ -1904,6 +1912,58 @@ impl App {
                 self.shift_held = pressed;
                 Task::none()
             }
+            Message::HotkeyCmdF => {
+                // Route Cmd+F to whichever search overlay is on the
+                // active tab. File viewer and terminal both grab it.
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                let ws = &self.workshops[idx];
+                if let Some(active_id) = ws.bench.active_tab {
+                    let kind = ws
+                        .bench
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == active_id)
+                        .map(|t| &t.kind);
+                    match kind {
+                        Some(screen::bench::TabKind::FileViewer(_)) => self
+                            .update(Message::FileViewer(
+                                file_viewer::Message::OpenSearch,
+                            )),
+                        Some(
+                            screen::bench::TabKind::Terminal
+                            | screen::bench::TabKind::CodingAgent(_),
+                        ) => self.handle_bench_message(
+                            screen::bench::Message::OpenTerminalSearch,
+                        ),
+                        _ => Task::none(),
+                    }
+                } else {
+                    Task::none()
+                }
+            }
+            Message::HotkeyEscape => {
+                // Escape: close any open search overlay on the active
+                // tab. Always also clears file-viewer selection so the
+                // pre-existing behavior is preserved.
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                let ws = &self.workshops[idx];
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if let Some(active_id) = ws.bench.active_tab
+                    && ws.bench.terminal_search.contains_key(&active_id)
+                {
+                    tasks.push(self.handle_bench_message(
+                        screen::bench::Message::CloseTerminalSearch,
+                    ));
+                }
+                tasks.push(self.update(Message::FileViewer(
+                    file_viewer::Message::ClearSelection,
+                )));
+                Task::batch(tasks)
+            }
             Message::Bench(msg) => self.handle_bench_message(msg),
             Message::Sparks(msg) => {
                 let Some(idx) = self.active_workshop else {
@@ -2810,6 +2870,107 @@ impl App {
             }
             // TerminalEvent handled above
             screen::bench::Message::TerminalEvent(_) => {}
+            screen::bench::Message::OpenTerminalSearch => {
+                let ws = &mut self.workshops[idx];
+                let Some(active_id) = ws.bench.active_tab else {
+                    return Task::none();
+                };
+                // Only meaningful for terminal tabs (CodingAgent counts as
+                // a terminal — both render the same iced_term widget).
+                let is_terminal_kind = ws.bench.tabs.iter().any(|t| {
+                    t.id == active_id
+                        && matches!(
+                            t.kind,
+                            screen::bench::TabKind::Terminal
+                                | screen::bench::TabKind::CodingAgent(_)
+                        )
+                });
+                if !is_terminal_kind || !ws.terminals.contains_key(&active_id) {
+                    return Task::none();
+                }
+                ws.bench
+                    .terminal_search
+                    .entry(active_id)
+                    .or_default();
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    screen::bench::TERMINAL_SEARCH_INPUT_ID,
+                ));
+            }
+            screen::bench::Message::CloseTerminalSearch => {
+                let ws = &mut self.workshops[idx];
+                let Some(active_id) = ws.bench.active_tab else {
+                    return Task::none();
+                };
+                if ws.bench.terminal_search.remove(&active_id).is_some()
+                    && let Some(term) = ws.terminals.get_mut(&active_id)
+                {
+                    term.clear_search_selection();
+                }
+            }
+            screen::bench::Message::TerminalSearchQueryChanged(q) => {
+                let ws = &mut self.workshops[idx];
+                let Some(active_id) = ws.bench.active_tab else {
+                    return Task::none();
+                };
+                let Some(term) = ws.terminals.get_mut(&active_id) else {
+                    return Task::none();
+                };
+                let matches = term.search(&q);
+                let entry = ws
+                    .bench
+                    .terminal_search
+                    .entry(active_id)
+                    .or_default();
+                entry.query = q;
+                entry.match_count = matches.len();
+                if matches.is_empty() {
+                    entry.current_match = None;
+                    term.clear_search_selection();
+                } else {
+                    entry.current_match = Some(0);
+                    term.focus_match(&matches[0]);
+                }
+            }
+            screen::bench::Message::TerminalSearchNext
+            | screen::bench::Message::TerminalSearchPrev => {
+                let forward = matches!(
+                    msg,
+                    screen::bench::Message::TerminalSearchNext
+                );
+                let ws = &mut self.workshops[idx];
+                let Some(active_id) = ws.bench.active_tab else {
+                    return Task::none();
+                };
+                let Some(term) = ws.terminals.get_mut(&active_id) else {
+                    return Task::none();
+                };
+                let Some(entry) =
+                    ws.bench.terminal_search.get_mut(&active_id)
+                else {
+                    return Task::none();
+                };
+                if entry.query.is_empty() {
+                    return Task::none();
+                }
+                // Re-run the search so navigation reflects any new
+                // output that landed since the last query change. The
+                // active terminal can grow under us at any moment.
+                let matches = term.search(&entry.query);
+                entry.match_count = matches.len();
+                if matches.is_empty() {
+                    entry.current_match = None;
+                    term.clear_search_selection();
+                    return Task::none();
+                }
+                let next = match entry.current_match {
+                    None => 0,
+                    Some(i) if forward => (i + 1) % matches.len(),
+                    Some(0) => matches.len() - 1,
+                    Some(i) => i - 1,
+                };
+                entry.current_match = Some(next);
+                term.focus_match(&matches[next]);
+            }
         }
         Task::none()
     }
@@ -3296,14 +3457,14 @@ impl App {
                         return Message::FileViewer(file_viewer::Message::CopySelection);
                     }
                     if modifiers.command() && c.as_str() == "f" {
-                        return Message::FileViewer(file_viewer::Message::OpenSearch);
+                        return Message::HotkeyCmdF;
                     }
                 }
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 } => {
-                    return Message::FileViewer(file_viewer::Message::ClearSelection);
+                    return Message::HotkeyEscape;
                 }
                 keyboard::Event::ModifiersChanged(modifiers) => {
                     return Message::ShiftStateChanged(modifiers.shift());
@@ -3799,8 +3960,16 @@ impl App {
                 )
                 .map(Message::Home)
             } else if let Some(term) = ws.terminals.get(&active_id) {
-                iced_term::TerminalView::show_with_transparent_bg(term, has_bg)
-                    .map(|e| Message::Bench(screen::bench::Message::TerminalEvent(e)))
+                let term_view = iced_term::TerminalView::show_with_transparent_bg(term, has_bg)
+                    .map(|e| Message::Bench(screen::bench::Message::TerminalEvent(e)));
+                if let Some(search_bar) = ws.bench.view_terminal_search(pal) {
+                    stack![term_view, search_bar.map(Message::Bench)]
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    term_view
+                }
             } else if let Some(viewer) = ws.file_viewers.get(&active_id) {
                 file_viewer::view(viewer, &ws.directory, pal, has_bg).map(Message::FileViewer)
             } else if let Some(tail) = ws.log_tails.get(&active_id) {
