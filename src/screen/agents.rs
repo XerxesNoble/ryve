@@ -740,10 +740,16 @@ fn render_head_row<'a>(
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "(unknown)".to_string())
     });
-    row_widget = row_widget.push(text(title).size(FONT_BODY).color(pal.text_primary));
+    // Title takes the leftover space (and wraps within it) so the trailing
+    // spark chip can never be pushed past the panel's right edge.
+    row_widget = row_widget.push(
+        text(title)
+            .size(FONT_BODY)
+            .color(pal.text_primary)
+            .width(Length::Fill),
+    );
 
     // Spark chip — opens the epic spark detail.
-    row_widget = row_widget.push(Space::new().width(Length::Fill));
     if let Some(s) = epic {
         row_widget = row_widget.push(spark_chip(&s.id, pal));
     }
@@ -876,13 +882,19 @@ fn render_hand_row<'a>(
     let title = spark
         .map(|s| s.title.clone())
         .unwrap_or_else(|| session.name.clone());
-    row_widget = row_widget.push(text(title).size(FONT_BODY).color(pal.text_primary));
+    // Title takes the leftover space (and wraps within it) so the trailing
+    // spark chip can never be pushed past the panel's right edge.
+    row_widget = row_widget.push(
+        text(title)
+            .size(FONT_BODY)
+            .color(pal.text_primary)
+            .width(Length::Fill),
+    );
 
     if session.is_background() {
         row_widget = row_widget.push(text("bg").size(FONT_SMALL).color(pal.text_tertiary));
     }
 
-    row_widget = row_widget.push(Space::new().width(Length::Fill));
     if let Some(s) = spark {
         row_widget = row_widget.push(spark_chip(&s.id, pal));
     }
@@ -919,7 +931,12 @@ fn render_history_row<'a>(
     let title = spark
         .map(|s| s.title.clone())
         .unwrap_or_else(|| session.name.clone());
-    let label = text(title).size(FONT_BODY).color(pal.text_secondary);
+    // Title takes the leftover space (and wraps within it) so the trailing
+    // spark chip can never be pushed past the panel's right edge.
+    let label = text(title)
+        .size(FONT_BODY)
+        .color(pal.text_secondary)
+        .width(Length::Fill);
     let time_label = text(format_relative_time(&session.started_at))
         .size(FONT_SMALL)
         .color(pal.text_tertiary);
@@ -933,7 +950,6 @@ fn render_history_row<'a>(
     }
     row_widget = row_widget.push(label);
     row_widget = row_widget.push(time_label);
-    row_widget = row_widget.push(Space::new().width(Length::Fill));
 
     if let Some(s) = spark {
         row_widget = row_widget.push(spark_chip(&s.id, pal));

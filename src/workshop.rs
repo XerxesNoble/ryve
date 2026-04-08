@@ -14,13 +14,13 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::coding_agents::CodingAgent;
-use crate::style::{Appearance, Palette};
 use crate::screen::agents::AgentSession;
 use crate::screen::background_picker::PickerState;
 use crate::screen::bench::{BenchState, TabKind};
 use crate::screen::file_explorer::FileExplorerState;
 use crate::screen::file_viewer::FileViewerState;
 use crate::screen::log_tail::LogTailState;
+use crate::style::{Appearance, Palette};
 
 const BOTTOM_PIN_NEWLINES: usize = 20;
 

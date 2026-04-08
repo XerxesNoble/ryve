@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
-//! Initial prompts for the three roles a coding agent can take on inside a
+//! Initial prompts for the four roles a coding agent can take on inside a
 //! Ryve workshop:
 //!
-//! 1. **Hand** — works on a single spark in its own worktree. Existing flow.
-//! 2. **Head** — orchestrates a Crew of Hands. Decomposes a user goal into
-//!    sparks and spawns Hands via `ryve hand spawn`.
-//! 3. **Merger** — collects the Crew's worktree branches into a single PR
+//! 1. **Atlas** — the **Director**. Top-level user-facing primary agent.
+//!    All user-originated requests route through Atlas by default
+//!    (spark ryve-acdb248a). Atlas coordinates Heads, owns final
+//!    coherence, and never executes spark work directly; it delegates to
+//!    Heads (multi-spark goals) or Hands (single sparks).
+//! 2. **Head** — orchestrates a Crew of Hands. Decomposes a delegated goal
+//!    into sparks and spawns Hands via `ryve hand spawn`.
+//! 3. **Hand** — works on a single spark in its own worktree.
+//! 4. **Merger** — collects the Crew's worktree branches into a single PR
 //!    for human review.
 //!
-//! All three are plain coding agents (claude / codex / aider / opencode).
+//! All four are plain coding agents (claude / codex / aider / opencode).
 //! What distinguishes them is the system prompt we inject at launch.
 //!
 //! Centralising the prompts here keeps the user-facing instructions (spark
@@ -18,6 +23,113 @@
 //! stay consistent across the UI and the `ryve hand spawn` CLI path.
 
 use data::sparks::types::Spark;
+
+/// Compose the initial system prompt for **Atlas**, Ryve's primary
+/// user-facing Director agent.
+///
+/// Atlas is the conversational counterpart for the human user. Its job is
+/// to *coordinate*, never to *execute*: it picks the right Head for a
+/// goal, delegates, and synthesises Head outputs back into one coherent
+/// reply for the user. This prompt encodes the four director semantics
+/// the role depends on:
+///
+/// 1. **User-facing** — Atlas owns the conversation with the user.
+/// 2. **Coordinates, does not execute** — Atlas never edits files, runs
+///    tests, or claims sparks. All execution happens through delegated
+///    Heads (which in turn spawn Hands).
+/// 3. **Selects Heads** — Atlas chooses which Head archetype is the right
+///    fit for a goal and spawns it via the `ryve` CLI.
+/// 4. **Owns final coherence** — Atlas is responsible for the final
+///    synthesised answer to the user; partial Head outputs are inputs,
+///    not the deliverable.
+///
+/// This helper centralises Atlas's role contract so the same prompt text
+/// can be reused consistently anywhere Atlas is launched or validated
+/// (currently `App::spawn_atlas` and the prompt regression tests).
+pub fn compose_atlas_prompt() -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str(
+        "You are **Atlas**, the Director of this Ryve workshop and the user's primary \
+         conversational counterpart. You are an LLM-powered coordinator running as a \
+         coding-agent subprocess. You are the single, stable, user-facing voice of \
+         Ryve: every top-level user request lands with you first, and every final \
+         answer to the user goes out under your name.\n\n",
+    );
+
+    prompt.push_str(
+        "ROLE — DIRECTOR. Internalise these four semantics; they define what Atlas \
+         is and what Atlas is not.\n\n\
+         1. USER-FACING. You own the conversation with the human user. Speak in the \
+            first person as Atlas. Acknowledge the user's goal in your own words \
+            before delegating, and deliver the final synthesised result back to them \
+            yourself. Heads and Hands never address the user directly — their output \
+            flows through you.\n\
+         2. COORDINATE, DO NOT EXECUTE. You never edit source files, run tests, \
+            claim sparks, run destructive git/shell commands, or implement features \
+            yourself. If you catch yourself reaching for an editor or a build tool, \
+            stop: that work belongs to a Head or a Hand. Your tools are the `ryve` \
+            CLI (to inspect the workgraph, create epics, spawn Heads, post comments) \
+            and natural-language conversation with the user.\n\
+         3. SELECT HEADS. For each goal, decide which Head archetype is the right \
+            fit and delegate to it. Spawn a Head with \
+            `ryve hand spawn <epic_id> --role head --agent claude` (Heads are \
+            spawned through the same `ryve hand spawn` CLI as Hands, distinguished \
+            by `--role head`), and pass them the parent epic id you created for \
+            the goal. Prefer one Head per coherent goal; do not fan out work \
+            across Heads that should belong together. If no archetype fits \
+            cleanly, ask the user a clarifying question rather than guessing.\n\
+         4. OWN FINAL COHERENCE. The user's deliverable is one coherent answer \
+            from Atlas — not a transcript of Head output. When Heads (and their \
+            Crews of Hands) report back, you read their results, reconcile any \
+            contradictions, and produce the synthesised reply yourself. If a Head \
+            returns work that is incomplete, inconsistent, or off-spec, it is your \
+            responsibility to redirect, re-delegate, or escalate to the user — \
+            never to forward broken output as the final answer.\n\n",
+    );
+
+    prompt.push_str(
+        "WORKFLOW for a typical user request:\n\
+         1. Acknowledge the user's goal in one or two sentences, in your own voice.\n\
+         2. Inspect the workgraph: `ryve spark list` and (if relevant) \
+            `ryve crew list` so you do not duplicate active work.\n\
+         3. Create a parent epic that captures the goal, with a clear problem \
+            statement and acceptance criteria:\n\
+            `ryve spark create --type epic --priority 1 \\\n\
+                --problem '<goal>' --acceptance '<measurable outcome>' '<title>'`\n\
+         4. Pick the appropriate Head archetype for the goal and spawn it, passing \
+            the parent epic id so the Head decomposes that epic instead of \
+            inventing a new one.\n\
+         5. While the Head's Crew is running, stay available to the user. Relay \
+            clarifying questions in both directions. Do not poll in a tight loop — \
+            use your host agent's recurring-task primitive (e.g. `/loop` in Claude \
+            Code) if you need to check progress on a schedule.\n\
+         6. When the Head reports completion, read the outputs, verify them \
+            against the epic's acceptance criteria, and synthesise one coherent \
+            reply for the user. If something is missing, re-delegate before \
+            replying.\n\n",
+    );
+
+    prompt.push_str(
+        "HARD RULES:\n\
+         - You are the Director. You coordinate; you do not execute. No file \
+           edits, no test runs, no spark claims, no destructive git/shell.\n\
+         - All workgraph mutations go through the `ryve` CLI. Never touch \
+           `.ryve/sparks.db` directly.\n\
+         - Reference any epic id you create as `[sp-xxxx]` in comments and in \
+           the final reply to the user.\n\
+         - Never make architectural decisions on the user's behalf. When the \
+           goal is ambiguous, ask the user before spawning a Head.\n\
+         - Never let a Head or Hand speak to the user as themselves. The user's \
+           counterpart is Atlas; partial outputs from delegated agents are \
+           inputs to your synthesis, not deliverables.\n\
+         - Respect user overrides: if the user closes an epic or redirects \
+           mid-flight, treat that as authoritative immediately.\n\n\
+         Begin now. Greet the user as Atlas and wait for their goal.\n",
+    );
+
+    prompt
+}
 
 /// Compose the initial prompt sent to a newly-spawned Hand working on a
 /// specific spark.
@@ -294,6 +406,29 @@ mod tests {
         );
     }
 
+    /// Spark ryve-acdb248a — Atlas is the default routing destination for
+    /// top-level user requests. The prompt must establish Atlas as the
+    /// **Director** and explain the agent hierarchy so it can delegate.
+    /// User-facing documentation of the bypass paths lives in
+    /// `docs/ATLAS.md`, not the system prompt itself.
+    #[test]
+    fn atlas_prompt_establishes_director_role_and_delegation() {
+        let p = compose_atlas_prompt();
+        assert!(p.contains("Atlas"));
+        assert!(p.contains("Director") || p.contains("DIRECTOR"));
+        // Hierarchy: Atlas → Head/Hand
+        assert!(p.contains("Head"));
+        assert!(p.contains("Hand"));
+        // Routing uses the real `ryve hand spawn ... --role head` CLI surface;
+        // there is no separate `ryve head spawn` command.
+        assert!(p.contains("ryve hand spawn"));
+        assert!(!p.contains("ryve head spawn"));
+        // Atlas must never execute work itself.
+        assert!(
+            p.contains("never edit") || p.contains("DO NOT EXECUTE") || p.contains("not execute")
+        );
+    }
+
     #[test]
     fn head_prompt_explains_workflow() {
         let p = compose_head_prompt(Some("sp-abcd"), Some("User profile editing"));
@@ -313,6 +448,65 @@ mod tests {
         assert!(p.contains("no epic selected"));
         assert!(p.contains("wait for the user"));
         assert!(!p.contains("PARENT EPIC"));
+    }
+
+    /// sp-ryve-9972f264: the Atlas system prompt must reinforce the four
+    /// director semantics — user-facing, coordinates not executes, selects
+    /// Heads, owns final coherence. These assertions are deliberately
+    /// behavioural so future edits cannot quietly drop a pillar.
+    #[test]
+    fn atlas_prompt_reinforces_director_semantics() {
+        let p = compose_atlas_prompt();
+
+        // Identity: Atlas, Director.
+        assert!(p.contains("Atlas"), "must name Atlas");
+        assert!(
+            p.contains("Director") || p.contains("DIRECTOR"),
+            "must establish Director role"
+        );
+
+        // 1. User-facing.
+        assert!(
+            p.contains("user-facing") || p.contains("USER-FACING"),
+            "must mark Atlas as user-facing"
+        );
+        assert!(
+            p.contains("conversation") && p.contains("user"),
+            "must place Atlas as the user's conversational counterpart"
+        );
+
+        // 2. Coordinates, does not execute.
+        assert!(
+            p.contains("coordinate") || p.contains("Coordinate") || p.contains("COORDINATE"),
+            "must use coordination language"
+        );
+        assert!(
+            p.contains("not execute")
+                || p.contains("DO NOT EXECUTE")
+                || p.contains("never edit")
+                || p.contains("never execute"),
+            "must explicitly forbid Atlas from executing work"
+        );
+
+        // 3. Selects Heads.
+        assert!(
+            p.contains("Head") && (p.contains("select") || p.contains("SELECT")),
+            "must direct Atlas to select Heads"
+        );
+        assert!(
+            p.contains("delegate") || p.contains("delegating") || p.contains("delegation"),
+            "must frame Atlas's action as delegation"
+        );
+
+        // 4. Owns final coherence.
+        assert!(
+            p.contains("coherence") || p.contains("coherent"),
+            "must charge Atlas with final coherence"
+        );
+        assert!(
+            p.contains("synthes"),
+            "must require Atlas to synthesise Head outputs"
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 mod agent_prompts;
 mod cli;
 mod coding_agents;
+mod delegation;
 mod hand_spawn;
 mod icons;
 mod screen;
@@ -547,8 +548,7 @@ impl App {
                 // user before tearing down the workshop instead of killing
                 // their terminals/agents instantly.
                 if let Some(ws) = self.workshops.get(idx) {
-                    let active_hands =
-                        ws.agent_sessions.iter().filter(|s| s.active).count();
+                    let active_hands = ws.agent_sessions.iter().filter(|s| s.active).count();
                     if active_hands > 0 {
                         self.pending_close_workshop = Some(idx);
                         return Task::none();
@@ -569,9 +569,7 @@ impl App {
             Message::NewWorkshopDialog => Task::perform(pick_workshop_directory(), |path| {
                 Message::WorkshopDirPicked(path)
             }),
-            Message::WorkshopDirPicked(Some(path)) => {
-                self.update(Message::OpenWorkshopPath(path))
-            }
+            Message::WorkshopDirPicked(Some(path)) => self.update(Message::OpenWorkshopPath(path)),
             Message::WorkshopDirPicked(None) => Task::none(),
             Message::OpenWorkshopPath(path) => {
                 // If the user clicks a stale recent entry, surface a toast
@@ -2015,16 +2013,13 @@ impl App {
                         .find(|t| t.id == active_id)
                         .map(|t| &t.kind);
                     match kind {
-                        Some(screen::bench::TabKind::FileViewer(_)) => self
-                            .update(Message::FileViewer(
-                                file_viewer::Message::OpenSearch,
-                            )),
+                        Some(screen::bench::TabKind::FileViewer(_)) => {
+                            self.update(Message::FileViewer(file_viewer::Message::OpenSearch))
+                        }
                         Some(
                             screen::bench::TabKind::Terminal
                             | screen::bench::TabKind::CodingAgent(_),
-                        ) => self.handle_bench_message(
-                            screen::bench::Message::OpenTerminalSearch,
-                        ),
+                        ) => self.handle_bench_message(screen::bench::Message::OpenTerminalSearch),
                         _ => Task::none(),
                     }
                 } else {
@@ -2043,13 +2038,11 @@ impl App {
                 if let Some(active_id) = ws.bench.active_tab
                     && ws.bench.terminal_search.contains_key(&active_id)
                 {
-                    tasks.push(self.handle_bench_message(
-                        screen::bench::Message::CloseTerminalSearch,
-                    ));
+                    tasks.push(
+                        self.handle_bench_message(screen::bench::Message::CloseTerminalSearch),
+                    );
                 }
-                tasks.push(self.update(Message::FileViewer(
-                    file_viewer::Message::ClearSelection,
-                )));
+                tasks.push(self.update(Message::FileViewer(file_viewer::Message::ClearSelection)));
                 Task::batch(tasks)
             }
             Message::Bench(msg) => self.handle_bench_message(msg),
@@ -3019,6 +3012,28 @@ impl App {
                 ws.bench.dropdown_open = false;
                 ws.pending_head_spawn = Some(screen::head_picker::PickerState::default());
             }
+            screen::bench::Message::NewAtlas => {
+                // Spark ryve-acdb248a — Atlas is the **default entry point**
+                // for top-level user requests. Atlas is conversational and
+                // delegates downward, so we don't open a picker here: the
+                // user has not yet expressed a goal. We pick the first
+                // compatible coding agent automatically and spawn it with
+                // the Atlas Director system prompt. The user types their
+                // request into the resulting bench tab and Atlas decides
+                // whether to delegate to a Head or a Hand.
+                let ws = &mut self.workshops[idx];
+                ws.bench.dropdown_open = false;
+                let agent = match self
+                    .available_agents
+                    .iter()
+                    .find(|a| !a.compatibility.is_unsupported())
+                    .cloned()
+                {
+                    Some(a) => a,
+                    None => return Task::none(),
+                };
+                return self.spawn_atlas(idx, agent);
+            }
             screen::bench::Message::NewCustomAgent(agent_idx) => {
                 let ws = &mut self.workshops[idx];
                 let def = match ws.custom_agents.get(agent_idx) {
@@ -3062,10 +3077,7 @@ impl App {
                 if !is_terminal_kind || !ws.terminals.contains_key(&active_id) {
                     return Task::none();
                 }
-                ws.bench
-                    .terminal_search
-                    .entry(active_id)
-                    .or_default();
+                ws.bench.terminal_search.entry(active_id).or_default();
                 return iced::widget::operation::focus(iced::widget::Id::new(
                     screen::bench::TERMINAL_SEARCH_INPUT_ID,
                 ));
@@ -3090,11 +3102,7 @@ impl App {
                     return Task::none();
                 };
                 let matches = term.search(&q);
-                let entry = ws
-                    .bench
-                    .terminal_search
-                    .entry(active_id)
-                    .or_default();
+                let entry = ws.bench.terminal_search.entry(active_id).or_default();
                 entry.query = q;
                 entry.match_count = matches.len();
                 if matches.is_empty() {
@@ -3107,10 +3115,7 @@ impl App {
             }
             screen::bench::Message::TerminalSearchNext
             | screen::bench::Message::TerminalSearchPrev => {
-                let forward = matches!(
-                    msg,
-                    screen::bench::Message::TerminalSearchNext
-                );
+                let forward = matches!(msg, screen::bench::Message::TerminalSearchNext);
                 let ws = &mut self.workshops[idx];
                 let Some(active_id) = ws.bench.active_tab else {
                     return Task::none();
@@ -3118,9 +3123,7 @@ impl App {
                 let Some(term) = ws.terminals.get_mut(&active_id) else {
                     return Task::none();
                 };
-                let Some(entry) =
-                    ws.bench.terminal_search.get_mut(&active_id)
-                else {
+                let Some(entry) = ws.bench.terminal_search.get_mut(&active_id) else {
                     return Task::none();
                 };
                 if entry.query.is_empty() {
@@ -3443,6 +3446,98 @@ impl App {
         Task::batch(tasks)
     }
 
+    /// Spawn **Atlas** — a coding agent launched with the Atlas Director
+    /// system prompt. Spark ryve-acdb248a: Atlas is the default entry point
+    /// for user-originated requests. It has no spark assignment of its own
+    /// and creates no Crew up front; its job is to talk to the user and
+    /// delegate to a Head (multi-spark goal) or a Hand (single spark) via
+    /// the `ryve` CLI.
+    ///
+    /// Mechanically nearly identical to `spawn_head`: only the session
+    /// label and the injected prompt differ.
+    fn spawn_atlas(&mut self, workshop_idx: usize, agent: CodingAgent) -> Task<Message> {
+        let ws = &mut self.workshops[workshop_idx];
+
+        let session_id = Uuid::new_v4().to_string();
+        let title = format!("Atlas ({})", agent.display_name);
+        let agent_command = agent.command.clone();
+        let agent_args = agent.args.clone();
+        let full_auto = self
+            .global_config
+            .agent_settings
+            .get(&agent.command)
+            .is_some_and(|s| s.full_auto);
+
+        let tab_id = ws.spawn_terminal(
+            title.clone(),
+            Some(&agent),
+            &mut self.next_terminal_id,
+            Some(&session_id),
+            full_auto,
+        );
+
+        ws.agent_sessions.push(AgentSession {
+            id: session_id.clone(),
+            name: title.clone(),
+            agent: agent.clone(),
+            tab_id: Some(tab_id),
+            active: true,
+            stale: false,
+            resume_id: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            log_path: None,
+            last_output_at: None,
+            // Atlas is the top of the hierarchy — no parent.
+            parent_session_id: None,
+        });
+
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        if let Some(ref pool) = ws.sparks_db {
+            let pool = pool.clone();
+            let ws_id = ws.workshop_id();
+            let new_session = data::sparks::types::NewAgentSession {
+                id: session_id.clone(),
+                workshop_id: ws_id,
+                agent_name: title,
+                agent_command,
+                agent_args,
+                // Distinct label so traces, the Hands panel, and any
+                // future Atlas-aware UI can pick Atlas out from regular
+                // Heads and Hands.
+                session_label: Some("atlas".to_string()),
+                child_pid: None,
+                resume_id: None,
+                log_path: None,
+                parent_session_id: None,
+            };
+            tasks.push(Task::perform(
+                async move {
+                    let _ = data::sparks::agent_session_repo::create(&pool, &new_session).await;
+                },
+                |_| Message::AgentSessionSaved,
+            ));
+        }
+
+        // Inject the Atlas Director system prompt the same way the Head and
+        // Hand flows do — typed into the terminal after a short boot delay.
+        let prompt = agent_prompts::compose_atlas_prompt();
+        let prompt_tab_id = tab_id;
+        tasks.push(Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            },
+            move |_| Message::SendSparkPrompt {
+                tab_id: prompt_tab_id,
+                prompt,
+            },
+        ));
+
+        if let Some(term) = ws.terminals.get(&tab_id) {
+            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
+        }
+        Task::batch(tasks)
+    }
+
     fn handle_background_message(
         &mut self,
         msg: screen::background_picker::Message,
@@ -3641,6 +3736,16 @@ impl App {
             screen::background_picker::Message::StepTerminalFontSize(_)
             | screen::background_picker::Message::SetTerminalFontFamily(_)
             | screen::background_picker::Message::ClearTerminalFontFamily => Task::none(),
+            screen::background_picker::Message::SetDelegationVisibility(level) => {
+                self.global_config.delegation_visibility = level;
+                let config = self.global_config.clone();
+                Task::perform(
+                    async move {
+                        config.save().ok();
+                    },
+                    |_| Message::BackgroundConfigSaved,
+                )
+            }
             screen::background_picker::Message::ToggleFullAuto(cmd) => {
                 let entry = self
                     .global_config
@@ -3776,28 +3881,22 @@ impl App {
         let close_dialog: Option<Element<'_, Message>> =
             self.pending_close_workshop.and_then(|idx| {
                 let target = self.workshops.get(idx)?;
-                let active_hands =
-                    target.agent_sessions.iter().filter(|s| s.active).count();
+                let active_hands = target.agent_sessions.iter().filter(|s| s.active).count();
                 let pal = match target.bg_is_dark {
                     Some(true) => style::Palette::dark(),
                     Some(false) => style::Palette::light(),
                     None => self.appearance.palette(),
                 };
                 Some(
-                    screen::close_workshop_dialog::view(
-                        idx,
-                        target.name(),
-                        active_hands,
-                        &pal,
-                    )
-                    .map(|m| match m {
-                        screen::close_workshop_dialog::Message::Confirm(i) => {
-                            Message::ConfirmCloseWorkshop(i)
-                        }
-                        screen::close_workshop_dialog::Message::Cancel => {
-                            Message::CancelCloseWorkshop
-                        }
-                    }),
+                    screen::close_workshop_dialog::view(idx, target.name(), active_hands, &pal)
+                        .map(|m| match m {
+                            screen::close_workshop_dialog::Message::Confirm(i) => {
+                                Message::ConfirmCloseWorkshop(i)
+                            }
+                            screen::close_workshop_dialog::Message::Cancel => {
+                                Message::CancelCloseWorkshop
+                            }
+                        }),
                 )
             });
 
@@ -3880,6 +3979,7 @@ impl App {
                         dim_opacity,
                         agents,
                         terminal_font,
+                        self.global_config.delegation_visibility,
                     )
                     .map(Message::Background),
                 );
@@ -3986,8 +4086,7 @@ impl App {
         // open anything.
         let concept_row = |label: &'static str, body: &'static str| -> Element<'_, Message> {
             row![
-                container(text(label).size(13).color(pal.text_primary))
-                    .width(Length::Fixed(96.0)),
+                container(text(label).size(13).color(pal.text_primary)).width(Length::Fixed(96.0)),
                 text(body).size(13).color(pal.text_secondary),
             ]
             .spacing(12)
@@ -4018,12 +4117,8 @@ impl App {
             .style(move |_theme: &Theme| style::glass_panel(&pal, false))
             .into()
         } else {
-            let mut list = column![
-                text("Recent workshops")
-                    .size(12)
-                    .color(pal.text_secondary),
-            ]
-            .spacing(8);
+            let mut list =
+                column![text("Recent workshops").size(12).color(pal.text_secondary),].spacing(8);
             for path in self.global_config.recent_workshops.iter().take(8) {
                 let label = path
                     .file_name()
@@ -4141,6 +4236,27 @@ impl App {
         let bench = self.view_bench(ws, has_bg, &pal);
 
         // -- Right: sparks panel (or detail view) --
+        // Derive the delegation trace on demand so it always reflects the
+        // latest poll-loaded state of hand_assignments / agent_sessions /
+        // crews / crew_members / sparks rather than a snapshot taken at
+        // BondsLoaded. Built unconditionally and cheaply (small filter +
+        // sort over already-cached vectors); the binding lives for the
+        // remainder of this function so the spark_detail::view borrow is
+        // valid for the returned `Element`.
+        let delegation = ws
+            .selected_spark
+            .as_deref()
+            .map(|selected_id| {
+                screen::delegation_trace::build_trace(
+                    selected_id,
+                    &ws.hand_assignments,
+                    &ws.agent_sessions,
+                    &ws.crews,
+                    &ws.crew_members,
+                    &ws.sparks,
+                )
+            })
+            .unwrap_or_default();
         let sparks_panel = if let Some(ref selected_id) = ws.selected_spark {
             if let Some(spark) = ws.sparks.iter().find(|s| s.id == *selected_id) {
                 screen::spark_detail::view(
@@ -4148,6 +4264,7 @@ impl App {
                     &ws.selected_spark_contracts,
                     &ws.selected_spark_bonds,
                     &ws.sparks,
+                    &delegation,
                     &ws.contract_create_form,
                     &pal,
                     has_bg,
@@ -4337,6 +4454,7 @@ impl App {
                     dim_opacity,
                     agents,
                     terminal_font,
+                    self.global_config.delegation_visibility,
                 )
                 .map(Message::Background),
             );
@@ -4792,8 +4910,9 @@ async fn load_sparks(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Spark> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use data::ryve_dir::BackgroundConfig;
+
+    use super::*;
 
     #[test]
     fn attribution_label_present_when_photographer_set() {

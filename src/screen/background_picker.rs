@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use data::config::DelegationVisibility;
 use data::unsplash::Photo;
 use iced::widget::{
     Space, button, column, container, image, mouse_area, row, rule, scrollable, slider, text,
@@ -14,6 +15,12 @@ use iced::widget::{
 use iced::{Element, Length, Theme};
 
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_LABEL, FONT_SMALL, Palette};
+
+/// Settings-modal blurb that frames the listed coding agents as tools the
+/// Atlas Director delegates to. Centralised so the wording stays in sync
+/// with the rest of the UI's "Atlas (Director)" presentation.
+pub const ATLAS_AGENT_BLURB: &str = "Atlas (Director) is your primary agent and delegates to these coding agents \
+     when it spawns Heads or Hands.";
 
 // ── Messages ──────────────────────────────────────────
 
@@ -65,9 +72,13 @@ pub enum Message {
     SetTerminalFontFamily(String),
     /// Reset the terminal font family override to the platform default.
     ClearTerminalFontFamily,
+
+    // ── Delegation visibility (sp-7252755d) ──────────────
+    /// Choose how much delegation detail Atlas surfaces in responses.
+    SetDelegationVisibility(DelegationVisibility),
 }
 
-// ── State ───────────────────────────────────���─────────
+// ── State ─────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PickerState {
@@ -135,6 +146,7 @@ pub fn view<'a>(
     dim_opacity: f32,
     agents: Vec<AgentInfo>,
     terminal_font: TerminalFontInfo,
+    delegation_visibility: DelegationVisibility,
 ) -> Element<'a, Message> {
     let pal = *pal;
 
@@ -152,6 +164,7 @@ pub fn view<'a>(
 
     // ── Agent Settings Section ───────────────────────────
     content = content.push(text("Coding Agents").size(14).color(pal.text_primary));
+    content = content.push(text(ATLAS_AGENT_BLURB).size(12).color(pal.text_secondary));
 
     // Default agent selector
     {
@@ -216,6 +229,42 @@ pub fn view<'a>(
             );
         }
         content = content.push(auto_row);
+    }
+
+    // ── Delegation visibility (sp-7252755d) ──────────────
+    content = content.push(
+        text("Atlas delegation visibility")
+            .size(12)
+            .color(pal.text_secondary),
+    );
+    {
+        let mut vis_row = row![].spacing(6);
+        for option in DelegationVisibility::ALL {
+            let is_selected = option == delegation_visibility;
+            vis_row = vis_row.push(
+                button(text(option.label()).size(12))
+                    .style(if is_selected {
+                        button::primary
+                    } else {
+                        button::secondary
+                    })
+                    .padding([4, 10])
+                    .on_press(Message::SetDelegationVisibility(option)),
+            );
+        }
+        content = content.push(vis_row);
+        let hint = match delegation_visibility {
+            DelegationVisibility::Invisible => {
+                "Atlas hides every delegation hop — responses look like Atlas alone."
+            }
+            DelegationVisibility::Summary => {
+                "Atlas surfaces a short summary of which Heads it consulted."
+            }
+            DelegationVisibility::FullTrace => {
+                "Atlas exposes the entire delegation trace, including Hand spawns."
+            }
+        };
+        content = content.push(text(hint).size(11).color(pal.text_tertiary));
     }
 
     content = content.push(rule::horizontal(1));
@@ -435,6 +484,15 @@ fn view_thumbnail<'a>(
 mod tests {
     use super::*;
 
+    /// Spark ryve-7aa4dcd8: the settings modal must consistently identify
+    /// Atlas as the Director above the listed coding agents.
+    #[test]
+    fn settings_blurb_names_atlas_as_director() {
+        assert!(ATLAS_AGENT_BLURB.contains("Atlas"));
+        assert!(ATLAS_AGENT_BLURB.contains("Director"));
+        assert!(ATLAS_AGENT_BLURB.contains("delegates"));
+    }
+
     #[test]
     fn preview_handle_defaults_to_none() {
         let state = PickerState::new();
@@ -452,6 +510,20 @@ mod tests {
 
         state.clear_preview();
         assert!(state.preview_handle.is_none());
+    }
+
+    #[test]
+    fn delegation_visibility_message_carries_each_variant() {
+        // Guard the wiring between the button row and the update loop —
+        // every variant in ALL must be representable as a Message so the
+        // settings UI can never produce an unhandled selection.
+        for option in DelegationVisibility::ALL {
+            let msg = Message::SetDelegationVisibility(option);
+            match msg {
+                Message::SetDelegationVisibility(v) => assert_eq!(v, option),
+                _ => panic!("expected SetDelegationVisibility"),
+            }
+        }
     }
 
     #[test]

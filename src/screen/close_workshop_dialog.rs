@@ -42,23 +42,19 @@ pub fn view<'a>(
         .padding([6, 14])
         .on_press(Message::Cancel);
 
-    let confirm_btn = button(
-        text("Close anyway")
-            .size(FONT_LABEL)
-            .color(pal.window_bg),
-    )
-    .style(move |_t: &Theme, _s| button::Style {
-        background: Some(iced::Background::Color(pal.danger)),
-        text_color: pal.window_bg,
-        border: iced::Border {
-            color: pal.danger,
-            width: 1.0,
-            radius: iced::border::Radius::from(6.0),
-        },
-        ..button::Style::default()
-    })
-    .padding([6, 14])
-    .on_press(Message::Confirm(workshop_idx));
+    let confirm_btn = button(text("Close anyway").size(FONT_LABEL).color(pal.window_bg))
+        .style(move |_t: &Theme, _s| button::Style {
+            background: Some(iced::Background::Color(pal.danger)),
+            text_color: pal.window_bg,
+            border: iced::Border {
+                color: pal.danger,
+                width: 1.0,
+                radius: iced::border::Radius::from(6.0),
+            },
+            ..button::Style::default()
+        })
+        .padding([6, 14])
+        .on_press(Message::Confirm(workshop_idx));
 
     let actions = row![Space::new().width(Length::Fill), cancel_btn, confirm_btn]
         .spacing(8)
@@ -114,4 +110,3 @@ mod tests {
         assert!(s.starts_with("my-project "), "got: {s}");
     }
 }
-

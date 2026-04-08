@@ -12,6 +12,7 @@ pub mod commit_link_repo;
 pub mod constraint_helpers;
 pub mod contract_repo;
 pub mod crew_repo;
+pub mod delegation_trace_repo;
 pub mod ember_repo;
 pub mod engraving_repo;
 pub mod error;

@@ -819,3 +819,287 @@ pub struct CrewMember {
     pub role: Option<String>,
     pub joined_at: String,
 }
+
+// ── Agent Role Model ─────────────────────────────────
+//
+// Ryve's agent system has three first-class roles. They form a strict
+// delegation hierarchy: a Director plans and routes work, Heads
+// orchestrate Crews, Hands execute sparks. The role is intrinsic to the
+// agent — it determines which prompts, tools, and authority the agent
+// gets — and is distinct from `AssignmentRole` (which describes how a
+// specific Hand session relates to a single spark).
+//
+// Spark `ryve-d772adfe`: prior to this enum the hierarchy lived only in
+// docs and prompt strings; "Director" wasn't represented in code at all,
+// so there was no place to anchor a default user-facing agent. Atlas
+// (see [`Agent::atlas`]) is that anchor: Ryve's primary Director.
+
+/// First-class agent role in Ryve's Director → Head → Hand hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    /// Top of the hierarchy: the user-facing planner. Receives requests
+    /// directly from the user, decomposes them into work, and delegates
+    /// to Heads (or, for trivial tasks, straight to a Hand). A workshop
+    /// has exactly one default Director — Atlas.
+    Director,
+    /// Mid-tier orchestrator: owns a Crew of Hands, splits a goal into
+    /// sparks, dispatches them, and integrates the results. A Director
+    /// can spawn many Heads in parallel for unrelated initiatives.
+    Head,
+    /// Leaf executor: claims a single spark, does the work in an
+    /// isolated worktree, and closes the spark. Reports up to its Head
+    /// (or directly to the Director if spawned solo).
+    Hand,
+}
+
+impl AgentRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Director => "director",
+            Self::Head => "head",
+            Self::Hand => "hand",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "director" => Some(Self::Director),
+            "head" => Some(Self::Head),
+            "hand" => Some(Self::Hand),
+            _ => None,
+        }
+    }
+
+    /// True if this role may delegate work to the `other` role.
+    /// Encodes the strict Director → Head → Hand hierarchy.
+    pub fn can_delegate_to(&self, other: AgentRole) -> bool {
+        matches!(
+            (self, other),
+            (Self::Director, Self::Head) | (Self::Director, Self::Hand) | (Self::Head, Self::Hand)
+        )
+    }
+}
+
+/// A named agent identity within Ryve, paired with its role. This is the
+/// in-memory representation of a "who" — Atlas the Director, an
+/// anonymous Head spawned by the user, etc. Persistence still happens
+/// through `agent_sessions`; this type lets the orchestration layer
+/// reason about role and identity without parsing free-form labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agent {
+    pub name: String,
+    pub role: AgentRole,
+}
+
+impl Agent {
+    pub fn new(name: impl Into<String>, role: AgentRole) -> Self {
+        Self {
+            name: name.into(),
+            role,
+        }
+    }
+
+    /// Atlas — Ryve's default, primary user-facing Director. Every
+    /// workshop instantiates Atlas at boot so the user always has a
+    /// stable conversational counterpart, even before any Heads or
+    /// Hands have been spawned. See parent epic `ryve-5472d4c6`.
+    pub fn atlas() -> Self {
+        Self {
+            name: ATLAS_NAME.to_string(),
+            role: AgentRole::Director,
+        }
+    }
+}
+
+/// Canonical display name for the default Director. Kept as a constant
+/// so UI copy, prompts, and logs all reference the same string.
+pub const ATLAS_NAME: &str = "Atlas";
+
+// ── Delegation Trace ─────────────────────────────────
+
+/// The Director identity that owns originating requests by default. Atlas is
+/// Ryve's primary user-facing agent, so every trace whose origin is not
+/// explicitly overridden is recorded as Atlas-originated. Spark
+/// ryve-1e3848b6.
+pub const ATLAS_ORIGIN: &str = "atlas";
+
+/// Where a participant in a delegation hop sits in the agent hierarchy. Used
+/// for both the delegating actor and the delegated target so a hop can
+/// describe e.g. `Director → Head` or `Head → Hand`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    /// The top-level Director agent (Atlas).
+    Director,
+    /// A Head: orchestrator that manages a Crew of Hands.
+    Head,
+    /// A Hand: leaf worker that runs against a single spark.
+    Hand,
+    /// A non-agent tool invocation (shell, MCP server, etc.).
+    Tool,
+    /// The human user — only ever appears as the delegating actor on the root
+    /// hop when the user talks directly to a non-Director agent.
+    User,
+}
+
+impl ActorKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Director => "director",
+            Self::Head => "head",
+            Self::Hand => "hand",
+            Self::Tool => "tool",
+            Self::User => "user",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "director" => Some(Self::Director),
+            "head" => Some(Self::Head),
+            "hand" => Some(Self::Hand),
+            "tool" => Some(Self::Tool),
+            "user" => Some(Self::User),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl DelegationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One hop in a delegation chain. The chain is reconstructed by walking
+/// `parent_trace_id` upward; the root hop's `origin_actor` (typically
+/// `ATLAS_ORIGIN`) identifies the Director that owns the entire request.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct DelegationTrace {
+    pub id: String,
+    pub workshop_id: String,
+    pub spark_id: Option<String>,
+    pub parent_trace_id: Option<String>,
+    pub originating_request: String,
+    pub origin_actor: String,
+    pub delegating_actor: String,
+    pub delegating_actor_kind: String,
+    pub delegated_target: String,
+    pub delegated_target_kind: String,
+    pub status: String,
+    pub execution_result: Option<String>,
+    pub final_synthesis: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+impl DelegationTrace {
+    /// True when this trace was rooted at Atlas (the default Director).
+    /// Used by the UI and tests to assert Atlas visibility on a trace.
+    pub fn is_atlas_originated(&self) -> bool {
+        self.origin_actor == ATLAS_ORIGIN
+    }
+}
+
+pub struct NewDelegationTrace {
+    pub workshop_id: String,
+    pub spark_id: Option<String>,
+    pub parent_trace_id: Option<String>,
+    pub originating_request: String,
+    /// Director identity that owns the request. `None` defaults to Atlas.
+    pub origin_actor: Option<String>,
+    pub delegating_actor: String,
+    pub delegating_actor_kind: ActorKind,
+    pub delegated_target: String,
+    pub delegated_target_kind: ActorKind,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spark `ryve-d772adfe`: Director, Head, and Hand must all be
+    /// first-class enum variants with stable string representations so
+    /// the rest of the orchestration layer can pattern-match on them
+    /// instead of stringly-typed agent labels.
+    #[test]
+    fn agent_role_has_director_head_and_hand_variants() {
+        assert_eq!(AgentRole::Director.as_str(), "director");
+        assert_eq!(AgentRole::Head.as_str(), "head");
+        assert_eq!(AgentRole::Hand.as_str(), "hand");
+
+        assert_eq!(AgentRole::from_str("director"), Some(AgentRole::Director));
+        assert_eq!(AgentRole::from_str("head"), Some(AgentRole::Head));
+        assert_eq!(AgentRole::from_str("hand"), Some(AgentRole::Hand));
+        assert_eq!(AgentRole::from_str("merger"), None);
+    }
+
+    /// The role hierarchy is strict: a Director can delegate down to
+    /// Heads and (in trivial cases) Hands; a Head can dispatch to
+    /// Hands; nothing delegates upward and Hands do not delegate at
+    /// all. Encodes the invariant from the parent epic.
+    #[test]
+    fn agent_role_delegation_follows_hierarchy() {
+        assert!(AgentRole::Director.can_delegate_to(AgentRole::Head));
+        assert!(AgentRole::Director.can_delegate_to(AgentRole::Hand));
+        assert!(AgentRole::Head.can_delegate_to(AgentRole::Hand));
+
+        // No upward delegation.
+        assert!(!AgentRole::Hand.can_delegate_to(AgentRole::Head));
+        assert!(!AgentRole::Hand.can_delegate_to(AgentRole::Director));
+        assert!(!AgentRole::Head.can_delegate_to(AgentRole::Director));
+
+        // Same-level / self delegation is not delegation.
+        assert!(!AgentRole::Director.can_delegate_to(AgentRole::Director));
+        assert!(!AgentRole::Head.can_delegate_to(AgentRole::Head));
+        assert!(!AgentRole::Hand.can_delegate_to(AgentRole::Hand));
+    }
+
+    /// Acceptance criterion for `ryve-d772adfe`: Atlas is instantiated
+    /// as the default Director — same name, same role, every time.
+    #[test]
+    fn atlas_is_the_default_director() {
+        let atlas = Agent::atlas();
+        assert_eq!(atlas.name, ATLAS_NAME);
+        assert_eq!(atlas.name, "Atlas");
+        assert_eq!(atlas.role, AgentRole::Director);
+    }
+
+    #[test]
+    fn agent_role_round_trips_through_serde() {
+        for role in [AgentRole::Director, AgentRole::Head, AgentRole::Hand] {
+            let json = serde_json::to_string(&role).unwrap();
+            let back: AgentRole = serde_json::from_str(&json).unwrap();
+            assert_eq!(role, back, "round-trip mismatch for {role:?}");
+        }
+    }
+}

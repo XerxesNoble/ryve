@@ -1,6 +1,10 @@
 # Ryve Architecture
 
+> See also [`AGENT_HIERARCHY.md`](AGENT_HIERARCHY.md) for the Atlas (Director) → Heads → Hands agent model and delegation rules.
+
 Ryve is a desktop IDE for managing development work through LLM-powered coding agents. It combines a tabbed terminal interface (the **bench**), a file explorer with git awareness, an embedded issue tracker (**Workgraph**), and support for multiple coding agent CLIs. Built in Rust with Iced 0.14 for the UI, SQLite for persistence, and alacritty-terminal for embedded terminals.
+
+The same binary that runs the UI also acts as the `ryve` CLI — Hands and Heads call it as a subprocess to read and mutate the workgraph.
 
 ```
 +------------------------------------------------------------------+
@@ -30,14 +34,28 @@ Ryve is a Cargo workspace with four crates and one vendored dependency:
 ```
 ryve/
 +-- Cargo.toml           # workspace root (edition 2024, AGPL-3.0-or-later)
-+-- src/                  # Application crate (binary)
-+-- data/                 # Data layer: DB, config, git, sparks, unsplash, github
++-- src/                  # Application crate (binary: `ryve` — UI + CLI)
+|   +-- main.rs           # App state, message routing, Iced lifecycle
+|   +-- cli.rs            # ryve CLI dispatch (spark/bond/crew/hand/...)
+|   +-- workshop.rs       # per-workshop state and lifecycle
+|   +-- hand_spawn.rs     # shared Hand/Head spawn helper for UI + CLI
+|   +-- agent_prompts.rs  # compose_hand_prompt / compose_head_prompt / compose_merger_prompt
+|   +-- coding_agents.rs  # PATH detection + system-prompt flag table
+|   +-- worktree_cleanup.rs
+|   +-- icons.rs / style.rs
+|   +-- screen/           # bench, sparks, file_explorer, head_picker, spark_picker,
+|   |                     # spark_detail, file_viewer, log_tail, ember_bar, status_bar,
+|   |                     # background_picker, agents, home, toast, close_workshop_dialog
+|   +-- widget/           # badge, splitter
++-- data/                 # Data layer: DB, config, git, sparks, agent_context, unsplash, github
+|   +-- migrations/       # 001-009 sqlx migrations
+|   +-- src/sparks/       # spark/bond/crew/contract/assignment/... repos
 +-- llm/                  # LLM client (genai multi-provider)
 |   +-- proto/            # Protocol types: Thread, Message, Agent
 +-- ipc/                  # Single-instance enforcement (Unix socket)
 +-- vendor/
 |   +-- iced_term/        # Vendored terminal emulator widget (patched)
-+-- docs/
++-- docs/                 # ARCHITECTURE.md (this file), HEAD_PLAN.md, WORKGRAPH.md
 ```
 
 ### Key Dependencies
@@ -162,6 +180,8 @@ struct Workshop {
 4. Wraps the command with the **bottom-pin technique**
 5. Creates an `iced_term::Terminal` and stores it by ID
 
+The actual spawn logic for both UI and CLI lives in `src/hand_spawn.rs` so a Head can call `ryve hand spawn` and end up creating exactly the same worktree, agent_session row, hand_assignment row, and detached subprocess that the bench's "New Hand" button would have. The running UI picks up CLI-spawned sessions on its next 3-second poll via `load_agent_sessions`.
+
 **Worktree isolation** -- Every Hand runs in its own git worktree (`hand/<session-id-prefix>` branch) to prevent merge conflicts between concurrent agents.
 
 **System prompt injection** -- The WORKSHOP.md file containing active sparks, constraints, contracts, and workflow rules is injected directly into the agent's system instructions. This is not optional — only agents that support system prompt flags are included in `KNOWN_AGENTS`.
@@ -196,19 +216,37 @@ Terminal actions are handled by `Workshop::handle_terminal_action()`:
 
 ## Screen Components (`src/screen/`)
 
+| Module | Purpose |
+|---|---|
+| `bench.rs` | Tabbed work surface (terminals, coding agents, file viewers, log tails) |
+| `sparks.rs` | Workgraph panel: list, status cycling, inline create, 3s auto-refresh |
+| `spark_picker.rs` | Spark selector for "New Hand" with coding-agent radio |
+| `spark_detail.rs` | Per-spark drill-down (intent, bonds, comments, contracts) |
+| `head_picker.rs` | Modal for "New Head" — selects coding agent and optional goal |
+| `file_explorer.rs` | Git-aware project tree |
+| `file_viewer.rs` | In-bench syntax-highlighted file viewer (syntect) |
+| `log_tail.rs` | Tail of `.ryve/logs/hand-<session>.log` for detached Hands |
+| `agents.rs` | Active Hands panel with crew badges |
+| `ember_bar.rs` | Ribbon showing active inter-Hand embers |
+| `status_bar.rs` | Bottom bar (branch, hand counts, workshop name) |
+| `background_picker.rs` | Modal: Unsplash search + local upload |
+| `home.rs` | Welcome / no-workshop screen |
+| `toast.rs` | Transient notifications |
+| `close_workshop_dialog.rs` | Confirmation modal for closing a workshop |
+
 ### Bench (`bench.rs`)
 
-Tabbed workspace area holding terminals and coding agent sessions.
+Tabbed workspace area holding terminals, coding agent sessions, file viewers, and log tails.
 
 ```rust
 struct BenchState {
-    tabs: Vec<Tab>,          // id, title, kind (Terminal | CodingAgent)
+    tabs: Vec<Tab>,          // id, title, kind (Terminal | CodingAgent | FileViewer | LogTail)
     active_tab: Option<u64>, // Currently displayed tab
     dropdown_open: bool,     // "+" menu visibility
 }
 ```
 
-The tab bar renders tab buttons with close controls and a "+" dropdown menu listing "New Terminal" plus each detected coding agent.
+The tab bar renders tab buttons with close controls and a "+" dropdown menu offering "New Terminal", "New Hand", and "New Head" entries. The bench snapshot is persisted per-workshop in the `open_tabs` table (migration 007) and restored on workshop reopen.
 
 ### File Explorer (`file_explorer.rs`)
 
@@ -261,6 +299,26 @@ Modal overlay (rendered via `stack![]` layering) for setting workshop background
 - Photographer attribution stored in config
 
 ---
+
+## Hand Spawn (`src/hand_spawn.rs`)
+
+The single shared entry point for launching a coding-agent subprocess as a Hand or Head. Both the UI's bench dropdown and the `ryve hand spawn` CLI dispatch through here. Responsibilities:
+
+1. Resolve the requested coding agent from `coding_agents::known_agents()` (or a workshop-local custom `AgentDef`).
+2. Allocate a session id and create a `.ryve/worktrees/<short>/` git worktree on a `hand/<short>` branch.
+3. Persist `agent_sessions` (with `child_pid`, `log_path`, optional `parent_session_id`), `hand_assignments`, and `crew_members` rows as appropriate.
+4. Compose the initial prompt via `agent_prompts::compose_hand_prompt`, `compose_head_prompt`, or `compose_merger_prompt`.
+5. Spawn the detached subprocess with stdout/stderr redirected to `.ryve/logs/hand-<session>.log`, exporting `RYVE_WORKSHOP_ROOT` and `RYVE_HAND_SESSION_ID` so that any `ryve hand spawn` the child invokes can record itself as a child of its parent (migration 009).
+
+Detached children survive Ryve restarts and re-appear in the Hands panel via the workgraph poll.
+
+## Agent Prompts (`src/agent_prompts.rs`)
+
+Central home for the system prompts injected into Hand/Head/Merger sessions:
+
+- `compose_hand_prompt(workshop_root, spark)` — boilerplate plus the spark's intent.
+- `compose_head_prompt(workshop_root, user_goal)` — Director instructions: decompose the goal into sparks, create a Crew, spawn child Hands via `ryve hand spawn`, poll progress, retire stale Hands, and finally spawn a Merger.
+- `compose_merger_prompt(crew_id, member_spark_ids)` — instructions for the Merger Hand to walk member branches, build an integration branch `crew/<id>`, push, and open one PR — never auto-merging to main.
 
 ## Coding Agents (`src/coding_agents.rs`)
 
@@ -341,7 +399,7 @@ model = "claude-sonnet-4-20250514"
 
 SQLite with WAL journaling, opened via sqlx. Max 5 connections per pool.
 
-**Schema** (from `migrations/001-004`):
+**Schema** (from `migrations/001-009`):
 
 | Table | Purpose |
 |---|---|
@@ -359,8 +417,11 @@ SQLite with WAL journaling, opened via sqlx. Max 5 connections per pool.
 | `contracts` | Verification criteria on sparks (required/advisory, kind, check_command, status) |
 | `commit_links` | Git commit-to-spark linkage (parsed from `[sp-xxxx]` in messages) |
 | `hand_assignments` | Liveness-aware Hand-to-Spark claims (heartbeat, lease, handoff) |
-| `crews` | Optional Hand groupings (schema-only, future use) |
-| `crew_members` | Crew membership (schema-only, future use) |
+| `crews` | Head-led Crew rows (status, head_session_id, parent_spark_id — migration 005) |
+| `crew_members` | Crew membership with role (`hand` / `merger`) |
+| `open_tabs` | Per-workshop bench tab snapshot, restored on workshop reopen (migration 007) |
+
+Migrations 006–009 extend `agent_sessions` with `child_pid`, `log_path`, and `parent_session_id` so the runtime can track detached Hand processes, tail their logs, and reconstruct Head→child Hand spawn trees.
 
 ### Workgraph System (`sparks/`)
 
@@ -527,3 +588,67 @@ The backend's `resize()` method only sends PTY resize notifications when the com
 | **Marker Injection** | Agent boot files | `<!-- RYVE:START/END -->` markers safely inject pointers into CLAUDE.md etc. |
 | **Constraint Engravings** | Architectural rules | `constraint:` key prefix on engravings for typed architectural constraints |
 | **Poll-based Refresh** | Sparks panel | 3-second timer detects external DB mutations by agents |
+| **Shared Spawn Helper** | `hand_spawn.rs` | UI and CLI both spawn Hands through one helper so behaviour stays identical |
+| **Detached Subprocess** | Head-spawned Hands | Children survive Ryve restarts; UI re-discovers them via the workgraph poll |
+| **Single Binary CLI** | `ryve` | Same binary runs the UI and the workgraph CLI; `default-run = "ryve"` |
+
+---
+
+## Roadmap (near-term objectives)
+
+The following epics are open and actively shaping the codebase. They are listed in priority order and tracked as P1 sparks in the workgraph.
+
+### 1. Execution Workflow Foundation (`ryve-8a218dd4`)
+
+A canonical execution truth for Ryve. Spark status stays minimal; review/repair/merge phases live on a separate `assignment_phase` axis carried by `hand_assignments`. Components:
+
+- New append-only `lifecycle_events` table — the canonical execution log.
+- `LifecycleEvent` enum (9 v1 variants) and `AssignmentPhase` enum (`assigned` → `in_progress` → `awaiting_review` → `in_repair` → `approved` → `ready_for_merge` → `merging` → `merged`/`rejected`/`escalated`).
+- A single pure `transition()` validator with exhaustive (from, to) tests.
+- A pure projector deriving `CrewView` and `TaskView` from `Vec<LifecycleEvent>`.
+- An in-process tokio broadcast bus fanning every persisted event to live subscribers.
+- `ryve lifecycle` subcommand (`emit`, `tail`, `projection`).
+- Auto-emission of lifecycle events from `hand_spawn`, `assign`, and `spark status` flows.
+- A UI lifecycle tail panel that updates within 3s of an event being persisted.
+
+This unblocks Epic 2.
+
+### 2. Adversarial Review Runtime + IRC Facade (`ryve-5dcdf56e`)
+
+An operator-facing live surface for human/agent collaboration over the lifecycle stream:
+
+- Reviewer Hand role with auto-spawn loop (max 3 repair cycles, then escalate).
+- Cross-vendor reviewer preference; reviewer must not be the author.
+- A localhost IRC adapter speaking enough RFC 1459 for nick / join / privmsg / topic.
+- Auto-created `#ryve:epic:<id>` and `#ryve:crew:<id>` channels driven by existing crews/epics.
+- IRC writes validated against the `LifecycleEvent` schema before being appended.
+
+### 3. Atlas — Primary Director Agent (`ryve-5472d4c6`)
+
+Formalize a single user-facing primary agent. Atlas is assigned the Director role; user requests default to Atlas; Atlas delegates to Heads rather than executing directly. Includes UI copy alignment, delegation traces, and a Director / Head / Hand hierarchy doc.
+
+### 4. Hand Lifecycle Ownership (`ryve-bf1cf6f6`)
+
+Stop trusting PID liveness. The runtime owns the full Hand lifecycle: detect spark close transitions, SIGTERM (then SIGKILL) the Hand PID, release the assignment, mark the worktree reapable, run a wall-clock watchdog, and render the Hands panel from the joined `(spark_status, assignment.active, process_alive)` truth so a Hand only shows "working" when all three agree. Adds `ryve hand reap` CLI.
+
+### 5. Build & Test Health (`ryve-4af75c86`)
+
+Restore `cargo test -p data` after `NewSpark` field additions in migration 004. Pre-existing clippy `--tests` errors in `toast.rs` and `hand_spawn.rs` get fixed alongside.
+
+### 6. Terminal Improvements (`ryve-4b68b405`)
+
+Font preferences, theme-aware terminal background, scrollback fix, in-terminal search.
+
+### 7. Workshop Shell, Onboarding & Responsive Layout (`ryve-31429136`)
+
+Welcome screen, close confirmation, click-outside dismiss, background dim slider, responsive sidebar collapse, photographer attribution chip.
+
+### 8. Auto-clean Stale Hand Worktrees (`ryve-b61e7ed4`)
+
+Three-layer cleanup: (A) `ryve worktree prune` CLI — shipped; (B) auto-prune at session end; (C) config-gated boot-time sweeper.
+
+### 9. Pro Polish (`ryve-f92aed3e`)
+
+Command palette (`Cmd+Shift+P`), source control panel (staging / commit / history), smooth animations and transitions.
+
+Other in-flight work includes unifying the UI and CLI Hand spawn paths (`ryve-43535580`), enforcing a `Ready for Review` status when a Hand finishes (`ryve-cb384116`), and saving conversation history and plans into the workgraph (`sp-f5e4`).

@@ -24,6 +24,12 @@ use iced::{Element, Length, Theme};
 use crate::screen::agents::{AgentSession, format_relative_time};
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_LABEL, FONT_SMALL, Palette};
 
+/// Canonical "Atlas (Director)" identity line shown at the top of the Home
+/// dashboard. Centralised so tests can assert the spelling stays consistent
+/// across UI surfaces and so future copy edits live in one place.
+pub const ATLAS_IDENTITY_LINE: &str =
+    "Atlas (Director) — your primary agent. Delegates to Heads, who run Hands.";
+
 // ── Messages ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -62,7 +68,15 @@ pub fn view<'a>(data: HomeData<'a>, pal: &Palette, has_bg: bool) -> Element<'a, 
     .padding([8, 14])
     .align_y(iced::Alignment::Center);
 
+    // Identify Atlas as the Director that coordinates the Heads and Hands
+    // listed below. This is the primary user-facing surface, so it carries
+    // the canonical "Atlas (Director)" framing the rest of the UI references.
+    let identity = text(ATLAS_IDENTITY_LINE)
+        .size(FONT_SMALL)
+        .color(pal.text_secondary);
+
     let body = column![
+        identity,
         section_active_hands(&data, &pal),
         section_assigned_sparks(&data, &pal),
         section_blocked_sparks(&data, &pal),
@@ -419,6 +433,19 @@ mod tests {
             handoff_to: None,
             handoff_reason: None,
         }
+    }
+
+    #[test]
+    fn atlas_identity_line_consistent_across_ui_surfaces() {
+        // Spark ryve-7aa4dcd8: the Home dashboard is the chat-style coordination
+        // surface and must consistently present "Atlas" with the "Director"
+        // annotation. Locking the wording prevents accidental drift between
+        // this and the rest of the UI (settings, status bar, head picker).
+        assert!(ATLAS_IDENTITY_LINE.contains("Atlas"));
+        assert!(ATLAS_IDENTITY_LINE.contains("Director"));
+        assert!(ATLAS_IDENTITY_LINE.contains("primary"));
+        assert!(ATLAS_IDENTITY_LINE.contains("Heads"));
+        assert!(ATLAS_IDENTITY_LINE.contains("Hands"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod agents;
 pub mod background_picker;
 pub mod bench;
 pub mod close_workshop_dialog;
+pub mod delegation_trace;
 pub mod ember_bar;
 pub mod file_explorer;
 pub mod file_viewer;

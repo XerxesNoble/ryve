@@ -4,10 +4,14 @@
 //! Status bar — rich bottom bar showing git branch, diff stats, spark breakdown,
 //! file viewer position/language, active Hands, failing contracts, and settings.
 
+use data::sparks::types::ATLAS_NAME;
 use iced::widget::{Space, button, container, row, text};
 use iced::{Element, Length, Theme};
 
 use crate::style::{self, FONT_ICON, FONT_LABEL, Palette};
+
+/// Role annotation rendered next to [`ATLAS_NAME`] in the status bar.
+pub const ATLAS_ROLE_ANNOTATION: &str = "(Director)";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -232,6 +236,21 @@ pub fn view<'a>(
         right = right.push(separator(&pal));
     }
 
+    // Atlas (Director) indicator — anchors the agent hierarchy in the status
+    // bar so users always see who is in charge, whether or not Hands are
+    // currently running. Sits immediately before the Hand count.
+    right = right.push(
+        row![
+            text(ATLAS_NAME).size(FONT_LABEL).color(pal.text_primary),
+            text(ATLAS_ROLE_ANNOTATION)
+                .size(FONT_LABEL)
+                .color(pal.text_tertiary),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center),
+    );
+    right = right.push(separator(&pal));
+
     // Active Hand count indicator
     if total_hands > 0 {
         let hand_color = if active_hands > 0 {
@@ -312,6 +331,16 @@ fn separator<'a>(pal: &Palette) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spark ryve-7aa4dcd8: the status bar is the always-visible diagnostics
+    /// surface and must consistently identify Atlas as the Director. The
+    /// constants are referenced directly by `view`, so locking their values
+    /// pins the on-screen text without having to introspect iced widgets.
+    #[test]
+    fn status_bar_identifies_atlas_as_director() {
+        assert_eq!(ATLAS_NAME, "Atlas");
+        assert_eq!(ATLAS_ROLE_ANNOTATION, "(Director)");
+    }
 
     #[test]
     fn spark_summary_total_active_excludes_closed() {
