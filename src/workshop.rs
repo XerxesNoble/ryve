@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 
 use data::ryve_dir::{AgentDef, RyveDir, WorkshopConfig};
 use data::sparks::types::{Bond, Contract, Crew, CrewMember, Ember, HandAssignment, Spark};
-use iced::Theme;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::coding_agents::CodingAgent;
+use crate::style::{Appearance, Palette};
 use crate::screen::agents::AgentSession;
 use crate::screen::background_picker::PickerState;
 use crate::screen::bench::{BenchState, TabKind};
@@ -22,7 +22,7 @@ use crate::screen::file_explorer::FileExplorerState;
 use crate::screen::file_viewer::FileViewerState;
 use crate::screen::log_tail::LogTailState;
 
-const BOTTOM_PIN_NEWLINES: usize = 200;
+const BOTTOM_PIN_NEWLINES: usize = 20;
 
 /// State for a pending agent spawn waiting for spark selection.
 ///
@@ -137,6 +137,21 @@ pub struct Workshop {
     /// only fires once per workshop session, not on every SparksPoll tick
     /// that happens to refresh `agent_sessions`.
     pub tabs_restored: bool,
+    /// System appearance (dark/light) the workshop was last told about.
+    /// Used to pick the terminal background color so light mode doesn't
+    /// produce a jarring dark terminal pane. The App owns the source of
+    /// truth and propagates it via [`Workshop::set_appearance`] before
+    /// spawning terminals. Spark sp-ux0019.
+    pub appearance: Appearance,
+    /// Effective terminal font size, in points. Mirrors `Config::terminal_font_size`
+    /// (with the default applied) so spawn_terminal can read it without
+    /// holding a reference to the global config. Updated by main.rs whenever
+    /// the user changes the size via Cmd+scroll or the Settings modal.
+    /// Spark sp-ux0014.
+    pub terminal_font_size: f32,
+    /// Effective terminal font family. `None` falls back to `Font::MONOSPACE`.
+    /// Spark sp-ux0014.
+    pub terminal_font_family: Option<String>,
 }
 
 impl Workshop {
@@ -184,7 +199,60 @@ impl Workshop {
             pending_head_spawn: None,
             last_worktree_warning: None,
             tabs_restored: false,
+            appearance: Appearance::Dark,
+            terminal_font_size: data::config::DEFAULT_TERMINAL_FONT_SIZE,
+            terminal_font_family: None,
         }
+    }
+
+    /// Build the iced_term font settings used when spawning a new terminal
+    /// or coding-agent pane. Reads the workshop's currently-effective
+    /// terminal font size and family. Spark sp-ux0014.
+    pub fn terminal_font_settings(&self) -> iced_term::settings::FontSettings {
+        let font_type = match &self.terminal_font_family {
+            Some(name) => iced::Font {
+                family: iced::font::Family::Name(Box::leak(name.clone().into_boxed_str())),
+                ..iced::Font::MONOSPACE
+            },
+            None => iced::Font::MONOSPACE,
+        };
+        iced_term::settings::FontSettings {
+            size: self.terminal_font_size,
+            font_type,
+            ..iced_term::settings::FontSettings::default()
+        }
+    }
+
+    /// Update the appearance the workshop should use for newly spawned
+    /// terminals. The App calls this whenever its detected system
+    /// appearance changes (and on workshop creation).
+    pub fn set_appearance(&mut self, appearance: Appearance) {
+        self.appearance = appearance;
+    }
+
+    /// Effective palette for this workshop, honoring an adaptive
+    /// background image override (`bg_is_dark`) and falling back to the
+    /// system appearance. Mirrors the same selection used by
+    /// `App::view_workshop` so the terminal background matches the
+    /// surrounding UI.
+    pub fn effective_palette(&self) -> Palette {
+        match self.bg_is_dark {
+            Some(true) => Palette::dark(),
+            Some(false) => Palette::light(),
+            None => self.appearance.palette(),
+        }
+    }
+
+    /// Hex string for the terminal background, derived from the
+    /// effective palette's window background.
+    pub fn terminal_bg_hex(&self) -> String {
+        let c = self.effective_palette().window_bg;
+        format!(
+            "#{:02x}{:02x}{:02x}",
+            (c.r * 255.0).round() as u8,
+            (c.g * 255.0).round() as u8,
+            (c.b * 255.0).round() as u8,
+        )
     }
 
     /// Drain a pending worktree warning, if any. Returns the message so the
@@ -441,9 +509,11 @@ impl Workshop {
             self.directory.clone()
         };
 
-        let mut settings = iced_term::settings::Settings::default();
-        settings.font.size = 14.0;
-        settings.theme.color_pallete.background = app_background_color();
+        let mut settings = iced_term::settings::Settings {
+            font: self.terminal_font_settings(),
+            ..iced_term::settings::Settings::default()
+        };
+        settings.theme.color_pallete.background = self.terminal_bg_hex();
         settings.backend.working_directory = Some(working_dir);
 
         // Inject Ryve env vars for Hand sessions so `ryve` CLI works
@@ -535,9 +605,11 @@ impl Workshop {
             }
         };
 
-        let mut settings = iced_term::settings::Settings::default();
-        settings.font.size = 14.0;
-        settings.theme.color_pallete.background = app_background_color();
+        let mut settings = iced_term::settings::Settings {
+            font: self.terminal_font_settings(),
+            ..iced_term::settings::Settings::default()
+        };
+        settings.theme.color_pallete.background = self.terminal_bg_hex();
         settings.backend.working_directory = Some(working_dir);
         (settings.backend.program, settings.backend.args) =
             wrap_command_with_bottom_pin(&def.command, &def.args);
@@ -817,17 +889,6 @@ pub(crate) fn hand_env_vars(workshop_dir: &Path) -> Vec<(String, String)> {
     vars
 }
 
-fn app_background_color() -> String {
-    let color = Theme::Dark.palette().background;
-
-    format!(
-        "#{:02x}{:02x}{:02x}",
-        (color.r * 255.0).round() as u8,
-        (color.g * 255.0).round() as u8,
-        (color.b * 255.0).round() as u8,
-    )
-}
-
 /// Result of async workshop initialization.
 pub struct WorkshopInit {
     pub pool: SqlitePool,
@@ -885,6 +946,40 @@ mod tests {
     use crate::screen::agents::AgentSession;
 
     #[test]
+    fn terminal_font_settings_uses_workshop_size() {
+        // Spark sp-ux0014: spawn_terminal must read the workshop's
+        // configured font size instead of a hardcoded 14.0.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.terminal_font_size = 22.0;
+        let font = ws.terminal_font_settings();
+        assert_eq!(font.size, 22.0);
+    }
+
+    #[test]
+    fn terminal_font_settings_defaults_to_14() {
+        // Spark sp-ux0014: a workshop with no override still gets 14pt.
+        let ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        assert_eq!(
+            ws.terminal_font_size,
+            data::config::DEFAULT_TERMINAL_FONT_SIZE
+        );
+        assert_eq!(ws.terminal_font_settings().size, 14.0);
+    }
+
+    #[test]
+    fn terminal_font_settings_applies_family_override() {
+        // Spark sp-ux0014: a configured family must propagate into the
+        // FontSettings handed to iced_term.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.terminal_font_family = Some("JetBrains Mono".to_string());
+        let font = ws.terminal_font_settings();
+        match font.font_type.family {
+            iced::font::Family::Name(name) => assert_eq!(name, "JetBrains Mono"),
+            other => panic!("expected named family, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn workshop_id_derives_from_directory_name() {
         let ws = Workshop::new(PathBuf::from("/home/user/projects/my-project"));
         assert_eq!(ws.workshop_id(), "my-project");
@@ -902,6 +997,55 @@ mod tests {
             .to_string();
         let ws = Workshop::new(dir);
         assert_eq!(ws.workshop_id(), cli_id);
+    }
+
+    #[test]
+    fn terminal_bg_follows_appearance_and_adaptive_palette() {
+        // Spark sp-ux0019: terminal background must reflect the actual
+        // appearance, not a hardcoded dark theme.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+
+        // Default (dark) appearance, no background image — picks the dark
+        // window background.
+        ws.set_appearance(Appearance::Dark);
+        let dark_hex = ws.terminal_bg_hex();
+        let dark_expected = {
+            let c = Palette::dark().window_bg;
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (c.r * 255.0).round() as u8,
+                (c.g * 255.0).round() as u8,
+                (c.b * 255.0).round() as u8,
+            )
+        };
+        assert_eq!(dark_hex, dark_expected);
+
+        // Light appearance, no background image — must NOT return the dark
+        // hex (this was the bug: light mode produced a dark terminal).
+        ws.set_appearance(Appearance::Light);
+        let light_hex = ws.terminal_bg_hex();
+        let light_expected = {
+            let c = Palette::light().window_bg;
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (c.r * 255.0).round() as u8,
+                (c.g * 255.0).round() as u8,
+                (c.b * 255.0).round() as u8,
+            )
+        };
+        assert_eq!(light_hex, light_expected);
+        assert_ne!(light_hex, dark_hex);
+
+        // Adaptive override: a dark background image forces the dark
+        // palette even when system appearance is Light.
+        ws.bg_is_dark = Some(true);
+        assert_eq!(ws.terminal_bg_hex(), dark_expected);
+
+        // And vice versa — a light background image forces the light
+        // palette even when system appearance is Dark.
+        ws.set_appearance(Appearance::Dark);
+        ws.bg_is_dark = Some(false);
+        assert_eq!(ws.terminal_bg_hex(), light_expected);
     }
 
     #[test]
@@ -984,5 +1128,25 @@ mod tests {
             );
             prev = cur;
         }
+    }
+
+    #[test]
+    fn bottom_pin_newlines_is_modest() {
+        // Spark sp-ux0027: 200 newlines polluted scrollback. Keep this small
+        // (<= 30) so scroll-up history isn't drowned in blank lines.
+        assert!(BOTTOM_PIN_NEWLINES <= 30);
+        assert!(BOTTOM_PIN_NEWLINES >= 10);
+    }
+
+    #[test]
+    fn wrap_command_with_bottom_pin_uses_constant() {
+        let (shell, args) = wrap_command_with_bottom_pin("echo", &["hi".to_string()]);
+        assert_eq!(shell, "/bin/sh");
+        assert_eq!(args[0], "-lc");
+        assert!(
+            args[1].contains(&format!("-lt {BOTTOM_PIN_NEWLINES}")),
+            "wrapped command should embed BOTTOM_PIN_NEWLINES loop bound: {}",
+            args[1]
+        );
     }
 }

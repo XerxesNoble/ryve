@@ -18,6 +18,12 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone)]
 pub enum Event {
     BackendCall(u64, backend::Command),
+    /// User requested a font-size change for this terminal (e.g. via
+    /// Cmd+scroll). The host application is expected to translate this
+    /// into a `Command::ChangeFont` and broadcast it to whichever
+    /// terminals should respond. `delta` is in points (positive = grow,
+    /// negative = shrink).
+    FontSizeDelta(u64, f32),
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +74,25 @@ impl Terminal {
     /// PID of the shell process spawned inside this terminal's PTY.
     pub fn child_pid(&self) -> u32 {
         self.backend.child_pid()
+    }
+
+    /// Run a regex search across this terminal's scrollback + viewport.
+    /// Used by the Cmd+F overlay (sp-ux0030).
+    pub fn search(&self, query: &str) -> Vec<crate::backend::Match> {
+        self.backend.search(query)
+    }
+
+    /// Scroll a search match into view and highlight it via the
+    /// existing selection rendering path.
+    pub fn focus_match(&mut self, m: &crate::backend::Match) {
+        self.backend.focus_match(m);
+        self.sync_and_redraw();
+    }
+
+    /// Drop any highlight set by [`Terminal::focus_match`].
+    pub fn clear_search_selection(&mut self) {
+        self.backend.clear_search_selection();
+        self.sync_and_redraw();
     }
 
     pub fn subscription(&self) -> Subscription<Event> {

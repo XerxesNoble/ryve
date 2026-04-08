@@ -131,6 +131,7 @@ impl<'a> TerminalView<'a> {
         layout_position: Point,
         cursor_position: Point,
         event: &iced::mouse::Event,
+        view_events: &mut Vec<Event>,
     ) -> Vec<Command> {
         let mut commands = Vec::new();
         let terminal_content = self.term.backend.renderable_content();
@@ -180,12 +181,31 @@ impl<'a> TerminalView<'a> {
                 );
             },
             iced::mouse::Event::WheelScrolled { delta } => {
-                Self::handle_wheel_scrolled(
-                    state,
-                    *delta,
-                    &self.term.font.measure,
-                    &mut commands,
-                );
+                // Cmd+scroll resizes the terminal font instead of scrolling
+                // the buffer. We bubble a FontSizeDelta up to the host app
+                // so it can broadcast a ChangeFont command to all terminals
+                // and persist the new size to the global config.
+                // Spark sp-ux0014.
+                if state.keyboard_modifiers.contains(Modifiers::COMMAND) {
+                    let dy = match delta {
+                        ScrollDelta::Lines { y, .. } => *y,
+                        ScrollDelta::Pixels { y, .. } => *y / 40.0,
+                    };
+                    if dy != 0.0 {
+                        // 1 point per line of scroll feels close to native
+                        // terminals (iTerm2, Terminal.app).
+                        let step = if dy > 0.0 { 1.0 } else { -1.0 };
+                        view_events
+                            .push(Event::FontSizeDelta(self.term.id, step));
+                    }
+                } else {
+                    Self::handle_wheel_scrolled(
+                        state,
+                        *delta,
+                        &self.term.font.measure,
+                        &mut commands,
+                    );
+                }
             },
             _ => {},
         }
@@ -668,6 +688,7 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
         let is_cursor_in_layout = self.is_cursor_in_layout(cursor, layout);
         self.handle_focus(event, state, is_cursor_in_layout);
 
+        let mut view_events: Vec<Event> = Vec::new();
         let commands = match event {
             iced::Event::Mouse(mouse_event) if is_cursor_in_layout => self
                 .handle_mouse_event(
@@ -675,6 +696,7 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                     layout.position(),
                     cursor.position().unwrap(),
                     mouse_event,
+                    &mut view_events,
                 ),
             iced::Event::Keyboard(keyboard_event) => {
                 if !state.is_focused() {
@@ -688,12 +710,15 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
             _ => Vec::new(),
         };
 
-        if !commands.is_empty() {
+        if !commands.is_empty() || !view_events.is_empty() {
             shell.capture_event();
         }
 
         for cmd in commands {
             shell.publish(Event::BackendCall(self.term.id, cmd));
+        }
+        for ev in view_events {
+            shell.publish(ev);
         }
     }
 

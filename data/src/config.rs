@@ -17,6 +17,16 @@ pub struct Config {
     #[serde(default)]
     pub font_family: Option<String>,
 
+    /// Custom font family used inside terminal/coding-agent panes.
+    /// When unset, uses the platform default monospace font.
+    #[serde(default)]
+    pub terminal_font_family: Option<String>,
+
+    /// Terminal font size in points. Defaults to 14.0 when unset so that
+    /// pre-existing configs keep their previous look. Spark sp-ux0014.
+    #[serde(default)]
+    pub terminal_font_size: Option<f32>,
+
     /// Default coding agent to launch with Cmd+H (e.g. "claude", "codex").
     /// Must match a known agent command name. When unset, Cmd+H does nothing.
     #[serde(default)]
@@ -35,6 +45,24 @@ pub struct Config {
 
 /// Maximum number of recent workshop entries to retain in the global config.
 pub const MAX_RECENT_WORKSHOPS: usize = 10;
+
+/// Default terminal font size (in points) used when no override is set.
+pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 14.0;
+/// Hard floor for the terminal font size — anything below this is unreadable
+/// and starts producing degenerate cell measurements in iced_term.
+pub const MIN_TERMINAL_FONT_SIZE: f32 = 6.0;
+/// Hard ceiling for the terminal font size — keeps Cmd+scroll from running
+/// the cell grid off the screen.
+pub const MAX_TERMINAL_FONT_SIZE: f32 = 48.0;
+
+impl Config {
+    /// Effective terminal font size, applying the default + clamp.
+    pub fn effective_terminal_font_size(&self) -> f32 {
+        self.terminal_font_size
+            .unwrap_or(DEFAULT_TERMINAL_FONT_SIZE)
+            .clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE)
+    }
+}
 
 /// Per-agent configuration stored in the global config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +125,47 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+mod terminal_font_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_14() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.effective_terminal_font_size(),
+            DEFAULT_TERMINAL_FONT_SIZE
+        );
+    }
+
+    #[test]
+    fn clamps_below_minimum() {
+        let cfg = Config {
+            terminal_font_size: Some(1.0),
+            ..Config::default()
+        };
+        assert_eq!(cfg.effective_terminal_font_size(), MIN_TERMINAL_FONT_SIZE);
+    }
+
+    #[test]
+    fn clamps_above_maximum() {
+        let cfg = Config {
+            terminal_font_size: Some(999.0),
+            ..Config::default()
+        };
+        assert_eq!(cfg.effective_terminal_font_size(), MAX_TERMINAL_FONT_SIZE);
+    }
+
+    #[test]
+    fn passes_through_in_range() {
+        let cfg = Config {
+            terminal_font_size: Some(18.0),
+            ..Config::default()
+        };
+        assert_eq!(cfg.effective_terminal_font_size(), 18.0);
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -105,6 +174,8 @@ impl Default for Config {
                 .expect("no home directory found")
                 .join("dev"),
             font_family: None,
+            terminal_font_family: None,
+            terminal_font_size: None,
             default_agent: None,
             agent_settings: HashMap::new(),
             recent_workshops: Vec::new(),

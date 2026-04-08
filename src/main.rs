@@ -247,6 +247,12 @@ enum Message {
     HandAssignmentSaved,
     /// Shift key state changed (for shift-click line selection).
     ShiftStateChanged(bool),
+    /// Cmd+F pressed. The handler routes to the active tab — file
+    /// viewer search or terminal search overlay (sp-ux0030).
+    HotkeyCmdF,
+    /// Escape pressed. Dispatched globally; handlers close any open
+    /// search overlay or selection on the active tab.
+    HotkeyEscape,
     /// Send initial spark prompt to a Hand's terminal after agent boots.
     SendSparkPrompt {
         tab_id: u64,
@@ -375,6 +381,8 @@ impl std::fmt::Debug for Message {
             Self::NewDefaultHand => write!(f, "NewDefaultHand"),
             Self::HandAssignmentSaved => write!(f, "HandAssignmentSaved"),
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
+            Self::HotkeyCmdF => write!(f, "HotkeyCmdF"),
+            Self::HotkeyEscape => write!(f, "HotkeyEscape"),
             Self::SendSparkPrompt { tab_id, .. } => write!(f, "SendSparkPrompt({tab_id})"),
             Self::SubmitSparkPrompt { tab_id } => write!(f, "SubmitSparkPrompt({tab_id})"),
             Self::SplitterPressed(k) => write!(f, "SplitterPressed({k:?})"),
@@ -596,7 +604,13 @@ impl App {
                     let _ = cfg.save();
                 });
 
-                let workshop = Workshop::new(path.clone());
+                let mut workshop = Workshop::new(path.clone());
+                workshop.set_appearance(self.appearance);
+                // Inherit the user's currently-effective terminal font
+                // settings so the very first terminal in the new workshop
+                // already respects the global preference. Spark sp-ux0014.
+                workshop.terminal_font_size = self.global_config.effective_terminal_font_size();
+                workshop.terminal_font_family = self.global_config.terminal_font_family.clone();
                 let ws_id = workshop.id;
                 self.workshops.push(workshop);
                 let idx = self.workshops.len() - 1;
@@ -1986,6 +2000,58 @@ impl App {
                 self.shift_held = pressed;
                 Task::none()
             }
+            Message::HotkeyCmdF => {
+                // Route Cmd+F to whichever search overlay is on the
+                // active tab. File viewer and terminal both grab it.
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                let ws = &self.workshops[idx];
+                if let Some(active_id) = ws.bench.active_tab {
+                    let kind = ws
+                        .bench
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == active_id)
+                        .map(|t| &t.kind);
+                    match kind {
+                        Some(screen::bench::TabKind::FileViewer(_)) => self
+                            .update(Message::FileViewer(
+                                file_viewer::Message::OpenSearch,
+                            )),
+                        Some(
+                            screen::bench::TabKind::Terminal
+                            | screen::bench::TabKind::CodingAgent(_),
+                        ) => self.handle_bench_message(
+                            screen::bench::Message::OpenTerminalSearch,
+                        ),
+                        _ => Task::none(),
+                    }
+                } else {
+                    Task::none()
+                }
+            }
+            Message::HotkeyEscape => {
+                // Escape: close any open search overlay on the active
+                // tab. Always also clears file-viewer selection so the
+                // pre-existing behavior is preserved.
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                let ws = &self.workshops[idx];
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if let Some(active_id) = ws.bench.active_tab
+                    && ws.bench.terminal_search.contains_key(&active_id)
+                {
+                    tasks.push(self.handle_bench_message(
+                        screen::bench::Message::CloseTerminalSearch,
+                    ));
+                }
+                tasks.push(self.update(Message::FileViewer(
+                    file_viewer::Message::ClearSelection,
+                )));
+                Task::batch(tasks)
+            }
             Message::Bench(msg) => self.handle_bench_message(msg),
             Message::Sparks(msg) => {
                 let Some(idx) = self.active_workshop else {
@@ -2669,7 +2735,77 @@ impl App {
         }
     }
 
+    /// Apply a terminal-font-size delta from a Cmd+scroll gesture, clamped
+    /// to the configured min/max. Updates the global config, mirrors the
+    /// new value onto every workshop, and broadcasts a `ChangeFont` command
+    /// to every live terminal so the resize is immediate. Spark sp-ux0014.
+    fn apply_terminal_font_delta(&mut self, delta: f32) -> Task<Message> {
+        let current = self.global_config.effective_terminal_font_size();
+        let next = (current + delta).clamp(
+            data::config::MIN_TERMINAL_FONT_SIZE,
+            data::config::MAX_TERMINAL_FONT_SIZE,
+        );
+        if (next - current).abs() < f32::EPSILON {
+            return Task::none();
+        }
+        self.set_terminal_font(Some(next), self.global_config.terminal_font_family.clone())
+    }
+
+    /// Update the terminal font (size and/or family) globally. Mirrors the
+    /// new values to every workshop, broadcasts `ChangeFont` to every live
+    /// terminal, and persists the global config to disk. Spark sp-ux0014.
+    fn set_terminal_font(&mut self, size: Option<f32>, family: Option<String>) -> Task<Message> {
+        if let Some(s) = size {
+            self.global_config.terminal_font_size = Some(s);
+        }
+        self.global_config.terminal_font_family = family;
+        let effective_size = self.global_config.effective_terminal_font_size();
+        let effective_family = self.global_config.terminal_font_family.clone();
+
+        // Build the FontSettings once and clone into each terminal handle.
+        let font_type = match &effective_family {
+            Some(name) => iced::Font {
+                family: iced::font::Family::Name(Box::leak(name.clone().into_boxed_str())),
+                ..iced::Font::MONOSPACE
+            },
+            None => iced::Font::MONOSPACE,
+        };
+        let font = iced_term::settings::FontSettings {
+            size: effective_size,
+            font_type,
+            ..iced_term::settings::FontSettings::default()
+        };
+
+        for ws in self.workshops.iter_mut() {
+            ws.terminal_font_size = effective_size;
+            ws.terminal_font_family = effective_family.clone();
+            for term in ws.terminals.values_mut() {
+                let _ = term.handle(iced_term::Command::ChangeFont(font.clone()));
+            }
+        }
+
+        let config = self.global_config.clone();
+        Task::perform(
+            async move {
+                if let Err(e) = config.save() {
+                    log::warn!("Failed to persist terminal font settings: {e}");
+                }
+            },
+            |_| Message::BackgroundConfigSaved,
+        )
+    }
+
     fn handle_bench_message(&mut self, msg: screen::bench::Message) -> Task<Message> {
+        // Cmd+scroll bubbles up as a FontSizeDelta event from iced_term.
+        // Persist the new size to the global config and broadcast it to
+        // every live terminal so the resize is uniform across panes.
+        // Spark sp-ux0014.
+        if let screen::bench::Message::TerminalEvent(iced_term::Event::FontSizeDelta(_id, delta)) =
+            msg
+        {
+            return self.apply_terminal_font_delta(delta);
+        }
+
         // Terminal events can come from any workshop, so we need to
         // find the right one by terminal ID for terminal events.
         if let screen::bench::Message::TerminalEvent(iced_term::Event::BackendCall(id, ref cmd)) =
@@ -2908,6 +3044,107 @@ impl App {
             }
             // TerminalEvent handled above
             screen::bench::Message::TerminalEvent(_) => {}
+            screen::bench::Message::OpenTerminalSearch => {
+                let ws = &mut self.workshops[idx];
+                let Some(active_id) = ws.bench.active_tab else {
+                    return Task::none();
+                };
+                // Only meaningful for terminal tabs (CodingAgent counts as
+                // a terminal — both render the same iced_term widget).
+                let is_terminal_kind = ws.bench.tabs.iter().any(|t| {
+                    t.id == active_id
+                        && matches!(
+                            t.kind,
+                            screen::bench::TabKind::Terminal
+                                | screen::bench::TabKind::CodingAgent(_)
+                        )
+                });
+                if !is_terminal_kind || !ws.terminals.contains_key(&active_id) {
+                    return Task::none();
+                }
+                ws.bench
+                    .terminal_search
+                    .entry(active_id)
+                    .or_default();
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    screen::bench::TERMINAL_SEARCH_INPUT_ID,
+                ));
+            }
+            screen::bench::Message::CloseTerminalSearch => {
+                let ws = &mut self.workshops[idx];
+                let Some(active_id) = ws.bench.active_tab else {
+                    return Task::none();
+                };
+                if ws.bench.terminal_search.remove(&active_id).is_some()
+                    && let Some(term) = ws.terminals.get_mut(&active_id)
+                {
+                    term.clear_search_selection();
+                }
+            }
+            screen::bench::Message::TerminalSearchQueryChanged(q) => {
+                let ws = &mut self.workshops[idx];
+                let Some(active_id) = ws.bench.active_tab else {
+                    return Task::none();
+                };
+                let Some(term) = ws.terminals.get_mut(&active_id) else {
+                    return Task::none();
+                };
+                let matches = term.search(&q);
+                let entry = ws
+                    .bench
+                    .terminal_search
+                    .entry(active_id)
+                    .or_default();
+                entry.query = q;
+                entry.match_count = matches.len();
+                if matches.is_empty() {
+                    entry.current_match = None;
+                    term.clear_search_selection();
+                } else {
+                    entry.current_match = Some(0);
+                    term.focus_match(&matches[0]);
+                }
+            }
+            screen::bench::Message::TerminalSearchNext
+            | screen::bench::Message::TerminalSearchPrev => {
+                let forward = matches!(
+                    msg,
+                    screen::bench::Message::TerminalSearchNext
+                );
+                let ws = &mut self.workshops[idx];
+                let Some(active_id) = ws.bench.active_tab else {
+                    return Task::none();
+                };
+                let Some(term) = ws.terminals.get_mut(&active_id) else {
+                    return Task::none();
+                };
+                let Some(entry) =
+                    ws.bench.terminal_search.get_mut(&active_id)
+                else {
+                    return Task::none();
+                };
+                if entry.query.is_empty() {
+                    return Task::none();
+                }
+                // Re-run the search so navigation reflects any new
+                // output that landed since the last query change. The
+                // active terminal can grow under us at any moment.
+                let matches = term.search(&entry.query);
+                entry.match_count = matches.len();
+                if matches.is_empty() {
+                    entry.current_match = None;
+                    term.clear_search_selection();
+                    return Task::none();
+                }
+                let next = match entry.current_match {
+                    None => 0,
+                    Some(i) if forward => (i + 1) % matches.len(),
+                    Some(0) => matches.len() - 1,
+                    Some(i) => i - 1,
+                };
+                entry.current_match = Some(next);
+                term.focus_match(&matches[next]);
+            }
         }
         Task::none()
     }
@@ -3210,6 +3447,29 @@ impl App {
         &mut self,
         msg: screen::background_picker::Message,
     ) -> Task<Message> {
+        // Terminal font controls don't touch any per-workshop picker state,
+        // and they need `&mut self` to broadcast across all workshops, so
+        // handle them up front before borrowing the active workshop.
+        // Spark sp-ux0014.
+        match &msg {
+            screen::background_picker::Message::StepTerminalFontSize(delta) => {
+                return self.apply_terminal_font_delta(*delta);
+            }
+            screen::background_picker::Message::SetTerminalFontFamily(name) => {
+                let trimmed = name.trim();
+                let family = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                return self.set_terminal_font(None, family);
+            }
+            screen::background_picker::Message::ClearTerminalFontFamily => {
+                return self.set_terminal_font(None, None);
+            }
+            _ => {}
+        }
+
         let Some(idx) = self.active_workshop else {
             return Task::none();
         };
@@ -3375,6 +3635,12 @@ impl App {
                     |_| Message::BackgroundConfigSaved,
                 )
             }
+            // Terminal font arms are handled up-front (above) before the
+            // workshop borrow; these arms exist only to keep the match
+            // exhaustive. Spark sp-ux0014.
+            screen::background_picker::Message::StepTerminalFontSize(_)
+            | screen::background_picker::Message::SetTerminalFontFamily(_)
+            | screen::background_picker::Message::ClearTerminalFontFamily => Task::none(),
             screen::background_picker::Message::ToggleFullAuto(cmd) => {
                 let entry = self
                     .global_config
@@ -3421,7 +3687,7 @@ impl App {
                         return Message::FileViewer(file_viewer::Message::CopySelection);
                     }
                     if modifiers.command() && c.as_str() == "f" {
-                        return Message::FileViewer(file_viewer::Message::OpenSearch);
+                        return Message::HotkeyCmdF;
                     }
                     // Cmd+O — open workshop directory picker. Advertised on
                     // the welcome screen so first-time users have a way in
@@ -3435,7 +3701,7 @@ impl App {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 } => {
-                    return Message::FileViewer(file_viewer::Message::ClearSelection);
+                    return Message::HotkeyEscape;
                 }
                 keyboard::Event::ModifiersChanged(modifiers) => {
                     return Message::ShiftStateChanged(modifiers.shift());
@@ -3602,6 +3868,10 @@ impl App {
                         is_default: self.global_config.default_agent.as_ref() == Some(&a.command),
                     })
                     .collect();
+                let terminal_font = screen::background_picker::TerminalFontInfo {
+                    size: self.global_config.effective_terminal_font_size(),
+                    family: self.global_config.terminal_font_family.clone(),
+                };
                 layers.push(
                     screen::background_picker::view(
                         &ws.background_picker,
@@ -3609,6 +3879,7 @@ impl App {
                         has_bg,
                         dim_opacity,
                         agents,
+                        terminal_font,
                     )
                     .map(Message::Background),
                 );
@@ -4054,6 +4325,10 @@ impl App {
                     is_default: self.global_config.default_agent.as_ref() == Some(&a.command),
                 })
                 .collect();
+            let terminal_font = screen::background_picker::TerminalFontInfo {
+                size: self.global_config.effective_terminal_font_size(),
+                family: self.global_config.terminal_font_family.clone(),
+            };
             layers.push(
                 screen::background_picker::view(
                     &ws.background_picker,
@@ -4061,6 +4336,7 @@ impl App {
                     has_bg,
                     dim_opacity,
                     agents,
+                    terminal_font,
                 )
                 .map(Message::Background),
             );
@@ -4136,8 +4412,16 @@ impl App {
                 )
                 .map(Message::Home)
             } else if let Some(term) = ws.terminals.get(&active_id) {
-                iced_term::TerminalView::show_with_transparent_bg(term, has_bg)
-                    .map(|e| Message::Bench(screen::bench::Message::TerminalEvent(e)))
+                let term_view = iced_term::TerminalView::show_with_transparent_bg(term, has_bg)
+                    .map(|e| Message::Bench(screen::bench::Message::TerminalEvent(e)));
+                if let Some(search_bar) = ws.bench.view_terminal_search(pal) {
+                    stack![term_view, search_bar.map(Message::Bench)]
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    term_view
+                }
             } else if let Some(viewer) = ws.file_viewers.get(&active_id) {
                 file_viewer::view(viewer, &ws.directory, pal, has_bg).map(Message::FileViewer)
             } else if let Some(tail) = ws.log_tails.get(&active_id) {

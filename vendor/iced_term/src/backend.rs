@@ -8,7 +8,8 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
+pub use alacritty_terminal::term::search::Match;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
@@ -545,6 +546,71 @@ impl Backend {
             .find(|rm| rm.contains(&point));
         x
     }
+
+    /// Find every literal occurrence of `query` across the terminal's
+    /// scrollback + viewport. Matches are returned ordered
+    /// top-to-bottom, left-to-right. The query is treated as a literal
+    /// string — regex metacharacters are escaped — so the Cmd+F overlay
+    /// matches what users actually type.
+    ///
+    /// This is the public hook the search overlay UI uses (sp-ux0030).
+    pub fn search(&self, query: &str) -> Vec<Match> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let escaped = escape_literal_for_regex(query);
+        let mut regex = match RegexSearch::new(&escaped) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        let term = self.term.lock();
+        let topmost = term.grid().topmost_line();
+        let bottommost = term.bottommost_line();
+        let last_col = term.last_column();
+        let start = Point::new(topmost, Column(0));
+        let end = Point::new(bottommost, last_col);
+
+        RegexIter::new(start, end, Direction::Right, &*term, &mut regex)
+            .collect()
+    }
+
+    /// Scroll the terminal so `m` is in view and select the matched
+    /// region so the existing renderer highlights it. Used by the
+    /// search overlay (sp-ux0030) when navigating prev/next.
+    pub fn focus_match(&mut self, m: &Match) {
+        let term = self.term.clone();
+        let mut term = term.lock();
+        term.scroll_to_point(*m.start());
+        let mut sel =
+            Selection::new(SelectionType::Simple, *m.start(), Side::Left);
+        sel.update(*m.end(), Side::Right);
+        term.selection = Some(sel);
+    }
+
+    /// Drop any selection that was set by [`Backend::focus_match`].
+    /// Called when the search overlay is closed so the highlight goes
+    /// away with it.
+    pub fn clear_search_selection(&mut self) {
+        let term = self.term.clone();
+        let mut term = term.lock();
+        term.selection = None;
+    }
+}
+
+/// Escape regex metacharacters so a user-typed substring like `a.b*c`
+/// matches itself instead of being interpreted as a regex pattern. Used
+/// by [`Backend::search`] to keep the Cmd+F overlay literal.
+fn escape_literal_for_regex(input: &str) -> String {
+    const META: &str = r".+*?()|[]{}^$\";
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if META.contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Copied from alacritty/src/display/hint.rs:
@@ -600,5 +666,31 @@ pub struct EventProxy(mpsc::Sender<Event>);
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let _ = self.0.blocking_send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_literal_for_regex;
+
+    #[test]
+    fn escape_passes_plain_text_through() {
+        assert_eq!(escape_literal_for_regex("hello"), "hello");
+    }
+
+    #[test]
+    fn escape_quotes_regex_metacharacters() {
+        // Every metachar should get a leading backslash so the engine
+        // treats the query as the literal string the user typed in the
+        // Cmd+F overlay.
+        assert_eq!(
+            escape_literal_for_regex("a.b*c+d?e(f)g|h[i]j{k}l^m$n\\o"),
+            r"a\.b\*c\+d\?e\(f\)g\|h\[i\]j\{k\}l\^m\$n\\o"
+        );
+    }
+
+    #[test]
+    fn escape_keeps_unicode_intact() {
+        assert_eq!(escape_literal_for_regex("héllo→世界"), "héllo→世界");
     }
 }

@@ -56,6 +56,15 @@ pub enum Message {
     SetDefaultAgent(Option<String>),
     /// Toggle full-auto mode for a specific agent command.
     ToggleFullAuto(String),
+
+    // ── Terminal font settings (sp-ux0014) ───────────────
+    /// Step the terminal font size by `delta` points (positive = grow).
+    StepTerminalFontSize(f32),
+    /// Set the terminal font family by name. Empty string clears the
+    /// override and falls back to the platform default monospace font.
+    SetTerminalFontFamily(String),
+    /// Reset the terminal font family override to the platform default.
+    ClearTerminalFontFamily,
 }
 
 // ── State ───────────────────────────────────���─────────
@@ -112,12 +121,20 @@ pub struct AgentInfo {
     pub is_default: bool,
 }
 
+/// Snapshot of the terminal font preferences for the Settings modal.
+/// Spark sp-ux0014.
+pub struct TerminalFontInfo {
+    pub size: f32,
+    pub family: Option<String>,
+}
+
 pub fn view<'a>(
     state: &'a PickerState,
     pal: &Palette,
     has_background: bool,
     dim_opacity: f32,
     agents: Vec<AgentInfo>,
+    terminal_font: TerminalFontInfo,
 ) -> Element<'a, Message> {
     let pal = *pal;
 
@@ -199,6 +216,55 @@ pub fn view<'a>(
             );
         }
         content = content.push(auto_row);
+    }
+
+    content = content.push(rule::horizontal(1));
+
+    // ── Terminal font (sp-ux0014) ────────────────────────
+    content = content.push(text("Terminal").size(14).color(pal.text_primary));
+
+    {
+        let label = format!("Font size: {:.0}pt", terminal_font.size);
+        let size_row = row![
+            text(label).size(12).color(pal.text_secondary),
+            Space::new().width(Length::Fill),
+            button(text("\u{2212}").size(12))
+                .style(button::secondary)
+                .padding([4, 10])
+                .on_press(Message::StepTerminalFontSize(-1.0)),
+            button(text("+").size(12))
+                .style(button::secondary)
+                .padding([4, 10])
+                .on_press(Message::StepTerminalFontSize(1.0)),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        content = content.push(size_row);
+        content = content.push(
+            text("Tip: hold ⌘ and scroll over a terminal to resize")
+                .size(11)
+                .color(pal.text_tertiary),
+        );
+    }
+
+    {
+        let family_value = terminal_font.family.clone().unwrap_or_default();
+        let family_input = text_input("Font family (e.g. JetBrains Mono)", &family_value)
+            .on_input(Message::SetTerminalFontFamily)
+            .size(FONT_BODY)
+            .padding(6);
+        let mut family_row = row![family_input]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+        if terminal_font.family.is_some() {
+            family_row = family_row.push(
+                button(text("Default").size(12))
+                    .style(button::secondary)
+                    .padding([4, 10])
+                    .on_press(Message::ClearTerminalFontFamily),
+            );
+        }
+        content = content.push(family_row);
     }
 
     content = content.push(rule::horizontal(1));
