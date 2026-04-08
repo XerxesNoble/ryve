@@ -3,11 +3,12 @@
 
 //! Bench panel — tabbed workspace for terminal sessions and coding agents.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use data::ryve_dir::AgentDef;
-use iced::widget::{Space, button, column, container, row, scrollable, text, tooltip};
-use iced::{Element, Length, Theme};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input, tooltip};
+use iced::{Color, Element, Length, Theme};
 
 use crate::coding_agents::CodingAgent;
 use crate::style::{self, FONT_BODY, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette};
@@ -38,11 +39,38 @@ pub enum TabKind {
     },
 }
 
+/// Per-terminal-tab Cmd+F search state. Lives in [`BenchState`] keyed
+/// by tab id so each terminal remembers its own query while the user
+/// switches between tabs. Match positions are stored as opaque indices
+/// into the live result list returned by `Terminal::search`; we
+/// re-run the search whenever the query changes so it stays in sync
+/// with the terminal's scrollback.
+#[derive(Debug, Default, Clone)]
+pub struct TerminalSearchState {
+    pub query: String,
+    /// Number of matches the last search produced. We don't keep the
+    /// `Match` values themselves because they reference grid points
+    /// that may shift as the terminal scrolls — we just need the count
+    /// for the "x / N" indicator.
+    pub match_count: usize,
+    /// 0-based index of the currently focused match within
+    /// `match_count`. None when there are no matches.
+    pub current_match: Option<usize>,
+}
+
+/// Stable widget id for the terminal search input — only one is
+/// visible at a time so a single id is fine.
+pub const TERMINAL_SEARCH_INPUT_ID: &str = "bench-terminal-search-input";
+
 /// State for the bench panel.
 pub struct BenchState {
     pub tabs: Vec<Tab>,
     pub active_tab: Option<u64>,
     pub dropdown_open: bool,
+    /// Cmd+F search overlay state per terminal tab. A tab is in
+    /// "search open" mode iff it has an entry here. Closing the search
+    /// removes the entry so the overlay disappears entirely.
+    pub terminal_search: HashMap<u64, TerminalSearchState>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +94,16 @@ pub enum Message {
     NewCodingAgent(CodingAgent),
     NewCustomAgent(usize),
     TerminalEvent(iced_term::Event),
+    /// Open the Cmd+F search bar over the active terminal tab. No-op
+    /// when the active tab isn't a terminal.
+    OpenTerminalSearch,
+    /// Close the active terminal's search bar and drop the highlight.
+    CloseTerminalSearch,
+    /// User edited the search input for the active terminal.
+    TerminalSearchQueryChanged(String),
+    /// Jump to the next / previous match in the active terminal.
+    TerminalSearchNext,
+    TerminalSearchPrev,
 }
 
 impl BenchState {
@@ -74,7 +112,14 @@ impl BenchState {
             tabs: Vec::new(),
             active_tab: None,
             dropdown_open: false,
+            terminal_search: HashMap::new(),
         }
+    }
+
+    /// Whether the active tab currently has the search overlay open.
+    pub fn active_terminal_search(&self) -> Option<&TerminalSearchState> {
+        self.active_tab
+            .and_then(|id| self.terminal_search.get(&id))
     }
 
     /// Create a tab with an externally-assigned ID.
@@ -86,6 +131,7 @@ impl BenchState {
 
     pub fn close_tab(&mut self, id: u64) {
         self.tabs.retain(|t| t.id != id);
+        self.terminal_search.remove(&id);
         if self.active_tab == Some(id) {
             self.active_tab = self.tabs.last().map(|t| t.id);
         }
@@ -166,6 +212,84 @@ impl BenchState {
             .spacing(4)
             .padding([4, 8])
             .into()
+    }
+
+    /// Render the Cmd+F search overlay for the active terminal tab.
+    /// Returns None when search is closed for the active tab. The
+    /// overlay is meant to be stacked on top of the terminal view by
+    /// the caller in `view_bench`.
+    pub fn view_terminal_search<'a>(
+        &'a self,
+        pal: &Palette,
+    ) -> Option<Element<'a, Message>> {
+        let state = self.active_terminal_search()?;
+        let pal = *pal;
+
+        let input = text_input("Find in terminal", &state.query)
+            .id(iced::widget::Id::new(TERMINAL_SEARCH_INPUT_ID))
+            .size(13)
+            .padding([4, 8])
+            .on_input(Message::TerminalSearchQueryChanged)
+            .on_submit(Message::TerminalSearchNext);
+
+        let count_label: String = if state.query.is_empty() {
+            String::new()
+        } else if state.match_count == 0 {
+            "no matches".to_string()
+        } else {
+            let cur = state.current_match.map(|i| i + 1).unwrap_or(0);
+            format!("{} / {}", cur, state.match_count)
+        };
+
+        let prev_btn = button(text("\u{2191}").size(12))
+            .style(button::text)
+            .padding([2, 6])
+            .on_press(Message::TerminalSearchPrev);
+
+        let next_btn = button(text("\u{2193}").size(12))
+            .style(button::text)
+            .padding([2, 6])
+            .on_press(Message::TerminalSearchNext);
+
+        let close_btn = button(text("\u{2715}").size(12))
+            .style(button::text)
+            .padding([2, 6])
+            .on_press(Message::CloseTerminalSearch);
+
+        let bar = row![
+            input,
+            text(count_label).size(12).color(pal.text_secondary),
+            prev_btn,
+            next_btn,
+            close_btn,
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        let card = container(bar)
+            .padding([4, 8])
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.55,
+                })),
+                border: iced::Border {
+                    color: pal.border,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // Pin to the top-right of the terminal area, like browsers do.
+        Some(
+            row![Space::new().width(Length::Fill), card]
+                .padding([6, 8])
+                .width(Length::Fill)
+                .into(),
+        )
     }
 
     /// Render the dropdown menu (meant to be overlaid, not in flow).
@@ -306,5 +430,41 @@ mod tests {
         let bench = BenchState::new();
         let pal = Palette::dark();
         let _element = bench.view_tab_bar(&pal);
+    }
+
+    #[test]
+    fn close_tab_clears_terminal_search_entry() {
+        // sp-ux0030: per-tab search state must follow tab lifetime —
+        // closing the tab while search is open should drop the entry
+        // so a future tab with the same id doesn't inherit it.
+        let mut bench = BenchState::new();
+        bench.create_tab(7, "term".into(), TabKind::Terminal);
+        bench
+            .terminal_search
+            .insert(7, TerminalSearchState::default());
+        assert!(bench.terminal_search.contains_key(&7));
+        bench.close_tab(7);
+        assert!(!bench.terminal_search.contains_key(&7));
+    }
+
+    #[test]
+    fn view_terminal_search_only_renders_when_active_tab_has_entry() {
+        // sp-ux0030: the overlay is gated on the active tab having a
+        // TerminalSearchState entry. No entry → no overlay.
+        let mut bench = BenchState::new();
+        bench.create_tab(1, "a".into(), TabKind::Terminal);
+        bench.create_tab(2, "b".into(), TabKind::Terminal);
+        let pal = Palette::dark();
+        assert!(bench.view_terminal_search(&pal).is_none());
+        // Open search on tab 1, but make tab 2 active — overlay must
+        // stay hidden because the *active* tab has no entry.
+        bench
+            .terminal_search
+            .insert(1, TerminalSearchState::default());
+        bench.active_tab = Some(2);
+        assert!(bench.view_terminal_search(&pal).is_none());
+        // Switch to tab 1 — now the overlay appears.
+        bench.active_tab = Some(1);
+        assert!(bench.view_terminal_search(&pal).is_some());
     }
 }
