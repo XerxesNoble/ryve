@@ -15,6 +15,13 @@ use iced::{Element, Length, Theme};
 
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_LABEL, FONT_SMALL, Palette};
 
+/// Settings-modal blurb that frames the listed coding agents as tools the
+/// Atlas Director delegates to. Centralised so the wording stays in sync
+/// with the rest of the UI's "Atlas (Director)" presentation.
+pub const ATLAS_AGENT_BLURB: &str =
+    "Atlas (Director) is your primary agent and delegates to these coding agents \
+     when it spawns Heads or Hands.";
+
 // ── Messages ──────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -152,6 +159,11 @@ pub fn view<'a>(
 
     // ── Agent Settings Section ───────────────────────────
     content = content.push(text("Coding Agents").size(14).color(pal.text_primary));
+    content = content.push(
+        text(ATLAS_AGENT_BLURB)
+            .size(12)
+            .color(pal.text_secondary),
+    );
 
     // Default agent selector
     {
@@ -434,6 +446,15 @@ fn view_thumbnail<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spark ryve-7aa4dcd8: the settings modal must consistently identify
+    /// Atlas as the Director above the listed coding agents.
+    #[test]
+    fn settings_blurb_names_atlas_as_director() {
+        assert!(ATLAS_AGENT_BLURB.contains("Atlas"));
+        assert!(ATLAS_AGENT_BLURB.contains("Director"));
+        assert!(ATLAS_AGENT_BLURB.contains("delegates"));
+    }
 
     #[test]
     fn preview_handle_defaults_to_none() {

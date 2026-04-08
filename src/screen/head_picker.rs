@@ -17,6 +17,14 @@ use iced::{Element, Length, Theme};
 use crate::coding_agents::{CodingAgent, CompatStatus};
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_LABEL, FONT_SMALL, Palette};
 
+/// Subtitle of the Head picker modal. Frames Heads as a tool Atlas (the
+/// Director) usually delegates to on the user's behalf, so the picker
+/// reinforces the Atlas → Heads → Hands hierarchy.
+pub const HEAD_PICKER_SUBTITLE: &str =
+    "Atlas, your Director, normally delegates work for you. Spawn a Head directly when you \
+     want a coding agent to decompose an epic into sparks, spawn Hands, and finally spawn a \
+     Merger to integrate the result into a single PR.";
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// User picked (or cleared) the optional parent epic. `None` means no
@@ -52,12 +60,9 @@ pub fn view<'a>(
     let header =
         row![title, Space::new().width(Length::Fill), close_btn].align_y(iced::Alignment::Center);
 
-    let subtitle = text(
-        "A Head is a coding agent that decomposes an epic into sparks, spawns Hands, and \
-         finally spawns a Merger to integrate the result into a single PR.",
-    )
-    .size(FONT_SMALL)
-    .color(pal.text_secondary);
+    let subtitle = text(HEAD_PICKER_SUBTITLE)
+        .size(FONT_SMALL)
+        .color(pal.text_secondary);
 
     // ── epic list ──
     // Spark ryve-0742ef5a: instead of a free-form goal textbox, show the
@@ -239,4 +244,19 @@ fn epic_row<'a>(
         .padding([5, 10])
         .on_press(on_press)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spark ryve-7aa4dcd8: the Head picker subtitle frames Heads in terms of
+    /// Atlas (Director). Lock the wording so a future copy edit can't quietly
+    /// drop Atlas from this surface.
+    #[test]
+    fn head_picker_subtitle_names_atlas_as_director() {
+        assert!(HEAD_PICKER_SUBTITLE.contains("Atlas"));
+        assert!(HEAD_PICKER_SUBTITLE.contains("Director"));
+        assert!(HEAD_PICKER_SUBTITLE.contains("delegates"));
+    }
 }
