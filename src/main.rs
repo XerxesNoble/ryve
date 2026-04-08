@@ -5,6 +5,7 @@ mod agent_prompts;
 mod cli;
 mod coding_agents;
 mod delegation;
+mod font_intern;
 mod hand_spawn;
 mod icons;
 mod screen;
@@ -68,7 +69,7 @@ fn main() -> iced::Result {
     let config = data::config::Config::load();
     let default_font = match config.font_family {
         Some(name) => iced::Font {
-            family: iced::font::Family::Name(Box::leak(name.into_boxed_str())),
+            family: iced::font::Family::Name(font_intern::intern(&name)),
             ..iced::Font::DEFAULT
         },
         None => iced::Font {
@@ -2758,7 +2759,7 @@ impl App {
         // Build the FontSettings once and clone into each terminal handle.
         let font_type = match &effective_family {
             Some(name) => iced::Font {
-                family: iced::font::Family::Name(Box::leak(name.clone().into_boxed_str())),
+                family: iced::font::Family::Name(font_intern::intern(name)),
                 ..iced::Font::MONOSPACE
             },
             None => iced::Font::MONOSPACE,
