@@ -4,6 +4,7 @@
 mod agent_prompts;
 mod cli;
 mod coding_agents;
+mod delegation;
 mod hand_spawn;
 mod icons;
 mod screen;
