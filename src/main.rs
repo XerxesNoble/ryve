@@ -4910,8 +4910,9 @@ async fn load_sparks(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Spark> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use data::ryve_dir::BackgroundConfig;
+
+    use super::*;
 
     #[test]
     fn attribution_label_present_when_photographer_set() {

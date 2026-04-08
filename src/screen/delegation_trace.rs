@@ -190,7 +190,7 @@ where
             let epic_id = c.parent_spark_id.clone();
             let epic_title = epic_id
                 .as_deref()
-                .and_then(|id| spark_lookup(id))
+                .and_then(spark_lookup)
                 .map(|s| s.title.clone());
             (
                 Some(c.id.clone()),

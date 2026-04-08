@@ -4,10 +4,9 @@
 //! Status bar — rich bottom bar showing git branch, diff stats, spark breakdown,
 //! file viewer position/language, active Hands, failing contracts, and settings.
 
+use data::sparks::types::ATLAS_NAME;
 use iced::widget::{Space, button, container, row, text};
 use iced::{Element, Length, Theme};
-
-use data::sparks::types::ATLAS_NAME;
 
 use crate::style::{self, FONT_ICON, FONT_LABEL, Palette};
 

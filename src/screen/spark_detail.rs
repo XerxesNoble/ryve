@@ -115,6 +115,7 @@ pub enum Message {
 
 // ── View ─────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     spark: &'a Spark,
     contracts: &'a [Contract],
