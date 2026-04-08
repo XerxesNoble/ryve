@@ -2814,6 +2814,10 @@ impl App {
             screen::bench::Message::ToggleDropdown => {
                 self.workshops[idx].bench.dropdown_open = !self.workshops[idx].bench.dropdown_open;
             }
+            screen::bench::Message::CloseDropdown => {
+                self.workshops[idx].bench.dropdown_open = false;
+            }
+            screen::bench::Message::NoOp => {}
             screen::bench::Message::OpenHome => {
                 self.workshops[idx].bench.dropdown_open = false;
                 let next_id = &mut self.next_terminal_id;
@@ -4155,13 +4159,21 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        // Overlay the dropdown menu on top of the content area
+        // Overlay the dropdown menu on top of the content area. When it's
+        // open, a full-size transparent backdrop sits between body and
+        // menu so any click outside the menu dismisses it (sp-ux0022).
         if let Some(dropdown) =
             ws.bench
                 .view_dropdown(&self.available_agents, &ws.custom_agents, pal)
         {
+            let backdrop = ws
+                .bench
+                .view_dropdown_backdrop()
+                .map(|b| b.map(Message::Bench))
+                .unwrap_or_else(|| Space::new().width(Length::Fill).height(Length::Fill).into());
             stack![
                 body,
+                backdrop,
                 // Position the dropdown just below the tab bar
                 column![
                     Space::new().height(30), // approximate tab bar height

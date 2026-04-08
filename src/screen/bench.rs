@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use data::ryve_dir::AgentDef;
-use iced::widget::{Space, button, column, container, row, scrollable, text, tooltip};
+use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text, tooltip};
 use iced::{Element, Length, Theme};
 
 use crate::coding_agents::CodingAgent;
@@ -50,6 +50,14 @@ pub enum Message {
     SelectTab(u64),
     CloseTab(u64),
     ToggleDropdown,
+    /// Close the "+" dropdown without taking any other action. Emitted by
+    /// the backdrop mouse_area so a click anywhere outside the menu
+    /// dismisses it (sp-ux0022).
+    CloseDropdown,
+    /// Swallowed click on the dropdown container itself — prevents the
+    /// backdrop from closing the menu when the user clicks an empty
+    /// gap inside it (sp-ux0022).
+    NoOp,
     NewTerminal,
     /// Open (or focus) the Home / multi-Hand coordination dashboard tab.
     /// Singleton per workshop.
@@ -269,14 +277,39 @@ impl BenchState {
         // dropdown items are removed in a follow-up spark.
         let _ = available_agents;
 
-        let dropdown = container(menu)
-            .style(move |_theme: &Theme| style::dropdown(&pal))
-            .width(220);
+        // Wrap the dropdown container in a mouse_area that swallows clicks
+        // on the menu itself so the backdrop below doesn't immediately
+        // close it. The backdrop (rendered in main.rs as a separate stack
+        // layer) fires CloseDropdown for any click that misses the menu.
+        let dropdown = mouse_area(
+            container(menu)
+                .style(move |_theme: &Theme| style::dropdown(&pal))
+                .width(220),
+        )
+        .on_press(Message::NoOp);
 
         Some(
             row![Space::new().width(Length::Fill), dropdown]
                 .width(Length::Fill)
                 .into(),
+        )
+    }
+
+    /// Render a full-size transparent backdrop that closes the dropdown
+    /// when clicked. Returns `None` when the dropdown is closed so the
+    /// backdrop doesn't swallow clicks the rest of the time.
+    pub fn view_dropdown_backdrop<'a>(&self) -> Option<Element<'a, Message>> {
+        if !self.dropdown_open {
+            return None;
+        }
+        Some(
+            mouse_area(
+                Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Message::CloseDropdown)
+            .into(),
         )
     }
 }
@@ -306,5 +339,21 @@ mod tests {
         let bench = BenchState::new();
         let pal = Palette::dark();
         let _element = bench.view_tab_bar(&pal);
+    }
+
+    #[test]
+    fn dropdown_backdrop_only_exists_when_open() {
+        // sp-ux0022: the click-outside backdrop must only be rendered while
+        // the dropdown is visible — otherwise it would swallow clicks to
+        // the rest of the UI when no menu is up.
+        let mut bench = BenchState::new();
+        assert!(!bench.dropdown_open);
+        assert!(bench.view_dropdown_backdrop().is_none());
+
+        bench.dropdown_open = true;
+        assert!(bench.view_dropdown_backdrop().is_some());
+
+        bench.dropdown_open = false;
+        assert!(bench.view_dropdown_backdrop().is_none());
     }
 }
