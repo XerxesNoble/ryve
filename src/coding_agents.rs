@@ -161,7 +161,23 @@ impl CodingAgent {
                 // the user message; agent_prompts.rs leads with an explicit
                 // EXECUTE-NOW header so claude does not treat it as a
                 // reading-comprehension exercise.
+                //
+                // Streaming output (spark ryve-... follow-up to PR #6 spy
+                // logic): plain `--print` buffers all stdout in memory when
+                // stdout is a redirected pipe (not a TTY) and only flushes
+                // on exit. Hands run detached with stdout redirected to a
+                // log file, so the spy view always saw an empty file until
+                // the agent finished. Adding `--output-format stream-json`
+                // forces claude to emit one JSON event per line as it
+                // thinks/acts; `--verbose` is required by the CLI to enable
+                // streaming output. The spy view receives line-buffered
+                // JSON, which is uglier than the text output but actually
+                // *visible* — and gives the future spy-view parser
+                // structured events to render as a timeline.
                 args.push("--print".to_string());
+                args.push("--output-format".to_string());
+                args.push("stream-json".to_string());
+                args.push("--verbose".to_string());
                 args.push("--dangerously-skip-permissions".to_string());
                 args.push(prompt.to_string());
             }
@@ -565,6 +581,27 @@ mod tests {
             args.last().map(String::as_str),
             Some("hello"),
             "user prompt must be the trailing positional for claude"
+        );
+    }
+
+    #[test]
+    fn build_headless_args_claude_streams_output_for_spy_view() {
+        // Regression for the spy-view-empty-log bug: `claude --print`
+        // buffers all stdout in memory when stdout is a pipe (not a
+        // TTY) and only flushes on exit, so the spy view always saw an
+        // empty log file. `--output-format stream-json --verbose`
+        // forces line-buffered streaming output. The spy view depends
+        // on this — without it the panel is useless for live Hands.
+        let agent = agent_for("claude");
+        let args = agent.build_headless_args("hi", &PathBuf::from("/tmp/x"));
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--output-format stream-json"),
+            "claude must stream output: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--verbose"),
+            "stream-json output requires --verbose: {args:?}"
         );
     }
 

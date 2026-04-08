@@ -17,6 +17,7 @@ use crate::icons::{self, UiIcon};
 use crate::style::{
     self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette,
 };
+use crate::widget::badge::{priority_badge, type_badge};
 
 /// How long a Hand's terminal must be silent before it is considered idle
 /// (waiting on the user). Chosen to be a bit longer than the 3s sparks-poll
@@ -468,7 +469,11 @@ pub fn view<'a>(
     pal: Palette,
 ) -> Element<'a, Message> {
     let now = Instant::now();
-    let header = text("Hands").size(FONT_HEADER).color(pal.text_primary);
+    // Panel title is "Activity" (not "Hands") because the panel actually
+    // shows the entire orchestration tree — Heads, Crews, leaf Hands,
+    // and history — not just Hands. The inner section labels ("Active",
+    // "History", "Stale") describe the buckets within.
+    let header = text("Activity").size(FONT_HEADER).color(pal.text_primary);
 
     // Search box. The icon is a tinted SVG so it can scale up and theme
     // with the rest of the panel.
@@ -635,6 +640,7 @@ fn render_active_node<'a>(
                 expanded,
                 pal,
                 assignments,
+                sparks,
                 now,
             );
             let mut col = column![head_row].spacing(2);
@@ -663,6 +669,10 @@ fn render_active_node<'a>(
     }
 }
 
+// TODO(refactor): collapse the per-renderer (assignments, sparks, pal,
+// now) parameters into a shared `RenderCtx<'a>` borrow struct so the
+// row renderers don't keep growing. Tracked separately from this PR.
+#[allow(clippy::too_many_arguments)]
 fn render_head_row<'a>(
     session: Option<&'a AgentSession>,
     session_id: String,
@@ -670,6 +680,7 @@ fn render_head_row<'a>(
     expanded: bool,
     pal: &Palette,
     assignments: &'a [HandAssignment],
+    sparks: &'a [Spark],
     now: Instant,
 ) -> Element<'a, Message> {
     let chev_icon = if expanded {
@@ -708,19 +719,33 @@ fn render_head_row<'a>(
         .height(14)
         .style(icons::ui_icon_color(pal.text_secondary));
 
-    let name = session
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| "(unknown)".to_string());
-    let label = text(name).size(FONT_BODY).color(pal.text_primary);
+    // Resolve the epic spark this Head is decomposing/orchestrating.
+    // If unknown (Head spawned with no goal yet, or epic deleted), the
+    // row falls back to the session's display name so it stays usable.
+    let epic = epic_spark_id
+        .as_deref()
+        .and_then(|id| sparks.iter().find(|s| s.id == id));
 
-    let mut row_widget = row![chev, dot, head_icon, agent_icon, label]
+    let mut row_widget = row![chev, dot, head_icon, agent_icon]
         .spacing(6)
         .align_y(iced::Alignment::Center);
 
+    if let Some(s) = epic {
+        row_widget = row_widget.push(type_badge::<Message>(&s.spark_type, pal));
+        row_widget = row_widget.push(priority_badge::<Message>(s.priority, pal));
+    }
+
+    let title = epic.map(|s| s.title.clone()).unwrap_or_else(|| {
+        session
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "(unknown)".to_string())
+    });
+    row_widget = row_widget.push(text(title).size(FONT_BODY).color(pal.text_primary));
+
     // Spark chip — opens the epic spark detail.
     row_widget = row_widget.push(Space::new().width(Length::Fill));
-    if let Some(spark_id) = epic_spark_id {
-        row_widget = row_widget.push(spark_chip(&spark_id, pal));
+    if let Some(s) = epic {
+        row_widget = row_widget.push(spark_chip(&s.id, pal));
     }
 
     // Whole row toggles expand/collapse on click.
@@ -802,7 +827,7 @@ fn render_crew_node<'a>(
 fn render_hand_row<'a>(
     session: &'a AgentSession,
     assignments: &'a [HandAssignment],
-    _sparks: &'a [Spark],
+    sparks: &'a [Spark],
     pal: &Palette,
     now: Instant,
     depth: u16,
@@ -824,22 +849,42 @@ fn render_hand_row<'a>(
     .height(14)
     .style(icons::ui_icon_color(pal.text_secondary));
 
-    let label = text(&session.name).size(FONT_BODY).color(pal.text_primary);
+    // Resolve the spark this Hand owns (if any). Used for the row label,
+    // type/priority badges, and the trailing chip — all three derive
+    // from the same lookup so the row tells a coherent story about
+    // *what* the Hand is working on, not just which agent it is.
+    let spark = owner_spark_for_session(&session.id, assignments)
+        .and_then(|id| sparks.iter().find(|s| s.id == id));
 
     // Indent by depth so crew children sit one tab in from the Head row.
     let indent = Space::new().width(Length::Fixed(16.0 * depth as f32));
 
-    let mut row_widget = row![indent, dot, agent_icon, label]
+    let mut row_widget = row![indent, dot, agent_icon]
         .spacing(6)
         .align_y(iced::Alignment::Center);
+
+    // Type + priority badges, mirroring the spawn-Hand picker layout so
+    // the panel reads like the picker the user already knows.
+    if let Some(s) = spark {
+        row_widget = row_widget.push(type_badge::<Message>(&s.spark_type, pal));
+        row_widget = row_widget.push(priority_badge::<Message>(s.priority, pal));
+    }
+
+    // Row label: prefer the spark title (the actual *work* the Hand is
+    // doing), fall back to the session display name when there's no
+    // assignment yet (newly-spawned, between sparks, etc.).
+    let title = spark
+        .map(|s| s.title.clone())
+        .unwrap_or_else(|| session.name.clone());
+    row_widget = row_widget.push(text(title).size(FONT_BODY).color(pal.text_primary));
 
     if session.is_background() {
         row_widget = row_widget.push(text("bg").size(FONT_SMALL).color(pal.text_tertiary));
     }
 
     row_widget = row_widget.push(Space::new().width(Length::Fill));
-    if let Some(spark_id) = owner_spark_for_session(&session.id, assignments) {
-        row_widget = row_widget.push(spark_chip(spark_id, pal));
+    if let Some(s) = spark {
+        row_widget = row_widget.push(spark_chip(&s.id, pal));
     }
 
     let btn = button(row_widget)
@@ -854,7 +899,7 @@ fn render_hand_row<'a>(
 fn render_history_row<'a>(
     session: &'a AgentSession,
     assignments: &'a [HandAssignment],
-    _sparks: &'a [Spark],
+    sparks: &'a [Spark],
     pal: &Palette,
 ) -> Element<'a, Message> {
     // Per product decision: history rows are read-only. Click does
@@ -868,20 +913,30 @@ fn render_history_row<'a>(
     .height(14)
     .style(icons::ui_icon_color(pal.text_tertiary));
 
-    let label = text(&session.name)
-        .size(FONT_BODY)
-        .color(pal.text_secondary);
+    let spark = owner_spark_for_session(&session.id, assignments)
+        .and_then(|id| sparks.iter().find(|s| s.id == id));
+
+    let title = spark
+        .map(|s| s.title.clone())
+        .unwrap_or_else(|| session.name.clone());
+    let label = text(title).size(FONT_BODY).color(pal.text_secondary);
     let time_label = text(format_relative_time(&session.started_at))
         .size(FONT_SMALL)
         .color(pal.text_tertiary);
 
-    let mut row_widget = row![dot, agent_icon, label, time_label]
+    let mut row_widget = row![dot, agent_icon]
         .spacing(6)
         .align_y(iced::Alignment::Center);
+    if let Some(s) = spark {
+        row_widget = row_widget.push(type_badge::<Message>(&s.spark_type, pal));
+        row_widget = row_widget.push(priority_badge::<Message>(s.priority, pal));
+    }
+    row_widget = row_widget.push(label);
+    row_widget = row_widget.push(time_label);
     row_widget = row_widget.push(Space::new().width(Length::Fill));
 
-    if let Some(spark_id) = owner_spark_for_session(&session.id, assignments) {
-        row_widget = row_widget.push(spark_chip(spark_id, pal));
+    if let Some(s) = spark {
+        row_widget = row_widget.push(spark_chip(&s.id, pal));
     }
 
     // Delete is the only mutation allowed on a history row.

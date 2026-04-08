@@ -3,4 +3,5 @@
 
 //! Custom Iced widgets for Ryve.
 
+pub mod badge;
 pub mod splitter;

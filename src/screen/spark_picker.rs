@@ -331,31 +331,8 @@ fn view_spark_row<'a>(
     }
 }
 
-/// Tiny badge labelling the spark type (`task`, `bug`, etc.). Rendered as a
-/// boxed uppercase abbreviation so each row in the picker shows what kind
-/// of work is being claimed.
-fn type_badge<'a>(spark_type: &str, pal: &Palette) -> Element<'a, Message> {
-    let pal = *pal;
-    let label: String = match spark_type {
-        "epic" => "EPIC".to_string(),
-        "task" => "TASK".to_string(),
-        "bug" => "BUG".to_string(),
-        "feature" => "FEAT".to_string(),
-        "chore" => "CHORE".to_string(),
-        "spike" => "SPIKE".to_string(),
-        "milestone" => "MILE".to_string(),
-        other => other.to_uppercase().chars().take(4).collect(),
-    };
-    container(text(label).size(FONT_SMALL).color(pal.text_secondary))
-        .padding([1, 4])
-        .style(move |_t: &Theme| container::Style {
-            background: Some(iced::Background::Color(pal.surface)),
-            border: iced::Border {
-                color: pal.border,
-                width: 1.0,
-                radius: iced::border::Radius::from(4.0),
-            },
-            ..container::Style::default()
-        })
-        .into()
-}
+// `type_badge` lives in `crate::widget::badge` so the spark picker, the
+// workgraph panel, and the Activity panel all share one implementation.
+// We re-export it through a thin alias here to keep call sites in this
+// file readable; the call site below uses the alias.
+use crate::widget::badge::type_badge;
