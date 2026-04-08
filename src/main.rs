@@ -33,6 +33,88 @@ use uuid::Uuid;
 use widget::splitter::{self, SplitterDrag, SplitterKind};
 use workshop::Workshop;
 
+/// Slot the std `UnixListener` returned by `ipc::acquire` waits in until
+/// the iced subscription wakes up and takes ownership of it. We can't
+/// hand it directly to iced from `main()` because the subscription
+/// closure is invoked later, from inside the iced runtime; this static
+/// is the bridge. Stored as a `Mutex<Option<_>>` so the subscription can
+/// `take()` it exactly once on first run.
+#[cfg(unix)]
+static IPC_LISTENER_SLOT: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::os::unix::net::UnixListener>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn store_ipc_listener(listener: std::os::unix::net::UnixListener) {
+    let _ = IPC_LISTENER_SLOT.set(std::sync::Mutex::new(Some(listener)));
+}
+
+#[cfg(unix)]
+fn take_ipc_listener() -> Option<std::os::unix::net::UnixListener> {
+    IPC_LISTENER_SLOT.get().and_then(|m| m.lock().ok()?.take())
+}
+
+/// Stream factory for the single-instance accept loop. Pulled out into
+/// a free function so it can be passed to `Subscription::run` (which
+/// requires a `fn` pointer, not a closure).
+///
+/// The stream:
+/// 1. Takes the std listener out of [`IPC_LISTENER_SLOT`] exactly once.
+///    If the slot is empty (no listener registered, e.g. because
+///    `ipc::acquire` errored at startup), the stream emits nothing and
+///    completes immediately — no harm done.
+/// 2. Converts to a tokio listener and accepts forwarded invocations
+///    in a loop, emitting `Message::IpcInvocation` for each.
+/// 3. Logs and ignores per-connection errors so a single malformed
+///    peer cannot kill the listener.
+#[cfg(unix)]
+fn ipc_subscription_stream() -> iced::futures::stream::BoxStream<'static, Message> {
+    use iced::futures::SinkExt;
+
+    Box::pin(iced::stream::channel::<Message>(
+        16,
+        async move |mut output| {
+            let Some(std_listener) = take_ipc_listener() else {
+                return;
+            };
+            let listener = match tokio::net::UnixListener::from_std(std_listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("ryve: failed to register IPC listener with tokio: {e}");
+                    return;
+                }
+            };
+
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, _addr)) => match ipc::read_invocation(&mut stream).await {
+                        Ok(invocation) => {
+                            if output
+                                .send(Message::IpcInvocation(invocation))
+                                .await
+                                .is_err()
+                            {
+                                // iced runtime has dropped the receiver —
+                                // app is shutting down. Stop accepting.
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("ryve: malformed IPC invocation: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("ryve: IPC accept failed: {e}");
+                        // Brief backoff before retrying so a wedged listener
+                        // doesn't spin the CPU.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        },
+    ))
+}
+
 fn process_is_alive(child_pid: i64) -> bool {
     let Ok(pid) = u32::try_from(child_pid) else {
         return false;
@@ -62,6 +144,30 @@ fn main() -> iced::Result {
             .expect("failed to build tokio runtime");
         rt.block_on(cli::run(args));
         return Ok(());
+    }
+
+    // Single-instance enforcement: only one ryve UI may run per user.
+    // If another instance is already up, forward our cwd+args to it
+    // (so it can raise its window and open this directory) and exit.
+    // IPC failures are non-fatal — log and start anyway, otherwise a
+    // broken socket dir would lock the user out of ryve entirely.
+    let invocation = ipc::ForwardedInvocation::from_env();
+    match ipc::acquire(&invocation) {
+        Ok(ipc::Acquired::Forwarded) => {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        Ok(ipc::Acquired::First { listener }) => {
+            store_ipc_listener(listener);
+        }
+        #[cfg(not(unix))]
+        Ok(ipc::Acquired::First {}) => {}
+        Err(e) => {
+            eprintln!(
+                "ryve: single-instance check failed ({e}); starting anyway. \
+                 Multiple ryve windows may run simultaneously."
+            );
+        }
     }
 
     // Load global config for font preferences
@@ -152,6 +258,11 @@ enum Message {
     /// no longer exists, the entry is dropped from the recent list and a
     /// toast is shown.
     OpenWorkshopPath(PathBuf),
+    /// A second `ryve` invocation tried to start while this process was
+    /// already running and the `ipc` layer forwarded its `(cwd, args)`
+    /// over the single-instance socket. The handler raises this window
+    /// and, if the cwd looks like a workshop, opens it as a tab.
+    IpcInvocation(ipc::ForwardedInvocation),
     /// `workshop::init_workshop` failed (bad db, unreadable config, etc.).
     WorkshopInitFailed {
         id: Uuid,
@@ -313,6 +424,7 @@ impl std::fmt::Debug for Message {
             Self::NewWorkshopDialog => write!(f, "NewWorkshopDialog"),
             Self::WorkshopDirPicked(p) => write!(f, "WorkshopDirPicked({p:?})"),
             Self::OpenWorkshopPath(p) => write!(f, "OpenWorkshopPath({p:?})"),
+            Self::IpcInvocation(inv) => write!(f, "IpcInvocation(cwd={:?})", inv.cwd),
             Self::WorkshopInitFailed { id, error } => {
                 write!(f, "WorkshopInitFailed({id}, {error})")
             }
@@ -570,6 +682,22 @@ impl App {
                 Message::WorkshopDirPicked(path)
             }),
             Message::WorkshopDirPicked(Some(path)) => self.update(Message::OpenWorkshopPath(path)),
+
+            Message::IpcInvocation(inv) => {
+                // A second `ryve` invocation forwarded its working
+                // directory to us via the single-instance socket. Raise
+                // the window so the user knows we noticed, and if the
+                // forwarded cwd looks like a workshop (existing
+                // directory) hand it to OpenWorkshopPath — that handler
+                // already deduplicates against open tabs and prunes
+                // stale entries.
+                let focus = window::oldest().and_then(window::gain_focus);
+                if inv.cwd.is_dir() {
+                    let open = self.update(Message::OpenWorkshopPath(inv.cwd));
+                    return Task::batch([focus, open]);
+                }
+                focus
+            }
             Message::WorkshopDirPicked(None) => Task::none(),
             Message::OpenWorkshopPath(path) => {
                 // If the user clicks a stale recent entry, surface a toast
@@ -3845,6 +3973,15 @@ impl App {
         // move when nothing cares about them.
         if self.splitter_drag.is_some() {
             subs.push(event::listen_with(splitter_event_filter));
+        }
+
+        // Single-instance accept loop. Hashes a fixed id so iced never
+        // restarts the stream — the stream owns the only listener and
+        // restarting would lose it. The stream factory is a free fn
+        // (see `ipc_subscription_stream`) so the closure stays `Fn`.
+        #[cfg(unix)]
+        {
+            subs.push(Subscription::run(ipc_subscription_stream));
         }
 
         Subscription::batch(subs)
