@@ -919,6 +919,132 @@ impl Agent {
 /// so UI copy, prompts, and logs all reference the same string.
 pub const ATLAS_NAME: &str = "Atlas";
 
+// ── Delegation Trace ─────────────────────────────────
+
+/// The Director identity that owns originating requests by default. Atlas is
+/// Ryve's primary user-facing agent, so every trace whose origin is not
+/// explicitly overridden is recorded as Atlas-originated. Spark
+/// ryve-1e3848b6.
+pub const ATLAS_ORIGIN: &str = "atlas";
+
+/// Where a participant in a delegation hop sits in the agent hierarchy. Used
+/// for both the delegating actor and the delegated target so a hop can
+/// describe e.g. `Director → Head` or `Head → Hand`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    /// The top-level Director agent (Atlas).
+    Director,
+    /// A Head: orchestrator that manages a Crew of Hands.
+    Head,
+    /// A Hand: leaf worker that runs against a single spark.
+    Hand,
+    /// A non-agent tool invocation (shell, MCP server, etc.).
+    Tool,
+    /// The human user — only ever appears as the delegating actor on the root
+    /// hop when the user talks directly to a non-Director agent.
+    User,
+}
+
+impl ActorKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Director => "director",
+            Self::Head => "head",
+            Self::Hand => "hand",
+            Self::Tool => "tool",
+            Self::User => "user",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "director" => Some(Self::Director),
+            "head" => Some(Self::Head),
+            "hand" => Some(Self::Hand),
+            "tool" => Some(Self::Tool),
+            "user" => Some(Self::User),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl DelegationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One hop in a delegation chain. The chain is reconstructed by walking
+/// `parent_trace_id` upward; the root hop's `origin_actor` (typically
+/// `ATLAS_ORIGIN`) identifies the Director that owns the entire request.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct DelegationTrace {
+    pub id: String,
+    pub workshop_id: String,
+    pub spark_id: Option<String>,
+    pub parent_trace_id: Option<String>,
+    pub originating_request: String,
+    pub origin_actor: String,
+    pub delegating_actor: String,
+    pub delegating_actor_kind: String,
+    pub delegated_target: String,
+    pub delegated_target_kind: String,
+    pub status: String,
+    pub execution_result: Option<String>,
+    pub final_synthesis: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+impl DelegationTrace {
+    /// True when this trace was rooted at Atlas (the default Director).
+    /// Used by the UI and tests to assert Atlas visibility on a trace.
+    pub fn is_atlas_originated(&self) -> bool {
+        self.origin_actor == ATLAS_ORIGIN
+    }
+}
+
+pub struct NewDelegationTrace {
+    pub workshop_id: String,
+    pub spark_id: Option<String>,
+    pub parent_trace_id: Option<String>,
+    pub originating_request: String,
+    /// Director identity that owns the request. `None` defaults to Atlas.
+    pub origin_actor: Option<String>,
+    pub delegating_actor: String,
+    pub delegating_actor_kind: ActorKind,
+    pub delegated_target: String,
+    pub delegated_target_kind: ActorKind,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
