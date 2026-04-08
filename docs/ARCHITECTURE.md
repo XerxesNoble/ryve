@@ -1,5 +1,7 @@
 # Ryve Architecture
 
+> See also [`AGENT_HIERARCHY.md`](AGENT_HIERARCHY.md) for the Atlas (Director) → Heads → Hands agent model and delegation rules.
+
 Ryve is a desktop IDE for managing development work through LLM-powered coding agents. It combines a tabbed terminal interface (the **bench**), a file explorer with git awareness, an embedded issue tracker (**Workgraph**), and support for multiple coding agent CLIs. Built in Rust with Iced 0.14 for the UI, SQLite for persistence, and alacritty-terminal for embedded terminals.
 
 ```
