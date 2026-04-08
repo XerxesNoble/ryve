@@ -142,6 +142,11 @@ enum Message {
     CancelCloseWorkshop,
     NewWorkshopDialog,
     WorkshopDirPicked(Option<PathBuf>),
+    /// Open a workshop at a known path (recent-list click, drag-drop, etc.).
+    /// Equivalent to picking the directory in a file dialog. If the path
+    /// no longer exists, the entry is dropped from the recent list and a
+    /// toast is shown.
+    OpenWorkshopPath(PathBuf),
     /// `workshop::init_workshop` failed (bad db, unreadable config, etc.).
     WorkshopInitFailed {
         id: Uuid,
@@ -292,6 +297,7 @@ impl std::fmt::Debug for Message {
             Self::CancelCloseWorkshop => write!(f, "CancelCloseWorkshop"),
             Self::NewWorkshopDialog => write!(f, "NewWorkshopDialog"),
             Self::WorkshopDirPicked(p) => write!(f, "WorkshopDirPicked({p:?})"),
+            Self::OpenWorkshopPath(p) => write!(f, "OpenWorkshopPath({p:?})"),
             Self::WorkshopInitFailed { id, error } => {
                 write!(f, "WorkshopInitFailed({id}, {error})")
             }
@@ -547,6 +553,40 @@ impl App {
                 Message::WorkshopDirPicked(path)
             }),
             Message::WorkshopDirPicked(Some(path)) => {
+                self.update(Message::OpenWorkshopPath(path))
+            }
+            Message::WorkshopDirPicked(None) => Task::none(),
+            Message::OpenWorkshopPath(path) => {
+                // If the user clicks a stale recent entry, surface a toast
+                // and prune the dead path so the welcome list doesn't keep
+                // dangling references.
+                if !path.is_dir() {
+                    self.global_config.remove_recent_workshop(&path);
+                    let cfg = self.global_config.clone();
+                    std::thread::spawn(move || {
+                        let _ = cfg.save();
+                    });
+                    return self.push_toast(
+                        "Workshop not found",
+                        format!("Path no longer exists: {}", path.display()),
+                        ToastKind::Error,
+                    );
+                }
+
+                // If this workshop is already open, just focus it instead
+                // of duplicating the tab.
+                if let Some(existing) = self.workshops.iter().position(|ws| ws.directory == path) {
+                    self.active_workshop = Some(existing);
+                    return Task::none();
+                }
+
+                // Record as most-recently opened.
+                self.global_config.add_recent_workshop(path.clone());
+                let cfg = self.global_config.clone();
+                std::thread::spawn(move || {
+                    let _ = cfg.save();
+                });
+
                 let workshop = Workshop::new(path.clone());
                 let ws_id = workshop.id;
                 self.workshops.push(workshop);
@@ -568,7 +608,6 @@ impl App {
                     },
                 })
             }
-            Message::WorkshopDirPicked(None) => Task::none(),
             Message::WorkshopInitFailed { id, error } => {
                 // Remove the half-initialized workshop so we don't leave a
                 // ghost tab pointing at a broken directory.
@@ -3332,6 +3371,13 @@ impl App {
                     if modifiers.command() && c.as_str() == "f" {
                         return Message::FileViewer(file_viewer::Message::OpenSearch);
                     }
+                    // Cmd+O — open workshop directory picker. Advertised on
+                    // the welcome screen so first-time users have a way in
+                    // beyond clicking the button. Active everywhere so the
+                    // shortcut works once a workshop is already loaded too.
+                    if modifiers.command() && c.as_str() == "o" {
+                        return Message::NewWorkshopDialog;
+                    }
                 }
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
@@ -3352,11 +3398,23 @@ impl App {
         // drag deltas into a sensible sidebar split ratio.
         let resizes = window::resize_events().map(|(_, size)| Message::WindowResized(size));
 
+        // Drag-and-drop a folder onto the window to open it as a workshop.
+        // We accept drops regardless of which screen is showing — the open
+        // handler dedupes against already-open workshops and rejects files
+        // that aren't directories. Welcome-screen onboarding for sp-ux0016.
+        let file_drops = event::listen_with(|event, _status, _id| match event {
+            iced::Event::Window(window::Event::FileDropped(path)) if path.is_dir() => {
+                Some(Message::OpenWorkshopPath(path))
+            }
+            _ => None,
+        });
+
         let mut subs: Vec<Subscription<Message>> = term_subs
             .into_iter()
             .chain(std::iter::once(poll))
             .chain(std::iter::once(hotkeys))
             .chain(std::iter::once(resizes))
+            .chain(std::iter::once(file_drops))
             .collect();
 
         // Only listen to global mouse events while a splitter drag is
@@ -3563,22 +3621,137 @@ impl App {
             .into()
     }
 
-    /// Welcome screen when no workshops are open.
+    /// Welcome screen when no workshops are open. Onboards new users with a
+    /// concept primer, recent-workshops list, drag-folder affordance and the
+    /// keyboard shortcut for opening a workshop. Spark sp-ux0016.
     fn view_welcome(&self) -> Element<'_, Message> {
         let pal = self.appearance.palette();
-        container(
-            column![
-                text("Ryve").size(40).color(pal.text_primary),
-                text("Open a workshop to get started")
-                    .size(16)
-                    .color(pal.text_secondary),
-                button(text("Open Workshop...").size(14))
-                    .style(button::primary)
-                    .padding([8, 20])
-                    .on_press(Message::NewWorkshopDialog),
+
+        // ── Hero ────────────────────────────────────────────
+        let hero = column![
+            text("Ryve").size(48).color(pal.text_primary),
+            text("A workshop for orchestrating coding agents.")
+                .size(15)
+                .color(pal.text_secondary),
+        ]
+        .spacing(6)
+        .align_x(iced::Alignment::Center);
+
+        // ── Concept primer ──────────────────────────────────
+        // Three-line glossary so first-time users can map our vocabulary
+        // ("Workshop / Hand / Spark") onto familiar concepts before they
+        // open anything.
+        let concept_row = |label: &'static str, body: &'static str| -> Element<'_, Message> {
+            row![
+                container(text(label).size(13).color(pal.text_primary))
+                    .width(Length::Fixed(96.0)),
+                text(body).size(13).color(pal.text_secondary),
             ]
-            .spacing(16)
+            .spacing(12)
+            .into()
+        };
+        let concepts = container(
+            column![
+                concept_row("Workshop", "A project directory managed by Ryve."),
+                concept_row("Spark", "A unit of work — feature, bug, or task."),
+                concept_row("Hand", "A coding agent assigned to a spark."),
+            ]
+            .spacing(8),
+        )
+        .padding(16)
+        .width(Length::Fixed(420.0))
+        .style(move |_theme: &Theme| style::glass_panel(&pal, false));
+
+        // ── Recent workshops ────────────────────────────────
+        let recent_section: Element<'_, Message> = if self.global_config.recent_workshops.is_empty()
+        {
+            container(
+                text("No recent workshops yet — open one to get started.")
+                    .size(13)
+                    .color(pal.text_secondary),
+            )
+            .padding(16)
+            .width(Length::Fixed(420.0))
+            .style(move |_theme: &Theme| style::glass_panel(&pal, false))
+            .into()
+        } else {
+            let mut list = column![
+                text("Recent workshops")
+                    .size(12)
+                    .color(pal.text_secondary),
+            ]
+            .spacing(8);
+            for path in self.global_config.recent_workshops.iter().take(8) {
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let parent = path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let row_content = column![
+                    text(label).size(14).color(pal.text_primary),
+                    text(parent).size(11).color(pal.text_secondary),
+                ]
+                .spacing(2);
+                let entry = button(row_content)
+                    .width(Length::Fill)
+                    .padding([8, 12])
+                    .style(button::text)
+                    .on_press(Message::OpenWorkshopPath(path.clone()));
+                list = list.push(entry);
+            }
+            container(list)
+                .padding(12)
+                .width(Length::Fixed(420.0))
+                .style(move |_theme: &Theme| style::glass_panel(&pal, false))
+                .into()
+        };
+
+        // ── Drag-folder affordance ──────────────────────────
+        let drop_zone = container(
+            column![
+                text("Drop a folder here").size(14).color(pal.text_primary),
+                text("…or use the button below to pick one.")
+                    .size(12)
+                    .color(pal.text_secondary),
+            ]
+            .spacing(4)
             .align_x(iced::Alignment::Center),
+        )
+        .padding(20)
+        .width(Length::Fixed(420.0))
+        .center_x(Length::Fill)
+        .style(move |_theme: &Theme| {
+            let mut s = style::glass_panel(&pal, false);
+            s.border.width = 1.5;
+            s.border.color = pal.text_secondary;
+            s
+        });
+
+        // ── Open button + shortcut hint ─────────────────────
+        let shortcut_hint = if cfg!(target_os = "macos") {
+            "⌘O"
+        } else {
+            "Ctrl+O"
+        };
+        let actions = row![
+            button(text("Open Workshop...").size(14))
+                .style(button::primary)
+                .padding([8, 20])
+                .on_press(Message::NewWorkshopDialog),
+            text(format!("or press {shortcut_hint}"))
+                .size(12)
+                .color(pal.text_secondary),
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center);
+
+        container(
+            column![hero, concepts, recent_section, drop_zone, actions]
+                .spacing(20)
+                .align_x(iced::Alignment::Center),
         )
         .center(Length::Fill)
         .into()
