@@ -3019,6 +3019,28 @@ impl App {
                 ws.bench.dropdown_open = false;
                 ws.pending_head_spawn = Some(screen::head_picker::PickerState::default());
             }
+            screen::bench::Message::NewAtlas => {
+                // Spark ryve-acdb248a — Atlas is the **default entry point**
+                // for top-level user requests. Atlas is conversational and
+                // delegates downward, so we don't open a picker here: the
+                // user has not yet expressed a goal. We pick the first
+                // compatible coding agent automatically and spawn it with
+                // the Atlas Director system prompt. The user types their
+                // request into the resulting bench tab and Atlas decides
+                // whether to delegate to a Head or a Hand.
+                let ws = &mut self.workshops[idx];
+                ws.bench.dropdown_open = false;
+                let agent = match self
+                    .available_agents
+                    .iter()
+                    .find(|a| !a.compatibility.is_unsupported())
+                    .cloned()
+                {
+                    Some(a) => a,
+                    None => return Task::none(),
+                };
+                return self.spawn_atlas(idx, agent);
+            }
             screen::bench::Message::NewCustomAgent(agent_idx) => {
                 let ws = &mut self.workshops[idx];
                 let def = match ws.custom_agents.get(agent_idx) {
@@ -3426,6 +3448,98 @@ impl App {
         // via flag too, but the existing infra here uses the typed-prompt
         // path so we stay consistent and avoid having to fork the spawn API.
         let prompt = agent_prompts::compose_head_prompt(epic_id.as_deref(), epic_title.as_deref());
+        let prompt_tab_id = tab_id;
+        tasks.push(Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            },
+            move |_| Message::SendSparkPrompt {
+                tab_id: prompt_tab_id,
+                prompt,
+            },
+        ));
+
+        if let Some(term) = ws.terminals.get(&tab_id) {
+            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Spawn **Atlas** — a coding agent launched with the Atlas Director
+    /// system prompt. Spark ryve-acdb248a: Atlas is the default entry point
+    /// for user-originated requests. It has no spark assignment of its own
+    /// and creates no Crew up front; its job is to talk to the user and
+    /// delegate to a Head (multi-spark goal) or a Hand (single spark) via
+    /// the `ryve` CLI.
+    ///
+    /// Mechanically nearly identical to `spawn_head`: only the session
+    /// label and the injected prompt differ.
+    fn spawn_atlas(&mut self, workshop_idx: usize, agent: CodingAgent) -> Task<Message> {
+        let ws = &mut self.workshops[workshop_idx];
+
+        let session_id = Uuid::new_v4().to_string();
+        let title = format!("Atlas ({})", agent.display_name);
+        let agent_command = agent.command.clone();
+        let agent_args = agent.args.clone();
+        let full_auto = self
+            .global_config
+            .agent_settings
+            .get(&agent.command)
+            .is_some_and(|s| s.full_auto);
+
+        let tab_id = ws.spawn_terminal(
+            title.clone(),
+            Some(&agent),
+            &mut self.next_terminal_id,
+            Some(&session_id),
+            full_auto,
+        );
+
+        ws.agent_sessions.push(AgentSession {
+            id: session_id.clone(),
+            name: title.clone(),
+            agent: agent.clone(),
+            tab_id: Some(tab_id),
+            active: true,
+            stale: false,
+            resume_id: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            log_path: None,
+            last_output_at: None,
+            // Atlas is the top of the hierarchy — no parent.
+            parent_session_id: None,
+        });
+
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        if let Some(ref pool) = ws.sparks_db {
+            let pool = pool.clone();
+            let ws_id = ws.workshop_id();
+            let new_session = data::sparks::types::NewAgentSession {
+                id: session_id.clone(),
+                workshop_id: ws_id,
+                agent_name: title,
+                agent_command,
+                agent_args,
+                // Distinct label so traces, the Hands panel, and any
+                // future Atlas-aware UI can pick Atlas out from regular
+                // Heads and Hands.
+                session_label: Some("atlas".to_string()),
+                child_pid: None,
+                resume_id: None,
+                log_path: None,
+                parent_session_id: None,
+            };
+            tasks.push(Task::perform(
+                async move {
+                    let _ = data::sparks::agent_session_repo::create(&pool, &new_session).await;
+                },
+                |_| Message::AgentSessionSaved,
+            ));
+        }
+
+        // Inject the Atlas Director system prompt the same way the Head and
+        // Hand flows do — typed into the terminal after a short boot delay.
+        let prompt = agent_prompts::compose_atlas_prompt();
         let prompt_tab_id = tab_id;
         tasks.push(Task::perform(
             async move {

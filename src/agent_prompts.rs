@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Loomantix
 
-//! Initial prompts for the three roles a coding agent can take on inside a
+//! Initial prompts for the four roles a coding agent can take on inside a
 //! Ryve workshop:
 //!
-//! 1. **Hand** — works on a single spark in its own worktree. Existing flow.
+//! 1. **Atlas** — the **Director**. Top-level user-facing primary agent.
+//!    All user-originated requests route through Atlas by default
+//!    (spark ryve-acdb248a). Atlas never edits code itself; it delegates
+//!    to Heads (multi-spark goals) or Hands (single sparks).
 //! 2. **Head** — orchestrates a Crew of Hands. Decomposes a user goal into
 //!    sparks and spawns Hands via `ryve hand spawn`.
-//! 3. **Merger** — collects the Crew's worktree branches into a single PR
+//! 3. **Hand** — works on a single spark in its own worktree. Existing flow.
+//! 4. **Merger** — collects the Crew's worktree branches into a single PR
 //!    for human review.
 //!
-//! All three are plain coding agents (claude / codex / aider / opencode).
+//! All four are plain coding agents (claude / codex / aider / opencode).
 //! What distinguishes them is the system prompt we inject at launch.
 //!
 //! Centralising the prompts here keeps the user-facing instructions (spark
@@ -45,6 +49,80 @@ pub fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
     prompt.push_str(
         "\nBegin the work now. Do not wait for further instructions. \
          When complete, verify against `.ryve/checklists/DONE.md`, close the spark, and exit.\n",
+    );
+
+    prompt
+}
+
+/// Compose the initial prompt for **Atlas** — Ryve's primary user-facing
+/// Director agent.
+///
+/// Atlas is the default routing destination for top-level user requests
+/// (spark ryve-acdb248a). It is conversational and never edits source code
+/// itself; instead, it interprets the user's intent and delegates downward
+/// to a Head (multi-spark goals that need decomposition + a Crew) or to a
+/// Hand (concrete work on a single spark) via the `ryve` CLI.
+///
+/// The behavioural details of the Director role (tone, identity, refusal
+/// of direct execution, etc.) are owned by spark ryve-9972f264 and may be
+/// extended over time. This function intentionally stays minimal so the
+/// routing layer can land independently of the prompting layer.
+pub fn compose_atlas_prompt() -> String {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "You are **Atlas**, the **Director** of this Ryve workshop and the primary \
+         user-facing agent. The user is talking to you because every top-level \
+         request in Ryve routes through Atlas by default. Your job is not to write \
+         code yourself — it is to understand what the user wants and to delegate \
+         the work to the right subordinate agent.\n\n",
+    );
+
+    prompt.push_str(
+        "AGENT HIERARCHY:\n\
+         - **Atlas (you)** — Director. Talks to the user. Decides who should do the work.\n\
+         - **Head** — Orchestrator. Decomposes a multi-step goal into sparks and \
+           spawns a Crew of Hands. Use a Head when the user's request is a goal that \
+           needs to be broken into 2+ tasks.\n\
+         - **Hand** — Executor. Works on a single, well-defined spark in its own git \
+           worktree. Use a Hand when there is already a concrete spark to work on.\n\
+         - **Merger** — Special Hand. Integrates a Crew's branches into one PR.\n\n",
+    );
+
+    prompt.push_str(
+        "ROUTING WORKFLOW (do this on every user request):\n\
+         1. Read the workgraph: `ryve spark list --json` and `ryve crew list --json`. \
+            Never assume — always check current state first.\n\
+         2. Classify the request:\n\
+            - **Question / clarification** → answer directly in this terminal. Do \
+              not spawn anything.\n\
+            - **Concrete spark** the user named → `ryve hand spawn <spark_id> \
+              --agent <agent>` and tell the user which Hand picked it up.\n\
+            - **High-level goal** that needs decomposition → create or pick a parent \
+              epic with `ryve spark create --type epic ...`, then spawn a Head with \
+              that epic so the Head can fan out a Crew.\n\
+         3. Always reply to the user with what you did and which subordinate is now \
+            handling it. Watch for follow-ups.\n\n",
+    );
+
+    prompt.push_str(
+        "HARD RULES:\n\
+         - You are the **Director**. Never edit source files, never run tests, \
+           never run destructive git commands. Delegate everything that touches code.\n\
+         - Use the `ryve` CLI for ALL workgraph operations. NEVER touch \
+           `.ryve/sparks.db` directly.\n\
+         - If a request is ambiguous, ASK the user a clarifying question before \
+           delegating. Do not guess.\n\
+         - Respect explicit user overrides: if the user says \"just do X yourself\" \
+           or \"skip Atlas\", remind them they can use `+ → New Hand` / `+ → New \
+           Head` / `+ → New Terminal` from the bench dropdown to bypass you for \
+           advanced flows. The bypass paths are documented in `docs/ATLAS.md`.\n\
+         - You are conversational. Wait for the user to speak before delegating \
+           anything. Do not pre-emptively create sparks or spawn Hands on boot.\n\n",
+    );
+
+    prompt.push_str(
+        "Begin now by greeting the user briefly and asking what they want to work on. \
+         Then route their request through the workflow above.\n",
     );
 
     prompt
@@ -292,6 +370,28 @@ mod tests {
             !hand.contains("Read these rules carefully"),
             "obsolete passive framing leaked back into HOUSE_RULES"
         );
+    }
+
+    /// Spark ryve-acdb248a — Atlas is the default routing destination for
+    /// top-level user requests. The prompt must establish Atlas as the
+    /// **Director**, explain the agent hierarchy so it can delegate, and
+    /// document the bypass paths so users who want to skip Atlas know how.
+    #[test]
+    fn atlas_prompt_establishes_director_role_and_bypass() {
+        let p = compose_atlas_prompt();
+        assert!(p.contains("Atlas"));
+        assert!(p.contains("Director"));
+        // Hierarchy: Atlas → Head/Hand
+        assert!(p.contains("Head"));
+        assert!(p.contains("Hand"));
+        // Routing workflow uses ryve CLI to delegate, never edits code itself
+        assert!(p.contains("ryve hand spawn"));
+        assert!(p.contains("Never edit source files"));
+        // Bypass path is documented
+        assert!(p.contains("New Hand"));
+        assert!(p.contains("New Head"));
+        assert!(p.contains("New Terminal"));
+        assert!(p.contains("docs/ATLAS.md"));
     }
 
     #[test]

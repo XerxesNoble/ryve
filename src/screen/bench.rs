@@ -92,11 +92,20 @@ pub enum Message {
     /// Open (or focus) the Home / multi-Hand coordination dashboard tab.
     /// Singleton per workshop.
     OpenHome,
-    /// Open the spark+agent picker for spawning a regular Hand on a spark.
+    /// Spawn **Atlas** — Ryve's primary user-facing Director agent. This is
+    /// the **default entry point** for top-level user requests
+    /// (spark ryve-acdb248a). Atlas talks to the user, classifies their
+    /// intent, and delegates to a Head or a Hand instead of executing code
+    /// itself. New Hand / New Head / New Terminal remain as documented
+    /// bypass paths for advanced flows that want to skip routing through
+    /// Atlas; see `docs/ATLAS.md`.
+    NewAtlas,
+    /// BYPASS: open the spark+agent picker for spawning a regular Hand on
+    /// a spark directly, without going through Atlas. For advanced users
+    /// who already know which spark they want to claim.
     NewHand,
-    /// Open the agent picker for spawning a Head — a coding agent that
-    /// orchestrates a Crew of Hands. No spark is selected; the Head creates
-    /// its own.
+    /// BYPASS: open the agent picker for spawning a Head directly. The
+    /// Head will mint its own Crew. Skips the Atlas routing layer.
     NewHead,
     /// Legacy: directly spawn a coding agent of the given type. Still emitted
     /// from the Hand picker once the user has chosen both the spark and the
@@ -327,10 +336,41 @@ impl BenchState {
                 .on_press(Message::OpenHome),
         );
 
-        // Top-level: the three roles a new tab can take on. The agent
-        // picker happens inside the spark picker for Hand / inside its own
-        // tiny picker for Head.
+        // Spark ryve-acdb248a — Atlas is the **default entry point** for
+        // top-level user requests. It is the first item in the dropdown
+        // (immediately after Home) so the user's eye lands on it before
+        // the bypass options. Atlas itself is a coding agent launched with
+        // the Director system prompt; it delegates to Heads / Hands rather
+        // than editing code, so the only thing the user has to choose at
+        // this point is whether they want Atlas at all — agent selection
+        // happens automatically (we pick the first compatible coding agent).
+        // Users who want fine control bypass Atlas via New Hand / New Head /
+        // New Terminal below.
         let any_agent_available = !available_agents.is_empty();
+
+        let atlas_button = button(text("Ask Atlas...").size(FONT_BODY).color(
+            if any_agent_available {
+                pal.text_primary
+            } else {
+                pal.text_tertiary
+            },
+        ))
+        .style(button::text)
+        .width(Length::Fill);
+        let atlas_button = if any_agent_available {
+            atlas_button.on_press(Message::NewAtlas)
+        } else {
+            atlas_button
+        };
+        menu = menu.push(atlas_button);
+
+        // ── Bypass paths (for advanced flows that skip Atlas) ──
+        // Documented in docs/ATLAS.md.
+        menu = menu.push(
+            text("Bypass Atlas")
+                .size(FONT_LABEL)
+                .color(pal.text_tertiary),
+        );
 
         let head_button = button(text("New Head...").size(FONT_BODY).color(
             if any_agent_available {
@@ -496,6 +536,20 @@ mod tests {
         assert!(bench.terminal_search.contains_key(&7));
         bench.close_tab(7);
         assert!(!bench.terminal_search.contains_key(&7));
+    }
+
+    /// Spark ryve-acdb248a — confirm `Message::NewAtlas` exists as a
+    /// distinct routing variant. The default entry point for user-originated
+    /// requests must produce this message so the app can dispatch it to the
+    /// Atlas spawn handler instead of the bypass paths.
+    #[test]
+    fn new_atlas_message_variant_exists() {
+        let m = Message::NewAtlas;
+        assert!(matches!(m, Message::NewAtlas));
+        // The bypass variants must remain available for advanced flows.
+        assert!(matches!(Message::NewHead, Message::NewHead));
+        assert!(matches!(Message::NewHand, Message::NewHand));
+        assert!(matches!(Message::NewTerminal, Message::NewTerminal));
     }
 
     #[test]
