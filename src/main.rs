@@ -3778,43 +3778,14 @@ impl App {
         let poll =
             iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::SparksPoll);
 
-        let hotkeys = keyboard::listen().map(|event| {
-            match &event {
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                } => {
-                    if modifiers.command() && c.as_str() == "h" {
-                        return Message::NewDefaultHand;
-                    }
-                    if modifiers.command() && c.as_str() == "c" {
-                        return Message::FileViewer(file_viewer::Message::CopySelection);
-                    }
-                    if modifiers.command() && c.as_str() == "f" {
-                        return Message::HotkeyCmdF;
-                    }
-                    // Cmd+O — open workshop directory picker. Advertised on
-                    // the welcome screen so first-time users have a way in
-                    // beyond clicking the button. Active everywhere so the
-                    // shortcut works once a workshop is already loaded too.
-                    if modifiers.command() && c.as_str() == "o" {
-                        return Message::NewWorkshopDialog;
-                    }
-                }
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                    ..
-                } => {
-                    return Message::HotkeyEscape;
-                }
-                keyboard::Event::ModifiersChanged(modifiers) => {
-                    return Message::ShiftStateChanged(modifiers.shift());
-                }
-                _ => {}
-            }
-            // Swallow unmatched keyboard events — SparksPoll is a harmless no-op
-            Message::SparksPoll
+        // Hotkey filter — return None for unmatched events so we don't
+        // dispatch a no-op Message into update() on every keystroke. The
+        // previous version fell through to SparksPoll, which rebuilt
+        // sysinfo::System and ran DB queries on every keypress. See
+        // sp-27a217db / ryve-a13f9d3a.
+        let hotkeys = event::listen_with(|event, _status, _id| match event {
+            iced::Event::Keyboard(kb_event) => hotkey_for_keyboard_event(&kb_event),
+            _ => None,
         });
 
         // Track window resizes so the splitter can convert vertical
@@ -4606,6 +4577,45 @@ impl App {
 /// drag is in progress. `listen_with` requires a `fn` (no closures),
 /// so we always emit messages and let the `update` function decide
 /// what to do based on `splitter_drag` state.
+/// Map a raw keyboard event to one of our hotkey messages, or `None` if
+/// nothing wants it. Pulled out of the subscription closure so it can be
+/// unit-tested without standing up an iced runtime. Spark sp-27a217db.
+fn hotkey_for_keyboard_event(event: &keyboard::Event) -> Option<Message> {
+    match event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(c),
+            modifiers,
+            ..
+        } => {
+            if modifiers.command() && c.as_str() == "h" {
+                return Some(Message::NewDefaultHand);
+            }
+            if modifiers.command() && c.as_str() == "c" {
+                return Some(Message::FileViewer(file_viewer::Message::CopySelection));
+            }
+            if modifiers.command() && c.as_str() == "f" {
+                return Some(Message::HotkeyCmdF);
+            }
+            // Cmd+O — open workshop directory picker. Advertised on
+            // the welcome screen so first-time users have a way in
+            // beyond clicking the button. Active everywhere so the
+            // shortcut works once a workshop is already loaded too.
+            if modifiers.command() && c.as_str() == "o" {
+                return Some(Message::NewWorkshopDialog);
+            }
+            None
+        }
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            ..
+        } => Some(Message::HotkeyEscape),
+        keyboard::Event::ModifiersChanged(modifiers) => {
+            Some(Message::ShiftStateChanged(modifiers.shift()))
+        }
+        _ => None,
+    }
+}
+
 fn splitter_event_filter(
     event: iced::Event,
     _status: event::Status,
@@ -4937,6 +4947,75 @@ mod tests {
             unsplash_photographer_url: None,
         };
         assert!(unsplash_attribution_label(&bg).is_none());
+    }
+
+    fn synthetic_key_press(c: &str, modifiers: keyboard::Modifiers) -> keyboard::Event {
+        let key = keyboard::Key::Character(c.into());
+        keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key.clone(),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: Some(c.into()),
+            repeat: false,
+        }
+    }
+
+    /// Spark sp-27a217db: holding a key in a terminal tab used to spam
+    /// SparksPoll because the old listener fell through to it. The new
+    /// helper must return `None` for unmatched events so the subscription
+    /// never dispatches a message into update().
+    #[test]
+    fn hotkey_filter_swallows_unmatched_key_events() {
+        let burst: Vec<keyboard::Event> = "abdeghijklmnpqrstuvwxyz0123456789"
+            .chars()
+            .map(|c| synthetic_key_press(&c.to_string(), keyboard::Modifiers::default()))
+            .collect();
+
+        let mut sparks_polls = 0usize;
+        let mut produced = 0usize;
+        for ev in &burst {
+            if let Some(msg) = hotkey_for_keyboard_event(ev) {
+                produced += 1;
+                if matches!(msg, Message::SparksPoll) {
+                    sparks_polls += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            sparks_polls, 0,
+            "unmatched key events must never produce SparksPoll",
+        );
+        assert_eq!(
+            produced, 0,
+            "unmatched key events must produce no message at all",
+        );
+    }
+
+    #[test]
+    fn hotkey_filter_recognises_known_shortcuts() {
+        let cmd = keyboard::Modifiers::COMMAND;
+        assert!(matches!(
+            hotkey_for_keyboard_event(&synthetic_key_press("h", cmd)),
+            Some(Message::NewDefaultHand),
+        ));
+        assert!(matches!(
+            hotkey_for_keyboard_event(&synthetic_key_press("f", cmd)),
+            Some(Message::HotkeyCmdF),
+        ));
+        assert!(matches!(
+            hotkey_for_keyboard_event(&synthetic_key_press("o", cmd)),
+            Some(Message::NewWorkshopDialog),
+        ));
+        // Same characters without the command modifier must NOT fire.
+        assert!(
+            hotkey_for_keyboard_event(&synthetic_key_press("h", keyboard::Modifiers::default()))
+                .is_none()
+        );
     }
 
     #[test]
