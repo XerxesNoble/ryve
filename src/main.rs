@@ -912,6 +912,14 @@ impl App {
                     && ws.selected_spark.as_deref() == Some(spark_id.as_str())
                 {
                     ws.selected_spark_bonds = bonds;
+                    ws.selected_spark_delegation = screen::delegation_trace::build_trace(
+                        &spark_id,
+                        &ws.hand_assignments,
+                        &ws.agent_sessions,
+                        &ws.crews,
+                        &ws.crew_members,
+                        &ws.sparks,
+                    );
                 }
                 Task::none()
             }
@@ -1717,6 +1725,8 @@ impl App {
                         ws.selected_spark = Some(spark_id.clone());
                         ws.selected_spark_contracts.clear();
                         ws.selected_spark_bonds.clear();
+                        ws.selected_spark_delegation =
+                            screen::delegation_trace::DelegationTrace::default();
                         ws.contract_create_form.reset();
                         if let Some(ref pool) = ws.sparks_db {
                             let pool_c = pool.clone();
@@ -1771,6 +1781,8 @@ impl App {
                             ws.selected_spark = None;
                             ws.selected_spark_contracts.clear();
                             ws.selected_spark_bonds.clear();
+                            ws.selected_spark_delegation =
+                                screen::delegation_trace::DelegationTrace::default();
                             ws.contract_create_form.reset();
                         }
                     }
@@ -2076,6 +2088,8 @@ impl App {
                             ws.selected_spark = Some(spark_id.clone());
                             ws.selected_spark_contracts.clear();
                             ws.selected_spark_bonds.clear();
+                            ws.selected_spark_delegation =
+                                screen::delegation_trace::DelegationTrace::default();
                             ws.contract_create_form.reset();
                             if let Some(ref pool) = ws.sparks_db {
                                 let pool_c = pool.clone();
@@ -4274,6 +4288,7 @@ impl App {
                     &ws.selected_spark_contracts,
                     &ws.selected_spark_bonds,
                     &ws.sparks,
+                    &ws.selected_spark_delegation,
                     &ws.contract_create_form,
                     &pal,
                     has_bg,

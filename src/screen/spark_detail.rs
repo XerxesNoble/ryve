@@ -7,6 +7,7 @@ use data::sparks::types::{Bond, Contract, ContractEnforcement, ContractKind, Spa
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Theme};
 
+use crate::screen::delegation_trace::DelegationTrace;
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_LABEL, FONT_SMALL, Palette};
 
 // ── Form state ───────────────────────────────────────
@@ -119,6 +120,7 @@ pub fn view<'a>(
     contracts: &'a [Contract],
     bonds: &'a [Bond],
     all_sparks: &'a [Spark],
+    delegation: &'a DelegationTrace,
     create_form: &'a ContractCreateForm,
     pal: &Palette,
     has_bg: bool,
@@ -274,6 +276,12 @@ pub fn view<'a>(
         }
         body = body.push(items);
     }
+
+    // ── Delegation trace section ─────────────────────
+    // Surface the Atlas → Head → Hand chain so users can see who is
+    // working on this spark and where the request originated. See
+    // ryve-8fadd6ab.
+    body = body.push(crate::screen::delegation_trace::view(delegation, &pal));
 
     // ── Dependencies section ─────────────────────────
     // Surface bonds in both directions so a Hand can immediately see what
