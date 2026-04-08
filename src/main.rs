@@ -10,6 +10,7 @@ mod screen;
 mod style;
 mod widget;
 mod workshop;
+mod worktree_cleanup;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

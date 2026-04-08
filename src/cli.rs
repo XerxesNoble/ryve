@@ -16,12 +16,15 @@ use std::process;
 use data::ryve_dir::RyveDir;
 use data::sparks::types::*;
 use data::sparks::{
-    assignment_repo, bond_repo, comment_repo, commit_link_repo, constraint_helpers, contract_repo,
-    crew_repo, ember_repo, event_repo, spark_repo, stamp_repo,
+    agent_session_repo, assignment_repo, bond_repo, comment_repo, commit_link_repo,
+    constraint_helpers, contract_repo, crew_repo, ember_repo, event_repo, spark_repo, stamp_repo,
 };
 
 use crate::coding_agents::{self, CodingAgent};
 use crate::hand_spawn::{self, HandKind};
+use crate::worktree_cleanup::{
+    self, PruneCandidate, PruneSummary, WorktreeFacts, WorktreeStatus, classify_worktree,
+};
 
 /// Known CLI subcommands. If the first non-flag argument matches one of
 /// these, `main.rs` dispatches to `cli::run` instead of launching the UI.
@@ -50,6 +53,9 @@ pub const CLI_COMMANDS: &[&str] = &[
     "crews",
     "hand",
     "hands",
+    "worktree",
+    "worktrees",
+    "wt",
     "hot",
     "status",
     "init",
@@ -135,6 +141,9 @@ pub async fn run(args: Vec<String>) {
         "commit" | "commits" => handle_commit(&pool, &args_clean[2..], &ws_id, json_mode).await,
         "crew" | "crews" => handle_crew(&pool, &args_clean[2..], &ws_id, json_mode).await,
         "hand" | "hands" => handle_hand(&pool, &workshop_root, &args_clean[2..], json_mode).await,
+        "worktree" | "worktrees" | "wt" => {
+            handle_worktree(&pool, &workshop_root, &args_clean[2..], json_mode).await
+        }
         "hot" => handle_hot(&pool, &ws_id, json_mode).await,
         "status" => handle_status(&pool, &ws_id).await,
         other => {
@@ -230,6 +239,11 @@ fn print_usage() {
     eprintln!("  hand spawn <spark_id> [--agent <name>] [--role owner|merger] [--crew <id>]");
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
+    eprintln!();
+    eprintln!(
+        "  worktree prune [--yes]               Prune stale hand worktrees (dry-run by default)"
+    );
+    eprintln!("  wt prune                             Alias for worktree prune");
     eprintln!();
     eprintln!("FLAGS:");
     eprintln!("  --json    Output as JSON (for machine consumption)");
@@ -1556,6 +1570,303 @@ async fn handle_hand(
         },
         other => die(&format!("unknown hand subcommand '{other}'")),
     }
+}
+
+// ── Worktree pruning ─────────────────────────────────
+
+/// `ryve worktree prune` (alias `ryve wt prune`).
+///
+/// Walks `.ryve/worktrees/<short_id>/` and classifies each one via the
+/// pure [`worktree_cleanup::classify_worktree`] predicate. Dry-run by
+/// default — prints a per-row report and a summary. Pass `--yes` to
+/// actually run `git worktree remove --force` and `git branch -D
+/// hand/<short_id>` for every Removable candidate.
+///
+/// Spark `ryve-261d06f3` (Layer A of epic `ryve-b61e7ed4`).
+async fn handle_worktree(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    args: &[String],
+    json_mode: bool,
+) {
+    if args.is_empty() {
+        die("worktree subcommand required (prune)");
+    }
+    match args[0].as_str() {
+        "prune" => handle_worktree_prune(pool, workshop_root, &args[1..], json_mode).await,
+        other => die(&format!("unknown worktree subcommand '{other}'")),
+    }
+}
+
+async fn handle_worktree_prune(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    args: &[String],
+    json_mode: bool,
+) {
+    // Parse flags. The only flag for now is --yes; everything else is
+    // an error so a typo'd `--all` doesn't silently nuke worktrees.
+    let mut apply = false;
+    for arg in args {
+        match arg.as_str() {
+            "--yes" | "-y" => apply = true,
+            other => die(&format!("unknown worktree prune flag '{other}'")),
+        }
+    }
+
+    // Gather facts for every directory under .ryve/worktrees/. We need
+    // the live agent_sessions snapshot to answer "is this hand still
+    // active?" — pull it once up front.
+    let workshop_id = workshop_root
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let sessions = agent_session_repo::list_for_workshop(pool, &workshop_id)
+        .await
+        .unwrap_or_default();
+
+    let worktrees_dir = workshop_root.join(".ryve").join("worktrees");
+    if !worktrees_dir.exists() {
+        if json_mode {
+            println!(
+                "{{\"candidates\":[],\"summary\":{{\"removable\":0,\"dirty\":0,\"unmerged\":0,\"live\":0,\"out_of_scope\":0}}}}"
+            );
+        } else {
+            println!("no .ryve/worktrees/ directory — nothing to prune");
+        }
+        return;
+    }
+
+    let entries = match std::fs::read_dir(&worktrees_dir) {
+        Ok(e) => e,
+        Err(e) => die(&format!("read .ryve/worktrees/: {e}")),
+    };
+
+    let mut candidates: Vec<PruneCandidate> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let facts = gather_worktree_facts(&path, &dir_name, workshop_root, &sessions);
+        let status = classify_worktree(&facts);
+        candidates.push(PruneCandidate { facts, status });
+    }
+
+    // Sort: Removable first (so the user sees actionable items at the
+    // top), then UnmergedCommits, then Dirty, then Live, then
+    // out-of-scope. Within a status group, alphabetical by short_id so
+    // the report is deterministic.
+    candidates.sort_by(|a, b| {
+        let rank = |s: &WorktreeStatus| match s {
+            WorktreeStatus::Removable => 0,
+            WorktreeStatus::UnmergedCommits(_) => 1,
+            WorktreeStatus::DirtyTree => 2,
+            WorktreeStatus::LiveSession => 3,
+            WorktreeStatus::NotHandWorktree => 4,
+        };
+        rank(&a.status)
+            .cmp(&rank(&b.status))
+            .then_with(|| a.facts.short_id.cmp(&b.facts.short_id))
+    });
+
+    let mut summary = PruneSummary::default();
+    for c in &candidates {
+        summary.record(&c.status);
+    }
+
+    if json_mode {
+        print_prune_report_json(&candidates, &summary);
+    } else {
+        print_prune_report_text(&candidates, &summary, apply);
+    }
+
+    if !apply {
+        return;
+    }
+
+    // Apply path: remove every Removable candidate. We do NOT touch
+    // anything in any other status — the predicate already gated this.
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for c in &candidates {
+        if !matches!(c.status, WorktreeStatus::Removable) {
+            continue;
+        }
+        let short_id = c.facts.short_id.as_deref().unwrap_or("?");
+        let branch = c
+            .facts
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("hand/{short_id}"));
+
+        match worktree_cleanup::run_worktree_remove(workshop_root, &c.facts.path) {
+            Ok(()) => {
+                if let Err(e) = worktree_cleanup::run_branch_delete(workshop_root, &branch) {
+                    eprintln!("  ! {short_id} worktree removed but branch delete failed: {e}");
+                    // Count as success — the worktree is gone, the
+                    // branch is just a stale ref the user can delete
+                    // separately.
+                }
+                println!("  ✓ removed {short_id} ({branch})");
+                succeeded += 1;
+            }
+            Err(e) => {
+                eprintln!("  ✗ {short_id}: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    if failed == 0 {
+        println!("removed {succeeded} worktree{}", plural(succeeded));
+    } else {
+        println!("removed {succeeded}, failed {failed} (see errors above)",);
+    }
+}
+
+/// Build a [`WorktreeFacts`] for one directory under `.ryve/worktrees/`.
+/// This is the side-effect-y counterpart to the pure
+/// [`classify_worktree`] — it shells out to git and queries the live
+/// `agent_sessions` snapshot. Kept here (not in `worktree_cleanup`) so
+/// the cleanup module stays test-friendly.
+fn gather_worktree_facts(
+    path: &Path,
+    dir_name: &str,
+    workshop_root: &Path,
+    sessions: &[PersistedAgentSession],
+) -> WorktreeFacts {
+    let short_id = worktree_cleanup::parse_short_id(dir_name);
+    let branch = worktree_cleanup::worktree_branch(path);
+    let is_clean = worktree_cleanup::worktree_is_clean(path);
+
+    // Unmerged count is checked against the workshop's main repo, not
+    // the worktree itself — `git rev-list --count main..hand/<id>` from
+    // the workshop root resolves the same refs.
+    let unmerged_count = match branch.as_deref() {
+        Some(b) => worktree_cleanup::unmerged_count(workshop_root, b),
+        None => u32::MAX, // unknown branch → don't auto-remove
+    };
+
+    // Live session check: a session is "live" if its row matches this
+    // short_id (by id prefix) AND either status='active' or its
+    // child_pid is still alive. We match on the first 8 chars of the
+    // session id since that's how worktree dirs are named.
+    let session_live = if let Some(sid) = short_id.as_deref() {
+        sessions.iter().any(|s| {
+            if !s.id.starts_with(sid) {
+                return false;
+            }
+            if s.status == "active" {
+                return true;
+            }
+            // status='ended' but child_pid alive can happen if the row
+            // was force-ended but the agent didn't actually exit.
+            s.child_pid
+                .and_then(|pid| u32::try_from(pid).ok())
+                .map(worktree_cleanup::process_is_alive)
+                .unwrap_or(false)
+        })
+    } else {
+        false
+    };
+
+    WorktreeFacts {
+        path: path.to_path_buf(),
+        short_id,
+        branch,
+        is_clean,
+        unmerged_count,
+        session_live,
+    }
+}
+
+fn print_prune_report_text(candidates: &[PruneCandidate], summary: &PruneSummary, apply: bool) {
+    if candidates.is_empty() {
+        println!("no worktrees under .ryve/worktrees/");
+        return;
+    }
+
+    println!(
+        "{} worktree{} found under .ryve/worktrees/",
+        candidates.len(),
+        plural(candidates.len())
+    );
+    println!();
+
+    for c in candidates {
+        let id = c.facts.short_id.as_deref().unwrap_or("(non-hand)");
+        let branch = c.facts.branch.as_deref().unwrap_or("(no branch)");
+        println!(
+            "  {} {:8}  {:24}  {}",
+            c.status.glyph(),
+            id,
+            branch,
+            c.status.reason()
+        );
+    }
+
+    println!();
+    println!(
+        "summary: {} removable, {} unmerged, {} dirty, {} live, {} out-of-scope",
+        summary.removable, summary.unmerged, summary.dirty, summary.live, summary.out_of_scope,
+    );
+
+    if !apply {
+        if summary.removable > 0 {
+            println!();
+            println!(
+                "dry-run: pass --yes to remove the {} removable worktree{}",
+                summary.removable,
+                plural(summary.removable),
+            );
+        } else {
+            println!();
+            println!("dry-run: nothing to remove");
+        }
+    }
+}
+
+fn print_prune_report_json(candidates: &[PruneCandidate], summary: &PruneSummary) {
+    let mut items: Vec<serde_json::Value> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        items.push(serde_json::json!({
+            "short_id": c.facts.short_id,
+            "branch": c.facts.branch,
+            "path": c.facts.path,
+            "is_clean": c.facts.is_clean,
+            "unmerged_count": c.facts.unmerged_count,
+            "session_live": c.facts.session_live,
+            "status": match &c.status {
+                WorktreeStatus::Removable => "removable",
+                WorktreeStatus::DirtyTree => "dirty",
+                WorktreeStatus::UnmergedCommits(_) => "unmerged",
+                WorktreeStatus::LiveSession => "live",
+                WorktreeStatus::NotHandWorktree => "out_of_scope",
+            },
+        }));
+    }
+    let payload = serde_json::json!({
+        "candidates": items,
+        "summary": {
+            "removable": summary.removable,
+            "dirty": summary.dirty,
+            "unmerged": summary.unmerged,
+            "live": summary.live,
+            "out_of_scope": summary.out_of_scope,
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Resolve a coding-agent name (or `None`) to a `CodingAgent` definition.
