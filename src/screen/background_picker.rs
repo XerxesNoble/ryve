@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 use data::unsplash::Photo;
 use iced::widget::{
-    Space, button, column, container, image, row, rule, scrollable, text, text_input,
+    Space, button, column, container, image, mouse_area, row, rule, scrollable, slider, text,
+    text_input,
 };
 use iced::{Element, Length, Theme};
 
@@ -38,6 +39,18 @@ pub enum Message {
     /// Remove the current background.
     RemoveBackground,
 
+    // ── Dim opacity ──────────────────────────────────────
+    /// Live update from the dim opacity slider (not yet persisted).
+    DimOpacityChanged(f32),
+    /// Slider released — persist the current dim opacity to config.
+    DimOpacityCommitted,
+
+    // ── Preview ──────────────────────────────────────────
+    /// Hover over an Unsplash thumbnail — show it as a temporary background.
+    PreviewPhoto(String),
+    /// Mouse left a previewable thumbnail — clear the preview.
+    ClearPreview,
+
     // ── Agent settings ───────────────────────────────────
     /// Set the default agent command (or None to clear).
     SetDefaultAgent(Option<String>),
@@ -56,6 +69,9 @@ pub struct PickerState {
     pub thumbnails: HashMap<String, image::Handle>,
     pub loading: bool,
     pub has_unsplash_key: bool,
+    /// While the user hovers a thumbnail we surface it as a temporary
+    /// background preview. None means "show the committed background".
+    pub preview_handle: Option<image::Handle>,
 }
 
 impl PickerState {
@@ -68,7 +84,21 @@ impl PickerState {
             thumbnails: HashMap::new(),
             loading: false,
             has_unsplash_key,
+            preview_handle: None,
         }
+    }
+
+    /// Show the thumbnail for `photo_id` as a temporary preview.
+    /// No-op if the thumbnail hasn't loaded yet.
+    pub fn set_preview(&mut self, photo_id: &str) {
+        if let Some(handle) = self.thumbnails.get(photo_id) {
+            self.preview_handle = Some(handle.clone());
+        }
+    }
+
+    /// Drop the temporary preview and fall back to the committed background.
+    pub fn clear_preview(&mut self) {
+        self.preview_handle = None;
     }
 }
 
@@ -86,6 +116,7 @@ pub fn view<'a>(
     state: &'a PickerState,
     pal: &Palette,
     has_background: bool,
+    dim_opacity: f32,
     agents: Vec<AgentInfo>,
 ) -> Element<'a, Message> {
     let pal = *pal;
@@ -193,6 +224,27 @@ pub fn view<'a>(
         );
     }
 
+    // Dim opacity slider — only meaningful when a background is set, but we
+    // expose it whenever the picker is open so users can preview the effect
+    // against the live preview thumbnail too.
+    {
+        let pct = (dim_opacity * 100.0).round() as i32;
+        let label = row![
+            text("Dim").size(FONT_LABEL).color(pal.text_secondary),
+            Space::new().width(Length::Fill),
+            text(format!("{pct}%"))
+                .size(FONT_LABEL)
+                .color(pal.text_tertiary),
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let dim_slider = slider(0.0..=1.0, dim_opacity, Message::DimOpacityChanged)
+            .step(0.01_f32)
+            .on_release(Message::DimOpacityCommitted);
+
+        content = content.push(column![label, dim_slider].spacing(4));
+    }
+
     content = content.push(rule::horizontal(1));
 
     // Unsplash section
@@ -298,10 +350,48 @@ fn view_thumbnail<'a>(
             .into()
     };
 
-    button(content)
+    let btn = button(content)
         .style(button::secondary)
         .padding(4)
         .width(Length::FillPortion(1))
-        .on_press(Message::SelectPhoto(photo.clone()))
+        .on_press(Message::SelectPhoto(photo.clone()));
+
+    // Wrap the button so hovering it surfaces the thumbnail as a temporary
+    // preview behind the modal — without committing to the (slow) full-res
+    // download until the user actually clicks.
+    mouse_area(btn)
+        .on_enter(Message::PreviewPhoto(photo.id.clone()))
+        .on_exit(Message::ClearPreview)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_handle_defaults_to_none() {
+        let state = PickerState::new();
+        assert!(state.preview_handle.is_none());
+    }
+
+    #[test]
+    fn set_preview_with_known_id_populates_handle() {
+        let mut state = PickerState::new();
+        let handle = image::Handle::from_bytes(vec![1, 2, 3]);
+        state.thumbnails.insert("photo-1".into(), handle);
+
+        state.set_preview("photo-1");
+        assert!(state.preview_handle.is_some());
+
+        state.clear_preview();
+        assert!(state.preview_handle.is_none());
+    }
+
+    #[test]
+    fn set_preview_with_unknown_id_is_noop() {
+        let mut state = PickerState::new();
+        state.set_preview("missing");
+        assert!(state.preview_handle.is_none());
+    }
 }
