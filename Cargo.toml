@@ -4,6 +4,7 @@ members = [
     "ipc",
     "llm",
     "llm/proto",
+    "perf_core",
 ]
 resolver = "2"
 
@@ -32,6 +33,7 @@ path = "src/main.rs"
 data = { path = "data" }
 ipc = { path = "ipc" }
 llm = { path = "llm" }
+perf_core = { path = "perf_core" }
 
 chrono = { version = "0.4", features = ["serde"] }
 dark-light = "2"

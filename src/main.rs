@@ -28,19 +28,15 @@ use screen::agents::AgentSession;
 use screen::toast::{self, Toast, ToastKind};
 use screen::{file_explorer, file_viewer, log_tail};
 use style::Appearance;
-use sysinfo::{Pid, ProcessesToUpdate, System};
 use uuid::Uuid;
 use widget::splitter::{self, SplitterDrag, SplitterKind};
 use workshop::Workshop;
 
+/// Thin re-export so the binary and the perf regression harness measure
+/// the *same* function. The implementation lives in `perf_core` so the
+/// criterion benchmark can call it directly. Spark ryve-5b9c5d93.
 fn process_is_alive(child_pid: i64) -> bool {
-    let Ok(pid) = u32::try_from(child_pid) else {
-        return false;
-    };
-
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    system.process(Pid::from_u32(pid)).is_some()
+    perf_core::process_is_alive_i64(child_pid)
 }
 
 fn main() -> iced::Result {
@@ -243,6 +239,11 @@ enum Message {
     AgentContextSynced,
     /// Periodic sparks poll tick
     SparksPoll,
+    /// Inert no-op. Used by the global keyboard subscription for any key
+    /// event that does not map to a real hotkey, so unmatched keystrokes
+    /// can never accidentally re-trigger an expensive `SparksPoll`.
+    /// Spark ryve-5b9c5d93 (perf regression harness).
+    Noop,
     /// Spawn a new Hand with the default agent (Cmd+H)
     NewDefaultHand,
     HandAssignmentSaved,
@@ -379,6 +380,7 @@ impl std::fmt::Debug for Message {
             Self::BackgroundConfigSaved => write!(f, "BackgroundConfigSaved"),
             Self::AgentContextSynced => write!(f, "AgentContextSynced"),
             Self::SparksPoll => write!(f, "SparksPoll"),
+            Self::Noop => write!(f, "Noop"),
             Self::NewDefaultHand => write!(f, "NewDefaultHand"),
             Self::HandAssignmentSaved => write!(f, "HandAssignmentSaved"),
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
@@ -2395,6 +2397,7 @@ impl App {
             }
             Message::BackgroundConfigSaved => Task::none(),
             Message::AgentContextSynced => Task::none(),
+            Message::Noop => Task::none(),
             Message::SparksPoll => {
                 // Opportunistically surface any worktree warnings that the
                 // synchronous spawn paths accumulated since the last tick.
@@ -3778,43 +3781,63 @@ impl App {
         let poll =
             iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::SparksPoll);
 
+        // Translate Iced keyboard events into the framework-agnostic
+        // [`perf_core::KeyKind`] / [`perf_core::KeyModifiers`] pair so the
+        // routing decision lives in [`perf_core::classify_key_event`]. The
+        // smoke test in `perf_core/tests/sparks_poll_smoke.rs` drives the
+        // *same* classifier with synthetic events to assert no key path
+        // ever resolves to `SparksPoll`. Spark ryve-5b9c5d93.
         let hotkeys = keyboard::listen().map(|event| {
-            match &event {
+            let (kind, mods) = match &event {
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(c),
                     modifiers,
                     ..
                 } => {
-                    if modifiers.command() && c.as_str() == "h" {
-                        return Message::NewDefaultHand;
-                    }
-                    if modifiers.command() && c.as_str() == "c" {
-                        return Message::FileViewer(file_viewer::Message::CopySelection);
-                    }
-                    if modifiers.command() && c.as_str() == "f" {
-                        return Message::HotkeyCmdF;
-                    }
-                    // Cmd+O — open workshop directory picker. Advertised on
-                    // the welcome screen so first-time users have a way in
-                    // beyond clicking the button. Active everywhere so the
-                    // shortcut works once a workshop is already loaded too.
-                    if modifiers.command() && c.as_str() == "o" {
-                        return Message::NewWorkshopDialog;
-                    }
+                    let ch = c.chars().next().unwrap_or('\0');
+                    (
+                        perf_core::KeyKind::Character(ch),
+                        perf_core::KeyModifiers {
+                            command: modifiers.command(),
+                        },
+                    )
                 }
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
-                } => {
-                    return Message::HotkeyEscape;
+                } => (
+                    perf_core::KeyKind::Escape,
+                    perf_core::KeyModifiers::default(),
+                ),
+                keyboard::Event::ModifiersChanged(modifiers) => (
+                    perf_core::KeyKind::ModifiersChanged {
+                        shift: modifiers.shift(),
+                    },
+                    perf_core::KeyModifiers::default(),
+                ),
+                _ => (
+                    perf_core::KeyKind::Other,
+                    perf_core::KeyModifiers::default(),
+                ),
+            };
+
+            match perf_core::classify_key_event(kind, mods) {
+                perf_core::KeyDispatch::NewDefaultHand => Message::NewDefaultHand,
+                perf_core::KeyDispatch::CopySelection => {
+                    Message::FileViewer(file_viewer::Message::CopySelection)
                 }
-                keyboard::Event::ModifiersChanged(modifiers) => {
-                    return Message::ShiftStateChanged(modifiers.shift());
+                perf_core::KeyDispatch::HotkeyCmdF => Message::HotkeyCmdF,
+                perf_core::KeyDispatch::NewWorkshopDialog => Message::NewWorkshopDialog,
+                perf_core::KeyDispatch::HotkeyEscape => Message::HotkeyEscape,
+                perf_core::KeyDispatch::ShiftStateChanged(shift) => {
+                    Message::ShiftStateChanged(shift)
                 }
-                _ => {}
+                // SparksPoll is a sentinel that classify_key_event must
+                // never return. The regression test asserts this; if it
+                // ever did escape, we still want a no-op rather than a
+                // workgraph reload — so map it to Noop here too.
+                perf_core::KeyDispatch::Noop | perf_core::KeyDispatch::SparksPoll => Message::Noop,
             }
-            // Swallow unmatched keyboard events — SparksPoll is a harmless no-op
-            Message::SparksPoll
         });
 
         // Track window resizes so the splitter can convert vertical
