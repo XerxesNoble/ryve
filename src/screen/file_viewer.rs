@@ -959,14 +959,32 @@ impl<'a> canvas::Program<Message> for Minimap<'a> {
             // pixel. Clamp the draw rectangle height so each line is
             // still visible, even if they overlap slightly (this is
             // what VS Code does too).
-            let draw_h = slot_h.max(1.0);
             let usable_w = (bounds.width - 2.0 * MINIMAP_PADDING_X).max(0.0);
 
-            for (i, line) in self.lines.iter().enumerate() {
+            // Sampling: when many source lines collapse into the same
+            // physical pixel rows, drawing every line/span is wasted work.
+            // Sample one line per visible pixel bucket in that case while
+            // keeping per-line behaviour for shorter files where each line
+            // still contributes meaningfully. PR #5 review (Copilot) flagged
+            // the unsampled loop as a hot spot on huge files; the cache
+            // above takes the repeat-frame cost out, this takes the first-
+            // paint cost out. Spark ryve-20e0fa52.
+            let max_visible_rows = bounds.height.ceil().max(1.0) as usize;
+            let sample_step = if total_lines > max_visible_rows {
+                total_lines.div_ceil(max_visible_rows)
+            } else {
+                1
+            };
+            // When we sample, draw a strip thick enough to fill the bucket.
+            let base_draw_h = slot_h.max(1.0);
+
+            for i in (0..total_lines).step_by(sample_step) {
                 let y = i as f32 * slot_h;
                 if y >= bounds.height {
                     break;
                 }
+                let draw_h = (base_draw_h * sample_step as f32).min(bounds.height - y);
+                let line = &self.lines[i];
 
                 let mut x = MINIMAP_PADDING_X;
                 for span in &line.spans {

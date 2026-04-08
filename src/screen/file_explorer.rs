@@ -396,12 +396,17 @@ fn file_diff_stat(
         return diff_stats.get(rel_path).copied().unwrap_or_default();
     }
 
-    // Directory: aggregate all children's stats
-    let dir_prefix = rel_path.to_string_lossy();
+    // Directory: aggregate all *strict descendants*. Use `Path::starts_with`
+    // (whole-component compare) so a directory `src` does NOT pull in
+    // siblings like `src2/foo.rs` — same correctness fix as `file_git_status`
+    // above. PR #5 Copilot review flagged the underlying antipattern; this
+    // function had the same shape. Spark ryve-20e0fa52.
     let mut total = DiffStat::default();
     for (path, stat) in diff_stats {
-        let path_str = path.to_string_lossy();
-        if path_str.starts_with(dir_prefix.as_ref()) && path_str.len() > dir_prefix.len() {
+        if path == rel_path {
+            continue;
+        }
+        if path.starts_with(rel_path) {
             total.additions += stat.additions;
             total.deletions += stat.deletions;
         }
@@ -498,5 +503,59 @@ mod tests {
         let statuses: HashMap<PathBuf, FileStatus> = HashMap::new();
         let got = file_git_status(Path::new("src"), &NodeKind::Directory, &statuses);
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn file_git_status_directory_does_not_match_sibling_with_same_prefix() {
+        // Regression for the PR #5 Copilot review (spark ryve-20e0fa52):
+        // a string-prefix check would have made directory `src` light up
+        // because of changes inside `src2/`. With `Path::starts_with` the
+        // boundary is component-aware and `src` must report `None`.
+        let mut statuses = HashMap::new();
+        statuses.insert(PathBuf::from("src2/foo.rs"), FileStatus::Modified);
+        statuses.insert(PathBuf::from("src22/bar.rs"), FileStatus::Modified);
+
+        let got = file_git_status(Path::new("src"), &NodeKind::Directory, &statuses);
+        assert_eq!(
+            got, None,
+            "directory `src` must not absorb siblings `src2/`"
+        );
+
+        // The actual `src2` directory should still report Modified.
+        let got = file_git_status(Path::new("src2"), &NodeKind::Directory, &statuses);
+        assert_eq!(got, Some(FileStatus::Modified));
+    }
+
+    #[test]
+    fn file_diff_stat_directory_does_not_match_sibling_with_same_prefix() {
+        // Same regression, applied to the diff_stat aggregation. Spark
+        // ryve-20e0fa52: `file_diff_stat` previously used
+        // `to_string_lossy().starts_with()` and would have folded changes
+        // from `src2/foo.rs` into directory `src`'s totals.
+        let mut diff_stats = HashMap::new();
+        diff_stats.insert(
+            PathBuf::from("src2/foo.rs"),
+            DiffStat {
+                additions: 7,
+                deletions: 3,
+            },
+        );
+        diff_stats.insert(
+            PathBuf::from("src/lib.rs"),
+            DiffStat {
+                additions: 2,
+                deletions: 1,
+            },
+        );
+
+        // `src` must only see its own descendants.
+        let got = file_diff_stat(Path::new("src"), &NodeKind::Directory, &diff_stats);
+        assert_eq!(got.additions, 2);
+        assert_eq!(got.deletions, 1);
+
+        // `src2` must only see its own descendants.
+        let got = file_diff_stat(Path::new("src2"), &NodeKind::Directory, &diff_stats);
+        assert_eq!(got.additions, 7);
+        assert_eq!(got.deletions, 3);
     }
 }
