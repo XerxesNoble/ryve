@@ -80,6 +80,10 @@ fn main() -> iced::Result {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut window = iced::window::Settings {
         size: iced::Size::new(1400.0, 900.0),
+        // Floor below which the layout cannot collapse any further. Picked
+        // so that even a single pane plus the title bar remains usable.
+        // sp-ux0025.
+        min_size: Some(iced::Size::new(480.0, 400.0)),
         transparent: true,
         ..Default::default()
     };
@@ -3646,20 +3650,23 @@ impl App {
         )
         .map(Message::StatusBar);
 
-        let main_row = container(
-            row![
-                sidebar,
-                sidebar_bench_splitter,
-                bench,
-                bench_sparks_splitter,
-                sparks_col
-            ]
-            .spacing(0)
-            .height(Length::Fill),
-        )
-        .padding(style::PANEL_GAP)
-        .width(Length::Fill)
-        .height(Length::Fill);
+        // Responsive layout: collapse side panels at small window widths
+        // so the bench remains usable. sp-ux0025.
+        let (show_sidebar, show_sparks) = Workshop::responsive_panels(self.window_size.width);
+
+        let mut main_row_inner = row![].spacing(0).height(Length::Fill);
+        if show_sidebar {
+            main_row_inner = main_row_inner.push(sidebar).push(sidebar_bench_splitter);
+        }
+        main_row_inner = main_row_inner.push(bench);
+        if show_sparks {
+            main_row_inner = main_row_inner.push(bench_sparks_splitter).push(sparks_col);
+        }
+
+        let main_row = container(main_row_inner)
+            .padding(style::PANEL_GAP)
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         // Ember notification bar — sits above the main row so dismissible
         // Hand-to-Hand signals are visible without blocking the workgraph
