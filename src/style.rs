@@ -387,6 +387,32 @@ pub fn tab_pill(pal: &Palette, active: bool) -> container::Style {
     }
 }
 
+/// Translucent attribution chip overlaid on the workspace when an
+/// Unsplash image is the active background. Sits in the bottom-right
+/// corner and stays unobtrusive while remaining legible over varied
+/// imagery. Spark sp-ux0033.
+pub fn attribution_chip() -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.45,
+        })),
+        border: Border {
+            color: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.15,
+            },
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
 /// Status bar at the bottom.
 pub fn status_bar_style(pal: &Palette, has_bg: bool) -> container::Style {
     container::Style {

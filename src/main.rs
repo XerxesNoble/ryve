@@ -286,6 +286,10 @@ enum Message {
         workshop_id: Uuid,
         ember_id: String,
     },
+
+    /// Open a URL in the user's default browser. Used by the Unsplash
+    /// attribution chip (spark sp-ux0033) to credit the photographer.
+    OpenUrl(String),
 }
 
 impl std::fmt::Debug for Message {
@@ -379,6 +383,7 @@ impl std::fmt::Debug for Message {
             Self::ToastExpired(id) => write!(f, "ToastExpired({id})"),
             Self::EmberBar(m) => write!(f, "EmberBar({m:?})"),
             Self::EmberDismissed { ember_id, .. } => write!(f, "EmberDismissed({ember_id})"),
+            Self::OpenUrl(url) => write!(f, "OpenUrl({url})"),
         }
     }
 }
@@ -2604,6 +2609,18 @@ impl App {
                 }
                 Task::none()
             }
+            Message::OpenUrl(url) => {
+                // Best-effort: if the OS can't open the URL we surface a toast
+                // rather than crashing the workspace.
+                if let Err(e) = open::that(&url) {
+                    return self.push_toast(
+                        "Could not open link",
+                        format!("{url}: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+                Task::none()
+            }
         }
     }
 
@@ -3518,6 +3535,12 @@ impl App {
 
             layers.push(main_content);
 
+            // Unsplash attribution chip — bottom-right, click opens the
+            // photographer's profile. Spark sp-ux0033.
+            if let Some(chip) = unsplash_attribution_overlay(ws) {
+                layers.push(chip);
+            }
+
             // Settings modal overlay
             if ws.background_picker.open {
                 let has_bg = ws.config.background.image.is_some();
@@ -4125,6 +4148,59 @@ fn splitter_event_filter(
     }
 }
 
+/// Format the chip label for an Unsplash attribution. Pure helper so the
+/// rendering decision can be unit-tested without standing up an iced view.
+/// Spark sp-ux0033.
+fn unsplash_attribution_label(bg: &data::ryve_dir::BackgroundConfig) -> Option<String> {
+    let photographer = bg.unsplash_photographer.as_deref()?.trim();
+    if photographer.is_empty() {
+        return None;
+    }
+    Some(format!("Photo by {photographer} on Unsplash"))
+}
+
+/// Render the translucent attribution chip in the bottom-right of the
+/// workspace when an Unsplash image is the active background. Returns
+/// `None` when there is no photographer credit on file (e.g. local
+/// uploads), so the caller can skip pushing a layer entirely. Spark
+/// sp-ux0033.
+fn unsplash_attribution_overlay(ws: &Workshop) -> Option<Element<'_, Message>> {
+    ws.background_handle.as_ref()?;
+    let label = unsplash_attribution_label(&ws.config.background)?;
+    let url = ws
+        .config
+        .background
+        .unsplash_photographer_url
+        .clone()
+        .unwrap_or_else(|| "https://unsplash.com".to_string());
+
+    let chip_text = text(label).size(11).color(Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 0.92,
+    });
+
+    let chip_button = button(chip_text)
+        .style(button::text)
+        .padding([4, 10])
+        .on_press(Message::OpenUrl(url));
+
+    let chip = container(chip_button)
+        .padding(0)
+        .style(|_theme: &Theme| style::attribution_chip());
+
+    Some(
+        container(chip)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .padding(12)
+            .into(),
+    )
+}
+
 /// Stack toast notifications on top of an existing view, if any are active.
 fn overlay_with_toasts<'a>(
     base: Element<'a, Message>,
@@ -4356,4 +4432,46 @@ async fn load_sparks(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Spark> 
     }
 
     sparks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data::ryve_dir::BackgroundConfig;
+
+    #[test]
+    fn attribution_label_present_when_photographer_set() {
+        let bg = BackgroundConfig {
+            image: Some("photo.jpg".into()),
+            dim_opacity: 0.7,
+            unsplash_photographer: Some("Jane Doe".into()),
+            unsplash_photographer_url: Some("https://unsplash.com/@jane".into()),
+        };
+        assert_eq!(
+            unsplash_attribution_label(&bg).as_deref(),
+            Some("Photo by Jane Doe on Unsplash"),
+        );
+    }
+
+    #[test]
+    fn attribution_label_absent_for_local_upload() {
+        let bg = BackgroundConfig {
+            image: Some("local.jpg".into()),
+            dim_opacity: 0.7,
+            unsplash_photographer: None,
+            unsplash_photographer_url: None,
+        };
+        assert!(unsplash_attribution_label(&bg).is_none());
+    }
+
+    #[test]
+    fn attribution_label_absent_for_blank_photographer() {
+        let bg = BackgroundConfig {
+            image: Some("photo.jpg".into()),
+            dim_opacity: 0.7,
+            unsplash_photographer: Some("   ".into()),
+            unsplash_photographer_url: None,
+        };
+        assert!(unsplash_attribution_label(&bg).is_none());
+    }
 }
