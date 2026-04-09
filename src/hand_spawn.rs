@@ -32,7 +32,7 @@ use data::sparks::{agent_session_repo, assignment_repo, crew_repo, spark_repo};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::agent_prompts::{compose_hand_prompt, compose_merger_prompt};
+use crate::agent_prompts::{compose_hand_prompt, compose_head_prompt, compose_merger_prompt};
 use crate::coding_agents::CodingAgent;
 use crate::workshop;
 
@@ -42,6 +42,14 @@ use crate::workshop;
 pub enum HandKind {
     /// Standard owner-of-the-spark Hand.
     Owner,
+    /// A **Head**: a coding-agent subprocess that orchestrates a Crew of
+    /// Hands. Mechanically identical to an Owner Hand (same worktree,
+    /// same session row, same launch flow), distinguished by
+    /// `agent_sessions.session_label = "head"` and by the Head system
+    /// prompt composed via [`compose_head_prompt`]. The assignment row
+    /// records `AssignmentRole::Owner` against the parent epic because
+    /// the Head "owns" that epic for the lifetime of its crew.
+    Head,
     /// The crew's integrator. Requires `crew_id` to be set.
     Merger,
 }
@@ -50,6 +58,10 @@ impl HandKind {
     fn role(self) -> AssignmentRole {
         match self {
             Self::Owner => AssignmentRole::Owner,
+            // Heads own the epic they are orchestrating — same assignment
+            // semantics as an Owner Hand, just a different session_label
+            // and system prompt.
+            Self::Head => AssignmentRole::Owner,
             Self::Merger => AssignmentRole::Merger,
         }
     }
@@ -129,6 +141,7 @@ pub async fn spawn_hand(
         agent_args: agent.args.clone(),
         session_label: Some(match kind {
             HandKind::Owner => "hand".to_string(),
+            HandKind::Head => "head".to_string(),
             HandKind::Merger => "merger".to_string(),
         }),
         child_pid: None,
@@ -150,6 +163,7 @@ pub async fn spawn_hand(
     if let Some(cid) = crew_id {
         let role_label = match kind {
             HandKind::Owner => "hand",
+            HandKind::Head => "head",
             HandKind::Merger => "merger",
         };
         crew_repo::add_member(pool, cid, &session_id, Some(role_label)).await?;
@@ -169,6 +183,14 @@ pub async fn spawn_hand(
             .await
             .unwrap_or_else(|_| Vec::<Spark>::new());
             compose_hand_prompt(&sparks, spark_id)
+        }
+        HandKind::Head => {
+            // Look up the epic title so the Head prompt can reference it
+            // by name. If the spark isn't in the DB (shouldn't happen at
+            // this point — the assignment row would have failed above)
+            // we still compose a prompt with just the id.
+            let epic_title = spark_repo::get(pool, spark_id).await.ok().map(|s| s.title);
+            compose_head_prompt(Some(spark_id), epic_title.as_deref())
         }
         HandKind::Merger => compose_merger_prompt(crew_id.unwrap_or(""), spark_id),
     };

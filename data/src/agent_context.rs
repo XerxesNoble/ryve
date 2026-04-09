@@ -331,6 +331,166 @@ fn generate_workshop_md() -> String {
 
     md.push_str("Ryve auto-refreshes every 3 seconds. Changes are picked up by the UI and other Hands automatically.\n\n");
 
+    // ── Heads ──────────────────────────────────────────────────────
+    md.push_str("## Heads (Crew Orchestrators)\n\n");
+    md.push_str(
+        "A **Head** is the layer above a Hand. Where a Hand owns a *single* spark and \
+         edits code in its own worktree, a Head owns a *goal* — an epic — and \
+         orchestrates a **Crew** of Hands that work on its child sparks in parallel.\n\n",
+    );
+    md.push_str("```\n");
+    md.push_str("       User\n");
+    md.push_str("         │ talks to\n");
+    md.push_str("         ▼\n");
+    md.push_str("       Atlas (Director)        — singleton, user-facing, never edits code\n");
+    md.push_str("         │ delegates a goal\n");
+    md.push_str("         ▼\n");
+    md.push_str("       Head                    — crew orchestrator, decomposes + supervises\n");
+    md.push_str("         │ spawns & supervises\n");
+    md.push_str("         ▼\n");
+    md.push_str("       Hand, Hand, Hand, …     — workers, each claim one spark in a worktree\n");
+    md.push_str("         │ when all children close\n");
+    md.push_str("         ▼\n");
+    md.push_str("       Merger (Hand)           — integrates worktrees into one PR\n");
+    md.push_str("```\n\n");
+    md.push_str(
+        "Mechanically, a Head is the **same kind of coding-agent subprocess** as a Hand \
+         (same worktree machinery, same `agent_sessions` row, same launch flow). What \
+         distinguishes it is the *system prompt* (composed via `compose_head_prompt`) \
+         and the session label `session_label = \"head\"`. A Head is not an in-process \
+         LLM call and does not need any special schema or process type.\n\n",
+    );
+
+    md.push_str("### Lifecycle\n\n");
+    md.push_str(
+        "1. **Atlas spawns a Head** on an epic spark with a populated intent: \
+         `ryve head spawn <epic_id> --agent claude`. This creates a worktree, an agent \
+         session, and an assignment where the Head \"owns\" the epic.\n",
+    );
+    md.push_str(
+        "2. **The Head reads the epic** (`ryve spark show <epic_id>`) and decomposes it \
+         into 2–8 child task sparks via `ryve spark create`, bonded back to the epic with \
+         `parent_child`.\n",
+    );
+    md.push_str(
+        "3. **The Head creates a Crew** bundling those sparks: \
+         `ryve crew create '<name>' --parent <epic_id> --head-session $RYVE_SESSION_ID`.\n",
+    );
+    md.push_str(
+        "4. **The Head spawns one Hand per child spark**: \
+         `ryve hand spawn <child_id> --agent <a> --crew <crew_id>`. Each Hand works in \
+         its own worktree on `hand/<short>`.\n",
+    );
+    md.push_str(
+        "5. **The Head polls** `ryve crew show <crew_id>` and `ryve assign list <spark_id>`. \
+         Stalled Hands are released and respawned.\n",
+    );
+    md.push_str(
+        "6. **When every child spark is closed**, the Head creates a *merge spark* and \
+         spawns a **Merger** Hand: \
+         `ryve hand spawn <merge_spark> --role merger --crew <crew_id>`.\n",
+    );
+    md.push_str(
+        "7. **The Merger integrates** every `hand/<short>` branch into a single \
+         `crew/<crew_id>` branch, pushes, and opens one PR. It never merges to `main` — \
+         human review is always required.\n",
+    );
+    md.push_str(
+        "8. **The Head posts the PR URL** as a comment on the parent epic and exits. \
+         Atlas surfaces the URL to the user on its next poll.\n\n",
+    );
+    md.push_str(
+        "A Head **never edits code**. If a Head finds itself wanting to write a patch, \
+         it must spawn a Hand on a spark instead. This mirrors the worktree-isolation \
+         invariant: \"Hands must never work in the main tree\" applies to Heads too.\n\n",
+    );
+
+    md.push_str("### Archetypes\n\n");
+    md.push_str(
+        "Heads come in three **standard archetypes**. The archetype is a *prompting and \
+         delegation contract* — not a new subprocess type — and determines which kinds of \
+         child sparks and Hands a Head may create.\n\n",
+    );
+    md.push_str("| Archetype | Purpose | Default crew shape | Closes the epic by |\n");
+    md.push_str("|-----------|---------|--------------------|--------------------|\n");
+    md.push_str(
+        "| **Build** | Ship code that satisfies acceptance criteria | 2–8 implementer Hands + 1 Merger | Opening a PR via the Merger |\n",
+    );
+    md.push_str(
+        "| **Research** | Reduce uncertainty before code is written | 1–4 investigator Hands, no Merger | Posting findings + a recommendation |\n",
+    );
+    md.push_str(
+        "| **Review** | Critique existing code, designs, or PRs | 1–3 reviewer Hands, no Merger | Posting a structured review comment |\n\n",
+    );
+    md.push_str("Atlas selects an archetype per goal:\n\n");
+    md.push_str("1. *\"Should we do X?\"* → **Research Head**.\n");
+    md.push_str("2. *\"Critique this PR/design.\"* → **Review Head**.\n");
+    md.push_str("3. *Concrete acceptance criteria, path forward clear* → **Build Head**.\n");
+    md.push_str("4. *Otherwise* → ask the user. Do not invent a fourth archetype.\n\n");
+    md.push_str(
+        "Full definitions, delegation scopes, hard rules, and cross-archetype invariants \
+         live in [`docs/HEAD_ARCHETYPES.md`](../docs/HEAD_ARCHETYPES.md). To add a new \
+         archetype, follow [`docs/HEAD_HOWTO.md`](../docs/HEAD_HOWTO.md).\n\n",
+    );
+
+    md.push_str("### Commands\n\n");
+    md.push_str("```sh\n");
+    md.push_str("ryve head --help                                      # long-form Head docs\n");
+    md.push_str("ryve head spawn --help                                # spawn-specific help\n");
+    md.push_str(
+        "ryve head spawn <epic_id> [--agent <a>] [--crew <c>]  # launch a Head on an epic\n",
+    );
+    md.push_str(
+        "ryve head list                                        # list active Head sessions\n",
+    );
+    md.push('\n');
+    md.push_str("ryve crew create <name> --parent <epic_id> --head-session $RYVE_SESSION_ID\n");
+    md.push_str("ryve crew list\n");
+    md.push_str("ryve crew show <crew_id>\n");
+    md.push('\n');
+    md.push_str(
+        "ryve hand spawn <child_id> --agent <a> --crew <crew_id>            # worker Hand\n",
+    );
+    md.push_str("ryve hand spawn <merge_id> --role merger --crew <crew_id>          # Merger\n");
+    md.push_str("```\n\n");
+
+    md.push_str("### Worked example — OAuth login\n\n");
+    md.push_str("```sh\n");
+    md.push_str("# 1. Atlas (or the user) creates the epic.\n");
+    md.push_str("ryve spark create --type epic --priority 1 \\\n");
+    md.push_str("    --problem 'add OAuth login to the dashboard' \\\n");
+    md.push_str("    --acceptance 'user can log in with Google on /login' \\\n");
+    md.push_str("    --acceptance 'session cookie set and verified on /dashboard' \\\n");
+    md.push_str("    'Add OAuth login'\n");
+    md.push_str("# → created ryve-abcd1234\n\n");
+    md.push_str("# 2. Spawn a Build Head on the epic.\n");
+    md.push_str("ryve head spawn ryve-abcd1234 --agent claude\n");
+    md.push_str("# → spawned head <session> on epic ryve-abcd1234 (pid Some(…))\n\n");
+    md.push_str("# 3. The Head, running in its own worktree, will:\n");
+    md.push_str("#    - ryve spark show ryve-abcd1234                     (read intent)\n");
+    md.push_str("#    - ryve spark create --type task … (×3)              (decompose)\n");
+    md.push_str("#    - ryve bond create ryve-abcd1234 <child> parent_child\n");
+    md.push_str("#    - ryve crew create 'oauth-dashboard' --parent ryve-abcd1234 \\\n");
+    md.push_str("#          --head-session $RYVE_SESSION_ID\n");
+    md.push_str("#    - ryve hand spawn <child1> --agent claude --crew <crew_id>  (×3)\n");
+    md.push_str("#    - poll crew + assignments\n");
+    md.push_str("#    - ryve spark create --type chore … 'Merge crew <crew_id>'\n");
+    md.push_str("#    - ryve hand spawn <merge_id> --role merger --crew <crew_id>\n");
+    md.push_str("#    - ryve comment add ryve-abcd1234 '<pr-url>'\n");
+    md.push_str("#    - exit\n\n");
+    md.push_str("# 4. You can observe each layer at any time:\n");
+    md.push_str("ryve head list                 # the Head itself\n");
+    md.push_str("ryve crew list                 # the crew it created\n");
+    md.push_str("ryve hand list                 # the sub-Hands\n");
+    md.push_str("ryve spark show ryve-abcd1234  # child sparks as parent_child bonds\n");
+    md.push_str("```\n\n");
+    md.push_str(
+        "See [`docs/AGENT_HIERARCHY.md`](../docs/AGENT_HIERARCHY.md) for the full \
+         Atlas → Head → Hand architecture, [`docs/HEAD_ARCHETYPES.md`](../docs/HEAD_ARCHETYPES.md) \
+         for the three standard archetypes, and [`docs/HEAD_PLAN.md`](../docs/HEAD_PLAN.md) \
+         for the implementation plan and rationale.\n\n",
+    );
+
     // ── Alloys ─────────────────────────────────────────────────────
     md.push_str("## Alloys (Spark Groupings)\n\n");
     md.push_str(
@@ -559,6 +719,60 @@ mod tests {
         assert!(md.contains("--invariant"));
         assert!(md.contains("--non-goal"));
         assert!(md.contains("--acceptance"));
+    }
+
+    /// Spark ryve-80d69f32: WORKSHOP.md must teach Hands about Heads —
+    /// what they are, their lifecycle, the three standard archetypes,
+    /// and the `ryve head` CLI. Without this, the feature is invisible
+    /// to anyone reading the operations guide.
+    #[test]
+    fn workshop_md_documents_heads_and_archetypes() {
+        let md = generate_workshop_md();
+
+        // Section header exists.
+        assert!(
+            md.contains("## Heads"),
+            "WORKSHOP.md must have a Heads section"
+        );
+
+        // Definition: what a Head is and how it relates to a Hand.
+        assert!(
+            md.contains("crew orchestrator") || md.contains("Crew of Hands"),
+            "must define a Head as a crew orchestrator"
+        );
+        assert!(
+            md.contains("same kind of coding-agent subprocess"),
+            "must clarify Heads are mechanically identical to Hands"
+        );
+        assert!(
+            md.contains("never edit"),
+            "must state Heads never edit code themselves"
+        );
+
+        // Lifecycle steps map to concrete ryve commands.
+        assert!(
+            md.contains("### Lifecycle"),
+            "must have a Lifecycle section"
+        );
+        assert!(md.contains("ryve head spawn"));
+        assert!(md.contains("ryve crew create"));
+        assert!(md.contains("ryve hand spawn"));
+        assert!(md.contains("--role merger"));
+
+        // All three standard archetypes are listed.
+        assert!(md.contains("### Archetypes"));
+        assert!(md.contains("Build"));
+        assert!(md.contains("Research"));
+        assert!(md.contains("Review"));
+
+        // Worked example is present.
+        assert!(md.contains("### Worked example"));
+        assert!(md.contains("--type epic"));
+
+        // Help surface + pointer to the HOWTO.
+        assert!(md.contains("ryve head --help"));
+        assert!(md.contains("HEAD_HOWTO.md"));
+        assert!(md.contains("HEAD_ARCHETYPES.md"));
     }
 
     #[test]
