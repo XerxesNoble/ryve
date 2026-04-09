@@ -3,15 +3,163 @@
 
 //! Workgraph panel — displays and manages sparks for the active workshop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use data::sparks::types::Spark;
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Theme};
 
+use crate::screen::agents::AgentSession;
 use crate::style::{
     self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette,
 };
+
+// ── Filter state ────────────────────────────────────────
+
+/// All status values that can appear as filter pills.
+pub const FILTER_STATUSES: &[(&str, &str)] = &[
+    ("open", "Open"),
+    ("in_progress", "In Progress"),
+    ("blocked", "Blocked"),
+    ("deferred", "Deferred"),
+    ("completed", "Completed"),
+];
+
+/// Filter + sort state for the sparks panel. Empty filter sets mean
+/// "no constraint on that dimension", not "match nothing".
+/// `show_closed` is a separate toggle because closed sparks are hidden
+/// by default regardless of the status filter.
+///
+/// Invariant: pill state is a direct mirror of this struct — no separate
+/// UI-only flag.
+#[derive(Debug, Clone, Default)]
+pub struct SparksFilter {
+    pub status: HashSet<String>,
+    pub show_closed: bool,
+    /// Selected spark types (multi-select). Empty == show all.
+    pub spark_types: HashSet<String>,
+    /// Selected priorities (multi-select). Empty == show all.
+    pub priorities: HashSet<i32>,
+    /// Selected assignee. `None` == show all.
+    pub assignee: Option<String>,
+    /// Free-text search over title + description.
+    pub search: String,
+}
+
+impl SparksFilter {
+    /// Return `true` when no filter axis is active — every spark passes.
+    pub fn is_empty(&self) -> bool {
+        self.status.is_empty()
+            && self.spark_types.is_empty()
+            && self.priorities.is_empty()
+            && self.assignee.is_none()
+            && self.search.is_empty()
+            && !self.show_closed
+    }
+
+    /// Toggle a status in the filter. Returns `true` if the status is now
+    /// selected.
+    pub fn toggle_status(&mut self, status: &str) -> bool {
+        if !self.status.remove(status) {
+            self.status.insert(status.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a spark should be visible given the current filter state.
+    pub fn matches(&self, spark_status: &str) -> bool {
+        // Closed sparks obey their own toggle regardless of the status set.
+        if spark_status == "closed" {
+            return self.show_closed;
+        }
+        // Completed is a distinct terminal state that remains visible
+        // regardless of the show_closed toggle (which only governs
+        // `status == "closed"`).
+        if spark_status == "completed" {
+            if !self.status.is_empty() {
+                return self.status.contains(spark_status);
+            }
+            return true;
+        }
+        // Empty status set means "show all (minus closed unless toggled)".
+        if self.status.is_empty() {
+            return true;
+        }
+        self.status.contains(spark_status)
+    }
+
+    /// Whether a spark passes all active filter dimensions.
+    pub fn matches_spark(&self, spark: &Spark) -> bool {
+        if !self.matches(&spark.status) {
+            return false;
+        }
+        if !self.spark_types.is_empty() && !self.spark_types.contains(&spark.spark_type) {
+            return false;
+        }
+        if !self.priorities.is_empty() && !self.priorities.contains(&spark.priority) {
+            return false;
+        }
+        if let Some(ref assignee) = self.assignee
+            && spark.assignee.as_deref() != Some(assignee.as_str())
+        {
+            return false;
+        }
+        if !self.search.is_empty() {
+            let search_lower = self.search.to_lowercase();
+            let in_title = spark.title.to_lowercase().contains(&search_lower);
+            let in_desc = spark.description.to_lowercase().contains(&search_lower);
+            if !in_title && !in_desc {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn toggle_type(&mut self, ty: String) {
+        if !self.spark_types.remove(&ty) {
+            self.spark_types.insert(ty);
+        }
+    }
+
+    pub fn toggle_priority(&mut self, p: i32) {
+        if !self.priorities.remove(&p) {
+            self.priorities.insert(p);
+        }
+    }
+
+    pub fn set_assignee(&mut self, assignee: Option<String>) {
+        self.assignee = assignee;
+    }
+
+    /// Snapshot the filter state for persistence in `.ryve/ui_state.json`.
+    /// Note: sort_mode is stored on the Workshop, not on SparksFilter, so
+    /// the caller must pass it in.
+    pub fn to_persisted_with_sort(&self, sort_mode: SortMode) -> data::ryve_dir::SparksFilterState {
+        data::ryve_dir::SparksFilterState {
+            status: self.status.clone(),
+            spark_type: self.spark_types.clone(),
+            priority: self.priorities.clone(),
+            assignee: self.assignee.clone(),
+            search: self.search.clone(),
+            sort_mode: sort_mode.to_persist_key().to_string(),
+            show_closed: self.show_closed,
+        }
+    }
+
+    /// Rehydrate from persisted state.
+    pub fn from_persisted(state: &data::ryve_dir::SparksFilterState) -> Self {
+        Self {
+            status: state.status.clone(),
+            show_closed: state.show_closed,
+            spark_types: state.spark_type.clone(),
+            priorities: state.priority.clone(),
+            assignee: state.assignee.clone(),
+            search: state.search.clone(),
+        }
+    }
+}
 
 // ── State ────────────────────────────────────────────
 
@@ -104,6 +252,28 @@ pub fn resolve_default_parent_epic(sparks: &[Spark], focused_id: Option<&str>) -
     None
 }
 
+// Re-export SortMode from the sparks_filter module to avoid duplication.
+pub use crate::sparks_filter::SortMode;
+
+/// Collect distinct assignees from sparks and agent session names, sorted
+/// alphabetically. Deduplicates across both sources per the invariant.
+pub fn collect_assignees(sparks: &[Spark], agent_session_names: &[String]) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    for s in sparks {
+        if let Some(ref a) = s.assignee
+            && !a.is_empty()
+        {
+            set.insert(a.clone());
+        }
+    }
+    for name in agent_session_names {
+        if !name.is_empty() {
+            set.insert(name.clone());
+        }
+    }
+    set.into_iter().collect()
+}
+
 // ── Default sort ─────────────────────────────────────
 // NOTE: default_sort is a pure helper kept available for upcoming
 // refactors to the render pipeline (sorted grouping). Currently the
@@ -113,7 +283,6 @@ pub fn resolve_default_parent_epic(sparks: &[Spark], focused_id: Option<&str>) -
 /// Canonical ordering of `spark_type` values for the default sort. Any
 /// value not in this list sorts after every listed type but stably
 /// relative to other unknown types (via the string tiebreaker).
-#[allow(dead_code)]
 const SPARK_TYPE_ORDER: &[&str] = &[
     "epic",
     "bug",
@@ -126,7 +295,6 @@ const SPARK_TYPE_ORDER: &[&str] = &[
 
 /// Canonical ordering of `status` values for the default sort. Same
 /// "unknown sinks to the end" rule as [`SPARK_TYPE_ORDER`].
-#[allow(dead_code)]
 const STATUS_ORDER: &[&str] = &[
     "in_progress",
     "blocked",
@@ -136,16 +304,14 @@ const STATUS_ORDER: &[&str] = &[
     "closed",
 ];
 
-#[allow(dead_code)]
-fn spark_type_rank(ty: &str) -> usize {
+pub fn spark_type_rank(ty: &str) -> usize {
     SPARK_TYPE_ORDER
         .iter()
         .position(|t| *t == ty)
         .unwrap_or(SPARK_TYPE_ORDER.len())
 }
 
-#[allow(dead_code)]
-fn status_rank(status: &str) -> usize {
+pub fn status_rank(status: &str) -> usize {
     STATUS_ORDER
         .iter()
         .position(|s| *s == status)
@@ -210,7 +376,6 @@ pub fn group_by_epic<'a>(sparks: &'a [Spark]) -> Vec<EpicGroup<'a>> {
         let Some(pid) = s.parent_id.as_deref() else {
             continue;
         };
-        // Skip self-reference (shouldn't happen, but be defensive).
         if pid == s.id {
             continue;
         }
@@ -296,11 +461,38 @@ pub enum Message {
     BeginCloseFlow(String),
     /// Close the spark with a specific reason.
     CloseSparkWithReason(String, String),
+    /// Toggle a status in the filter pill row.
+    ToggleStatusFilter(String),
+    /// Toggle visibility of closed sparks.
+    ToggleShowClosed,
+    /// Change the active sort mode.
+    SetSortMode(SortMode),
+    /// Toggle the sort mode dropdown open/closed.
+    ToggleSortDropdown,
     /// Toggle the collapsed/expanded state of an epic group in the
     /// workgraph panel. The workshop persists the new state to
     /// `.ryve/ui_state.json` so the decision survives restart.
     /// Sparks ryve-8be256a8 / ryve-926870a9.
     ToggleEpicCollapse(String),
+    // ── Filter bar messages (spark ryve-baca34b0) ───────
+    /// Toggle a spark type in the multi-select filter.
+    FilterToggleType(String),
+    /// Toggle a priority level in the multi-select filter.
+    FilterTogglePriority(i32),
+    /// Set the assignee filter (None = clear).
+    FilterSetAssignee(Option<String>),
+    /// User typed in the search input; updates SparksFilter.search.
+    SearchChanged(String),
+    /// Clear the search input.
+    ClearSearch,
+    /// Navigate to an agent session in the agents panel (and open its
+    /// log tab if applicable). Spark ryve-dba4b8c4.
+    FocusAgentSession(String),
+    /// The sparks filter changed — persist to `.ryve/ui_state.json`.
+    /// Not yet emitted by filter widgets; will be wired once all filter
+    /// UI is integrated. Spark ryve-27e33825.
+    #[allow(dead_code)]
+    SparksFilterChanged,
 }
 
 // ── Refresh button glyph ─────────────────────────────
@@ -325,24 +517,39 @@ pub(crate) fn refresh_button_glyph(refreshing: bool) -> &'static str {
 pub struct ViewCtx<'a> {
     pub sparks: &'a [Spark],
     pub blocked_ids: &'a HashSet<String>,
+    pub agent_sessions: &'a [AgentSession],
     pub pal: Palette,
     pub has_bg: bool,
     pub create_form: &'a CreateForm,
     pub status_menu: &'a StatusMenu,
     pub collapsed: &'a HashSet<String>,
     pub refreshing: bool,
+    pub filter: &'a SparksFilter,
+    pub agent_session_names: &'a [String],
+    /// Pre-filtered sparks for display. When no filter is active this
+    /// should be the same slice as `sparks`. Kept separate so the
+    /// filter bar can still derive assignee lists from the full set.
+    pub filtered_sparks: &'a [Spark],
+    pub sort_mode: SortMode,
+    pub sort_dropdown_open: bool,
 }
 
 pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
     let ViewCtx {
         sparks,
         blocked_ids,
+        agent_sessions,
         pal,
         has_bg,
         create_form,
         status_menu,
         collapsed,
         refreshing,
+        filter,
+        agent_session_names,
+        filtered_sparks,
+        sort_mode,
+        sort_dropdown_open,
     } = ctx;
 
     // Refresh button: dim the glyph and swap it for an ellipsis while a
@@ -357,6 +564,14 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
     let header = row![
         text("Workgraph").size(FONT_HEADER).color(pal.text_primary),
         Space::new().width(Length::Fill),
+        button(
+            text(sort_mode.display_name())
+                .size(FONT_LABEL)
+                .color(pal.text_secondary),
+        )
+        .style(button::text)
+        .padding([2, 6])
+        .on_press(Message::ToggleSortDropdown),
         button(text("Releases").size(FONT_LABEL).color(pal.text_secondary))
             .style(button::text)
             .padding([2, 6])
@@ -373,21 +588,57 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
     .spacing(4)
     .padding([8, 10]);
 
+    // ── Filter pills (status) ──
+    let filter_row = view_filter_pills(filter, &pal);
+
+    // ── Filter bar (type / priority / assignee) ──
+    let filter_bar = view_filter_bar(sparks, filter, agent_session_names, &pal);
+
+    // ── Search bar ──
+    let search_input = text_input("Search sparks...", &filter.search)
+        .size(FONT_BODY)
+        .padding([6, 8])
+        .on_input(Message::SearchChanged);
+
+    let search_row = if filter.search.is_empty() {
+        row![search_input]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+    } else {
+        let clear_btn = button(
+            text("\u{00D7}")
+                .size(FONT_ICON_SM)
+                .color(pal.text_secondary),
+        )
+        .style(button::text)
+        .padding([2, 6])
+        .on_press(Message::ClearSearch);
+        row![search_input, clear_btn]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+    };
+
     let mut list = column![].spacing(2).padding([0, 10]);
 
-    // Inline create form
+    // Sort mode dropdown — shown inline below the header when toggled open.
+    if sort_dropdown_open {
+        list = list.push(view_sort_dropdown(sort_mode, pal));
+    }
+
+    // Inline create form (always uses unfiltered sparks for epic picker).
     if create_form.visible {
         list = list.push(view_create_form(sparks, create_form, &pal));
     }
 
-    if sparks.is_empty() && !create_form.visible {
-        list = list.push(
-            text("No sparks yet")
-                .size(FONT_BODY)
-                .color(pal.text_tertiary),
-        );
+    if filtered_sparks.is_empty() && !create_form.visible {
+        let msg = if filter.is_empty() {
+            "No sparks yet"
+        } else {
+            "No sparks match the current filters"
+        };
+        list = list.push(text(msg).size(FONT_BODY).color(pal.text_tertiary));
     } else {
-        let groups = group_by_epic(sparks);
+        let groups = group_by_epic(filtered_sparks);
         let epic_ids: HashSet<&str> = groups.iter().map(|g| g.epic.id.as_str()).collect();
         // Top-level groups are those whose epic has no epic-group parent;
         // nested epics are rendered inline under their parent group instead.
@@ -406,6 +657,7 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
                 &groups,
                 0,
                 blocked_ids,
+                agent_sessions,
                 &pal,
                 status_menu,
                 collapsed,
@@ -413,14 +665,242 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
         }
     }
 
-    let content = column![header, scrollable(list).height(Length::Fill)]
-        .width(Length::Fill)
-        .height(Length::Fill);
+    let content = column![
+        header,
+        filter_row,
+        filter_bar,
+        search_row,
+        scrollable(list).height(Length::Fill)
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
 
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg))
+        .into()
+}
+
+// ── Filter pills view (status) ──────────────────────
+
+fn view_filter_pills<'a>(filter: &SparksFilter, pal: &Palette) -> Element<'a, Message> {
+    let pal = *pal;
+    let mut pills = row![].spacing(4).align_y(iced::Alignment::Center);
+
+    for (key, label) in FILTER_STATUSES {
+        let selected = filter.status.contains(*key);
+        let color = style::status_color(key, &pal);
+        let key_owned = (*key).to_string();
+        pills = pills.push(filter_pill(label, selected, color, &pal, move || {
+            Message::ToggleStatusFilter(key_owned.clone())
+        }));
+    }
+
+    // "Closed" pill at the end — separate toggle.
+    pills = pills.push(filter_pill(
+        "Closed",
+        filter.show_closed,
+        style::status_color("closed", &pal),
+        &pal,
+        || Message::ToggleShowClosed,
+    ));
+
+    container(pills).padding([2, 10]).width(Length::Fill).into()
+}
+
+fn filter_pill<'a, F>(
+    label: &str,
+    selected: bool,
+    active_color: iced::Color,
+    pal: &Palette,
+    on_press: F,
+) -> Element<'a, Message>
+where
+    F: 'a + Fn() -> Message,
+{
+    let pal = *pal;
+    let (text_color, bg) = if selected {
+        (pal.window_bg, active_color)
+    } else {
+        // Dimmed: use the status color at reduced opacity for the text.
+        (
+            iced::Color {
+                a: 0.45,
+                ..active_color
+            },
+            pal.surface,
+        )
+    };
+    button(text(label.to_string()).size(FONT_LABEL).color(text_color))
+        .style(move |_t: &Theme, _s| button::Style {
+            background: Some(iced::Background::Color(bg)),
+            text_color,
+            border: iced::Border {
+                color: if selected { active_color } else { pal.border },
+                width: 1.0,
+                radius: iced::border::Radius::from(10.0),
+            },
+            ..button::Style::default()
+        })
+        .padding([2, 8])
+        .on_press_with(on_press)
+        .into()
+}
+
+// ── Filter bar view (type / priority / assignee) ────
+
+/// All spark types exposed in the filter bar, in display order.
+const FILTER_TYPES: &[(&str, &str)] = &[
+    ("epic", "Epic"),
+    ("bug", "Bug"),
+    ("feature", "Feature"),
+    ("task", "Task"),
+    ("spike", "Spike"),
+    ("chore", "Chore"),
+    ("milestone", "Milestone"),
+];
+
+fn view_filter_bar<'a>(
+    sparks: &[Spark],
+    filter: &SparksFilter,
+    agent_session_names: &[String],
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    // ── Type pills (multi-select) ──
+    let mut type_row = row![].spacing(3).align_y(iced::Alignment::Center);
+    for (key, label) in FILTER_TYPES {
+        let selected = filter.spark_types.contains(*key);
+        let key_owned = (*key).to_string();
+        type_row = type_row.push(filter_chip(label, selected, &pal, move || {
+            Message::FilterToggleType(key_owned.clone())
+        }));
+    }
+
+    // ── Priority pills (P0–P4, multi-select) ──
+    let mut prio_row = row![].spacing(3).align_y(iced::Alignment::Center);
+    for p in 0..=4i32 {
+        let selected = filter.priorities.contains(&p);
+        prio_row = prio_row.push(filter_chip(&format!("P{p}"), selected, &pal, move || {
+            Message::FilterTogglePriority(p)
+        }));
+    }
+
+    // ── Assignee dropdown (single-select with Clear) ──
+    let assignees = collect_assignees(sparks, agent_session_names);
+    let mut assignee_row = row![].spacing(3).align_y(iced::Alignment::Center);
+    // "Clear" chip — shown only when an assignee filter is active.
+    if filter.assignee.is_some() {
+        assignee_row = assignee_row.push(filter_chip("\u{00D7} Clear", false, &pal, || {
+            Message::FilterSetAssignee(None)
+        }));
+    }
+    for name in &assignees {
+        let selected = filter.assignee.as_deref() == Some(name.as_str());
+        let name_owned = name.clone();
+        assignee_row = assignee_row.push(filter_chip(name, selected, &pal, move || {
+            Message::FilterSetAssignee(Some(name_owned.clone()))
+        }));
+    }
+
+    let type_section = row![
+        text("Type").size(FONT_LABEL).color(pal.text_tertiary),
+        scrollable(type_row).direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new(),
+        )),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
+
+    let prio_section = row![
+        text("Priority").size(FONT_LABEL).color(pal.text_tertiary),
+        prio_row,
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
+
+    let assignee_section: Element<Message> = if assignees.is_empty() {
+        Space::new().height(0).into()
+    } else {
+        row![
+            text("Assignee").size(FONT_LABEL).color(pal.text_tertiary),
+            scrollable(assignee_row).direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new(),
+            )),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+        .into()
+    };
+
+    column![type_section, prio_section, assignee_section]
+        .spacing(4)
+        .padding([2, 10])
+        .into()
+}
+
+fn filter_chip<'a, F>(
+    label: &str,
+    selected: bool,
+    pal: &Palette,
+    on_press: F,
+) -> Element<'a, Message>
+where
+    F: 'a + Fn() -> Message,
+{
+    let pal = *pal;
+    let text_color = if selected {
+        pal.window_bg
+    } else {
+        pal.text_secondary
+    };
+    button(text(label.to_string()).size(FONT_SMALL).color(text_color))
+        .style(move |_t: &Theme, _s| button::Style {
+            background: Some(iced::Background::Color(if selected {
+                pal.accent
+            } else {
+                pal.surface
+            })),
+            text_color,
+            border: iced::Border {
+                color: pal.border,
+                width: 1.0,
+                radius: iced::border::Radius::from(8.0),
+            },
+            ..button::Style::default()
+        })
+        .padding([2, 6])
+        .on_press_with(on_press)
+        .into()
+}
+
+// ── Sort dropdown ───────────────────────────────────
+
+fn view_sort_dropdown(current: SortMode, pal: Palette) -> Element<'static, Message> {
+    let mut chips = row![].spacing(6).align_y(iced::Alignment::Center);
+    for &mode in SortMode::ALL {
+        let selected = mode == current;
+        chips = chips.push(menu_chip(mode.display_name(), selected, &pal, move || {
+            Message::SetSortMode(mode)
+        }));
+    }
+    container(chips)
+        .padding([4, 8])
+        .width(Length::Fill)
+        .style(move |_t: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                a: 0.06,
+                ..pal.text_primary
+            })),
+            border: iced::Border {
+                color: pal.border,
+                width: 1.0,
+                radius: iced::border::Radius::from(6.0),
+            },
+            ..Default::default()
+        })
         .into()
 }
 
@@ -604,11 +1084,13 @@ fn status_symbol(status: &str) -> &'static str {
 /// epics recurse once so `epic > epic > task` renders the inner epic as
 /// its own collapsible group; beyond two levels deep we flatten the
 /// remaining rows (per the spark non-goal).
+#[allow(clippy::too_many_arguments)]
 fn view_epic_group<'a>(
     group: &EpicGroup<'a>,
     all_groups: &[EpicGroup<'a>],
     depth: usize,
     blocked_ids: &HashSet<String>,
+    agent_sessions: &'a [AgentSession],
     pal: &Palette,
     status_menu: &'a StatusMenu,
     collapsed: &'a HashSet<String>,
@@ -638,6 +1120,7 @@ fn view_epic_group<'a>(
                     all_groups,
                     depth + 1,
                     blocked_ids,
+                    agent_sessions,
                     &pal,
                     status_menu,
                     collapsed,
@@ -649,6 +1132,7 @@ fn view_epic_group<'a>(
                 child,
                 child_blocked,
                 depth + 1,
+                agent_sessions,
                 &pal,
                 status_menu,
             ));
@@ -676,15 +1160,12 @@ fn view_epic_header<'a>(
         .on_press(Message::ToggleEpicCollapse(epic.id.clone()));
 
     let status_indicator = status_symbol(&epic.status);
+    let badge_color = style::status_color(&epic.status, &pal);
     let id = epic.id.clone();
-    let status_btn = button(
-        text(status_indicator)
-            .size(FONT_ICON_SM)
-            .color(pal.text_secondary),
-    )
-    .style(button::text)
-    .padding([2, 4])
-    .on_press(Message::OpenStatusMenu(id.clone()));
+    let status_btn = button(text(status_indicator).size(FONT_ICON_SM).color(badge_color))
+        .style(button::text)
+        .padding([2, 4])
+        .on_press(Message::OpenStatusMenu(id.clone()));
 
     let title_color = if is_blocked {
         pal.text_tertiary
@@ -728,20 +1209,25 @@ fn view_spark_row_indented<'a>(
     spark: &'a Spark,
     is_blocked: bool,
     depth: usize,
+    agent_sessions: &'a [AgentSession],
     pal: &Palette,
     status_menu: &'a StatusMenu,
 ) -> Element<'a, Message> {
     let indent = Space::new().width(Length::Fixed(16.0 * depth as f32));
-    row![indent, view_spark_row(spark, is_blocked, pal, status_menu)]
-        .spacing(0)
-        .align_y(iced::Alignment::Center)
-        .width(Length::Fill)
-        .into()
+    row![
+        indent,
+        view_spark_row(spark, is_blocked, agent_sessions, pal, status_menu)
+    ]
+    .spacing(0)
+    .align_y(iced::Alignment::Center)
+    .width(Length::Fill)
+    .into()
 }
 
 fn view_spark_row<'a>(
     spark: &'a Spark,
     is_blocked: bool,
+    agent_sessions: &'a [AgentSession],
     pal: &Palette,
     status_menu: &'a StatusMenu,
 ) -> Element<'a, Message> {
@@ -750,14 +1236,11 @@ fn view_spark_row<'a>(
     let priority_label = format!("P{}", spark.priority);
     let id = spark.id.clone();
 
-    let status_btn = button(
-        text(status_indicator)
-            .size(FONT_ICON_SM)
-            .color(pal.text_secondary),
-    )
-    .style(button::text)
-    .padding([2, 4])
-    .on_press(Message::OpenStatusMenu(id.clone()));
+    let badge_color = style::status_color(&spark.status, &pal);
+    let status_btn = button(text(status_indicator).size(FONT_ICON_SM).color(badge_color))
+        .style(button::text)
+        .padding([2, 4])
+        .on_press(Message::OpenStatusMenu(id.clone()));
 
     // When a spark has open blockers, dim the title and surface a 🔒-style
     // padlock so agents glance-read "don't claim this" without opening detail.
@@ -778,6 +1261,26 @@ fn view_spark_row<'a>(
 
     if is_blocked {
         row_inner = row_inner.push(text("\u{1F512}").size(FONT_LABEL).color(pal.text_tertiary));
+    }
+
+    // Assignee chip: clickable link when matching an agent session,
+    // dimmed plain text otherwise. Spark ryve-dba4b8c4.
+    if let Some(assignee) = spark.assignee.as_deref().filter(|s| !s.is_empty()) {
+        let assignee_el: Element<'a, Message> =
+            if let Some(session) = resolve_agent_session(assignee, agent_sessions) {
+                let session_id = session.id.clone();
+                button(text(assignee).size(FONT_LABEL).color(pal.accent))
+                    .style(button::text)
+                    .padding([0, 4])
+                    .on_press(Message::FocusAgentSession(session_id))
+                    .into()
+            } else {
+                text(assignee)
+                    .size(FONT_LABEL)
+                    .color(pal.text_tertiary)
+                    .into()
+            };
+        row_inner = row_inner.push(assignee_el);
     }
 
     let main_row = row![
@@ -898,9 +1401,25 @@ where
         .into()
 }
 
+// ── Agent session resolution ────────────────────────
+// Spark ryve-dba4b8c4: resolve an assignee string to a live agent session.
+
+/// Look up an assignee string against live agent sessions, matching by
+/// session name or id. Returns the first match so the link-or-plain-text
+/// decision is driven by live `agent_sessions` with no stale cache.
+pub(crate) fn resolve_agent_session<'a>(
+    assignee: &str,
+    sessions: &'a [AgentSession],
+) -> Option<&'a AgentSession> {
+    sessions
+        .iter()
+        .find(|s| s.name == assignee || s.id == assignee)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sparks_filter::{SparksFilter as FilterSparksFilter, apply_filter};
 
     fn mk_sort_spark(id: &str, priority: i32, spark_type: &str, status: &str) -> Spark {
         Spark {
@@ -1029,6 +1548,201 @@ mod tests {
             .collect();
         // Known type before unknown; within task, known status before unknown.
         assert_eq!(ids, vec!["b", "c", "a"]);
+    }
+
+    // ── Shared fixture for sort-mode tests ────────────
+
+    fn mk_filter_spark(
+        id: &str,
+        priority: i32,
+        spark_type: &str,
+        status: &str,
+        updated_at: &str,
+    ) -> Spark {
+        Spark {
+            id: id.to_string(),
+            title: id.to_string(),
+            description: String::new(),
+            status: status.to_string(),
+            priority,
+            spark_type: spark_type.to_string(),
+            assignee: None,
+            owner: None,
+            parent_id: None,
+            workshop_id: String::new(),
+            estimated_minutes: None,
+            github_issue_number: None,
+            github_repo: None,
+            metadata: String::new(),
+            created_at: String::new(),
+            updated_at: updated_at.to_string(),
+            closed_at: None,
+            closed_reason: None,
+            due_at: None,
+            defer_until: None,
+            risk_level: None,
+            scope_boundary: None,
+        }
+    }
+
+    fn sort_fixture() -> Vec<Spark> {
+        vec![
+            mk_filter_spark("sp-a", 2, "task", "open", "2026-04-01T00:00:00Z"),
+            mk_filter_spark("sp-b", 0, "bug", "in_progress", "2026-04-05T00:00:00Z"),
+            mk_filter_spark("sp-c", 1, "epic", "blocked", "2026-04-03T00:00:00Z"),
+            mk_filter_spark("sp-d", 0, "feature", "open", "2026-04-09T00:00:00Z"),
+            mk_filter_spark("sp-e", 2, "task", "blocked", "2026-04-02T00:00:00Z"),
+            mk_filter_spark("sp-f", 1, "bug", "open", "2026-04-07T00:00:00Z"),
+        ]
+    }
+
+    fn ids_of<'a>(sparks: &'a [&'a Spark]) -> Vec<&'a str> {
+        sparks.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn apply_filter_default_sort_matches_priority_type_status_id() {
+        let sparks = sort_fixture();
+        let filter = FilterSparksFilter {
+            show_closed: true,
+            ..Default::default()
+        };
+        let result = apply_filter(&filter, &sparks);
+        // P0 bug in_progress (sp-b), P0 feature open (sp-d),
+        // P1 epic blocked (sp-c), P1 bug open (sp-f),
+        // P2 task blocked (sp-e), P2 task open (sp-a)
+        assert_eq!(
+            ids_of(&result),
+            vec!["sp-b", "sp-d", "sp-c", "sp-f", "sp-e", "sp-a"]
+        );
+    }
+
+    #[test]
+    fn apply_filter_priority_only_sort() {
+        let sparks = sort_fixture();
+        let filter = FilterSparksFilter {
+            sort_mode: SortMode::PriorityOnly,
+            show_closed: true,
+            ..Default::default()
+        };
+        let result = apply_filter(&filter, &sparks);
+        // P0: sp-b, sp-d (by id); P1: sp-c, sp-f; P2: sp-a, sp-e
+        assert_eq!(
+            ids_of(&result),
+            vec!["sp-b", "sp-d", "sp-c", "sp-f", "sp-a", "sp-e"]
+        );
+    }
+
+    #[test]
+    fn apply_filter_recently_updated_sort() {
+        let sparks = sort_fixture();
+        let filter = FilterSparksFilter {
+            sort_mode: SortMode::RecentlyUpdated,
+            show_closed: true,
+            ..Default::default()
+        };
+        let result = apply_filter(&filter, &sparks);
+        // Descending updated_at: sp-d (04-09), sp-f (04-07), sp-b (04-05),
+        // sp-c (04-03), sp-e (04-02), sp-a (04-01)
+        assert_eq!(
+            ids_of(&result),
+            vec!["sp-d", "sp-f", "sp-b", "sp-c", "sp-e", "sp-a"]
+        );
+    }
+
+    #[test]
+    fn apply_filter_type_first_sort() {
+        let sparks = sort_fixture();
+        let filter = FilterSparksFilter {
+            sort_mode: SortMode::TypeFirst,
+            show_closed: true,
+            ..Default::default()
+        };
+        let result = apply_filter(&filter, &sparks);
+        // Type order: epic(sp-c P1), bug(sp-b P0, sp-f P1),
+        // feature(sp-d P0), task(sp-e P2 blocked, sp-a P2 open)
+        assert_eq!(
+            ids_of(&result),
+            vec!["sp-c", "sp-b", "sp-f", "sp-d", "sp-e", "sp-a"]
+        );
+    }
+
+    #[test]
+    fn apply_filter_default_hides_closed() {
+        let mut sparks = sort_fixture();
+        sparks.push(mk_filter_spark(
+            "sp-closed",
+            0,
+            "task",
+            "closed",
+            "2026-04-10T00:00:00Z",
+        ));
+        sparks.push(mk_filter_spark(
+            "sp-done",
+            0,
+            "task",
+            "completed",
+            "2026-04-10T00:00:00Z",
+        ));
+        let filter = FilterSparksFilter::default(); // show_closed = false
+        let result = apply_filter(&filter, &sparks);
+        let result_ids = ids_of(&result);
+        assert!(!result_ids.contains(&"sp-closed"));
+        // `completed` is a distinct terminal state and remains visible
+        // even when show_closed is false — only `closed` is hidden.
+        assert!(result_ids.contains(&"sp-done"));
+    }
+
+    #[test]
+    fn apply_filter_show_closed_reveals_them() {
+        let sparks = vec![
+            mk_filter_spark("sp-open", 0, "task", "open", "2026-04-01T00:00:00Z"),
+            mk_filter_spark("sp-closed", 0, "task", "closed", "2026-04-01T00:00:00Z"),
+        ];
+        let filter = FilterSparksFilter {
+            show_closed: true,
+            ..Default::default()
+        };
+        let result = apply_filter(&filter, &sparks);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn apply_filter_search_is_case_insensitive() {
+        let mut sparks = sort_fixture();
+        sparks[0].title = "Fix OAuth Bug".to_string();
+        let filter = FilterSparksFilter {
+            search: "oauth".to_string(),
+            show_closed: true,
+            ..Default::default()
+        };
+        let result = apply_filter(&filter, &sparks);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "sp-a");
+    }
+
+    #[test]
+    fn apply_filter_every_sort_mode_is_deterministic() {
+        let sparks = sort_fixture();
+        for &mode in SortMode::ALL {
+            let filter = FilterSparksFilter {
+                sort_mode: mode,
+                show_closed: true,
+                ..Default::default()
+            };
+            let result_a = apply_filter(&filter, &sparks);
+            let a = ids_of(&result_a);
+            let result_b = apply_filter(&filter, &sparks);
+            let b = ids_of(&result_b);
+            assert_eq!(a, b, "sort mode {:?} is not deterministic", mode);
+        }
+    }
+
+    #[test]
+    fn sort_mode_display_names_are_unique() {
+        let names: Vec<&str> = SortMode::ALL.iter().map(|m| m.display_name()).collect();
+        let unique: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len());
     }
 
     #[test]
@@ -1304,10 +2018,268 @@ mod tests {
         assert_eq!(busy, "\u{2026}");
     }
 
+    // ── SparksFilter tests (spark ryve-baca34b0) ──────
+
+    #[test]
+    fn filter_empty_matches_everything() {
+        let f = SparksFilter::default();
+        assert!(f.is_empty());
+        let spark = mk_sort_spark("sp-1", 2, "task", "open");
+        assert!(f.matches_spark(&spark));
+    }
+
+    #[test]
+    fn filter_by_type_narrows_to_selected() {
+        let mut f = SparksFilter::default();
+        f.toggle_type("bug".into());
+        let bug = mk_sort_spark("sp-1", 2, "bug", "open");
+        let task = mk_sort_spark("sp-2", 2, "task", "open");
+        assert!(f.matches_spark(&bug));
+        assert!(!f.matches_spark(&task));
+    }
+
+    #[test]
+    fn filter_by_type_multi_select() {
+        let mut f = SparksFilter::default();
+        f.toggle_type("bug".into());
+        f.toggle_type("feature".into());
+        let bug = mk_sort_spark("sp-1", 2, "bug", "open");
+        let feature = mk_sort_spark("sp-2", 1, "feature", "open");
+        let task = mk_sort_spark("sp-3", 2, "task", "open");
+        assert!(f.matches_spark(&bug));
+        assert!(f.matches_spark(&feature));
+        assert!(!f.matches_spark(&task));
+    }
+
+    #[test]
+    fn filter_toggle_type_deselects_on_second_call() {
+        let mut f = SparksFilter::default();
+        f.toggle_type("bug".into());
+        assert!(!f.is_empty());
+        f.toggle_type("bug".into());
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn filter_by_priority_narrows_to_selected() {
+        let mut f = SparksFilter::default();
+        f.toggle_priority(0);
+        f.toggle_priority(1);
+        let p0 = mk_sort_spark("sp-1", 0, "task", "open");
+        let p1 = mk_sort_spark("sp-2", 1, "task", "open");
+        let p2 = mk_sort_spark("sp-3", 2, "task", "open");
+        assert!(f.matches_spark(&p0));
+        assert!(f.matches_spark(&p1));
+        assert!(!f.matches_spark(&p2));
+    }
+
+    #[test]
+    fn filter_by_assignee() {
+        let mut f = SparksFilter::default();
+        f.set_assignee(Some("alice".into()));
+        let mut s1 = mk_sort_spark("sp-1", 2, "task", "open");
+        s1.assignee = Some("alice".into());
+        let s2 = mk_sort_spark("sp-2", 2, "task", "open");
+        assert!(f.matches_spark(&s1));
+        assert!(!f.matches_spark(&s2));
+    }
+
+    #[test]
+    fn filter_assignee_clear_resets() {
+        let mut f = SparksFilter::default();
+        f.set_assignee(Some("alice".into()));
+        assert!(!f.is_empty());
+        f.set_assignee(None);
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn filter_combined_type_and_priority() {
+        let mut f = SparksFilter::default();
+        f.toggle_type("bug".into());
+        f.toggle_priority(0);
+        // bug P0 → pass
+        assert!(f.matches_spark(&mk_sort_spark("a", 0, "bug", "open")));
+        // bug P2 → fail (priority doesn't match)
+        assert!(!f.matches_spark(&mk_sort_spark("b", 2, "bug", "open")));
+        // task P0 → fail (type doesn't match)
+        assert!(!f.matches_spark(&mk_sort_spark("c", 0, "task", "open")));
+    }
+
+    #[test]
+    fn collect_assignees_deduplicates() {
+        let mut s1 = mk_sort_spark("sp-1", 2, "task", "open");
+        s1.assignee = Some("alice".into());
+        let mut s2 = mk_sort_spark("sp-2", 2, "task", "open");
+        s2.assignee = Some("bob".into());
+        let agents = vec!["alice".to_string(), "charlie".to_string()];
+        let result = collect_assignees(&[s1, s2], &agents);
+        assert_eq!(result, vec!["alice", "bob", "charlie"]);
+    }
+
+    #[test]
+    fn collect_assignees_skips_empty_strings() {
+        let s1 = mk_sort_spark("sp-1", 2, "task", "open");
+        let agents = vec!["".to_string(), "bob".to_string()];
+        let result = collect_assignees(&[s1], &agents);
+        assert_eq!(result, vec!["bob"]);
+    }
+
     #[test]
     fn status_symbol_distinguishes_states() {
         assert_ne!(status_symbol("open"), status_symbol("in_progress"));
         assert_ne!(status_symbol("blocked"), status_symbol("deferred"));
         assert_ne!(status_symbol("closed"), status_symbol("open"));
+    }
+
+    // ── SparksFilter tests ───────────────────────────────
+
+    #[test]
+    fn filter_default_shows_all_except_closed() {
+        let f = SparksFilter::default();
+        assert!(f.matches("open"));
+        assert!(f.matches("in_progress"));
+        assert!(f.matches("blocked"));
+        assert!(f.matches("deferred"));
+        assert!(f.matches("completed"));
+        assert!(!f.matches("closed"));
+    }
+
+    #[test]
+    fn filter_toggle_adds_and_removes_status() {
+        let mut f = SparksFilter::default();
+        assert!(f.toggle_status("blocked"));
+        assert!(f.status.contains("blocked"));
+        assert!(!f.toggle_status("blocked"));
+        assert!(!f.status.contains("blocked"));
+    }
+
+    #[test]
+    fn filter_with_selected_status_only_shows_selected() {
+        let mut f = SparksFilter::default();
+        f.toggle_status("in_progress");
+        assert!(f.matches("in_progress"));
+        assert!(!f.matches("open"));
+        assert!(!f.matches("blocked"));
+        assert!(!f.matches("deferred"));
+        assert!(!f.matches("closed"));
+    }
+
+    #[test]
+    fn filter_show_closed_includes_closed_sparks() {
+        let mut f = SparksFilter::default();
+        assert!(!f.matches("closed"));
+        f.show_closed = true;
+        assert!(f.matches("closed"));
+    }
+
+    #[test]
+    fn filter_empty_status_set_is_show_all() {
+        let f = SparksFilter::default();
+        assert!(f.status.is_empty());
+        assert!(f.matches("open"));
+        assert!(f.matches("in_progress"));
+        assert!(f.matches("blocked"));
+        assert!(f.matches("deferred"));
+    }
+
+    #[test]
+    fn filter_multiple_statuses_selected() {
+        let mut f = SparksFilter::default();
+        f.toggle_status("open");
+        f.toggle_status("blocked");
+        assert!(f.matches("open"));
+        assert!(f.matches("blocked"));
+        assert!(!f.matches("in_progress"));
+        assert!(!f.matches("deferred"));
+    }
+
+    #[test]
+    fn filter_closed_obeys_own_toggle_even_when_status_selected() {
+        let mut f = SparksFilter::default();
+        f.toggle_status("in_progress");
+        assert!(!f.matches("closed"));
+        f.show_closed = true;
+        assert!(f.matches("closed"));
+    }
+
+    #[test]
+    fn filter_pill_state_mirrors_sparks_filter() {
+        // Invariant: pill state is a direct mirror of SparksFilter.
+        let mut f = SparksFilter::default();
+        f.toggle_status("blocked");
+        assert!(f.status.contains("blocked"));
+        assert_eq!(f.status.len(), 1);
+        f.toggle_status("blocked");
+        assert!(f.status.is_empty());
+    }
+
+    #[test]
+    fn filter_statuses_cover_expected_values() {
+        let keys: Vec<&str> = FILTER_STATUSES.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec!["open", "in_progress", "blocked", "deferred", "completed"]
+        );
+    }
+
+    #[test]
+    fn status_color_returns_distinct_colors_for_key_statuses() {
+        let pal = crate::style::Palette::dark();
+        assert_ne!(
+            crate::style::status_color("open", &pal),
+            crate::style::status_color("in_progress", &pal)
+        );
+        assert_ne!(
+            crate::style::status_color("blocked", &pal),
+            crate::style::status_color("deferred", &pal)
+        );
+        assert_ne!(
+            crate::style::status_color("in_progress", &pal),
+            crate::style::status_color("blocked", &pal)
+        );
+    }
+
+    fn mk_agent_session(id: &str, name: &str) -> AgentSession {
+        AgentSession {
+            id: id.to_string(),
+            name: name.to_string(),
+            agent: crate::coding_agents::CodingAgent {
+                display_name: name.to_string(),
+                command: String::new(),
+                args: vec![],
+                resume: crate::coding_agents::ResumeStrategy::None,
+                compatibility: Default::default(),
+            },
+            tab_id: None,
+            active: true,
+            stale: false,
+            resume_id: None,
+            started_at: String::new(),
+            log_path: None,
+            last_output_at: None,
+            parent_session_id: None,
+            session_label: None,
+            tmux_session_live: false,
+        }
+    }
+
+    #[test]
+    fn resolve_agent_session_matches_by_name() {
+        let sessions = vec![mk_agent_session("s1", "Claude Code")];
+        assert!(resolve_agent_session("Claude Code", &sessions).is_some());
+        assert!(resolve_agent_session("unknown", &sessions).is_none());
+    }
+
+    #[test]
+    fn resolve_agent_session_matches_by_id() {
+        let sessions = vec![mk_agent_session("s1", "Claude Code")];
+        assert!(resolve_agent_session("s1", &sessions).is_some());
+    }
+
+    #[test]
+    fn resolve_agent_session_returns_none_for_empty() {
+        let sessions: Vec<AgentSession> = vec![];
+        assert!(resolve_agent_session("anything", &sessions).is_none());
     }
 }

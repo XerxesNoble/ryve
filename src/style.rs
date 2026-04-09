@@ -80,6 +80,12 @@ pub struct Palette {
     pub tab_active: Color,
     /// Modal overlay backdrop.
     pub overlay: Color,
+    /// Atlas tab background (inactive) — tinted to distinguish from normal tabs.
+    pub atlas_tab_bg: Color,
+    /// Atlas tab background (active).
+    pub atlas_tab_active: Color,
+    /// Atlas tab border when active.
+    pub atlas_border_active: Color,
 }
 
 impl Palette {
@@ -187,6 +193,26 @@ impl Palette {
                 b: 0.0,
                 a: 0.5,
             },
+            // Atlas tabs use a warm amber/gold tint to stand out from the
+            // cool-neutral palette of regular tabs.
+            atlas_tab_bg: Color {
+                r: 0.918,
+                g: 0.702,
+                b: 0.220,
+                a: 0.10,
+            },
+            atlas_tab_active: Color {
+                r: 0.918,
+                g: 0.702,
+                b: 0.220,
+                a: 0.22,
+            },
+            atlas_border_active: Color {
+                r: 0.918,
+                g: 0.702,
+                b: 0.220,
+                a: 0.40,
+            },
         }
     }
 
@@ -289,6 +315,24 @@ impl Palette {
                 b: 0.0,
                 a: 0.35,
             },
+            atlas_tab_bg: Color {
+                r: 0.780,
+                g: 0.580,
+                b: 0.100,
+                a: 0.10,
+            },
+            atlas_tab_active: Color {
+                r: 0.780,
+                g: 0.580,
+                b: 0.100,
+                a: 0.18,
+            },
+            atlas_border_active: Color {
+                r: 0.780,
+                g: 0.580,
+                b: 0.100,
+                a: 0.35,
+            },
         }
     }
 }
@@ -377,6 +421,31 @@ pub fn tab_pill(pal: &Palette, active: bool) -> container::Style {
     } else {
         container::Style {
             background: Some(Background::Color(pal.tab_bg)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// Atlas director tab pill — warm amber tint to distinguish from normal tabs.
+pub fn atlas_tab_pill(pal: &Palette, active: bool) -> container::Style {
+    if active {
+        container::Style {
+            background: Some(Background::Color(pal.atlas_tab_active)),
+            border: Border {
+                color: pal.atlas_border_active,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        }
+    } else {
+        container::Style {
+            background: Some(Background::Color(pal.atlas_tab_bg)),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 1.0,
@@ -564,6 +633,28 @@ pub fn danger_surface(pal: &Palette) -> container::Style {
     }
 }
 
+// ── Status Colors ───────────────────────────────────
+
+/// Single source of truth for mapping a spark status string to a display color.
+///
+/// Covers: open, in_progress, blocked, deferred, completed, closed.
+/// Unknown statuses fall back to `text_secondary`.
+pub fn status_color(status: &str, pal: &Palette) -> Color {
+    match status {
+        "open" => pal.text_secondary,
+        "in_progress" => pal.accent,
+        "blocked" => pal.danger,
+        "deferred" => pal.text_tertiary,
+        "completed" => pal.success,
+        // Closed is terminal-neutral: a muted variant of success.
+        "closed" => Color {
+            a: 0.55,
+            ..pal.success
+        },
+        _ => pal.text_secondary,
+    }
+}
+
 // ── Layout Constants ─────────────────────────────────
 
 // ── Font Size Scale ──────────────────────────────────
@@ -607,6 +698,67 @@ mod tests {
     /// `row_button` must be transparent when idle and show the `hovered_item`
     /// background when hovered — this is the wiring that gives file explorer
     /// rows their hover feedback (sp-ux0024).
+    /// Every known status maps to a non-default color, and no two distinct
+    /// statuses share the same color.
+    #[test]
+    fn status_color_coverage_and_uniqueness() {
+        let statuses = [
+            "open",
+            "in_progress",
+            "blocked",
+            "deferred",
+            "completed",
+            "closed",
+        ];
+        let fallback_color = Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+
+        for palette_fn in [Palette::dark, Palette::light] {
+            let pal = palette_fn();
+            let fallback = status_color("__nonexistent__", &pal);
+
+            let mut seen: Vec<(&str, Color)> = Vec::new();
+            for &s in &statuses {
+                let c = status_color(s, &pal);
+
+                // Must differ from the fallback sentinel when status is known.
+                // (Fallback reuses text_secondary; "open" intentionally maps there
+                // too, so we skip that particular check for "open".)
+                if s != "open" {
+                    assert_ne!(
+                        (c.r, c.g, c.b, c.a),
+                        (fallback.r, fallback.g, fallback.b, fallback.a),
+                        "status {s:?} returned fallback color"
+                    );
+                }
+                assert_ne!(
+                    (c.r, c.g, c.b, c.a),
+                    (
+                        fallback_color.r,
+                        fallback_color.g,
+                        fallback_color.b,
+                        fallback_color.a
+                    ),
+                    "status {s:?} mapped to zero color"
+                );
+
+                // No two distinct statuses may share a color.
+                for &(prev_s, prev_c) in &seen {
+                    assert_ne!(
+                        (c.r, c.g, c.b, c.a),
+                        (prev_c.r, prev_c.g, prev_c.b, prev_c.a),
+                        "statuses {s:?} and {prev_s:?} have the same color"
+                    );
+                }
+                seen.push((s, c));
+            }
+        }
+    }
+
     #[test]
     fn row_button_highlights_on_hover() {
         let pal = Palette::dark();
@@ -625,5 +777,30 @@ mod tests {
             hovered.background, expected,
             "hovered row must reuse hovered_item's background"
         );
+    }
+
+    /// `status_color` must map each known spark status to the correct palette
+    /// color in both dark and light modes, ensuring scanability [sp-ryve-a54c61dc].
+    #[test]
+    fn status_color_maps_all_states() {
+        for pal in [Palette::dark(), Palette::light()] {
+            assert_eq!(status_color("open", &pal), pal.text_secondary);
+            assert_eq!(status_color("in_progress", &pal), pal.accent);
+            assert_eq!(status_color("blocked", &pal), pal.danger);
+            assert_eq!(status_color("deferred", &pal), pal.text_tertiary);
+            assert_eq!(status_color("completed", &pal), pal.success);
+            assert_eq!(
+                status_color("closed", &pal),
+                Color {
+                    a: 0.55,
+                    ..pal.success
+                }
+            );
+            assert_eq!(
+                status_color("unknown_status", &pal),
+                pal.text_secondary,
+                "unknown status should fall back to text_secondary"
+            );
+        }
     }
 }

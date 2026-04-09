@@ -68,7 +68,8 @@ here as a deliberate escape hatch — Atlas is the **default**, not the
 | Concern              | Where it lives                                          |
 |----------------------|---------------------------------------------------------|
 | Director system prompt | `src/agent_prompts.rs::compose_atlas_prompt`          |
-| Bench dropdown entry   | `src/screen/bench.rs` — `Message::NewAtlas` (first)   |
+| Bench dropdown entry   | `src/screen/bench.rs` — `Message::FocusAtlas` (focuses pinned tab) |
+| Auto-spawn (pinned)    | `src/main.rs::App::spawn_atlas_pinned` (on workshop open) |
 | Spawn handler          | `src/main.rs::App::spawn_atlas`                       |
 | Session label          | `agent_sessions.session_label = "atlas"`              |
 

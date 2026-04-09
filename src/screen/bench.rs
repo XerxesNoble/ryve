@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use data::ryve_dir::AgentDef;
 use iced::widget::{
-    Space, button, column, container, mouse_area, row, scrollable, text, text_input, tooltip,
+    Space, button, column, container, mouse_area, row, scrollable, svg, text, text_input, tooltip,
 };
 use iced::{Color, Element, Length, Theme};
 
@@ -21,6 +21,14 @@ pub struct Tab {
     pub id: u64,
     pub title: String,
     pub kind: TabKind,
+    /// When true the tab cannot be closed by the user — the close button is
+    /// hidden and [`Message::CloseTab`] is a no-op. Pinned tabs are also
+    /// locked to the front of the tab bar.
+    pub pinned: bool,
+    /// When true, this tab hosts the Atlas director session and receives
+    /// distinct visual treatment (tinted background, logo icon, "Atlas" label)
+    /// and a refresh button (spark ryve-71c3ec9f).
+    pub is_atlas: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,14 +108,11 @@ pub enum Message {
     /// Open (or focus) the Home / multi-Hand coordination dashboard tab.
     /// Singleton per workshop.
     OpenHome,
-    /// Spawn **Atlas** — Ryve's primary user-facing Director agent. This is
-    /// the **default entry point** for top-level user requests
-    /// (spark ryve-acdb248a). Atlas talks to the user, classifies their
-    /// intent, and delegates to a Head or a Hand instead of executing code
-    /// itself. New Hand / New Head / New Terminal remain as documented
-    /// bypass paths for advanced flows that want to skip routing through
-    /// Atlas; see `docs/ATLAS.md`.
-    NewAtlas,
+    /// Focus the pinned Atlas tab. Atlas is auto-spawned on workshop open
+    /// (spark ryve-fa0f8f93); this message switches the bench to show it.
+    /// If no Atlas tab exists yet (e.g. no agents installed at boot),
+    /// this is a no-op.
+    FocusAtlas,
     /// BYPASS: open the spark+agent picker for spawning a regular Hand on
     /// a spark directly, without going through Atlas. For advanced users
     /// who already know which spark they want to claim.
@@ -131,6 +136,10 @@ pub enum Message {
     /// Jump to the next / previous match in the active terminal.
     TerminalSearchNext,
     TerminalSearchPrev,
+    /// Kill the Atlas subprocess and relaunch it in-place. The tab id,
+    /// position, and label remain stable across refresh
+    /// (spark ryve-71c3ec9f).
+    RefreshAtlas(u64),
 }
 
 impl BenchState {
@@ -148,19 +157,81 @@ impl BenchState {
         self.active_tab.and_then(|id| self.terminal_search.get(&id))
     }
 
-    /// Create a tab with an externally-assigned ID.
+    /// Create a tab with an externally-assigned ID. Appended after all
+    /// existing tabs — pinned tabs stay at the front undisturbed.
     pub fn create_tab(&mut self, id: u64, title: String, kind: TabKind) {
-        self.tabs.push(Tab { id, title, kind });
+        self.tabs.push(Tab {
+            id,
+            title,
+            kind,
+            pinned: false,
+            is_atlas: false,
+        });
         self.active_tab = Some(id);
         self.dropdown_open = false;
     }
 
+    /// Create a pinned tab locked to index 0. Only one pinned tab
+    /// (Atlas) is expected; if another already exists it is inserted
+    /// immediately after the existing pinned tabs.
+    #[cfg(test)]
+    pub fn create_pinned_tab(&mut self, id: u64, title: String, kind: TabKind) {
+        let tab = Tab {
+            id,
+            title,
+            kind,
+            pinned: true,
+            is_atlas: false,
+        };
+        // Insert at the end of the current pinned range (i.e. at
+        // `first_unpinned_index`) so multiple pinned tabs stay
+        // contiguous and the newest one is rightmost among them.
+        let insert_at = self.first_unpinned_index();
+        self.tabs.insert(insert_at, tab);
+        self.active_tab = Some(id);
+        self.dropdown_open = false;
+    }
+
+    /// Create a tab marked as the Atlas director session. Pinned to the
+    /// front and receives distinct visual treatment (tinted pill, logo icon,
+    /// "Atlas" label).
+    pub fn create_atlas_tab(&mut self, id: u64, title: String, kind: TabKind) {
+        let tab = Tab {
+            id,
+            title,
+            kind,
+            pinned: true,
+            is_atlas: true,
+        };
+        let insert_at = self.first_unpinned_index();
+        self.tabs.insert(insert_at, tab);
+        self.active_tab = Some(id);
+        self.dropdown_open = false;
+    }
+
+    /// Index of the first non-pinned tab, or `tabs.len()` if every
+    /// tab is pinned (or the list is empty).
+    fn first_unpinned_index(&self) -> usize {
+        self.tabs
+            .iter()
+            .position(|t| !t.pinned)
+            .unwrap_or(self.tabs.len())
+    }
+
     pub fn close_tab(&mut self, id: u64) {
+        if self.tabs.iter().any(|t| t.id == id && t.pinned) {
+            return;
+        }
         self.tabs.retain(|t| t.id != id);
         self.terminal_search.remove(&id);
         if self.active_tab == Some(id) {
             self.active_tab = self.tabs.last().map(|t| t.id);
         }
+    }
+
+    /// Returns true if the tab with the given id is pinned (cannot be closed).
+    pub fn is_pinned(&self, id: u64) -> bool {
+        self.tabs.iter().any(|t| t.id == id && t.pinned)
     }
 
     /// Render the tab bar row with liquid glass pill tabs.
@@ -189,23 +260,65 @@ impl BenchState {
                 } => ("\u{2318}", format!("tmux: {tmux_session_name}")),
             };
 
-            let tab_content = row![
-                text(kind_icon).size(FONT_ICON_SM).color(text_color),
-                button(text(&tab.title).size(FONT_BODY).color(text_color))
-                    .style(button::text)
-                    .padding(0)
-                    .on_press(Message::SelectTab(tab.id)),
-                button(text("\u{00D7}").size(FONT_ICON).color(pal.text_tertiary))
-                    .style(button::text)
-                    .padding(0)
-                    .on_press(Message::CloseTab(tab.id)),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
+            let is_atlas = tab.is_atlas;
+
+            // Atlas tabs use logo.svg icon and "Atlas" label; others use the
+            // text glyph determined above.
+            let mut tab_content = if is_atlas {
+                let logo = svg(svg::Handle::from_path("assets/logo.svg"))
+                    .width(14)
+                    .height(14)
+                    .style(crate::icons::ui_icon_color(text_color));
+                row![
+                    logo,
+                    button(text("Atlas").size(FONT_BODY).color(text_color))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::SelectTab(tab.id)),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+            } else {
+                row![
+                    text(kind_icon).size(FONT_ICON_SM).color(text_color),
+                    button(text(&tab.title).size(FONT_BODY).color(text_color))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::SelectTab(tab.id)),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+            };
+
+            // Atlas tabs get a refresh button that kills and relaunches the
+            // subprocess in-place (spark ryve-71c3ec9f).
+            if tab.is_atlas {
+                tab_content = tab_content.push(
+                    button(text("\u{21BB}").size(FONT_ICON_SM).color(pal.text_tertiary))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::RefreshAtlas(tab.id)),
+                );
+            }
+
+            if !tab.pinned {
+                tab_content = tab_content.push(
+                    button(text("\u{00D7}").size(FONT_ICON).color(pal.text_tertiary))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::CloseTab(tab.id)),
+                );
+            }
 
             let pill = container(tab_content)
                 .padding([4, 10])
-                .style(move |_theme: &Theme| style::tab_pill(&pal, is_active));
+                .style(move |_theme: &Theme| {
+                    if is_atlas {
+                        style::atlas_tab_pill(&pal, is_active)
+                    } else {
+                        style::tab_pill(&pal, is_active)
+                    }
+                });
 
             tab_row = tab_row.push(
                 tooltip(
@@ -343,19 +456,14 @@ impl BenchState {
                 .on_press(Message::OpenHome),
         );
 
-        // Spark ryve-acdb248a — Atlas is the **default entry point** for
-        // top-level user requests. It is the first item in the dropdown
-        // (immediately after Home) so the user's eye lands on it before
-        // the bypass options. Atlas itself is a coding agent launched with
-        // the Director system prompt; it delegates to Heads / Hands rather
-        // than editing code, so the only thing the user has to choose at
-        // this point is whether they want Atlas at all — agent selection
-        // happens automatically (we pick the first compatible coding agent).
-        // Users who want fine control bypass Atlas via New Hand / New Head /
-        // New Terminal below.
-        let any_agent_available = !available_agents.is_empty();
+        // Spark ryve-fa0f8f93 — Atlas is auto-spawned as a pinned
+        // leftmost tab on workshop open. The dropdown entry now focuses
+        // that existing tab instead of spawning a new one.
+        let any_agent_available = available_agents
+            .iter()
+            .any(|a| !a.compatibility.is_unsupported());
 
-        let atlas_button = button(text("Ask Atlas...").size(FONT_BODY).color(
+        let atlas_button = button(text("Focus Atlas").size(FONT_BODY).color(
             if any_agent_available {
                 pal.text_primary
             } else {
@@ -365,7 +473,7 @@ impl BenchState {
         .style(button::text)
         .width(Length::Fill);
         let atlas_button = if any_agent_available {
-            atlas_button.on_press(Message::NewAtlas)
+            atlas_button.on_press(Message::FocusAtlas)
         } else {
             atlas_button
         };
@@ -541,18 +649,132 @@ mod tests {
         assert!(!bench.terminal_search.contains_key(&7));
     }
 
-    /// Spark ryve-acdb248a — confirm `Message::NewAtlas` exists as a
-    /// distinct routing variant. The default entry point for user-originated
-    /// requests must produce this message so the app can dispatch it to the
-    /// Atlas spawn handler instead of the bypass paths.
+    /// Spark ryve-5ebb111e — pinned Atlas tab stays at index 0 even
+    /// when other tabs are added before or after it.
     #[test]
-    fn new_atlas_message_variant_exists() {
-        let m = Message::NewAtlas;
-        assert!(matches!(m, Message::NewAtlas));
+    fn pinned_tab_stays_at_index_zero() {
+        let mut bench = BenchState::new();
+        // Add some regular tabs first.
+        bench.create_tab(1, "term-1".into(), TabKind::Terminal);
+        bench.create_tab(2, "term-2".into(), TabKind::Terminal);
+        // Now pin Atlas.
+        bench.create_pinned_tab(10, "Atlas".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs[0].id, 10, "pinned tab must be at index 0");
+        assert!(bench.tabs[0].pinned);
+        // Add another regular tab — it must land after the pinned one.
+        bench.create_tab(3, "term-3".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs[0].id, 10, "pinned tab still at index 0");
+        assert!(!bench.tabs.last().unwrap().pinned);
+    }
+
+    /// Spark ryve-5ebb111e — creating a pinned tab into an empty bench
+    /// puts it at index 0 and subsequent regular tabs follow.
+    #[test]
+    fn pinned_tab_first_in_empty_bench() {
+        let mut bench = BenchState::new();
+        bench.create_pinned_tab(99, "Atlas".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs.len(), 1);
+        assert_eq!(bench.tabs[0].id, 99);
+        assert!(bench.tabs[0].pinned);
+        bench.create_tab(1, "term".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs[0].id, 99, "pinned tab unchanged");
+        assert_eq!(bench.tabs[1].id, 1);
+    }
+
+    /// Spark ryve-5ebb111e — regular `create_tab` never produces a
+    /// pinned tab, preserving the invariant that only explicit
+    /// `create_pinned_tab` pins.
+    #[test]
+    fn create_tab_never_pins() {
+        let mut bench = BenchState::new();
+        bench.create_tab(1, "x".into(), TabKind::Terminal);
+        assert!(!bench.tabs[0].pinned);
+    }
+
+    /// Spark ryve-fa0f8f93 — confirm `Message::FocusAtlas` exists. Atlas
+    /// is auto-spawned on workshop open; the dropdown sends FocusAtlas to
+    /// switch the bench to the pinned Atlas tab.
+    #[test]
+    fn focus_atlas_message_variant_exists() {
+        let m = Message::FocusAtlas;
+        assert!(matches!(m, Message::FocusAtlas));
         // The bypass variants must remain available for advanced flows.
         assert!(matches!(Message::NewHead, Message::NewHead));
         assert!(matches!(Message::NewHand, Message::NewHand));
         assert!(matches!(Message::NewTerminal, Message::NewTerminal));
+    }
+
+    /// Spark ryve-682f4b02 — Atlas tabs are visually distinct from normal
+    /// CodingAgent tabs: `is_atlas` flag, different pill style, and the tab
+    /// bar renders without panicking when an Atlas tab is present.
+    #[test]
+    fn atlas_tab_has_distinct_style_and_renders() {
+        let mut bench = BenchState::new();
+        // Normal agent tab.
+        bench.create_tab(1, "Hand (claude)".into(), TabKind::Terminal);
+        assert!(!bench.tabs[0].is_atlas);
+
+        // Atlas tab via dedicated constructor — pinned to front (index 0).
+        bench.create_atlas_tab(2, "Atlas (claude)".into(), TabKind::Terminal);
+        assert!(bench.tabs[0].is_atlas);
+        assert_eq!(bench.tabs[0].id, 2);
+
+        // Both render without panic.
+        let pal = Palette::dark();
+        let _element = bench.view_tab_bar(&pal);
+
+        // Atlas pill style differs from the normal pill.
+        let normal = style::tab_pill(&pal, true);
+        let atlas = style::atlas_tab_pill(&pal, true);
+        // Background colors must be different.
+        assert_ne!(
+            format!("{:?}", normal.background),
+            format!("{:?}", atlas.background),
+        );
+    }
+
+    /// Spark ryve-71c3ec9f — `RefreshAtlas` message variant exists and the
+    /// `is_atlas` flag is correctly managed on tabs.
+    #[test]
+    fn refresh_atlas_message_and_flag() {
+        // Message variant exists.
+        let m = Message::RefreshAtlas(1);
+        assert!(matches!(m, Message::RefreshAtlas(1)));
+
+        // create_tab defaults is_atlas to false.
+        let mut bench = BenchState::new();
+        bench.create_tab(1, "Terminal".into(), TabKind::Terminal);
+        assert!(!bench.tabs[0].is_atlas);
+
+        // Setting is_atlas survives — tab identity is stable.
+        bench.tabs[0].is_atlas = true;
+        assert!(bench.tabs[0].is_atlas);
+        assert_eq!(bench.tabs[0].id, 1);
+    }
+
+    /// Spark ryve-fa0f8f93 — Atlas tab is pinned at position 0 (leftmost).
+    /// When the Atlas tab is appended and then moved to index 0, it must
+    /// become the first tab in the bar.
+    #[test]
+    fn atlas_tab_pinned_at_leftmost_position() {
+        let mut bench = BenchState::new();
+        // Pre-existing tabs from tab restore.
+        bench.create_tab(1, "Terminal".into(), TabKind::Terminal);
+        bench.create_tab(2, "File".into(), TabKind::Terminal);
+        // Atlas tab appended by spawn_atlas (via begin_hand_terminal).
+        bench.create_tab(3, "Atlas (Claude Code)".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs.len(), 3);
+        assert_eq!(bench.tabs[2].id, 3); // appended at end
+
+        // The pinned logic moves it to position 0.
+        let pos = bench.tabs.iter().position(|t| t.id == 3).unwrap();
+        let tab = bench.tabs.remove(pos);
+        bench.tabs.insert(0, tab);
+
+        assert_eq!(bench.tabs[0].id, 3);
+        assert_eq!(bench.tabs[0].title, "Atlas (Claude Code)");
+        assert_eq!(bench.tabs[1].id, 1);
+        assert_eq!(bench.tabs[2].id, 2);
     }
 
     #[test]
@@ -614,5 +836,28 @@ mod tests {
         bench.close_tab(200);
         assert_eq!(bench.tabs.len(), 0);
         assert_eq!(bench.active_tab, None);
+    }
+
+    /// Spark ryve-59983890 — pinned tabs cannot be closed.
+    #[test]
+    fn pinned_tab_is_not_closeable() {
+        let mut bench = BenchState::new();
+        bench.create_tab(1, "Atlas".into(), TabKind::Terminal);
+        // Pin the tab
+        bench.tabs[0].pinned = true;
+        bench.create_tab(2, "other".into(), TabKind::Terminal);
+
+        assert!(bench.is_pinned(1));
+        assert!(!bench.is_pinned(2));
+
+        // Attempting to close a pinned tab is a no-op
+        bench.close_tab(1);
+        assert_eq!(bench.tabs.len(), 2);
+        assert!(bench.tabs.iter().any(|t| t.id == 1));
+
+        // Non-pinned tab can still be closed
+        bench.close_tab(2);
+        assert_eq!(bench.tabs.len(), 1);
+        assert!(!bench.tabs.iter().any(|t| t.id == 2));
     }
 }

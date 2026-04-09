@@ -15,6 +15,8 @@ mod icons;
 mod process_snapshot;
 mod release_artifact;
 mod screen;
+#[allow(dead_code)]
+mod sparks_filter;
 mod style;
 mod tmux;
 mod widget;
@@ -692,6 +694,23 @@ impl App {
             tasks.push(app.push_toast(format!("Upgrade {name} CLI"), reason, ToastKind::Warning));
         }
 
+        // Spark ryve-f65077f4: if no compatible coding agent is available,
+        // notify the user that Atlas cannot start. The app remains fully
+        // functional for all other features — only the Atlas entry point is
+        // disabled.
+        let has_compatible_agent = app
+            .available_agents
+            .iter()
+            .any(|a| !a.compatibility.is_unsupported());
+        if !has_compatible_agent {
+            tasks.push(app.push_toast(
+                "Atlas unavailable",
+                "No compatible coding agent found. Install Claude Code, \
+                 Codex, or OpenCode to enable Atlas.",
+                ToastKind::Info,
+            ));
+        }
+
         (app, Task::batch(tasks))
     }
 
@@ -1043,6 +1062,14 @@ impl App {
                     // choices. Stale IDs are pruned once sparks finish
                     // loading (see SparksLoaded below). Spark ryve-926870a9.
                     ws.collapsed_epics = ui_state.collapsed_epics.clone();
+                    // Rehydrate the persisted sparks-panel filter so the
+                    // user returns to the same view. Spark ryve-27e33825.
+                    ws.sparks_filter = crate::screen::sparks::SparksFilter::from_persisted(
+                        &ui_state.sparks_filter,
+                    );
+                    ws.sort_mode = crate::screen::sparks::SortMode::from_persist_key(
+                        &ui_state.sparks_filter.sort_mode,
+                    );
                     // Hand off the warm hash cache from init_workshop so the
                     // first SparksLoaded sync tick is a no-op on disk.
                     // Spark ryve-86b0b326.
@@ -1145,6 +1172,10 @@ impl App {
                     // Replace (not append) so Refresh never duplicates
                     // entries. Invariant from spark ryve-7805b38b.
                     ws.sparks = sparks;
+                    // Re-sort according to the active sort mode.
+                    // Spark ryve-6f24ef2a.
+                    ws.sort_sparks();
+                    ws.recompute_filtered_sparks();
                     // Clear the Refresh-button indicator now that the
                     // refetch has landed. Both the explicit Refresh and
                     // the 3s poll route through this handler; clearing
@@ -1562,6 +1593,11 @@ impl App {
                         });
                     }
 
+                    // Refresh cached agent session names for the filter bar
+                    // (spark ryve-baca34b0).
+                    ws.agent_session_names =
+                        ws.agent_sessions.iter().map(|s| s.name.clone()).collect();
+
                     // First time we see agent_sessions for this workshop:
                     // chain into load_open_tabs so the persisted snapshot
                     // can resolve `coding_agent` / `log_tail` tabs against
@@ -1711,13 +1747,24 @@ impl App {
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
                             let next_id = &mut self.next_terminal_id;
-                            let tab_id = ws.begin_hand_terminal(
-                                session.name.clone(),
-                                workshop::PendingTerminalKind::Agent(resume_agent.clone()),
-                                next_id,
-                                session_id.clone(),
-                                full_auto,
-                            );
+                            let is_atlas = session.session_label.as_deref() == Some("atlas");
+                            let tab_id = if is_atlas {
+                                ws.begin_atlas_terminal(
+                                    session.name.clone(),
+                                    workshop::PendingTerminalKind::Agent(resume_agent.clone()),
+                                    next_id,
+                                    session_id.clone(),
+                                    full_auto,
+                                )
+                            } else {
+                                ws.begin_hand_terminal(
+                                    session.name.clone(),
+                                    workshop::PendingTerminalKind::Agent(resume_agent.clone()),
+                                    next_id,
+                                    session_id.clone(),
+                                    full_auto,
+                                )
+                            };
                             follow_up.push(Self::dispatch_worktree_task(
                                 ws,
                                 tab_id,
@@ -1769,6 +1816,24 @@ impl App {
                 // SparksPoll tick).
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     ws.tabs_restored = true;
+                }
+
+                // Spark ryve-fa0f8f93 — Auto-spawn a pinned Atlas tab as
+                // the leftmost tab if no active Atlas session already
+                // exists and at least one coding agent is available.
+                let has_atlas = self.workshops[idx]
+                    .agent_sessions
+                    .iter()
+                    .any(|s| s.session_label.as_deref() == Some("atlas") && s.active);
+                let atlas_agent = if !has_atlas {
+                    let config_pref = self.workshops[idx].config.atlas_agent.as_deref();
+                    coding_agents::resolve_atlas_agent(config_pref, &self.available_agents)
+                } else {
+                    None
+                };
+                if let Some(agent) = atlas_agent {
+                    let atlas_task = self.spawn_atlas_pinned(idx, agent);
+                    follow_up.push(atlas_task);
                 }
 
                 if follow_up.is_empty() {
@@ -2259,13 +2324,24 @@ impl App {
                                 .agent_settings
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
-                            let tab_id = ws.begin_hand_terminal(
-                                session.name.clone(),
-                                workshop::PendingTerminalKind::Agent(resume_agent.clone()),
-                                next_id,
-                                session_id.clone(),
-                                full_auto,
-                            );
+                            let is_atlas = session.session_label.as_deref() == Some("atlas");
+                            let tab_id = if is_atlas {
+                                ws.begin_atlas_terminal(
+                                    session.name.clone(),
+                                    workshop::PendingTerminalKind::Agent(resume_agent.clone()),
+                                    next_id,
+                                    session_id.clone(),
+                                    full_auto,
+                                )
+                            } else {
+                                ws.begin_hand_terminal(
+                                    session.name.clone(),
+                                    workshop::PendingTerminalKind::Agent(resume_agent.clone()),
+                                    next_id,
+                                    session_id.clone(),
+                                    full_auto,
+                                )
+                            };
                             let worktree_task =
                                 Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
@@ -3280,6 +3356,12 @@ impl App {
                             edit.update_draft(screen::spark_detail::Field::Title, val);
                         }
                     }
+                    // Spark ryve-dba4b8c4: navigate to the agent session.
+                    screen::spark_detail::Message::FocusAgentSession(session_id) => {
+                        return self.update(Message::Agents(screen::agents::Message::SelectAgent(
+                            session_id,
+                        )));
+                    }
                     screen::spark_detail::Message::TitleSubmit
                     | screen::spark_detail::Message::TitleBlur => {
                         let Some(ws) = self.workshops.get_mut(idx) else {
@@ -3745,6 +3827,36 @@ impl App {
                             }
                         }
                     }
+                    screen::sparks::Message::ToggleStatusFilter(status) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.toggle_status(&status);
+                            ws.recompute_filtered_sparks();
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
+                    screen::sparks::Message::ToggleShowClosed => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.show_closed = !ws.sparks_filter.show_closed;
+                            ws.recompute_filtered_sparks();
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
                     screen::sparks::Message::ToggleEpicCollapse(epic_id) => {
                         // Flip the collapse flag in memory and persist the
                         // new snapshot to `.ryve/ui_state.json` so the
@@ -3753,6 +3865,121 @@ impl App {
                         // Spark ryve-926870a9.
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.toggle_epic_collapse(&epic_id);
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
+                    // ── Filter bar (spark ryve-baca34b0) ───────
+                    screen::sparks::Message::FilterToggleType(ty) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.toggle_type(ty);
+                            ws.recompute_filtered_sparks();
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
+                    screen::sparks::Message::FilterTogglePriority(p) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.toggle_priority(p);
+                            ws.recompute_filtered_sparks();
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
+                    screen::sparks::Message::FilterSetAssignee(a) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.set_assignee(a);
+                            ws.recompute_filtered_sparks();
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
+                    screen::sparks::Message::SetSortMode(mode) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sort_mode = mode;
+                            ws.sort_dropdown_open = false;
+                            ws.sort_sparks();
+                            ws.recompute_filtered_sparks();
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
+                    screen::sparks::Message::ToggleSortDropdown => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sort_dropdown_open = !ws.sort_dropdown_open;
+                        }
+                    }
+                    screen::sparks::Message::SearchChanged(query) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.search = query;
+                            ws.recompute_filtered_sparks();
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
+                    screen::sparks::Message::ClearSearch => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.search.clear();
+                            ws.recompute_filtered_sparks();
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
+                        }
+                    }
+                    screen::sparks::Message::SparksFilterChanged => {
+                        // Persist the updated filter state to
+                        // `.ryve/ui_state.json`. Fire-and-forget — a
+                        // failed write is logged but never blocks the UI.
+                        // Spark ryve-27e33825.
+                        if let Some(ws) = self.workshops.get_mut(idx) {
                             let ryve_dir = ws.ryve_dir.clone();
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
@@ -3783,6 +4010,12 @@ impl App {
                                 );
                             }
                         }
+                    }
+                    // Spark ryve-dba4b8c4: navigate to the agent session.
+                    screen::sparks::Message::FocusAgentSession(session_id) => {
+                        return self.update(Message::Agents(screen::agents::Message::SelectAgent(
+                            session_id,
+                        )));
                     }
                 }
                 Task::none()
@@ -4062,7 +4295,7 @@ impl App {
                             log_path: None,
                             last_output_at: None,
                             parent_session_id: None,
-                            session_label: None,
+                            session_label: Some("auto-detected".to_string()),
                             tmux_session_live: false,
                         });
 
@@ -4737,6 +4970,9 @@ impl App {
             }
             screen::bench::Message::CloseTab(id) => {
                 let ws = &mut self.workshops[idx];
+                if ws.bench.is_pinned(id) {
+                    return Task::none();
+                }
                 ws.terminals.remove(&id);
                 ws.file_viewers.remove(&id);
 
@@ -4830,27 +5066,19 @@ impl App {
                 ws.bench.dropdown_open = false;
                 ws.pending_head_spawn = Some(screen::head_picker::PickerState::default());
             }
-            screen::bench::Message::NewAtlas => {
-                // Spark ryve-acdb248a — Atlas is the **default entry point**
-                // for top-level user requests. Atlas is conversational and
-                // delegates downward, so we don't open a picker here: the
-                // user has not yet expressed a goal. We pick the first
-                // compatible coding agent automatically and spawn it with
-                // the Atlas Director system prompt. The user types their
-                // request into the resulting bench tab and Atlas decides
-                // whether to delegate to a Head or a Hand.
+            screen::bench::Message::FocusAtlas => {
+                // Spark ryve-fa0f8f93 — Atlas is auto-spawned on workshop
+                // open. This message focuses the existing pinned Atlas tab.
                 let ws = &mut self.workshops[idx];
                 ws.bench.dropdown_open = false;
-                let agent = match self
-                    .available_agents
+                if let Some(atlas_tab_id) = ws
+                    .agent_sessions
                     .iter()
-                    .find(|a| !a.compatibility.is_unsupported())
-                    .cloned()
+                    .find(|s| s.session_label.as_deref() == Some("atlas") && s.active)
+                    .and_then(|s| s.tab_id)
                 {
-                    Some(a) => a,
-                    None => return Task::none(),
-                };
-                return self.spawn_atlas(idx, agent);
+                    ws.bench.active_tab = Some(atlas_tab_id);
+                }
             }
             screen::bench::Message::NewCustomAgent(agent_idx) => {
                 let ws = &mut self.workshops[idx];
@@ -4966,6 +5194,110 @@ impl App {
                 };
                 entry.current_match = Some(next);
                 term.focus_match(&matches[next]);
+            }
+            screen::bench::Message::RefreshAtlas(tab_id) => {
+                // Kill the current Atlas subprocess and relaunch a fresh
+                // one in-place. Tab id, position, and label stay stable.
+                // Spark ryve-71c3ec9f.
+                let ws = &mut self.workshops[idx];
+                let full_auto = ws
+                    .agent_sessions
+                    .iter()
+                    .find(|s| s.tab_id == Some(tab_id) && s.active)
+                    .and_then(|s| {
+                        self.global_config
+                            .agent_settings
+                            .get(&s.agent.command)
+                            .map(|cfg| cfg.full_auto)
+                    })
+                    .unwrap_or(false);
+
+                let new_session_id = Uuid::new_v4().to_string();
+                let Some((agent, ended_session_ids)) =
+                    ws.prepare_atlas_refresh(tab_id, new_session_id.clone(), full_auto)
+                else {
+                    return Task::none();
+                };
+
+                // Dispatch the worktree task (idempotent — reuses existing
+                // worktree directory).
+                let worktree_task =
+                    Self::dispatch_worktree_task(ws, tab_id, new_session_id.clone());
+
+                // Register the new session in memory.
+                let title = format!("Atlas ({})", agent.display_name);
+                let agent_command = agent.command.clone();
+                let agent_args = agent.args.clone();
+                ws.agent_sessions.push(AgentSession {
+                    id: new_session_id.clone(),
+                    name: title.clone(),
+                    agent,
+                    tab_id: Some(tab_id),
+                    active: true,
+                    stale: false,
+                    resume_id: None,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    log_path: None,
+                    last_output_at: None,
+                    parent_session_id: None,
+                    session_label: Some("atlas".to_string()),
+                    tmux_session_live: false,
+                });
+
+                let mut tasks: Vec<Task<Message>> = vec![worktree_task];
+
+                // Persist the new session + end the old one(s) in DB.
+                if let Some(ref pool) = self.workshops[idx].sparks_db {
+                    let pool_end = pool.clone();
+                    let pool_create = pool.clone();
+                    let ws_id = self.workshops[idx].workshop_id();
+
+                    // End old sessions for this tab in DB.
+                    for sid in ended_session_ids {
+                        let p = pool_end.clone();
+                        tasks.push(Task::perform(
+                            async move {
+                                let _ =
+                                    data::sparks::agent_session_repo::end_session(&p, &sid).await;
+                            },
+                            |_| Message::AgentSessionSaved,
+                        ));
+                    }
+
+                    let new_session = data::sparks::types::NewAgentSession {
+                        id: new_session_id.clone(),
+                        workshop_id: ws_id,
+                        agent_name: title,
+                        agent_command,
+                        agent_args,
+                        session_label: Some("atlas".to_string()),
+                        child_pid: None,
+                        resume_id: None,
+                        log_path: None,
+                        parent_session_id: None,
+                    };
+                    tasks.push(Task::perform(
+                        async move {
+                            let _ = data::sparks::agent_session_repo::create(
+                                &pool_create,
+                                &new_session,
+                            )
+                            .await;
+                        },
+                        |_| Message::AgentSessionSaved,
+                    ));
+                }
+
+                // Re-inject the Atlas Director prompt after a boot delay.
+                let prompt = agent_prompts::compose_atlas_prompt();
+                tasks.push(Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    },
+                    move |_| Message::SendSparkPrompt { tab_id, prompt },
+                ));
+
+                return Task::batch(tasks);
             }
         }
         Task::none()
@@ -5303,12 +5635,31 @@ impl App {
         Task::batch(tasks)
     }
 
+    /// Spawn Atlas as a pinned leftmost tab without stealing focus.
+    /// Used by the auto-spawn logic in `OpenTabsLoaded` (spark ryve-fa0f8f93).
+    fn spawn_atlas_pinned(&mut self, workshop_idx: usize, agent: CodingAgent) -> Task<Message> {
+        let prev_active = self.workshops[workshop_idx].bench.active_tab;
+        let task = self.spawn_atlas(workshop_idx, agent);
+        let ws = &mut self.workshops[workshop_idx];
+        // Move the newly-appended Atlas tab to position 0.
+        if let Some(pos) = ws.bench.tabs.iter().position(|t| {
+            ws.agent_sessions
+                .iter()
+                .any(|s| s.tab_id == Some(t.id) && s.session_label.as_deref() == Some("atlas"))
+        }) {
+            let tab = ws.bench.tabs.remove(pos);
+            ws.bench.tabs.insert(0, tab);
+        }
+        // Restore previous focus (or default to Atlas if nothing was active).
+        ws.bench.active_tab = prev_active.or(ws.bench.tabs.first().map(|t| t.id));
+        task
+    }
+
     /// Spawn **Atlas** — a coding agent launched with the Atlas Director
-    /// system prompt. Spark ryve-acdb248a: Atlas is the default entry point
-    /// for user-originated requests. It has no spark assignment of its own
-    /// and creates no Crew up front; its job is to talk to the user and
-    /// delegate to a Head (multi-spark goal) or a Hand (single spark) via
-    /// the `ryve` CLI.
+    /// system prompt. Atlas is the default entry point for user-originated
+    /// requests. It has no spark assignment of its own and creates no Crew
+    /// up front; its job is to talk to the user and delegate to a Head
+    /// (multi-spark goal) or a Hand (single spark) via the `ryve` CLI.
     ///
     /// Mechanically nearly identical to `spawn_head`: only the session
     /// label and the injected prompt differ.
@@ -5325,13 +5676,21 @@ impl App {
             .get(&agent.command)
             .is_some_and(|s| s.full_auto);
 
-        let tab_id = ws.begin_hand_terminal(
+        let tab_id = ws.begin_atlas_terminal(
             title.clone(),
             workshop::PendingTerminalKind::Agent(agent.clone()),
             &mut self.next_terminal_id,
             session_id.clone(),
             full_auto,
         );
+        // Atlas tabs are created via begin_atlas_terminal which sets both
+        // pinned and is_atlas. This guard is defensive — ensure both flags
+        // are set even if the create path changes (sparks ryve-59983890,
+        // ryve-71c3ec9f).
+        if let Some(tab) = ws.bench.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.pinned = true;
+            tab.is_atlas = true;
+        }
         let worktree_task = Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
         ws.agent_sessions.push(AgentSession {
@@ -6195,6 +6554,7 @@ impl App {
                     &ws.spark_edit_session,
                     ws.spark_edit.as_ref(),
                     &ws.assignee_edit,
+                    &ws.agent_sessions,
                     ws.description_editor.as_ref(),
                     description_draft,
                     ws.pending_nav_prompt.as_ref(),
@@ -6207,12 +6567,18 @@ impl App {
                 screen::sparks::view(screen::sparks::ViewCtx {
                     sparks: &ws.sparks,
                     blocked_ids: &ws.blocked_spark_ids,
+                    agent_sessions: &ws.agent_sessions,
                     pal,
                     has_bg,
                     create_form: &ws.spark_create_form,
                     status_menu: &ws.spark_status_menu,
                     collapsed: &ws.collapsed_epics,
                     refreshing: ws.sparks_refreshing,
+                    filter: &ws.sparks_filter,
+                    agent_session_names: &ws.agent_session_names,
+                    filtered_sparks: &ws.filtered_sparks,
+                    sort_mode: ws.sort_mode,
+                    sort_dropdown_open: ws.sort_dropdown_open,
                 })
                 .map(Message::Sparks)
             }
@@ -6220,12 +6586,18 @@ impl App {
             screen::sparks::view(screen::sparks::ViewCtx {
                 sparks: &ws.sparks,
                 blocked_ids: &ws.blocked_spark_ids,
+                agent_sessions: &ws.agent_sessions,
                 pal,
                 has_bg,
                 create_form: &ws.spark_create_form,
                 status_menu: &ws.spark_status_menu,
                 collapsed: &ws.collapsed_epics,
                 refreshing: ws.sparks_refreshing,
+                filter: &ws.sparks_filter,
+                agent_session_names: &ws.agent_session_names,
+                filtered_sparks: &ws.filtered_sparks,
+                sort_mode: ws.sort_mode,
+                sort_dropdown_open: ws.sort_dropdown_open,
             })
             .map(Message::Sparks)
         };
@@ -6924,6 +7296,44 @@ mod tests {
     // end to end by `perf_core/tests/sparks_poll_smoke.rs`, which drives
     // the same `perf_core::classify_key_event` classifier the live
     // subscription uses.
+
+    /// Spark ryve-f65077f4: verify the predicate that gates Atlas
+    /// availability — it should be false when the agent list is empty or
+    /// every agent is unsupported.
+    #[test]
+    fn no_compatible_agent_when_all_unsupported_or_empty() {
+        use coding_agents::{CodingAgent, CompatStatus, ResumeStrategy};
+
+        let make = |compat: CompatStatus| CodingAgent {
+            display_name: "test".into(),
+            command: "test".into(),
+            args: vec![],
+            resume: ResumeStrategy::None,
+            compatibility: compat,
+        };
+
+        // Empty list → no compatible agent.
+        let agents: Vec<CodingAgent> = vec![];
+        assert!(!agents.iter().any(|a| !a.compatibility.is_unsupported()));
+
+        // All unsupported → no compatible agent.
+        let agents = vec![make(CompatStatus::Unsupported {
+            version: "0.1".into(),
+            reason: "old".into(),
+        })];
+        assert!(!agents.iter().any(|a| !a.compatibility.is_unsupported()));
+
+        // One compatible → has compatible agent.
+        let agents = vec![make(CompatStatus::Compatible {
+            version: "1.0".into(),
+        })];
+        assert!(agents.iter().any(|a| !a.compatibility.is_unsupported()));
+
+        // Unknown counts as "not unsupported" — we give the benefit of
+        // the doubt when the version probe couldn't run.
+        let agents = vec![make(CompatStatus::Unknown)];
+        assert!(agents.iter().any(|a| !a.compatibility.is_unsupported()));
+    }
 
     #[test]
     fn attribution_label_absent_for_blank_photographer() {

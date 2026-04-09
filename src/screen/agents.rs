@@ -130,8 +130,9 @@ pub struct AgentSession {
     /// uses this to render Head → solo-Hand attribution when the child
     /// isn't a member of any of the Head's crews.
     pub parent_session_id: Option<String>,
-    /// `agent_sessions.session_label` — "hand", "head", or "merger".
-    /// Used to construct the tmux session name for attach. Spark ryve-8ba40d83.
+    /// `agent_sessions.session_label` — role label for this session
+    /// (e.g. "atlas", "head", "hand"). Used to identify pinned Atlas tabs
+    /// and to construct the tmux session name for attach. Spark ryve-8ba40d83.
     pub session_label: Option<String>,
     /// Whether this session has a live tmux session on the Ryve-private
     /// socket. Updated during the periodic 3s agent-session sync so the

@@ -282,10 +282,22 @@ pub struct Workshop {
     pub background_handle: Option<iced::widget::image::Handle>,
     /// Background picker modal state.
     pub background_picker: PickerState,
+    /// Status filter for the sparks panel. Pill state mirrors this directly.
+    pub sparks_filter: crate::screen::sparks::SparksFilter,
     /// Inline spark create form state.
     pub spark_create_form: crate::screen::sparks::CreateForm,
     /// Inline status popover state for the workgraph panel.
     pub spark_status_menu: crate::screen::sparks::StatusMenu,
+    /// Cached agent session names for the filter bar assignee dropdown.
+    /// Refreshed alongside `agent_sessions`. Spark ryve-baca34b0.
+    pub agent_session_names: Vec<String>,
+    /// Sparks after applying `sparks_filter`. Recomputed whenever
+    /// `sparks` or `sparks_filter` changes. Spark ryve-baca34b0.
+    pub filtered_sparks: Vec<Spark>,
+    /// Active sort mode for the sparks panel. Spark ryve-6f24ef2a.
+    pub sort_mode: crate::screen::sparks::SortMode,
+    /// Whether the sort mode dropdown is currently open. Spark ryve-6f24ef2a.
+    pub sort_dropdown_open: bool,
     /// Currently selected spark ID (for detail view).
     pub selected_spark: Option<String>,
     /// Cached contracts for the currently selected spark.
@@ -397,8 +409,13 @@ impl Workshop {
             agent_context: None,
             background_handle: None,
             background_picker: PickerState::new(),
+            sparks_filter: Default::default(),
             spark_create_form: Default::default(),
             spark_status_menu: Default::default(),
+            agent_session_names: Vec::new(),
+            filtered_sparks: Vec::new(),
+            sort_mode: Default::default(),
+            sort_dropdown_open: false,
             selected_spark: None,
             selected_spark_contracts: Vec::new(),
             selected_spark_bonds: Vec::new(),
@@ -428,7 +445,59 @@ impl Workshop {
         }
     }
 
+    // ── Sort mode (spark ryve-6f24ef2a) ─────────────────────
+
+    /// Re-sort `self.sparks` in place according to the active `sort_mode`.
+    /// Called after loading sparks from DB and after changing the sort mode.
+    pub fn sort_sparks(&mut self) {
+        use crate::screen::sparks::{SortMode, spark_type_rank, status_rank};
+        match self.sort_mode {
+            SortMode::Default => self.sparks.sort_by(|a, b| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| {
+                        spark_type_rank(&a.spark_type).cmp(&spark_type_rank(&b.spark_type))
+                    })
+                    .then_with(|| status_rank(&a.status).cmp(&status_rank(&b.status)))
+                    .then_with(|| a.id.cmp(&b.id))
+            }),
+            SortMode::PriorityOnly => {
+                self.sparks
+                    .sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+            }
+            SortMode::RecentlyUpdated => {
+                self.sparks.sort_by(|a, b| {
+                    b.updated_at
+                        .cmp(&a.updated_at)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+            }
+            SortMode::TypeFirst => self.sparks.sort_by(|a, b| {
+                spark_type_rank(&a.spark_type)
+                    .cmp(&spark_type_rank(&b.spark_type))
+                    .then_with(|| a.priority.cmp(&b.priority))
+                    .then_with(|| status_rank(&a.status).cmp(&status_rank(&b.status)))
+                    .then_with(|| a.id.cmp(&b.id))
+            }),
+        }
+    }
+
     // ── Collapsed epic state (spark ryve-926870a9) ──────────
+
+    /// Recompute `filtered_sparks` from `sparks` and `sparks_filter`.
+    /// Must be called after any mutation to either. Spark ryve-baca34b0.
+    pub fn recompute_filtered_sparks(&mut self) {
+        if self.sparks_filter.is_empty() {
+            self.filtered_sparks = self.sparks.clone();
+        } else {
+            self.filtered_sparks = self
+                .sparks
+                .iter()
+                .filter(|s| self.sparks_filter.matches_spark(s))
+                .cloned()
+                .collect();
+        }
+    }
 
     /// Flip the collapse state of the given epic. Returns `true` if the
     /// epic is now collapsed. Callers are expected to persist the updated
@@ -487,7 +556,9 @@ impl Workshop {
     /// fields. Used by the save side-effect helpers.
     pub fn ui_state_snapshot(&self) -> UiState {
         UiState {
+            version: 1,
             collapsed_epics: self.collapsed_epics.clone(),
+            sparks_filter: self.sparks_filter.to_persisted_with_sort(self.sort_mode),
         }
     }
 
@@ -1012,6 +1083,31 @@ impl Workshop {
         session_id: String,
         full_auto: bool,
     ) -> u64 {
+        self.begin_hand_terminal_inner(title, kind, next_terminal_id, session_id, full_auto, false)
+    }
+
+    /// Like [`begin_hand_terminal`] but marks the resulting tab as the Atlas
+    /// director — pinned to index 0 with distinct visual treatment.
+    pub fn begin_atlas_terminal(
+        &mut self,
+        title: String,
+        kind: PendingTerminalKind,
+        next_terminal_id: &mut u64,
+        session_id: String,
+        full_auto: bool,
+    ) -> u64 {
+        self.begin_hand_terminal_inner(title, kind, next_terminal_id, session_id, full_auto, true)
+    }
+
+    fn begin_hand_terminal_inner(
+        &mut self,
+        title: String,
+        kind: PendingTerminalKind,
+        next_terminal_id: &mut u64,
+        session_id: String,
+        full_auto: bool,
+        is_atlas: bool,
+    ) -> u64 {
         let tab_kind = match &kind {
             PendingTerminalKind::Agent(a) => TabKind::CodingAgent(a.clone()),
             PendingTerminalKind::CustomAgent(def) => TabKind::CodingAgent(CodingAgent {
@@ -1025,7 +1121,11 @@ impl Workshop {
 
         let tab_id = *next_terminal_id;
         *next_terminal_id += 1;
-        self.bench.create_tab(tab_id, title, tab_kind);
+        if is_atlas {
+            self.bench.create_atlas_tab(tab_id, title, tab_kind);
+        } else {
+            self.bench.create_tab(tab_id, title, tab_kind);
+        }
 
         // Pre-resolve the system-prompt file (for built-in agents that
         // support `--system-prompt`). Reading it now lets stage 2 stay
@@ -1166,6 +1266,72 @@ impl Workshop {
             }
             iced_term::actions::Action::Ignore => Vec::new(),
         }
+    }
+
+    /// Tear down the running terminal for an Atlas tab and queue a fresh
+    /// `PendingTerminalSpawn` so the next `HandWorktreeReady` rebuilds it
+    /// in-place. The tab itself (id, position, title, `is_atlas` flag) is
+    /// left untouched. Returns the `CodingAgent` that was running and the
+    /// IDs of sessions that were ended so the caller can persist the new
+    /// session and end only those specific sessions in the DB.
+    ///
+    /// Spark ryve-71c3ec9f.
+    pub fn prepare_atlas_refresh(
+        &mut self,
+        tab_id: u64,
+        new_session_id: String,
+        full_auto: bool,
+    ) -> Option<(CodingAgent, Vec<String>)> {
+        // Find the agent from the session attached to this tab.
+        let agent = self
+            .agent_sessions
+            .iter()
+            .find(|s| s.tab_id == Some(tab_id) && s.active)
+            .map(|s| s.agent.clone())?;
+
+        // Drop the old terminal — `Backend::drop` sends Msg::Shutdown to
+        // the PTY, killing the subprocess.
+        self.terminals.remove(&tab_id);
+
+        // End the old session(s) on this tab, collecting their IDs so the
+        // caller can persist the change in the DB.
+        let mut ended_ids = Vec::new();
+        for session in self.agent_sessions.iter_mut() {
+            if session.tab_id == Some(tab_id) {
+                ended_ids.push(session.id.clone());
+                session.tab_id = None;
+                session.active = false;
+                session.stale = false;
+            }
+        }
+
+        // Resolve system-prompt for the agent.
+        let system_prompt = agent.system_prompt_flag().and_then(|(flag, is_file)| {
+            let prompt_path = self.ryve_dir.workshop_md_path();
+            if !prompt_path.exists() {
+                return None;
+            }
+            let value = if is_file {
+                prompt_path.to_string_lossy().into_owned()
+            } else {
+                std::fs::read_to_string(&prompt_path).unwrap_or_default()
+            };
+            Some((flag.to_string(), value))
+        });
+
+        // Queue the pending spawn so `finalize_hand_terminal` picks it up
+        // when `HandWorktreeReady` arrives.
+        self.pending_terminal_spawns.insert(
+            tab_id,
+            PendingTerminalSpawn {
+                session_id: new_session_id,
+                kind: PendingTerminalKind::Agent(agent.clone()),
+                full_auto,
+                system_prompt,
+            },
+        );
+
+        Some((agent, ended_ids))
     }
 
     pub fn end_agent_sessions_for_tab(&mut self, id: u64) -> Vec<String> {

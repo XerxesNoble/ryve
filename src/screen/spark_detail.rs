@@ -868,6 +868,10 @@ pub enum Message {
     /// Discard the editor and revert to the pre-edit snapshot. Fired by
     /// Escape via the editor key binding.
     CancelProblem,
+
+    /// Navigate to an agent session in the agents panel (and open its
+    /// log tab if applicable). Spark ryve-dba4b8c4.
+    FocusAgentSession(String),
 }
 
 // ── Dropdown option lists ────────────────────────────
@@ -913,6 +917,7 @@ pub fn view<'a>(
     edit_session: &'a SparkEditSession,
     spark_edit: Option<&'a SparkEdit>,
     assignee_edit: &'a AssigneeEditState,
+    agent_sessions: &'a [crate::screen::agents::AgentSession],
     description_editor: Option<&'a text_editor::Content>,
     description_draft: Option<&'a str>,
     nav_prompt: Option<&'a crate::workshop::PendingNavPrompt>,
@@ -949,7 +954,7 @@ pub fn view<'a>(
 
     // Status / Priority / Type badges
     let status_indicator = status_symbol(&spark.status);
-    let status_color = status_color(&spark.status, &pal);
+    let status_color = style::status_color(&spark.status, &pal);
     let next = next_status_str(&spark.status);
 
     let status_pill = button(
@@ -1086,7 +1091,12 @@ pub fn view<'a>(
     // placeholder) swaps the label for a combo_box populated with the
     // union of active Hand session names and distinct past assignees.
     // See AssigneeEditState / Message::BeginEditAssignee.
-    meta = meta.push(view_assignee_row(spark, assignee_edit, &pal));
+    meta = meta.push(view_assignee_row(
+        spark,
+        assignee_edit,
+        agent_sessions,
+        &pal,
+    ));
 
     if let Some(ref owner) = spark.owner {
         meta = meta.push(
@@ -1337,6 +1347,7 @@ fn title_input_style(
 fn view_assignee_row<'a>(
     spark: &'a Spark,
     assignee_edit: &'a AssigneeEditState,
+    agent_sessions: &'a [crate::screen::agents::AgentSession],
     pal: &Palette,
 ) -> Element<'a, Message> {
     let pal = *pal;
@@ -1370,16 +1381,51 @@ fn view_assignee_row<'a>(
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or("unassigned");
-        let value_color = if spark.assignee.is_some() {
-            pal.text_secondary
+
+        // Spark ryve-dba4b8c4: render as a clickable link when the
+        // assignee resolves to a known agent session; dimmed plain text
+        // otherwise. The edit-on-click button follows after the link.
+        let matched_session = spark
+            .assignee
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|a| crate::screen::sparks::resolve_agent_session(a, agent_sessions));
+
+        let mut value_row = row![].spacing(4).align_y(iced::Alignment::Center);
+
+        if let Some(session) = matched_session {
+            let session_id = session.id.clone();
+            value_row = value_row.push(
+                button(text(display).size(FONT_SMALL).color(pal.accent))
+                    .style(button::text)
+                    .padding([2, 6])
+                    .on_press(Message::FocusAgentSession(session_id)),
+            );
         } else {
-            pal.text_tertiary
-        };
-        let value_btn = button(text(display).size(FONT_SMALL).color(value_color))
-            .style(button::text)
-            .padding([2, 6])
-            .on_press(Message::BeginEditAssignee);
-        row![label, value_btn]
+            let value_color = if spark.assignee.is_some() {
+                pal.text_secondary
+            } else {
+                pal.text_tertiary
+            };
+            value_row = value_row.push(
+                button(text(display).size(FONT_SMALL).color(value_color))
+                    .style(button::text)
+                    .padding([2, 6])
+                    .on_press(Message::BeginEditAssignee),
+            );
+        }
+
+        // Pencil icon to enter edit mode when the link is shown
+        if matched_session.is_some() {
+            value_row = value_row.push(
+                button(text("\u{270E}").size(FONT_SMALL).color(pal.text_tertiary))
+                    .style(button::text)
+                    .padding([2, 2])
+                    .on_press(Message::BeginEditAssignee),
+            );
+        }
+
+        row![label, value_row]
             .spacing(8)
             .align_y(iced::Alignment::Center)
             .into()
@@ -1729,7 +1775,7 @@ fn bond_status_symbol(status: &str) -> &'static str {
 fn view_bond_row<'a>(s: &'a Spark, pal: &Palette) -> Element<'a, Message> {
     let pal = *pal;
     let icon = bond_status_symbol(&s.status);
-    let color = status_color(&s.status, &pal);
+    let color = style::status_color(&s.status, &pal);
     row![
         text(icon).size(FONT_SMALL).color(color),
         text(format!("P{}", s.priority))
@@ -1756,7 +1802,7 @@ fn view_bond_row_typed<'a>(
 ) -> Element<'a, Message> {
     let pal = *pal;
     let icon = bond_status_symbol(&s.status);
-    let color = status_color(&s.status, &pal);
+    let color = style::status_color(&s.status, &pal);
     let arrow = if outgoing { "\u{2192}" } else { "\u{2190}" };
     row![
         text(icon).size(FONT_SMALL).color(color),
@@ -2127,17 +2173,6 @@ fn status_symbol(status: &str) -> &'static str {
         "deferred" => "\u{25CC}",    // ◌
         "closed" => "\u{25CF}",      // ●
         _ => "\u{25CB}",
-    }
-}
-
-fn status_color(status: &str, pal: &Palette) -> iced::Color {
-    match status {
-        "open" => pal.text_secondary,
-        "in_progress" => pal.accent,
-        "blocked" => pal.danger,
-        "deferred" => pal.text_tertiary,
-        "closed" => pal.text_tertiary,
-        _ => pal.text_secondary,
     }
 }
 
