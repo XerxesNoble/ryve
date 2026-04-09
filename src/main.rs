@@ -271,14 +271,18 @@ enum Message {
         error: String,
     },
 
-    /// Workshop .ryve/ initialized
+    /// Workshop .ryve/ initialized. Config + ui_state are boxed to keep
+    /// `Message` below the `large_enum_variant` clippy threshold — this
+    /// variant was already the fattest, and spark ryve-926870a9 pushed
+    /// it over the edge by adding a `UiState` field.
     WorkshopReady {
         id: Uuid,
         pool: sqlx::SqlitePool,
-        config: data::ryve_dir::WorkshopConfig,
+        config: Box<data::ryve_dir::WorkshopConfig>,
         custom_agents: Vec<data::ryve_dir::AgentDef>,
         agent_context: Option<String>,
         agent_context_sync_cache: std::sync::Arc<std::sync::Mutex<data::agent_context::SyncCache>>,
+        ui_state: Box<data::ryve_dir::UiState>,
     },
     /// Workgraph sparks loaded from DB
     SparksLoaded(Uuid, Vec<Spark>),
@@ -847,10 +851,11 @@ impl App {
                     Ok(init) => Message::WorkshopReady {
                         id: ws_id,
                         pool: init.pool,
-                        config: init.config,
+                        config: Box::new(init.config),
                         custom_agents: init.custom_agents,
                         agent_context: init.agent_context,
                         agent_context_sync_cache: init.agent_context_sync_cache,
+                        ui_state: Box::new(init.ui_state),
                     },
                     Err(e) => Message::WorkshopInitFailed {
                         id: ws_id,
@@ -887,6 +892,7 @@ impl App {
                 custom_agents,
                 agent_context,
                 agent_context_sync_cache,
+                ui_state,
             } => {
                 let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
                 let Some(idx) = ws_idx else {
@@ -894,9 +900,14 @@ impl App {
                 };
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     ws.sparks_db = Some(pool.clone());
-                    ws.config = config;
+                    ws.config = *config;
                     ws.custom_agents = custom_agents;
                     ws.agent_context = agent_context;
+                    // Apply persisted UI state before the first render so
+                    // the sparks panel honours the user's last collapse
+                    // choices. Stale IDs are pruned once sparks finish
+                    // loading (see SparksLoaded below). Spark ryve-926870a9.
+                    ws.collapsed_epics = ui_state.collapsed_epics.clone();
                     // Hand off the warm hash cache from init_workshop so the
                     // first SparksLoaded sync tick is a no-op on disk.
                     // Spark ryve-86b0b326.
@@ -987,6 +998,28 @@ impl App {
                     ws.prev_blocked_spark_ids = current_blocked;
                     ws.sparks_baseline_seen = true;
                     ws.sparks = sparks;
+
+                    // Silently drop any collapsed-epic IDs whose epic no
+                    // longer exists (deleted between runs, or already gone
+                    // when the stored set was first loaded). If anything
+                    // was pruned, write the cleaned snapshot back so the
+                    // on-disk file doesn't keep growing with dead IDs.
+                    // Spark ryve-926870a9.
+                    // Collect live epic ids into a temporary so we can
+                    // reborrow `ws` mutably for the prune call without
+                    // cloning the whole sparks vec.
+                    let live_epic_ids = Workshop::live_epic_ids(&ws.sparks);
+                    if ws.prune_collapsed_epics(&live_epic_ids) {
+                        let ryve_dir = ws.ryve_dir.clone();
+                        let snapshot = ws.ui_state_snapshot();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                            {
+                                log::warn!("failed to save .ryve/ui_state.json: {e}");
+                            }
+                        });
+                    }
 
                     // Refresh failing contract count + blocked-spark set +
                     // Home dashboard sources (failing contract list, active
@@ -2536,6 +2569,25 @@ impl App {
                                     move |sparks| Message::SparksLoaded(id, sparks),
                                 );
                             }
+                        }
+                    }
+                    screen::sparks::Message::ToggleEpicCollapse(epic_id) => {
+                        // Flip the collapse flag in memory and persist the
+                        // new snapshot to `.ryve/ui_state.json` so the
+                        // choice survives restart. Fire-and-forget — a
+                        // failed write is logged but never blocks the UI.
+                        // Spark ryve-926870a9.
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.toggle_epic_collapse(&epic_id);
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
                         }
                     }
                     screen::sparks::Message::CloseSparkWithReason(spark_id, reason) => {

@@ -70,6 +70,14 @@ impl RyveDir {
         self.root.join("WORKSHOP.md")
     }
 
+    /// Per-workshop UI state (collapsed epic groups, etc.) stored in
+    /// `.ryve/ui_state.json`. Kept separate from `config.toml` so frequent
+    /// UI-driven writes don't churn the canonical config file.
+    /// Spark ryve-926870a9.
+    pub fn ui_state_path(&self) -> PathBuf {
+        self.root.join("ui_state.json")
+    }
+
     pub fn checklists_dir(&self) -> PathBuf {
         self.root.join("checklists")
     }
@@ -301,6 +309,45 @@ pub async fn save_config(
     tokio::fs::write(ryve_dir.config_path(), content).await
 }
 
+// ── UI State (spark ryve-926870a9) ─────────────────────
+
+/// Per-workshop UI state persisted across restarts. Currently just the set
+/// of collapsed epic IDs in the workgraph panel; other mostly-ephemeral UI
+/// knobs (filter, sort, selection) can ride on the same file later without
+/// a new persistence plumb.
+///
+/// Stored as JSON in `.ryve/ui_state.json` — deliberately separate from
+/// `config.toml` so high-frequency, UI-driven writes don't rewrite the
+/// canonical (user-editable) workshop config on every chevron click.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiState {
+    /// IDs of epics the user has collapsed in the sparks panel. Default-
+    /// expanded: only collapsed IDs are persisted, so a freshly-created
+    /// epic appears open.
+    #[serde(default)]
+    pub collapsed_epics: std::collections::HashSet<String>,
+}
+
+/// Load per-workshop UI state from `.ryve/ui_state.json`. Returns the
+/// default (empty) state on any missing-file or parse error — UI state
+/// is cosmetic and must never block workshop open.
+pub async fn load_ui_state(ryve_dir: &RyveDir) -> UiState {
+    let path = ryve_dir.ui_state_path();
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => UiState::default(),
+    }
+}
+
+/// Save per-workshop UI state to `.ryve/ui_state.json`. The parent
+/// `.ryve/` directory is assumed to already exist — every caller has
+/// already passed through `ensure_exists`/`migrate_workshop`.
+pub async fn save_ui_state(ryve_dir: &RyveDir, state: &UiState) -> Result<(), std::io::Error> {
+    let content =
+        serde_json::to_string_pretty(state).map_err(|e| std::io::Error::other(e.to_string()))?;
+    tokio::fs::write(ryve_dir.ui_state_path(), content).await
+}
+
 /// Load all custom agent definitions from `.ryve/agents/*.toml`.
 pub async fn load_agent_defs(ryve_dir: &RyveDir) -> Vec<AgentDef> {
     let agents_dir = ryve_dir.agents_dir();
@@ -370,3 +417,48 @@ before closing the spark with `ryve spark close <id>`.
 ## Done
 - [ ] Spark closed: `ryve spark close <id> completed`
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Spark ryve-926870a9: per-workshop UI state persistence.
+
+    #[tokio::test]
+    async fn ui_state_load_missing_file_returns_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+        let state = load_ui_state(&ryve_dir).await;
+        assert!(state.collapsed_epics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ui_state_roundtrip_preserves_collapsed_epics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        let mut state = UiState::default();
+        state.collapsed_epics.insert("ep-1".to_string());
+        state.collapsed_epics.insert("ep-2".to_string());
+        save_ui_state(&ryve_dir, &state).await.unwrap();
+
+        let reloaded = load_ui_state(&ryve_dir).await;
+        assert_eq!(reloaded, state);
+    }
+
+    #[tokio::test]
+    async fn ui_state_load_tolerates_garbage_json() {
+        // Cosmetic state must never block workshop open — a corrupted
+        // file should silently fall back to the default.
+        let tmp = tempfile::tempdir().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+        tokio::fs::write(ryve_dir.ui_state_path(), "not json")
+            .await
+            .unwrap();
+        let state = load_ui_state(&ryve_dir).await;
+        assert!(state.collapsed_epics.is_empty());
+    }
+}

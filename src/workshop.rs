@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use data::agent_context::SyncCache as AgentContextSyncCache;
-use data::ryve_dir::{AgentDef, RyveDir, WorkshopConfig};
+use data::ryve_dir::{AgentDef, RyveDir, UiState, WorkshopConfig};
 use data::sparks::types::{Bond, Contract, Crew, CrewMember, Ember, HandAssignment, Spark};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -188,6 +188,12 @@ pub struct Workshop {
     /// 3-second sync tick produces zero file writes when nothing has
     /// changed. Spark ryve-86b0b326.
     pub agent_context_sync_cache: Arc<Mutex<AgentContextSyncCache>>,
+    /// IDs of epics the user has collapsed in the workgraph panel. Default
+    /// semantics: only collapsed IDs are stored, so newly-observed epics
+    /// render expanded. Persisted to `.ryve/ui_state.json` per workshop so
+    /// the panel survives restart; stale IDs (epics deleted between runs)
+    /// are pruned on load. Spark ryve-926870a9.
+    pub collapsed_epics: HashSet<String>,
 }
 
 impl Workshop {
@@ -240,6 +246,69 @@ impl Workshop {
             terminal_font_size: data::config::DEFAULT_TERMINAL_FONT_SIZE,
             terminal_font_family: None,
             agent_context_sync_cache: Arc::new(Mutex::new(AgentContextSyncCache::new())),
+            collapsed_epics: HashSet::new(),
+        }
+    }
+
+    // ── Collapsed epic state (spark ryve-926870a9) ──────────
+
+    /// Flip the collapse state of the given epic. Returns `true` if the
+    /// epic is now collapsed. Callers are expected to persist the result
+    /// via [`Workshop::save_ui_state_task`].
+    pub fn toggle_epic_collapse(&mut self, epic_id: &str) -> bool {
+        if self.collapsed_epics.remove(epic_id) {
+            false
+        } else {
+            self.collapsed_epics.insert(epic_id.to_string());
+            true
+        }
+    }
+
+    /// Is the given epic currently collapsed? Consumed by the sparks
+    /// panel chevron/grouping renderer (spark ryve-8be256a8); exposed
+    /// now so the blocked render-side spark can wire up without having
+    /// to poke at `collapsed_epics` directly.
+    #[allow(dead_code)]
+    pub fn is_epic_collapsed(&self, epic_id: &str) -> bool {
+        self.collapsed_epics.contains(epic_id)
+    }
+
+    /// Drop any collapsed-epic IDs that are not present in
+    /// `live_epic_ids`. Called after every sparks reload so epics deleted
+    /// on another machine or in another session silently disappear from
+    /// the set instead of accumulating indefinitely. Returns `true` if
+    /// anything was removed — the caller can use that to decide whether
+    /// to persist the cleaned snapshot.
+    ///
+    /// Takes a pre-computed id set rather than `&[Spark]` so the
+    /// `SparksLoaded` handler can build it from `self.sparks` and then
+    /// call this method without tripping the borrow checker.
+    pub fn prune_collapsed_epics(&mut self, live_epic_ids: &HashSet<String>) -> bool {
+        if self.collapsed_epics.is_empty() {
+            return false;
+        }
+        let before = self.collapsed_epics.len();
+        self.collapsed_epics.retain(|id| live_epic_ids.contains(id));
+        self.collapsed_epics.len() != before
+    }
+
+    /// Convenience wrapper: extract the live epic id set from a `Spark`
+    /// slice. Kept next to [`Workshop::prune_collapsed_epics`] because the
+    /// two are always used together (and the extraction rule —
+    /// `spark_type == "epic"` — must stay in sync).
+    pub fn live_epic_ids(sparks: &[Spark]) -> HashSet<String> {
+        sparks
+            .iter()
+            .filter(|s| s.spark_type == "epic")
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// Build a fresh [`UiState`] snapshot from the workshop's current UI
+    /// fields. Used by the save side-effect helpers.
+    pub fn ui_state_snapshot(&self) -> UiState {
+        UiState {
+            collapsed_epics: self.collapsed_epics.clone(),
         }
     }
 
@@ -910,6 +979,9 @@ pub struct WorkshopInit {
     /// off to the `Workshop` so subsequent sync ticks share the same warm
     /// cache and skip re-reading the just-written files. Spark ryve-86b0b326.
     pub agent_context_sync_cache: Arc<Mutex<AgentContextSyncCache>>,
+    /// Persisted per-workshop UI state (collapsed epics, ...). Loaded on
+    /// workshop open and applied to the initial render. Spark ryve-926870a9.
+    pub ui_state: UiState,
 }
 
 /// Initialize a workshop's `.ryve/` directory, DB, and load config.
@@ -939,6 +1011,11 @@ pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::spa
     // Load agents in parallel — config already loaded by the migration step.
     let custom_agents = data::ryve_dir::load_agent_defs(&ryve_dir).await;
     let agent_context = data::ryve_dir::load_agents_context(&ryve_dir).await;
+    // Load persisted per-workshop UI state so the sparks panel can
+    // rehydrate collapse/expand decisions on the first render. Silent
+    // fall-back to default on any I/O or parse failure — UI state is
+    // cosmetic. Spark ryve-926870a9.
+    let ui_state = data::ryve_dir::load_ui_state(&ryve_dir).await;
 
     // Generate WORKSHOP.md and inject pointers into agent boot files
     // (also propagates into any existing worktrees).
@@ -955,6 +1032,7 @@ pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::spa
         custom_agents,
         agent_context,
         agent_context_sync_cache,
+        ui_state,
     })
 }
 
@@ -1002,6 +1080,123 @@ mod tests {
     fn workshop_id_derives_from_directory_name() {
         let ws = Workshop::new(PathBuf::from("/home/user/projects/my-project"));
         assert_eq!(ws.workshop_id(), "my-project");
+    }
+
+    // ── Collapsed epic state (spark ryve-926870a9) ──────────
+
+    /// Build a bare `Spark` useful for collapse/prune tests. Only `id`
+    /// and `spark_type` matter to the functions under test.
+    fn make_spark(id: &str, spark_type: &str) -> Spark {
+        Spark {
+            id: id.to_string(),
+            title: String::new(),
+            description: String::new(),
+            status: "open".to_string(),
+            priority: 2,
+            spark_type: spark_type.to_string(),
+            assignee: None,
+            owner: None,
+            parent_id: None,
+            workshop_id: "ws-test".to_string(),
+            estimated_minutes: None,
+            github_issue_number: None,
+            github_repo: None,
+            metadata: "{}".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            closed_at: None,
+            closed_reason: None,
+            due_at: None,
+            defer_until: None,
+            risk_level: None,
+            scope_boundary: None,
+        }
+    }
+
+    #[test]
+    fn toggle_epic_collapse_flips_membership() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        assert!(!ws.is_epic_collapsed("ep-1"));
+
+        // First toggle collapses.
+        assert!(ws.toggle_epic_collapse("ep-1"));
+        assert!(ws.is_epic_collapsed("ep-1"));
+        assert!(ws.collapsed_epics.contains("ep-1"));
+
+        // Second toggle expands again.
+        assert!(!ws.toggle_epic_collapse("ep-1"));
+        assert!(!ws.is_epic_collapsed("ep-1"));
+        assert!(!ws.collapsed_epics.contains("ep-1"));
+    }
+
+    #[test]
+    fn toggle_epic_collapse_is_per_epic() {
+        // Invariant: collapsing one epic never touches another.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.toggle_epic_collapse("ep-1");
+        ws.toggle_epic_collapse("ep-2");
+        assert!(ws.is_epic_collapsed("ep-1"));
+        assert!(ws.is_epic_collapsed("ep-2"));
+
+        ws.toggle_epic_collapse("ep-1");
+        assert!(!ws.is_epic_collapsed("ep-1"));
+        assert!(ws.is_epic_collapsed("ep-2"));
+    }
+
+    #[test]
+    fn prune_collapsed_epics_drops_stale_ids() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.collapsed_epics.insert("ep-live".to_string());
+        ws.collapsed_epics.insert("ep-dead".to_string());
+        ws.collapsed_epics.insert("ep-also-dead".to_string());
+
+        let sparks = vec![make_spark("ep-live", "epic"), make_spark("sp-task", "task")];
+        let live = Workshop::live_epic_ids(&sparks);
+        let pruned = ws.prune_collapsed_epics(&live);
+        assert!(pruned, "prune should report that something was removed");
+        assert_eq!(ws.collapsed_epics.len(), 1);
+        assert!(ws.collapsed_epics.contains("ep-live"));
+        assert!(!ws.collapsed_epics.contains("ep-dead"));
+    }
+
+    #[test]
+    fn prune_collapsed_epics_ignores_non_epic_sparks_with_matching_id() {
+        // A task whose id happens to match a stored collapsed id must not
+        // keep that id alive — only actual epics count.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.collapsed_epics.insert("sp-42".to_string());
+        let sparks = vec![make_spark("sp-42", "task")];
+        let live = Workshop::live_epic_ids(&sparks);
+        assert!(ws.prune_collapsed_epics(&live));
+        assert!(ws.collapsed_epics.is_empty());
+    }
+
+    #[test]
+    fn prune_collapsed_epics_is_noop_when_all_live() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.collapsed_epics.insert("ep-1".to_string());
+        let sparks = vec![make_spark("ep-1", "epic")];
+        let live = Workshop::live_epic_ids(&sparks);
+        assert!(!ws.prune_collapsed_epics(&live));
+        assert!(ws.collapsed_epics.contains("ep-1"));
+    }
+
+    #[test]
+    fn prune_collapsed_epics_is_noop_when_set_empty() {
+        // The short-circuit path: no stored ids means no work to do.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        let sparks = vec![make_spark("ep-1", "epic")];
+        let live = Workshop::live_epic_ids(&sparks);
+        assert!(!ws.prune_collapsed_epics(&live));
+    }
+
+    #[test]
+    fn ui_state_snapshot_mirrors_collapsed_epics() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.toggle_epic_collapse("ep-a");
+        ws.toggle_epic_collapse("ep-b");
+        let snap = ws.ui_state_snapshot();
+        assert_eq!(snap.collapsed_epics, ws.collapsed_epics);
     }
 
     #[test]

@@ -143,6 +143,15 @@ pub enum Message {
     BeginCloseFlow(String),
     /// Close the spark with a specific reason.
     CloseSparkWithReason(String, String),
+    /// Toggle the collapsed/expanded state of an epic group in the
+    /// workgraph panel. The workshop persists the new state to
+    /// `.ryve/ui_state.json` so the decision survives restart. The
+    /// chevron that emits this message is added by the sparks-panel
+    /// grouping spark (ryve-8be256a8); the variant is defined here now
+    /// so both sparks can land independently.
+    /// Spark ryve-926870a9.
+    #[allow(dead_code)]
+    ToggleEpicCollapse(String),
 }
 
 // ── View ─────────────────────────────────────────────
