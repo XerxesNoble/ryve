@@ -7,7 +7,8 @@ async fn make_spark(pool: &sqlx::SqlitePool, id_suffix: &str) -> String {
         NewSpark {
             title: format!("Spark {id_suffix}"),
             description: String::new(),
-            spark_type: SparkType::Task,
+            // Epic: top-level allowed by the no-orphan invariant.
+            spark_type: SparkType::Epic,
             priority: 2,
             workshop_id: "ws-test".to_string(),
             assignee: None,

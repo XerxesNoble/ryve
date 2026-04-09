@@ -8,12 +8,14 @@ async fn test_create_spark(pool: sqlx::SqlitePool) {
         NewSpark {
             title: "New feature".to_string(),
             description: "A cool feature".to_string(),
+            // Parent is sp-0001 from seed_sparks.sql so the non-orphan
+            // invariant is satisfied for non-epic types.
             spark_type: SparkType::Feature,
             priority: 1,
             workshop_id: "ws-test".to_string(),
             assignee: Some("alice".to_string()),
             owner: None,
-            parent_id: None,
+            parent_id: Some("sp-0001".to_string()),
             due_at: None,
             estimated_minutes: Some(60),
             metadata: None,

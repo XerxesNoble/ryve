@@ -12,7 +12,9 @@ async fn make_spark_with(
         NewSpark {
             title: title.to_string(),
             description: String::new(),
-            spark_type: SparkType::Task,
+            // Epic so the helper can create top-level sparks without having
+            // to thread a parent through (no-orphan invariant).
+            spark_type: SparkType::Epic,
             priority,
             workshop_id: "ws-hot".to_string(),
             assignee: None,

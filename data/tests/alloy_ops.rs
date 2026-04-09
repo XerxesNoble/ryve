@@ -8,7 +8,9 @@ async fn make_spark(pool: &sqlx::SqlitePool, title: &str) -> String {
         NewSpark {
             title: title.to_string(),
             description: String::new(),
-            spark_type: SparkType::Task,
+            // Epic: top-level is the one case the invariant allows without
+            // a parent, keeping this helper single-shot.
+            spark_type: SparkType::Epic,
             priority: 2,
             workshop_id: "ws-alloy".to_string(),
             assignee: None,

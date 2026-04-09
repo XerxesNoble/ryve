@@ -30,10 +30,14 @@ fn unique_tempdir(tag: &str) -> PathBuf {
 }
 
 fn new_spark(workshop: &str, i: usize) -> NewSpark {
+    // Use Epic here so the stress test doesn't have to co-ordinate parent
+    // creation with each concurrent writer. The no-orphan invariant only
+    // rejects non-epic sparks without a parent; epics may be top-level.
+    // This test is about write contention, not hierarchy.
     NewSpark {
         title: format!("stress spark #{i}"),
         description: format!("concurrent write {i}"),
-        spark_type: SparkType::Task,
+        spark_type: SparkType::Epic,
         priority: 2,
         workshop_id: workshop.to_string(),
         assignee: None,

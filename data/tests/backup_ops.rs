@@ -55,7 +55,9 @@ async fn seed_one_spark(pool: &sqlx::SqlitePool, title: &str) -> String {
         NewSpark {
             title: title.to_string(),
             description: String::new(),
-            spark_type: SparkType::Task,
+            // Epic: the backup test just needs *a* row; top-level epic
+            // satisfies the no-orphan invariant without extra setup.
+            spark_type: SparkType::Epic,
             priority: 2,
             workshop_id: "ws-test".to_string(),
             assignee: None,

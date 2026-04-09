@@ -207,12 +207,14 @@ mod tests {
     }
 
     async fn make_spark(pool: &SqlitePool, ws: &str, title: &str) -> String {
+        // Create as an Epic so we have a top-level parent for crew tests —
+        // non-epic sparks require a parent_id after the no-orphan invariant.
         crate::sparks::spark_repo::create(
             pool,
             NewSpark {
                 title: title.into(),
                 description: String::new(),
-                spark_type: SparkType::Task,
+                spark_type: SparkType::Epic,
                 priority: 2,
                 workshop_id: ws.into(),
                 assignee: None,

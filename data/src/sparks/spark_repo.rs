@@ -11,6 +11,17 @@ use super::id::generate_spark_id;
 use super::types::*;
 
 pub async fn create(pool: &SqlitePool, new: NewSpark) -> Result<Spark, SparksError> {
+    // Invariant: only epics may be top-level. Every non-epic spark must live
+    // under a parent so the workgraph always has a hierarchy Hands and the UI
+    // can traverse — no orphan tasks, bugs, features, chores, spikes, or
+    // milestones. This check is the sole enforcement point; callers on every
+    // path (CLI, UI, GitHub sync, tests) must supply a parent_id for non-epics.
+    if new.spark_type != SparkType::Epic && new.parent_id.is_none() {
+        return Err(SparksError::OrphanChildRejected {
+            spark_type: new.spark_type.as_str().to_string(),
+        });
+    }
+
     let id = generate_spark_id(&new.workshop_id);
     let now = Utc::now().to_rfc3339();
     let spark_type = new.spark_type.as_str();
@@ -253,4 +264,161 @@ pub async fn list(pool: &SqlitePool, filter: SparkFilter) -> Result<Vec<Spark>, 
     }
 
     Ok(query.fetch_all(pool).await?)
+}
+
+/// Return the id of the workshop's 'Unsorted' catch-all epic, creating it if
+/// it doesn't already exist. Uses the same deterministic id scheme as
+/// migration 011 (`<workshop_id>-unsorted-epic`) so that this helper and the
+/// migration converge on a single epic per workshop.
+///
+/// This is the escape hatch for callers that import work from external
+/// sources (e.g. GitHub sync) where no meaningful parent exists yet.
+pub async fn ensure_unsorted_epic(
+    pool: &SqlitePool,
+    workshop_id: &str,
+) -> Result<String, SparksError> {
+    let id = format!("{workshop_id}-unsorted-epic");
+    let now = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO sparks (id, title, description, status, priority, spark_type, workshop_id, metadata, created_at, updated_at)
+         VALUES (?, 'Unsorted', 'Catch-all epic for sparks that have no explicit parent. Reparent or re-home them as needed.', 'open', 4, 'epic', ?, '{}', ?, ?)",
+    )
+    .bind(&id)
+    .bind(workshop_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    Ok(id)
+}
+
+#[cfg(test)]
+mod orphan_rejection_tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn fresh_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    fn new_spark(
+        workshop: &str,
+        title: &str,
+        spark_type: SparkType,
+        parent_id: Option<String>,
+    ) -> NewSpark {
+        NewSpark {
+            title: title.to_string(),
+            description: String::new(),
+            spark_type,
+            priority: 2,
+            workshop_id: workshop.to_string(),
+            assignee: None,
+            owner: None,
+            parent_id,
+            due_at: None,
+            estimated_minutes: None,
+            metadata: None,
+            risk_level: None,
+            scope_boundary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_orphan_task() {
+        let pool = fresh_pool().await;
+        let err = create(&pool, new_spark("ws", "orphan task", SparkType::Task, None))
+            .await
+            .expect_err("orphan non-epic must be rejected");
+        match err {
+            SparksError::OrphanChildRejected { spark_type } => {
+                assert_eq!(spark_type, "task");
+            }
+            other => panic!("expected OrphanChildRejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_orphan_bug_and_feature() {
+        let pool = fresh_pool().await;
+        for kind in [SparkType::Bug, SparkType::Feature, SparkType::Chore, SparkType::Spike, SparkType::Milestone] {
+            let err = create(&pool, new_spark("ws", "orphan", kind, None))
+                .await
+                .expect_err("orphan non-epic must be rejected");
+            assert!(matches!(err, SparksError::OrphanChildRejected { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_top_level_epic() {
+        let pool = fresh_pool().await;
+        let epic = create(
+            &pool,
+            new_spark("ws", "top level epic", SparkType::Epic, None),
+        )
+        .await
+        .expect("top-level epic must be accepted");
+        assert_eq!(epic.spark_type, "epic");
+        assert!(epic.parent_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn accepts_nested_epic() {
+        let pool = fresh_pool().await;
+        let parent = create(
+            &pool,
+            new_spark("ws", "outer epic", SparkType::Epic, None),
+        )
+        .await
+        .unwrap();
+        let nested = create(
+            &pool,
+            new_spark("ws", "inner epic", SparkType::Epic, Some(parent.id.clone())),
+        )
+        .await
+        .expect("nested epic must be accepted");
+        assert_eq!(nested.parent_id.as_deref(), Some(parent.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn accepts_child_of_epic() {
+        let pool = fresh_pool().await;
+        let epic = create(&pool, new_spark("ws", "parent", SparkType::Epic, None))
+            .await
+            .unwrap();
+        let child = create(
+            &pool,
+            new_spark("ws", "child task", SparkType::Task, Some(epic.id.clone())),
+        )
+        .await
+        .expect("child of epic must be accepted");
+        assert_eq!(child.parent_id.as_deref(), Some(epic.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn ensure_unsorted_epic_is_idempotent() {
+        let pool = fresh_pool().await;
+        let id1 = ensure_unsorted_epic(&pool, "ws-a").await.unwrap();
+        let id2 = ensure_unsorted_epic(&pool, "ws-a").await.unwrap();
+        assert_eq!(id1, id2);
+        // And a task can be parented under it.
+        let child = create(
+            &pool,
+            new_spark("ws-a", "orphan import", SparkType::Task, Some(id1.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some(id1.as_str()));
+    }
 }

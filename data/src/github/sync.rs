@@ -148,7 +148,11 @@ impl GitHubSync {
             )
             .await
         } else {
-            // Create new spark from issue
+            // Create new spark from issue. GitHub issues have no natural
+            // parent in the workgraph, so we park them under the workshop's
+            // catch-all 'Unsorted' epic — the no-orphan invariant requires
+            // every non-epic spark to have a parent_id.
+            let unsorted_parent = spark_repo::ensure_unsorted_epic(pool, workshop_id).await?;
             let new = NewSpark {
                 title: issue.title,
                 description: issue.body.map(|b| b.to_string()).unwrap_or_default(),
@@ -157,7 +161,7 @@ impl GitHubSync {
                 workshop_id: workshop_id.to_string(),
                 assignee: issue.assignee.map(|a| a.login),
                 owner: None,
-                parent_id: None,
+                parent_id: Some(unsorted_parent),
                 due_at: None,
                 estimated_minutes: None,
                 metadata: None,

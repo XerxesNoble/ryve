@@ -373,7 +373,10 @@ mod tests {
             NewSpark {
                 title: "first turn smoke test".into(),
                 description: "verify the agent receives a user prompt".into(),
-                spark_type: SparkType::Bug,
+                // Epic: top-level is the only non-parented shape the
+                // no-orphan invariant allows. This test only needs *a*
+                // spark to spawn a Hand against.
+                spark_type: SparkType::Epic,
                 priority: 1,
                 workshop_id: workshop_id.clone(),
                 assignee: None,

@@ -553,6 +553,9 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                 eprintln!("  --priority, -p <0-4>        P0=critical, P4=negligible (default: 2)");
                 eprintln!("  --risk, -r <level>          trivial|normal|elevated|critical");
                 eprintln!("  --scope, -s <boundary>      Scope boundary (e.g. 'src/auth/')");
+                eprintln!(
+                    "  --parent <spark_id>         Parent spark id (required for non-epic types)"
+                );
                 eprintln!("  --description, -d <text>    Description");
                 eprintln!("  --problem <text>            Intent: problem being solved");
                 eprintln!(
@@ -568,6 +571,7 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
             let mut priority = 2i32;
             let mut risk = None;
             let mut scope = None;
+            let mut parent_id: Option<String> = None;
             let mut description = String::new();
             let mut problem: Option<String> = None;
             let mut invariants: Vec<String> = Vec::new();
@@ -599,6 +603,12 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                         i += 1;
                         if i < args.len() {
                             scope = Some(args[i].clone());
+                        }
+                    }
+                    "--parent" => {
+                        i += 1;
+                        if i < args.len() {
+                            parent_id = Some(args[i].clone());
                         }
                     }
                     "--description" | "-d" => {
@@ -667,7 +677,7 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                 workshop_id: ws_id.to_string(),
                 assignee: None,
                 owner: None,
-                parent_id: None,
+                parent_id,
                 due_at: None,
                 estimated_minutes: None,
                 metadata,
