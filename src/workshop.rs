@@ -262,6 +262,11 @@ pub struct Workshop {
     /// committed back via `update_spark` on structural changes. See
     /// spark ryve-212c63aa.
     pub intent_list_drafts: crate::screen::intent_list_editor::IntentListDrafts,
+    /// Per-selection edit-session state for the spark detail view. Gates
+    /// `begin_edit` on closed/completed sparks behind a confirmation
+    /// modal and short-circuits the save path on failed validation.
+    /// See ryve-8ad372cf.
+    pub spark_edit_session: crate::screen::spark_detail::SparkEditSession,
     /// Whether the background image is dark (for adaptive font color).
     /// `None` means no background or not yet computed.
     pub bg_is_dark: Option<bool>,
@@ -342,6 +347,7 @@ impl Workshop {
             spark_edit: None,
             acceptance_criteria_edit: Default::default(),
             intent_list_drafts: Default::default(),
+            spark_edit_session: Default::default(),
             bg_is_dark: None,
             pending_agent_spawn: None,
             pending_head_spawn: None,

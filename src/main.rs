@@ -2658,6 +2658,43 @@ impl App {
                         }
                         return self.persist_acceptance_criteria(idx, &selected_id);
                     }
+                    screen::spark_detail::Message::BeginEditField(field) => {
+                        // Route every field-edit entry through the
+                        // confirmation gate. If the spark is terminal and
+                        // not yet acknowledged for this session, the
+                        // session stashes the field and the modal pops;
+                        // otherwise the gate returns Proceed and the
+                        // field-specific handler (from the sibling
+                        // editable-<field> sparks) can flip into edit
+                        // mode on the next frame. See ryve-8ad372cf.
+                        if let Some(ws) = self.workshops.get_mut(idx)
+                            && let Some(ref sid) = ws.selected_spark
+                            && let Some(spark) =
+                                ws.sparks.iter().find(|s| &s.id == sid).cloned()
+                        {
+                            let _ = ws.spark_edit_session.begin_edit(&spark, field);
+                            // The view re-renders from the session state
+                            // and will overlay the modal when needed;
+                            // no follow-up Task is required here.
+                        }
+                    }
+                    screen::spark_detail::Message::ConfirmClosedEdit => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            // Releasing the gate returns the pending
+                            // field so the caller can resume whatever
+                            // the user originally asked for. Until the
+                            // sibling field-edit plumbing lands in this
+                            // worktree the field is simply consumed —
+                            // the confirmation still unlocks future
+                            // edits in this session.
+                            let _ = ws.spark_edit_session.confirm_closed_edit();
+                        }
+                    }
+                    screen::spark_detail::Message::CancelClosedEdit => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_edit_session.cancel_closed_edit();
+                        }
+                    }
                     screen::spark_detail::Message::CycleStatus(spark_id, new_status) => {
                         if let Some(ws) = self.workshops.get(idx)
                             && let Some(ref pool) = ws.sparks_db
@@ -5262,6 +5299,7 @@ impl App {
                     &ws.contract_create_form,
                     &ws.acceptance_criteria_edit,
                     &ws.intent_list_drafts,
+                    &ws.spark_edit_session,
                     &pal,
                     has_bg,
                 )
