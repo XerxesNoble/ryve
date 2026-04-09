@@ -110,6 +110,7 @@ pub async fn spawn_hand(
     // 1. New session id + worktree.
     let session_id = Uuid::new_v4().to_string();
     let worktree_path = workshop::create_hand_worktree(workshop_dir, &ryve_dir, &session_id)
+        .await
         .map_err(HandSpawnError::Worktree)?;
 
     // Pre-compute the log path so it can be persisted alongside the

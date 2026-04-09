@@ -5,8 +5,10 @@ mod agent_prompts;
 mod cli;
 mod coding_agents;
 mod delegation;
+mod font_intern;
 mod hand_spawn;
 mod icons;
+mod process_snapshot;
 mod screen;
 mod style;
 mod widget;
@@ -15,6 +17,7 @@ mod worktree_cleanup;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use coding_agents::CodingAgent;
 use data::sparks::types::{
@@ -24,11 +27,11 @@ use iced::widget::{Space, button, column, container, row, stack, text};
 use iced::{
     Color, Element, Length, Point, Size, Subscription, Task, Theme, event, keyboard, mouse, window,
 };
+use process_snapshot::ProcessSnapshot;
 use screen::agents::AgentSession;
 use screen::toast::{self, Toast, ToastKind};
 use screen::{file_explorer, file_viewer, log_tail};
 use style::Appearance;
-use sysinfo::{Pid, ProcessesToUpdate, System};
 use uuid::Uuid;
 use widget::splitter::{self, SplitterDrag, SplitterKind};
 use workshop::Workshop;
@@ -115,15 +118,9 @@ fn ipc_subscription_stream() -> iced::futures::stream::BoxStream<'static, Messag
     ))
 }
 
-fn process_is_alive(child_pid: i64) -> bool {
-    let Ok(pid) = u32::try_from(child_pid) else {
-        return false;
-    };
-
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    system.process(Pid::from_u32(pid)).is_some()
-}
+// Note: the old synchronous `process_is_alive` helper was removed in
+// hand/4858031b ([sp-6b19b1d9]) and replaced by the per-tick
+// `ProcessSnapshot` shared via `App::last_process_snapshot`.
 
 fn main() -> iced::Result {
     // Dispatch: if the first non-flag arg is a known CLI subcommand,
@@ -174,7 +171,7 @@ fn main() -> iced::Result {
     let config = data::config::Config::load();
     let default_font = match config.font_family {
         Some(name) => iced::Font {
-            family: iced::font::Family::Name(Box::leak(name.into_boxed_str())),
+            family: iced::font::Family::Name(font_intern::intern(&name)),
             ..iced::Font::DEFAULT
         },
         None => iced::Font {
@@ -226,6 +223,11 @@ struct App {
     next_terminal_id: u64,
     /// Guard: true while a SparksPoll load is in flight
     poll_in_flight: bool,
+    /// Latest process snapshot captured for the running poll. Refreshed at
+    /// most once per [`Message::SparksPoll`] tick (off the UI thread via
+    /// `tokio::task::spawn_blocking`) and shared by every liveness /
+    /// auto-detect check that runs in the same tick. Spark `ryve-a5b9e4a1`.
+    last_process_snapshot: Option<Arc<ProcessSnapshot>>,
     /// Whether the Shift key is currently held (for shift-click line selection).
     shift_held: bool,
     /// Active drag-to-resize state, if any.
@@ -276,6 +278,7 @@ enum Message {
         config: data::ryve_dir::WorkshopConfig,
         custom_agents: Vec<data::ryve_dir::AgentDef>,
         agent_context: Option<String>,
+        agent_context_sync_cache: std::sync::Arc<std::sync::Mutex<data::agent_context::SyncCache>>,
     },
     /// Workgraph sparks loaded from DB
     SparksLoaded(Uuid, Vec<Spark>),
@@ -354,6 +357,17 @@ enum Message {
     AgentContextSynced,
     /// Periodic sparks poll tick
     SparksPoll,
+    /// A `SparksPoll` tick captured a fresh [`ProcessSnapshot`] off the UI
+    /// thread. The handler caches it on `App` and then runs the rest of the
+    /// poll body — auto-detect, persisted-session reload, log tails, sparks
+    /// reload — all reading liveness from this single snapshot. Spark
+    /// `ryve-a5b9e4a1`.
+    ProcessSnapshotReady(Arc<ProcessSnapshot>),
+    /// Inert no-op. Used by the global keyboard subscription for any key
+    /// event that does not map to a real hotkey, so unmatched keystrokes
+    /// can never accidentally re-trigger an expensive `SparksPoll`.
+    /// Spark ryve-5b9c5d93 (perf regression harness).
+    Noop,
     /// Spawn a new Hand with the default agent (Cmd+H)
     NewDefaultHand,
     HandAssignmentSaved,
@@ -365,6 +379,15 @@ enum Message {
     /// Escape pressed. Dispatched globally; handlers close any open
     /// search overlay or selection on the active tab.
     HotkeyEscape,
+    /// Result of an async `create_hand_worktree` task. Spark ryve-885ed3eb:
+    /// Hand terminal spawns are a two-step Task — stage 1 allocates the
+    /// tab and stores pending params, stage 2 (this message) finalizes the
+    /// `iced_term::Terminal` once the worktree is ready.
+    HandWorktreeReady {
+        workshop_id: Uuid,
+        tab_id: u64,
+        result: Result<PathBuf, String>,
+    },
     /// Send initial spark prompt to a Hand's terminal after agent boots.
     SendSparkPrompt {
         tab_id: u64,
@@ -491,11 +514,22 @@ impl std::fmt::Debug for Message {
             Self::BackgroundConfigSaved => write!(f, "BackgroundConfigSaved"),
             Self::AgentContextSynced => write!(f, "AgentContextSynced"),
             Self::SparksPoll => write!(f, "SparksPoll"),
+            Self::ProcessSnapshotReady(_) => write!(f, "ProcessSnapshotReady"),
+            Self::Noop => write!(f, "Noop"),
             Self::NewDefaultHand => write!(f, "NewDefaultHand"),
             Self::HandAssignmentSaved => write!(f, "HandAssignmentSaved"),
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
             Self::HotkeyCmdF => write!(f, "HotkeyCmdF"),
             Self::HotkeyEscape => write!(f, "HotkeyEscape"),
+            Self::HandWorktreeReady {
+                workshop_id,
+                tab_id,
+                result,
+            } => write!(
+                f,
+                "HandWorktreeReady({workshop_id}, {tab_id}, ok={})",
+                result.is_ok()
+            ),
             Self::SendSparkPrompt { tab_id, .. } => write!(f, "SendSparkPrompt({tab_id})"),
             Self::SubmitSparkPrompt { tab_id } => write!(f, "SubmitSparkPrompt({tab_id})"),
             Self::SplitterPressed(k) => write!(f, "SplitterPressed({k:?})"),
@@ -527,6 +561,7 @@ impl App {
             active_workshop: None,
             next_terminal_id: 1,
             poll_in_flight: false,
+            last_process_snapshot: None,
             shift_held: false,
             splitter_drag: None,
             window_size: Size::new(1400.0, 900.0),
@@ -750,6 +785,7 @@ impl App {
                         config: init.config,
                         custom_agents: init.custom_agents,
                         agent_context: init.agent_context,
+                        agent_context_sync_cache: init.agent_context_sync_cache,
                     },
                     Err(e) => Message::WorkshopInitFailed {
                         id: ws_id,
@@ -785,6 +821,7 @@ impl App {
                 config,
                 custom_agents,
                 agent_context,
+                agent_context_sync_cache,
             } => {
                 let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
                 let Some(idx) = ws_idx else {
@@ -795,6 +832,10 @@ impl App {
                     ws.config = config;
                     ws.custom_agents = custom_agents;
                     ws.agent_context = agent_context;
+                    // Hand off the warm hash cache from init_workshop so the
+                    // first SparksLoaded sync tick is a no-op on disk.
+                    // Spark ryve-86b0b326.
+                    ws.agent_context_sync_cache = agent_context_sync_cache;
 
                     // Load sparks + agent sessions + scan file tree in parallel
                     let ws_id = ws.workshop_id();
@@ -917,14 +958,20 @@ impl App {
                         ));
                     }
 
-                    // Sync .ryve/WORKSHOP.md and pointers (including into worktrees)
+                    // Sync .ryve/WORKSHOP.md and pointers (including into worktrees).
+                    // The shared `agent_context_sync_cache` lets repeated calls
+                    // skip writes when nothing on disk has changed — without it,
+                    // ~25 file writes fired every 3s on a 5-worktree workshop.
+                    // Spark ryve-86b0b326.
                     if !ws.config.agents.disable_sync {
                         let dir = ws.directory.clone();
                         let ryve_dir = ws.ryve_dir.clone();
                         let config = ws.config.clone();
+                        let cache = ws.agent_context_sync_cache.clone();
                         tasks.push(Task::perform(
                             async move {
-                                let _ = data::agent_context::sync(&dir, &ryve_dir, &config).await;
+                                let _ = data::agent_context::sync(&dir, &ryve_dir, &config, &cache)
+                                    .await;
                             },
                             |_| Message::AgentContextSynced,
                         ));
@@ -1088,6 +1135,12 @@ impl App {
                     return Task::none();
                 };
                 let mut chain_open_tabs: Option<Task<Message>> = None;
+                // Read liveness from the cached snapshot the current poll
+                // captured. At workshop init time (the very first
+                // `AgentSessionsLoaded`) there is no snapshot yet — every
+                // PID falls back to "not alive", and the next 3-second
+                // poll re-classifies them. Spark `ryve-a5b9e4a1`.
+                let snapshot = self.last_process_snapshot.clone();
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     let available = &self.available_agents;
                     let known_ids: std::collections::HashSet<String> =
@@ -1099,10 +1152,14 @@ impl App {
                             .iter()
                             .find(|s| s.id == p.id)
                             .and_then(|s| s.tab_id);
+                        let child_alive = match (snapshot.as_ref(), p.child_pid) {
+                            (Some(snap), Some(pid)) => snap.is_alive(pid),
+                            _ => false,
+                        };
                         let display_state = screen::agents::classify_session(
                             p.ended_at.is_some(),
                             existing_tab_id.is_some(),
-                            p.child_pid.is_some_and(process_is_alive),
+                            child_alive,
                         );
 
                         if known_ids.contains(&p.id) {
@@ -1187,8 +1244,7 @@ impl App {
                     match tab.tab_kind.as_str() {
                         "terminal" => {
                             let next_id = &mut self.next_terminal_id;
-                            self.workshops[idx]
-                                .spawn_terminal(tab.title, None, next_id, None, false);
+                            self.workshops[idx].spawn_plain_terminal(tab.title, next_id);
                         }
                         "file_viewer" => {
                             let Some(payload) = tab.payload else { continue };
@@ -1258,13 +1314,18 @@ impl App {
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
                             let next_id = &mut self.next_terminal_id;
-                            let tab_id = ws.spawn_terminal(
+                            let tab_id = ws.begin_hand_terminal(
                                 session.name.clone(),
-                                Some(&resume_agent),
+                                workshop::PendingTerminalKind::Agent(resume_agent.clone()),
                                 next_id,
-                                Some(&session_id),
+                                session_id.clone(),
                                 full_auto,
                             );
+                            follow_up.push(Self::dispatch_worktree_task(
+                                ws,
+                                tab_id,
+                                session_id.clone(),
+                            ));
                             if let Some(s) =
                                 ws.agent_sessions.iter_mut().find(|s| s.id == session_id)
                             {
@@ -1788,13 +1849,15 @@ impl App {
                                 .agent_settings
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
-                            let tab_id = ws.spawn_terminal(
+                            let tab_id = ws.begin_hand_terminal(
                                 session.name.clone(),
-                                Some(&resume_agent),
+                                workshop::PendingTerminalKind::Agent(resume_agent.clone()),
                                 next_id,
-                                Some(&session_id),
+                                session_id.clone(),
                                 full_auto,
                             );
+                            let worktree_task =
+                                Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
                             // Update the existing session to active
                             if let Some(s) =
@@ -1809,7 +1872,7 @@ impl App {
                             if let Some(ref pool) = ws.sparks_db {
                                 let pool = pool.clone();
                                 let sid = session_id.clone();
-                                return Task::perform(
+                                let reactivate = Task::perform(
                                     async move {
                                         let _ = data::sparks::agent_session_repo::reactivate(
                                             &pool, &sid,
@@ -1818,7 +1881,9 @@ impl App {
                                     },
                                     |_| Message::AgentSessionSaved,
                                 );
+                                return Task::batch([worktree_task, reactivate]);
                             }
+                            return worktree_task;
                         }
                     }
                     screen::agents::Message::DeleteSession(session_id) => {
@@ -2086,6 +2151,34 @@ impl App {
             Message::SparkPicker(msg) => self.handle_spark_picker_message(msg),
             Message::HeadPicker(msg) => self.handle_head_picker_message(msg),
             Message::HandAssignmentSaved => Task::none(),
+            Message::HandWorktreeReady {
+                workshop_id,
+                tab_id,
+                result,
+            } => {
+                // Stage 2 of the Hand spawn flow (spark ryve-885ed3eb):
+                // the async `create_hand_worktree` task has reported back.
+                // Finalize the terminal and, if successful, focus it so
+                // the user's next keystrokes land in the new Hand.
+                let Some(idx) = self.workshops.iter().position(|ws| ws.id == workshop_id) else {
+                    return Task::none();
+                };
+                let ws = &mut self.workshops[idx];
+                let created = ws.finalize_hand_terminal(tab_id, result);
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if created && let Some(term) = ws.terminals.get(&tab_id) {
+                    tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
+                }
+                // Surface any fallback-to-workshop-root warning as a toast.
+                if let Some(msg) = ws.take_worktree_warning() {
+                    tasks.push(self.push_toast("Worktree fallback", msg, ToastKind::Warning));
+                }
+                if tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(tasks)
+                }
+            }
             Message::SendSparkPrompt { tab_id, prompt } => {
                 // Find the terminal across all workshops and send the prompt as input.
                 // Wrap in bracketed paste so TUI agents see it as a single paste.
@@ -2523,6 +2616,7 @@ impl App {
             }
             Message::BackgroundConfigSaved => Task::none(),
             Message::AgentContextSynced => Task::none(),
+            Message::Noop => Task::none(),
             Message::SparksPoll => {
                 // Opportunistically surface any worktree warnings that the
                 // synchronous spawn paths accumulated since the last tick.
@@ -2531,7 +2625,7 @@ impl App {
                     .iter_mut()
                     .filter_map(|ws| ws.take_worktree_warning())
                     .collect();
-                let mut warning_tasks: Vec<Task<Message>> = warnings
+                let warning_tasks: Vec<Task<Message>> = warnings
                     .into_iter()
                     .map(|w| self.push_toast("Worktree fallback", w, ToastKind::Warning))
                     .collect();
@@ -2540,11 +2634,40 @@ impl App {
                     return Task::batch(warning_tasks);
                 }
 
-                let mut tasks: Vec<Task<Message>> = std::mem::take(&mut warning_tasks);
+                // Spark `ryve-a5b9e4a1`: snapshot the OS process table once
+                // per tick on a blocking thread, then resume the rest of the
+                // poll body inside `ProcessSnapshotReady` so the UI thread
+                // never calls `System::new_all` itself. Marking the poll
+                // in-flight here keeps the next tick from racing this one
+                // even though the work hasn't started yet.
+                self.poll_in_flight = true;
+                let snapshot_task = Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(ProcessSnapshot::capture)
+                            .await
+                            .unwrap_or_default()
+                    },
+                    |snap| Message::ProcessSnapshotReady(Arc::new(snap)),
+                );
+                let mut all = warning_tasks;
+                all.push(snapshot_task);
+                Task::batch(all)
+            }
 
-                // Auto-detect agent processes in plain terminals
+            Message::ProcessSnapshotReady(snapshot) => {
+                // Cache the snapshot so any handler that fires on the back
+                // half of this tick (`AgentSessionsLoaded`, `SparksLoaded`,
+                // …) can read liveness from the same scan instead of taking
+                // its own. Spark `ryve-a5b9e4a1`.
+                self.last_process_snapshot = Some(snapshot.clone());
+
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+
+                // Auto-detect agent processes in plain terminals, sharing
+                // the snapshot with `detect_untracked_agents` instead of
+                // letting it walk /proc itself.
                 for ws in self.workshops.iter_mut() {
-                    let detected = ws.detect_untracked_agents();
+                    let detected = ws.detect_untracked_agents(&snapshot);
                     for (tab_id, agent) in detected {
                         let session_id = Uuid::new_v4().to_string();
                         let name = agent.display_name.clone();
@@ -2654,11 +2777,13 @@ impl App {
                     .collect();
                 tasks.extend(spark_tasks);
 
-                if !tasks.is_empty() {
-                    self.poll_in_flight = true;
-                    return Task::batch(tasks);
+                if tasks.is_empty() {
+                    // Nothing to wait on — release the in-flight gate now,
+                    // otherwise the next 3-second tick would early-return.
+                    self.poll_in_flight = false;
+                    return Task::none();
                 }
-                Task::none()
+                Task::batch(tasks)
             }
             Message::NewDefaultHand => {
                 let Some(_idx) = self.active_workshop else {
@@ -2886,7 +3011,7 @@ impl App {
         // Build the FontSettings once and clone into each terminal handle.
         let font_type = match &effective_family {
             Some(name) => iced::Font {
-                family: iced::font::Family::Name(Box::leak(name.clone().into_boxed_str())),
+                family: iced::font::Family::Name(font_intern::intern(name)),
                 ..iced::Font::MONOSPACE
             },
             None => iced::Font::MONOSPACE,
@@ -3089,13 +3214,8 @@ impl App {
             }
             screen::bench::Message::NewTerminal => {
                 let next_id = &mut self.next_terminal_id;
-                let tab_id = self.workshops[idx].spawn_terminal(
-                    "Terminal".to_string(),
-                    None,
-                    next_id,
-                    None,
-                    false,
-                );
+                let tab_id =
+                    self.workshops[idx].spawn_plain_terminal("Terminal".to_string(), next_id);
                 let persist = self.persist_open_tabs(idx);
                 if let Some(term) = self.workshops[idx].terminals.get(&tab_id) {
                     let focus = iced_term::TerminalView::focus(term.widget_id().clone());
@@ -3370,6 +3490,25 @@ impl App {
         }
     }
 
+    /// Build a `Task` that drives the async `create_hand_worktree` call for
+    /// a Hand terminal and dispatches `HandWorktreeReady` back to `update`.
+    /// Spark ryve-885ed3eb: callers that begin a Hand spawn via
+    /// `Workshop::begin_hand_terminal` use this to kick off stage 2 without
+    /// blocking the UI thread on `git worktree add`.
+    fn dispatch_worktree_task(ws: &Workshop, tab_id: u64, session_id: String) -> Task<Message> {
+        let workshop_dir = ws.directory.clone();
+        let ryve_dir = ws.ryve_dir.clone();
+        let workshop_id = ws.id;
+        Task::perform(
+            async move { workshop::create_hand_worktree(&workshop_dir, &ryve_dir, &session_id).await },
+            move |result| Message::HandWorktreeReady {
+                workshop_id,
+                tab_id,
+                result,
+            },
+        )
+    }
+
     /// Proceed with spawning the pending agent and assigning a spark.
     fn spawn_pending_agent(&mut self, workshop_idx: usize, spark_id: String) -> Task<Message> {
         let ws = &mut self.workshops[workshop_idx];
@@ -3391,19 +3530,28 @@ impl App {
 
         let tab_id = if pending.is_custom {
             if let Some(ref def) = pending.custom_def {
-                ws.spawn_custom_agent(def, &mut self.next_terminal_id, &session_id)
+                ws.begin_hand_terminal(
+                    def.name.clone(),
+                    workshop::PendingTerminalKind::CustomAgent(def.clone()),
+                    &mut self.next_terminal_id,
+                    session_id.clone(),
+                    pending.full_auto,
+                )
             } else {
                 return Task::none();
             }
         } else {
-            ws.spawn_terminal(
+            ws.begin_hand_terminal(
                 title.clone(),
-                Some(&pending_agent),
+                workshop::PendingTerminalKind::Agent(pending_agent.clone()),
                 &mut self.next_terminal_id,
-                Some(&session_id),
+                session_id.clone(),
                 pending.full_auto,
             )
         };
+        // Stage 2: drive the async worktree creation. `HandWorktreeReady`
+        // will finalize the `iced_term::Terminal` and focus it.
+        let worktree_task = Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
         ws.agent_sessions.push(AgentSession {
             id: session_id.clone(),
@@ -3476,9 +3624,10 @@ impl App {
                 },
             ));
         }
-        if let Some(term) = ws.terminals.get(&tab_id) {
-            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
-        }
+        // Kick off the async worktree creation last so it is chained after
+        // the DB persistence tasks in the batch — finalization + focus fire
+        // when `HandWorktreeReady` lands, not synchronously here.
+        tasks.push(worktree_task);
         Task::batch(tasks)
     }
 
@@ -3504,13 +3653,14 @@ impl App {
             .get(&agent.command)
             .is_some_and(|s| s.full_auto);
 
-        let tab_id = ws.spawn_terminal(
+        let tab_id = ws.begin_hand_terminal(
             title.clone(),
-            Some(&agent),
+            workshop::PendingTerminalKind::Agent(agent.clone()),
             &mut self.next_terminal_id,
-            Some(&session_id),
+            session_id.clone(),
             full_auto,
         );
+        let worktree_task = Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
         ws.agent_sessions.push(AgentSession {
             id: session_id.clone(),
@@ -3527,6 +3677,7 @@ impl App {
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
+        tasks.push(worktree_task);
         if let Some(ref pool) = ws.sparks_db {
             let pool = pool.clone();
             let ws_id = ws.workshop_id();
@@ -3568,9 +3719,8 @@ impl App {
             },
         ));
 
-        if let Some(term) = ws.terminals.get(&tab_id) {
-            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
-        }
+        // Focus is handled by the `HandWorktreeReady` handler once the
+        // terminal widget actually exists.
         Task::batch(tasks)
     }
 
@@ -3596,13 +3746,14 @@ impl App {
             .get(&agent.command)
             .is_some_and(|s| s.full_auto);
 
-        let tab_id = ws.spawn_terminal(
+        let tab_id = ws.begin_hand_terminal(
             title.clone(),
-            Some(&agent),
+            workshop::PendingTerminalKind::Agent(agent.clone()),
             &mut self.next_terminal_id,
-            Some(&session_id),
+            session_id.clone(),
             full_auto,
         );
+        let worktree_task = Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
         ws.agent_sessions.push(AgentSession {
             id: session_id.clone(),
@@ -3620,6 +3771,7 @@ impl App {
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
+        tasks.push(worktree_task);
         if let Some(ref pool) = ws.sparks_db {
             let pool = pool.clone();
             let ws_id = ws.workshop_id();
@@ -3660,9 +3812,8 @@ impl App {
             },
         ));
 
-        if let Some(term) = ws.terminals.get(&tab_id) {
-            tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
-        }
+        // Focus is handled by the `HandWorktreeReady` handler once the
+        // terminal widget actually exists.
         Task::batch(tasks)
     }
 
@@ -3906,43 +4057,66 @@ impl App {
         let poll =
             iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::SparksPoll);
 
+        // Translate Iced keyboard events into the framework-agnostic
+        // [`perf_core::KeyKind`] / [`perf_core::KeyModifiers`] pair so the
+        // routing decision lives in [`perf_core::classify_key_event`]. The
+        // smoke test in `perf_core/tests/sparks_poll_smoke.rs` drives the
+        // *same* classifier with synthetic events to assert no key path
+        // ever resolves to `SparksPoll`. This subsumes the lean
+        // event::listen_with fix from hand/0e2ed795 ([sp-18253584]) by
+        // making the same correctness property automatically tested.
+        // Sparks ryve-5b9c5d93 + ryve-a13f9d3a.
         let hotkeys = keyboard::listen().map(|event| {
-            match &event {
+            let (kind, mods) = match &event {
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(c),
                     modifiers,
                     ..
                 } => {
-                    if modifiers.command() && c.as_str() == "h" {
-                        return Message::NewDefaultHand;
-                    }
-                    if modifiers.command() && c.as_str() == "c" {
-                        return Message::FileViewer(file_viewer::Message::CopySelection);
-                    }
-                    if modifiers.command() && c.as_str() == "f" {
-                        return Message::HotkeyCmdF;
-                    }
-                    // Cmd+O — open workshop directory picker. Advertised on
-                    // the welcome screen so first-time users have a way in
-                    // beyond clicking the button. Active everywhere so the
-                    // shortcut works once a workshop is already loaded too.
-                    if modifiers.command() && c.as_str() == "o" {
-                        return Message::NewWorkshopDialog;
-                    }
+                    let ch = c.chars().next().unwrap_or('\0');
+                    (
+                        perf_core::KeyKind::Character(ch),
+                        perf_core::KeyModifiers {
+                            command: modifiers.command(),
+                        },
+                    )
                 }
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
-                } => {
-                    return Message::HotkeyEscape;
+                } => (
+                    perf_core::KeyKind::Escape,
+                    perf_core::KeyModifiers::default(),
+                ),
+                keyboard::Event::ModifiersChanged(modifiers) => (
+                    perf_core::KeyKind::ModifiersChanged {
+                        shift: modifiers.shift(),
+                    },
+                    perf_core::KeyModifiers::default(),
+                ),
+                _ => (
+                    perf_core::KeyKind::Other,
+                    perf_core::KeyModifiers::default(),
+                ),
+            };
+
+            match perf_core::classify_key_event(kind, mods) {
+                perf_core::KeyDispatch::NewDefaultHand => Message::NewDefaultHand,
+                perf_core::KeyDispatch::CopySelection => {
+                    Message::FileViewer(file_viewer::Message::CopySelection)
                 }
-                keyboard::Event::ModifiersChanged(modifiers) => {
-                    return Message::ShiftStateChanged(modifiers.shift());
+                perf_core::KeyDispatch::HotkeyCmdF => Message::HotkeyCmdF,
+                perf_core::KeyDispatch::NewWorkshopDialog => Message::NewWorkshopDialog,
+                perf_core::KeyDispatch::HotkeyEscape => Message::HotkeyEscape,
+                perf_core::KeyDispatch::ShiftStateChanged(shift) => {
+                    Message::ShiftStateChanged(shift)
                 }
-                _ => {}
+                // SparksPoll is a sentinel that classify_key_event must
+                // never return. The regression test asserts this; if it
+                // ever did escape, we still want a no-op rather than a
+                // workgraph reload — so map it to Noop here too.
+                perf_core::KeyDispatch::Noop | perf_core::KeyDispatch::SparksPoll => Message::Noop,
             }
-            // Swallow unmatched keyboard events — SparksPoll is a harmless no-op
-            Message::SparksPoll
         });
 
         // Track window resizes so the splitter can convert vertical
@@ -4743,6 +4917,12 @@ impl App {
 /// drag is in progress. `listen_with` requires a `fn` (no closures),
 /// so we always emit messages and let the `update` function decide
 /// what to do based on `splitter_drag` state.
+//
+// Note: the previous `hotkey_for_keyboard_event` helper from
+// hand/0e2ed795 ([sp-18253584]) was removed during the perf/p1
+// integration merge — the regression-harness branch ([sp-961b4d5e])
+// replaced it with `perf_core::classify_key_event`, which is exercised
+// by the headless smoke test in `perf_core/tests/sparks_poll_smoke.rs`.
 fn splitter_event_filter(
     event: iced::Event,
     _status: event::Status,
@@ -5075,6 +5255,13 @@ mod tests {
         };
         assert!(unsplash_attribution_label(&bg).is_none());
     }
+
+    // Note: hotkey filter unit tests from hand/0e2ed795 ([sp-18253584])
+    // were removed during the perf/p1 integration merge. Their property
+    // — that no key event ever resolves to SparksPoll — is now enforced
+    // end to end by `perf_core/tests/sparks_poll_smoke.rs`, which drives
+    // the same `perf_core::classify_key_event` classifier the live
+    // subscription uses.
 
     #[test]
     fn attribution_label_absent_for_blank_photographer() {

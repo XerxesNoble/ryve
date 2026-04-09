@@ -1,0 +1,58 @@
+name: Perf Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-regression:
+    name: Performance regression harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-perf-
+
+      # SparksPoll dispatch smoke test (perf_core integration test).
+      # Fast — runs on every PR independent of the benchmarks below so a
+      # broken classifier fails before we spend minutes on criterion.
+      - name: SparksPoll dispatch smoke test
+        run: cargo test -p perf_core --test sparks_poll_smoke
+
+      # Criterion benchmarks. `--profile-time` is intentionally NOT set;
+      # we want criterion's full statistical run so the gate has a stable
+      # mean to compare against the budget. Crank `noise-threshold` up
+      # via env vars in CONTRIBUTING if CI noise becomes a problem.
+      - name: Run perf_core benchmarks
+        run: cargo bench -p perf_core --bench perf
+
+      - name: Run data crate benchmarks
+        run: cargo bench -p data --bench agent_context_sync
+
+      - name: Enforce performance budgets
+        run: python3 scripts/perf-gate.py --budgets perf-budgets.toml --target-dir target

@@ -1,0 +1,52 @@
+# Performance regression budgets — spark ryve-5b9c5d93.
+#
+# Each entry sets a hard ceiling on the mean wall-clock time of one criterion
+# benchmark. CI runs `cargo bench` over the perf_core and data crates, then
+# `scripts/perf-gate.py` reads `target/criterion/<bench>/new/estimates.json`
+# and fails the build if any benchmark's mean exceeds `budget_ns * (1 +
+# tolerance_pct / 100)`.
+#
+# How to add a new gate:
+#   1. Pick (or write) a pure function on a UI hot path.
+#   2. Add a criterion benchmark for it in `perf_core/benches/perf.rs`
+#      (or `data/benches/*.rs`).
+#   3. Run `cargo bench --bench <name>` locally and read the reported mean.
+#   4. Add an entry below with that mean as the `budget_ns`. Pick a tolerance
+#      generous enough to absorb CI noise — start at 50% and tighten over
+#      time as you collect runs.
+#
+# Budgets are intentionally generous on first commit. The harness exists to
+# catch *order-of-magnitude* regressions, not micro-noise. Update the budget
+# (and explain why in the commit message) whenever a perf improvement lands.
+
+# Default tolerance applied to any benchmark that does not override it.
+# Expressed as a percentage: a budget of 1000ns with default_tolerance_pct
+# = 50 fails when the new mean exceeds 1500ns.
+default_tolerance_pct = 50
+
+# ── perf_core/benches/perf.rs ──────────────────────────────
+
+[benchmarks.process_is_alive]
+# sysinfo refresh on the current process. Linux CI hovers under ~30ms.
+budget_ns = 60_000_000
+
+[benchmarks.session_filter]
+# 256-element vec scan. Sub-microsecond on every machine we've measured.
+budget_ns = 5_000
+
+[benchmarks.file_git_status_dir_aggregation]
+# 512-entry HashMap with prefix-match per entry. Tens of microseconds.
+budget_ns = 200_000
+
+[benchmarks.classify_key_event_unmatched]
+# Single match-arm dispatch. Should stay in single-digit nanoseconds.
+budget_ns = 50
+
+# ── data/benches/agent_context_sync.rs ─────────────────────
+
+[benchmarks.agent_context_sync_noop]
+# Steady-state sync: writes WORKSHOP.md + a few CLAUDE.md/.cursorrules
+# files. Bound by tokio fs writes; budget chosen to flag if anyone makes
+# the steady-state path scan or rewrite something it shouldn't.
+budget_ns = 25_000_000
+tolerance_pct = 100

@@ -353,65 +353,36 @@ fn collect_nodes<'a>(
 
 // ── Git status colors ─────────────────────────────────
 
+/// Convert the local file-explorer node kind into the perf_core variant
+/// the shared aggregation functions expect.
+fn perf_node_kind(kind: &NodeKind) -> perf_core::NodeKind {
+    match kind {
+        NodeKind::File => perf_core::NodeKind::File,
+        NodeKind::Directory => perf_core::NodeKind::Directory,
+    }
+}
+
 /// Resolve the effective git status for a file or directory.
-/// For directories, returns the "most important" status of any descendant.
+///
+/// Implementation lives in `perf_core` so the regression harness benches
+/// the same code path the UI hits on every redraw. Spark ryve-5b9c5d93.
 fn file_git_status(
     rel_path: &Path,
     kind: &NodeKind,
     statuses: &HashMap<PathBuf, FileStatus>,
 ) -> Option<FileStatus> {
-    if *kind == NodeKind::File {
-        return statuses.get(rel_path).copied();
-    }
-
-    // Directory: check if any child file (a strict descendant) has a git
-    // status. We use `Path::starts_with`, which compares whole path
-    // components, so a directory `src` does NOT match a sibling like
-    // `src2/foo.rs` — a bug the previous string-prefix check had.
-    let mut most_important: Option<FileStatus> = None;
-
-    for (path, status) in statuses {
-        if path == rel_path {
-            // The directory entry itself; skip — we only want descendants.
-            continue;
-        }
-        if path.starts_with(rel_path) {
-            most_important = Some(match most_important {
-                None => *status,
-                Some(prev) => higher_priority_status(prev, *status),
-            });
-        }
-    }
-
-    most_important
+    perf_core::file_git_status(rel_path, perf_node_kind(kind), statuses)
 }
 
 /// Get aggregated diff stats for a file or directory.
+///
+/// Implementation lives in `perf_core` (see [`file_git_status`]).
 fn file_diff_stat(
     rel_path: &Path,
     kind: &NodeKind,
     diff_stats: &HashMap<PathBuf, DiffStat>,
 ) -> DiffStat {
-    if *kind == NodeKind::File {
-        return diff_stats.get(rel_path).copied().unwrap_or_default();
-    }
-
-    // Directory: aggregate all *strict descendants*. Use `Path::starts_with`
-    // (whole-component compare) so a directory `src` does NOT pull in
-    // siblings like `src2/foo.rs` — same correctness fix as `file_git_status`
-    // above. PR #5 Copilot review flagged the underlying antipattern; this
-    // function had the same shape. Spark ryve-20e0fa52.
-    let mut total = DiffStat::default();
-    for (path, stat) in diff_stats {
-        if path == rel_path {
-            continue;
-        }
-        if path.starts_with(rel_path) {
-            total.additions += stat.additions;
-            total.deletions += stat.deletions;
-        }
-    }
-    total
+    perf_core::file_diff_stat(rel_path, perf_node_kind(kind), diff_stats)
 }
 
 fn status_color(status: FileStatus) -> Color {
@@ -440,22 +411,6 @@ fn status_letter(status: FileStatus) -> char {
         FileStatus::Ignored => 'I',
         FileStatus::Conflicted => 'U',
     }
-}
-
-fn higher_priority_status(a: FileStatus, b: FileStatus) -> FileStatus {
-    fn rank(s: FileStatus) -> u8 {
-        match s {
-            FileStatus::Conflicted => 7,
-            FileStatus::Deleted => 6,
-            FileStatus::Added => 5,
-            FileStatus::Modified => 4,
-            FileStatus::Renamed => 3,
-            FileStatus::Copied => 2,
-            FileStatus::Untracked => 1,
-            FileStatus::Ignored => 0,
-        }
-    }
-    if rank(b) > rank(a) { b } else { a }
 }
 
 #[cfg(test)]

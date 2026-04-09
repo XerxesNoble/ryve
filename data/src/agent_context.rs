@@ -9,9 +9,45 @@
 //! so they discover and read it automatically, and propagates both into every
 //! active worktree.
 
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::ryve_dir::{RyveDir, WorkshopConfig};
+
+// ── Sync cache ────────────────────────────────────────
+
+/// Cache of last-written content hashes per file. Lives in `Workshop` state
+/// and is passed through to [`sync`] on every refresh tick.
+///
+/// Without this cache, `sync` would rewrite WORKSHOP.md plus every agent
+/// boot file in the main checkout *and* every active worktree on every
+/// `SparksLoaded` event (~25 writes every 3s for a 5-worktree workshop),
+/// thrashing the filesystem and starving tokio workers.
+///
+/// With it, repeated `sync()` calls produce zero file writes when neither
+/// the config nor any worktree on disk has changed.
+#[derive(Debug, Default)]
+pub struct SyncCache {
+    /// Hash of the most recent content we wrote (or observed equal) at each
+    /// absolute path. A subsequent `sync()` that would write the same bytes
+    /// short-circuits without touching disk.
+    file_hashes: HashMap<PathBuf, u64>,
+}
+
+impl SyncCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    h.write(s.as_bytes());
+    h.finish()
+}
 
 // ── Marker ────────────────────────────────────────────
 
@@ -43,13 +79,22 @@ pub async fn sync(
     workshop_dir: &Path,
     ryve_dir: &RyveDir,
     config: &WorkshopConfig,
+    cache: &Mutex<SyncCache>,
 ) -> Result<(), std::io::Error> {
     let workshop_md = generate_workshop_md();
-    tokio::fs::write(ryve_dir.workshop_md_path(), &workshop_md).await?;
+    let workshop_md_hash = hash_str(&workshop_md);
+
+    write_if_changed(
+        ryve_dir.workshop_md_path(),
+        &workshop_md,
+        workshop_md_hash,
+        cache,
+    )
+    .await?;
 
     let targets = resolve_targets(config);
     for rel in &targets {
-        inject_pointer(workshop_dir, rel).await?;
+        inject_pointer_if_changed(workshop_dir, rel, cache).await?;
     }
 
     // Propagate WORKSHOP.md + pointers into every active worktree
@@ -64,16 +109,69 @@ pub async fn sync(
             let wt_ryve = wt_path.join(".ryve");
             if wt_ryve.is_dir() {
                 let wt_workshop_md = wt_ryve.join("WORKSHOP.md");
-                let _ = tokio::fs::write(&wt_workshop_md, &workshop_md).await;
+                let _ =
+                    write_if_changed(wt_workshop_md, &workshop_md, workshop_md_hash, cache).await;
             }
             // Re-inject pointers into the worktree's agent boot files
             for rel in &targets {
-                let _ = inject_pointer(&wt_path, rel).await;
+                let _ = inject_pointer_if_changed(&wt_path, rel, cache).await;
             }
         }
     }
 
     Ok(())
+}
+
+/// Write `content` to `path` only if the bytes already on disk differ from
+/// what we'd write. Updates `cache` so the next call can short-circuit
+/// without any I/O when nothing has changed.
+async fn write_if_changed(
+    path: PathBuf,
+    content: &str,
+    content_hash: u64,
+    cache: &Mutex<SyncCache>,
+) -> Result<(), std::io::Error> {
+    // Cheap path: cache hit means we already wrote (or observed) these exact
+    // bytes here. Trust the cache — no read, no write. Stale cache (the file
+    // was edited externally to match a different value) is self-correcting on
+    // the next miss because we re-read on every miss below.
+    if cache_hit(cache, &path, content_hash) {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    // Cache miss: read disk to see if it already matches. If so, no write
+    // needed — just record the hash so future calls take the cheap path.
+    if let Ok(existing) = tokio::fs::read_to_string(&path).await
+        && hash_str(&existing) == content_hash
+    {
+        cache_set(cache, path, content_hash);
+        return Ok(());
+    }
+
+    tokio::fs::write(&path, content).await?;
+    cache_set(cache, path, content_hash);
+    Ok(())
+}
+
+fn cache_hit(cache: &Mutex<SyncCache>, path: &Path, hash: u64) -> bool {
+    cache
+        .lock()
+        .expect("agent_context sync cache mutex poisoned")
+        .file_hashes
+        .get(path)
+        == Some(&hash)
+}
+
+fn cache_set(cache: &Mutex<SyncCache>, path: PathBuf, hash: u64) {
+    cache
+        .lock()
+        .expect("agent_context sync cache mutex poisoned")
+        .file_hashes
+        .insert(path, hash);
 }
 
 // ── WORKSHOP.md generation ────────────────────────────
@@ -306,12 +404,22 @@ fn pointer_line() -> String {
     )
 }
 
-/// Inject the pointer into a single agent boot file.
+/// Inject the pointer into a single agent boot file, skipping the write if
+/// the on-disk content is already what we'd produce.
 ///
 /// - If the file already contains the markers, replace the block between them.
 /// - If the file exists but has no markers, append the block.
 /// - If the file doesn't exist, create it with just the block.
-async fn inject_pointer(workshop_dir: &Path, relative: &str) -> Result<(), std::io::Error> {
+///
+/// `cache` records the hash of the file the last time we either wrote it or
+/// observed it equal to our target. When the disk hash still matches the
+/// cache, the pointer block is unchanged (the pointer literal is constant)
+/// and we skip recomputation entirely.
+async fn inject_pointer_if_changed(
+    workshop_dir: &Path,
+    relative: &str,
+    cache: &Mutex<SyncCache>,
+) -> Result<(), std::io::Error> {
     let path = workshop_dir.join(relative);
 
     // Ensure parent directory exists (e.g. `.github/`)
@@ -321,9 +429,18 @@ async fn inject_pointer(workshop_dir: &Path, relative: &str) -> Result<(), std::
 
     let pointer = pointer_line();
 
-    let content = match tokio::fs::read_to_string(&path).await {
+    let (new_content, existing_hash) = match tokio::fs::read_to_string(&path).await {
         Ok(existing) => {
-            if let (Some(start), Some(end)) =
+            let existing_hash = hash_str(&existing);
+
+            // Cheap path: file is bit-for-bit identical to what we last
+            // wrote. Re-running injection would yield the same bytes, so
+            // there is nothing to do.
+            if cache_hit(cache, &path, existing_hash) {
+                return Ok(());
+            }
+
+            let updated = if let (Some(start), Some(end)) =
                 (existing.find(MARKER_START), existing.find(MARKER_END))
             {
                 // Replace existing block
@@ -338,15 +455,26 @@ async fn inject_pointer(workshop_dir: &Path, relative: &str) -> Result<(), std::
             } else {
                 // No markers yet — append
                 format!("{existing}\n{pointer}\n")
-            }
+            };
+
+            (updated, Some(existing_hash))
         }
         Err(_) => {
             // File doesn't exist — create with just the pointer
-            format!("{pointer}\n")
+            (format!("{pointer}\n"), None)
         }
     };
 
-    tokio::fs::write(&path, content).await
+    let new_hash = hash_str(&new_content);
+    if Some(new_hash) == existing_hash {
+        // Disk already matches what injection would produce. Cache and skip.
+        cache_set(cache, path, new_hash);
+        return Ok(());
+    }
+
+    tokio::fs::write(&path, &new_content).await?;
+    cache_set(cache, path, new_hash);
+    Ok(())
 }
 
 // ── Config helpers ────────────────────────────────────
@@ -440,6 +568,99 @@ mod tests {
         assert!(md.contains("scatter"));
         assert!(md.contains("chain"));
         assert!(md.contains("watch"));
+    }
+
+    /// Acceptance criterion for spark ryve-86b0b326: with no config or
+    /// worktree changes, repeated `sync()` calls produce zero file writes.
+    /// We verify by snapshotting mtimes after the first sync, sleeping
+    /// past filesystem mtime resolution, and confirming the second sync
+    /// leaves every mtime untouched.
+    #[tokio::test]
+    async fn sync_is_idempotent_with_zero_writes_on_unchanged_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // `.ryve/` must exist for `RyveDir::workshop_md_path` to be writeable.
+        std::fs::create_dir_all(dir.join(".ryve")).unwrap();
+        let ryve_dir = RyveDir::new(&dir);
+        let config = WorkshopConfig::default();
+        let cache = Mutex::new(SyncCache::new());
+
+        // First sync: writes everything.
+        sync(&dir, &ryve_dir, &config, &cache).await.unwrap();
+
+        // Snapshot mtime + size of every file sync would touch.
+        let tracked: Vec<PathBuf> = target_paths(&dir, &config);
+        let snapshots: Vec<_> = tracked
+            .iter()
+            .map(|p| {
+                let m = std::fs::metadata(p).expect("file missing after first sync");
+                (p.clone(), m.modified().unwrap(), m.len())
+            })
+            .collect();
+        assert!(!snapshots.is_empty(), "sync should have produced files");
+
+        // Sleep past coarse mtime resolution (HFS+/APFS often 1s).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Second sync: should be a complete no-op on disk.
+        sync(&dir, &ryve_dir, &config, &cache).await.unwrap();
+
+        for (path, prev_mtime, prev_len) in &snapshots {
+            let m = std::fs::metadata(path).expect("file vanished between syncs");
+            assert_eq!(
+                m.modified().unwrap(),
+                *prev_mtime,
+                "second sync rewrote {} (mtime changed)",
+                path.display(),
+            );
+            assert_eq!(
+                m.len(),
+                *prev_len,
+                "second sync rewrote {} (length changed)",
+                path.display(),
+            );
+        }
+    }
+
+    /// Even when the cache starts cold (e.g. immediately after process
+    /// restart), sync must not rewrite files whose disk content already
+    /// matches what it would produce.
+    #[tokio::test]
+    async fn sync_with_cold_cache_skips_writes_when_disk_already_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(dir.join(".ryve")).unwrap();
+        let ryve_dir = RyveDir::new(&dir);
+        let config = WorkshopConfig::default();
+
+        // Prime disk with a first sync, then drop the cache.
+        {
+            let cache = Mutex::new(SyncCache::new());
+            sync(&dir, &ryve_dir, &config, &cache).await.unwrap();
+        }
+
+        let tracked = target_paths(&dir, &config);
+        let snapshots: Vec<_> = tracked
+            .iter()
+            .map(|p| (p.clone(), std::fs::metadata(p).unwrap().modified().unwrap()))
+            .collect();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Fresh cache: must read each file, see it already matches, and
+        // skip the write.
+        let cache = Mutex::new(SyncCache::new());
+        sync(&dir, &ryve_dir, &config, &cache).await.unwrap();
+
+        for (path, prev_mtime) in &snapshots {
+            let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+            assert_eq!(
+                mtime,
+                *prev_mtime,
+                "cold-cache sync rewrote {} despite matching content",
+                path.display(),
+            );
+        }
     }
 
     #[test]
