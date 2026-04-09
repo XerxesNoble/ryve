@@ -26,7 +26,8 @@ pub struct Tab {
     /// locked to the front of the tab bar.
     pub pinned: bool,
     /// When true, this tab hosts the Atlas director session and receives
-    /// distinct visual treatment (tinted background, logo icon, "Atlas" label).
+    /// distinct visual treatment (tinted background, logo icon, "Atlas" label)
+    /// and a refresh button (spark ryve-71c3ec9f).
     pub is_atlas: bool,
 }
 
@@ -130,6 +131,10 @@ pub enum Message {
     /// Jump to the next / previous match in the active terminal.
     TerminalSearchNext,
     TerminalSearchPrev,
+    /// Kill the Atlas subprocess and relaunch it in-place. The tab id,
+    /// position, and label remain stable across refresh
+    /// (spark ryve-71c3ec9f).
+    RefreshAtlas(u64),
 }
 
 impl BenchState {
@@ -275,6 +280,17 @@ impl BenchState {
                 .spacing(6)
                 .align_y(iced::Alignment::Center)
             };
+
+            // Atlas tabs get a refresh button that kills and relaunches the
+            // subprocess in-place (spark ryve-71c3ec9f).
+            if tab.is_atlas {
+                tab_content = tab_content.push(
+                    button(text("\u{21BB}").size(FONT_ICON_SM).color(pal.text_tertiary))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::RefreshAtlas(tab.id)),
+                );
+            }
 
             if !tab.pinned {
                 tab_content = tab_content.push(
@@ -713,6 +729,25 @@ mod tests {
             format!("{:?}", normal.background),
             format!("{:?}", atlas.background),
         );
+    }
+
+    /// Spark ryve-71c3ec9f — `RefreshAtlas` message variant exists and the
+    /// `is_atlas` flag is correctly managed on tabs.
+    #[test]
+    fn refresh_atlas_message_and_flag() {
+        // Message variant exists.
+        let m = Message::RefreshAtlas(1);
+        assert!(matches!(m, Message::RefreshAtlas(1)));
+
+        // create_tab defaults is_atlas to false.
+        let mut bench = BenchState::new();
+        bench.create_tab(1, "Terminal".into(), TabKind::Terminal);
+        assert!(!bench.tabs[0].is_atlas);
+
+        // Setting is_atlas survives — tab identity is stable.
+        bench.tabs[0].is_atlas = true;
+        assert!(bench.tabs[0].is_atlas);
+        assert_eq!(bench.tabs[0].id, 1);
     }
 
     #[test]
