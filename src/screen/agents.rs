@@ -767,15 +767,15 @@ fn render_head_row<'a>(
     );
 
     // Attach button for Heads with a live tmux session. Spark ryve-8ba40d83.
-    if let Some(s) = session {
-        if s.tmux_session_live {
-            let label = s.session_label.as_deref().unwrap_or("head");
-            let attach_btn = button(text("Attach").size(FONT_SMALL).color(pal.accent))
-                .style(button::text)
-                .padding([2, 6])
-                .on_press(Message::AttachSession(s.id.clone(), label.to_string()));
-            row_widget = row_widget.push(attach_btn);
-        }
+    if let Some(s) = session
+        && s.tmux_session_live
+    {
+        let label = s.session_label.as_deref().unwrap_or("head");
+        let attach_btn = button(text("Attach").size(FONT_SMALL).color(pal.accent))
+            .style(button::text)
+            .padding([2, 6])
+            .on_press(Message::AttachSession(s.id.clone(), label.to_string()));
+        row_widget = row_widget.push(attach_btn);
     }
 
     // Spark chip — opens the epic spark detail.

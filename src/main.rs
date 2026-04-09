@@ -1477,7 +1477,7 @@ impl App {
                         // reconciliation which runs before this load. If the
                         // DB row is still active after reconciliation, the
                         // tmux session exists. Spark [sp-0285181c].
-                        let tmux_alive = !p.ended_at.is_some()
+                        let tmux_alive = p.ended_at.is_none()
                             && p.child_pid.is_none()
                             && matches!(
                                 p.session_label.as_deref(),

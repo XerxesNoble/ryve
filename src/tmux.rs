@@ -55,6 +55,9 @@ pub enum TmuxError {
 // ── Session info ──────────────────────────────────────────
 
 /// Minimal information about a running tmux session.
+/// Currently only used in tests; will be wired into production once
+/// the full tmux session management UI is in place.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub name: String,
@@ -230,6 +233,30 @@ impl<R: CommandRunner> TmuxClient<R> {
         cmd
     }
 
+    /// Check whether a session with the given name exists.
+    pub fn has_session(&self, name: &str) -> Result<bool, TmuxError> {
+        let output = self.run_tmux(&["has-session", "-t", name])?;
+        Ok(output.status.success())
+    }
+
+    /// Pipe the output of the current pane in `name` to a log file.
+    ///
+    /// Uses `pipe-pane` so tmux streams the pane's content to the given path.
+    pub fn pipe_pane(&self, name: &str, log_path: &Path) -> Result<(), TmuxError> {
+        if !self.has_session(name)? {
+            return Err(TmuxError::SessionNotFound(name.to_string()));
+        }
+        let log_str = log_path.to_string_lossy();
+        let pipe_cmd = format!("cat >> {log_str}");
+        self.run_tmux_ok(&["pipe-pane", "-t", name, &pipe_cmd])?;
+        Ok(())
+    }
+}
+
+/// Methods used only in tests. Part of the TmuxClient API surface defined
+/// by spark ryve-4bae4ff6 but not yet wired into production code paths.
+#[cfg(test)]
+impl<R: CommandRunner> TmuxClient<R> {
     /// List all sessions on the private socket.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, TmuxError> {
         let output = self.run_tmux(&[
@@ -238,8 +265,6 @@ impl<R: CommandRunner> TmuxClient<R> {
             "#{session_name}\t#{session_created}\t#{session_attached}",
         ]);
 
-        // If there are no sessions, tmux exits non-zero with
-        // "no server running" or similar — treat as empty list.
         let output = match output {
             Ok(o) if o.status.success() => o,
             Ok(_) | Err(TmuxError::CommandFailed { .. }) => return Ok(Vec::new()),
@@ -265,31 +290,12 @@ impl<R: CommandRunner> TmuxClient<R> {
         Ok(sessions)
     }
 
-    /// Check whether a session with the given name exists.
-    pub fn has_session(&self, name: &str) -> Result<bool, TmuxError> {
-        let output = self.run_tmux(&["has-session", "-t", name])?;
-        Ok(output.status.success())
-    }
-
     /// Kill (destroy) a session by name.
     pub fn kill_session(&self, name: &str) -> Result<(), TmuxError> {
         if !self.has_session(name)? {
             return Err(TmuxError::SessionNotFound(name.to_string()));
         }
         self.run_tmux_ok(&["kill-session", "-t", name])?;
-        Ok(())
-    }
-
-    /// Pipe the output of the current pane in `name` to a log file.
-    ///
-    /// Uses `pipe-pane` so tmux streams the pane's content to the given path.
-    pub fn pipe_pane(&self, name: &str, log_path: &Path) -> Result<(), TmuxError> {
-        if !self.has_session(name)? {
-            return Err(TmuxError::SessionNotFound(name.to_string()));
-        }
-        let log_str = log_path.to_string_lossy();
-        let pipe_cmd = format!("cat >> {log_str}");
-        self.run_tmux_ok(&["pipe-pane", "-t", name, &pipe_cmd])?;
         Ok(())
     }
 
