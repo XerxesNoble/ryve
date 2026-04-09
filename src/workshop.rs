@@ -140,6 +140,8 @@ pub struct Workshop {
     pub spark_create_form: crate::screen::sparks::CreateForm,
     /// Inline status popover state for the workgraph panel.
     pub spark_status_menu: crate::screen::sparks::StatusMenu,
+    /// Expand/collapse state for epic group headers in the workgraph panel.
+    pub spark_collapsed_epics: crate::screen::sparks::CollapsedEpics,
     /// Currently selected spark ID (for detail view).
     pub selected_spark: Option<String>,
     /// Cached contracts for the currently selected spark.
@@ -226,6 +228,7 @@ impl Workshop {
             background_picker: PickerState::new(),
             spark_create_form: Default::default(),
             spark_status_menu: Default::default(),
+            spark_collapsed_epics: Default::default(),
             selected_spark: None,
             selected_spark_contracts: Vec::new(),
             selected_spark_bonds: Vec::new(),

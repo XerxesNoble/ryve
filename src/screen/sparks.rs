@@ -3,7 +3,7 @@
 
 //! Workgraph panel — displays and manages sparks for the active workshop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use data::sparks::types::Spark;
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
@@ -68,10 +68,15 @@ impl CreateForm {
 }
 
 // ── Default sort ─────────────────────────────────────
+// NOTE: default_sort is a pure helper kept available for upcoming
+// refactors to the render pipeline (sorted grouping). Currently the
+// view() path uses group_by_epic on the raw slice; sort integration is
+// tracked as follow-up work. Silence dead-code warnings until then.
 
 /// Canonical ordering of `spark_type` values for the default sort. Any
 /// value not in this list sorts after every listed type but stably
 /// relative to other unknown types (via the string tiebreaker).
+#[allow(dead_code)]
 const SPARK_TYPE_ORDER: &[&str] = &[
     "epic",
     "bug",
@@ -84,6 +89,7 @@ const SPARK_TYPE_ORDER: &[&str] = &[
 
 /// Canonical ordering of `status` values for the default sort. Same
 /// "unknown sinks to the end" rule as [`SPARK_TYPE_ORDER`].
+#[allow(dead_code)]
 const STATUS_ORDER: &[&str] = &[
     "in_progress",
     "blocked",
@@ -93,6 +99,7 @@ const STATUS_ORDER: &[&str] = &[
     "closed",
 ];
 
+#[allow(dead_code)]
 fn spark_type_rank(ty: &str) -> usize {
     SPARK_TYPE_ORDER
         .iter()
@@ -100,6 +107,7 @@ fn spark_type_rank(ty: &str) -> usize {
         .unwrap_or(SPARK_TYPE_ORDER.len())
 }
 
+#[allow(dead_code)]
 fn status_rank(status: &str) -> usize {
     STATUS_ORDER
         .iter()
@@ -112,6 +120,7 @@ fn status_rank(status: &str) -> usize {
 /// ASC as a deterministic tiebreaker. The input slice is not mutated.
 ///
 /// Two consecutive calls with identical input produce identical output.
+#[allow(dead_code)]
 pub fn default_sort(sparks: &[Spark]) -> Vec<&Spark> {
     let mut sorted: Vec<&Spark> = sparks.iter().collect();
     sorted.sort_by(|a, b| {
@@ -122,6 +131,78 @@ pub fn default_sort(sparks: &[Spark]) -> Vec<&Spark> {
             .then_with(|| a.id.cmp(&b.id))
     });
     sorted
+}
+
+// ── Epic grouping ────────────────────────────────────
+
+/// A single group in the sparks panel: an epic row with its direct
+/// children (tasks, bugs, and nested epics) nested underneath. Borrows
+/// from the input slice so callers control ownership.
+#[derive(Debug)]
+pub struct EpicGroup<'a> {
+    pub epic: &'a Spark,
+    pub children: Vec<&'a Spark>,
+}
+
+/// Build per-epic groups from a (pre-sorted) flat spark vec.
+///
+/// Every epic in `sparks` becomes exactly one `EpicGroup`, in the order
+/// the epics appear in the input. Non-epic sparks are appended to the
+/// group of their parent epic, preserving input order so the upstream
+/// default sort flows through unchanged. Nested epics also appear in
+/// their parent epic's `children` so the renderer can place them inline.
+///
+/// Non-epic sparks whose `parent_id` is missing or does not point at a
+/// known epic are dropped — the workgraph layer (spark ryve-b41f60dd)
+/// guarantees every non-epic has an epic parent, and silently dropping
+/// a malformed row is preferable to rendering it orphaned at top level
+/// (which would violate the "no child outside its parent group" invariant).
+pub fn group_by_epic<'a>(sparks: &'a [Spark]) -> Vec<EpicGroup<'a>> {
+    let mut groups: Vec<EpicGroup<'a>> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for s in sparks {
+        if s.spark_type == "epic" {
+            index.insert(s.id.as_str(), groups.len());
+            groups.push(EpicGroup {
+                epic: s,
+                children: Vec::new(),
+            });
+        }
+    }
+    for s in sparks {
+        let Some(pid) = s.parent_id.as_deref() else {
+            continue;
+        };
+        // Skip self-reference (shouldn't happen, but be defensive).
+        if pid == s.id {
+            continue;
+        }
+        if let Some(&i) = index.get(pid) {
+            groups[i].children.push(s);
+        }
+    }
+    groups
+}
+
+/// Persistent expand/collapse state for epic group headers in the
+/// sparks panel. Stored on the workshop so the state survives panel
+/// re-renders and spark reloads. By default every epic is expanded;
+/// an id is only present here once the user has clicked to collapse it.
+#[derive(Debug, Clone, Default)]
+pub struct CollapsedEpics {
+    ids: HashSet<String>,
+}
+
+impl CollapsedEpics {
+    pub fn is_collapsed(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    pub fn toggle(&mut self, id: &str) {
+        if !self.ids.remove(id) {
+            self.ids.insert(id.to_string());
+        }
+    }
 }
 
 // ── Status menu ──────────────────────────────────────
@@ -200,6 +281,8 @@ pub enum Message {
     BeginCloseFlow(String),
     /// Close the spark with a specific reason.
     CloseSparkWithReason(String, String),
+    /// Toggle the expand/collapse state of an epic group header.
+    ToggleEpicCollapse(String),
 }
 
 // ── View ─────────────────────────────────────────────
@@ -211,6 +294,7 @@ pub fn view<'a>(
     has_bg: bool,
     create_form: &'a CreateForm,
     status_menu: &'a StatusMenu,
+    collapsed: &'a CollapsedEpics,
 ) -> Element<'a, Message> {
     let pal = *pal;
 
@@ -243,12 +327,29 @@ pub fn view<'a>(
                 .color(pal.text_tertiary),
         );
     } else {
-        // Apply the default (priority, type, status, id) sort before
-        // rendering so users can scan for high-priority work. Done in
-        // the UI layer so filters and grouping compose with it later.
-        for spark in default_sort(sparks) {
-            let is_blocked = blocked_ids.contains(&spark.id);
-            list = list.push(view_spark_row(spark, is_blocked, &pal, status_menu));
+        let groups = group_by_epic(sparks);
+        let epic_ids: HashSet<&str> = groups.iter().map(|g| g.epic.id.as_str()).collect();
+        // Top-level groups are those whose epic has no epic-group parent;
+        // nested epics are rendered inline under their parent group instead.
+        for g in &groups {
+            let is_nested = g
+                .epic
+                .parent_id
+                .as_deref()
+                .map(|pid| epic_ids.contains(pid))
+                .unwrap_or(false);
+            if is_nested {
+                continue;
+            }
+            list = list.push(view_epic_group(
+                g,
+                &groups,
+                0,
+                blocked_ids,
+                &pal,
+                status_menu,
+                collapsed,
+            ));
         }
     }
 
@@ -434,6 +535,146 @@ fn status_symbol(status: &str) -> &'static str {
         "closed" => "\u{25CF}",      // ●
         _ => "\u{25CB}",
     }
+}
+
+/// Render an epic group: a chevron-prefixed header row plus, when the
+/// group is expanded, every direct child indented underneath. Nested
+/// epics recurse once so `epic > epic > task` renders the inner epic as
+/// its own collapsible group; beyond two levels deep we flatten the
+/// remaining rows (per the spark non-goal).
+fn view_epic_group<'a>(
+    group: &EpicGroup<'a>,
+    all_groups: &[EpicGroup<'a>],
+    depth: usize,
+    blocked_ids: &HashSet<String>,
+    pal: &Palette,
+    status_menu: &'a StatusMenu,
+    collapsed: &'a CollapsedEpics,
+) -> Element<'a, Message> {
+    let pal = *pal;
+    let epic = group.epic;
+    let is_collapsed = collapsed.is_collapsed(&epic.id);
+    let is_blocked = blocked_ids.contains(&epic.id);
+
+    let mut col = column![view_epic_header(epic, is_collapsed, is_blocked, depth, &pal)].spacing(2);
+
+    if !is_collapsed {
+        for child in &group.children {
+            if child.spark_type == "epic" && depth < 1 {
+                if let Some(nested) = all_groups.iter().find(|g| g.epic.id == child.id) {
+                    col = col.push(view_epic_group(
+                        nested,
+                        all_groups,
+                        depth + 1,
+                        blocked_ids,
+                        &pal,
+                        status_menu,
+                        collapsed,
+                    ));
+                    continue;
+                }
+            }
+            let child_blocked = blocked_ids.contains(&child.id);
+            col = col.push(view_spark_row_indented(
+                child,
+                child_blocked,
+                depth + 1,
+                &pal,
+                status_menu,
+            ));
+        }
+    }
+
+    col.into()
+}
+
+/// Header row for an `EpicGroup`: a clickable chevron that toggles the
+/// collapse state, followed by the same status button + title the task
+/// rows use. Indent by `depth` so nested epics sit under their parent.
+fn view_epic_header<'a>(
+    epic: &'a Spark,
+    is_collapsed: bool,
+    is_blocked: bool,
+    depth: usize,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+    let chevron = if is_collapsed {
+        "\u{25B8}"
+    } else {
+        "\u{25BE}"
+    };
+    let chevron_btn = button(
+        text(chevron)
+            .size(FONT_ICON_SM)
+            .color(pal.text_secondary),
+    )
+    .style(button::text)
+    .padding([2, 4])
+    .on_press(Message::ToggleEpicCollapse(epic.id.clone()));
+
+    let status_indicator = status_symbol(&epic.status);
+    let id = epic.id.clone();
+    let status_btn = button(
+        text(status_indicator)
+            .size(FONT_ICON_SM)
+            .color(pal.text_secondary),
+    )
+    .style(button::text)
+    .padding([2, 4])
+    .on_press(Message::OpenStatusMenu(id.clone()));
+
+    let title_color = if is_blocked {
+        pal.text_tertiary
+    } else {
+        pal.text_primary
+    };
+
+    let mut row_inner = row![
+        text(format!("P{}", epic.priority))
+            .size(FONT_LABEL)
+            .color(pal.text_tertiary),
+        text(&epic.title).size(FONT_BODY).color(title_color),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
+
+    if is_blocked {
+        row_inner = row_inner.push(text("\u{1F512}").size(FONT_LABEL).color(pal.text_tertiary));
+    }
+
+    let indent = Space::new().width(Length::Fixed(16.0 * depth as f32));
+
+    row![
+        indent,
+        chevron_btn,
+        status_btn,
+        button(row_inner)
+            .style(button::text)
+            .width(Length::Fill)
+            .padding([5, 6])
+            .on_press(Message::SelectSpark(id)),
+    ]
+    .spacing(2)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// Indented variant of `view_spark_row` for children nested under an
+/// epic header. `depth` is a row-level indent in steps of 16 px.
+fn view_spark_row_indented<'a>(
+    spark: &'a Spark,
+    is_blocked: bool,
+    depth: usize,
+    pal: &Palette,
+    status_menu: &'a StatusMenu,
+) -> Element<'a, Message> {
+    let indent = Space::new().width(Length::Fixed(16.0 * depth as f32));
+    row![indent, view_spark_row(spark, is_blocked, pal, status_menu)]
+        .spacing(0)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill)
+        .into()
 }
 
 fn view_spark_row<'a>(
@@ -746,6 +987,132 @@ mod tests {
     fn status_options_cover_all_non_closed_states() {
         let keys: Vec<&str> = STATUS_OPTIONS.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec!["open", "in_progress", "blocked", "deferred"]);
+    }
+
+    fn mk_spark(id: &str, spark_type: &str, parent: Option<&str>) -> Spark {
+        Spark {
+            id: id.to_string(),
+            title: id.to_string(),
+            description: String::new(),
+            status: "open".to_string(),
+            priority: 2,
+            spark_type: spark_type.to_string(),
+            assignee: None,
+            owner: None,
+            parent_id: parent.map(|s| s.to_string()),
+            workshop_id: "ws".to_string(),
+            estimated_minutes: None,
+            github_issue_number: None,
+            github_repo: None,
+            metadata: "{}".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            closed_at: None,
+            closed_reason: None,
+            due_at: None,
+            defer_until: None,
+            risk_level: None,
+            scope_boundary: None,
+        }
+    }
+
+    #[test]
+    fn group_by_epic_mixed_tree_places_children_under_their_parent() {
+        let sparks = vec![
+            mk_spark("e1", "epic", None),
+            mk_spark("e2", "epic", None),
+            mk_spark("t1", "task", Some("e1")),
+            mk_spark("t2", "task", Some("e2")),
+            mk_spark("t3", "task", Some("e1")),
+        ];
+
+        let groups = group_by_epic(&sparks);
+        assert_eq!(groups.len(), 2);
+
+        assert_eq!(groups[0].epic.id, "e1");
+        let e1_children: Vec<&str> = groups[0].children.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(e1_children, vec!["t1", "t3"]);
+
+        assert_eq!(groups[1].epic.id, "e2");
+        let e2_children: Vec<&str> = groups[1].children.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(e2_children, vec!["t2"]);
+    }
+
+    #[test]
+    fn group_by_epic_empty_epic_still_renders_as_empty_group() {
+        let sparks = vec![
+            mk_spark("e1", "epic", None),
+            mk_spark("e_empty", "epic", None),
+            mk_spark("t1", "task", Some("e1")),
+        ];
+        let groups = group_by_epic(&sparks);
+        assert_eq!(groups.len(), 2);
+        let empty = groups.iter().find(|g| g.epic.id == "e_empty").unwrap();
+        assert!(empty.children.is_empty());
+    }
+
+    #[test]
+    fn group_by_epic_nested_epic_is_both_child_and_its_own_group() {
+        let sparks = vec![
+            mk_spark("outer", "epic", None),
+            mk_spark("inner", "epic", Some("outer")),
+            mk_spark("leaf", "task", Some("inner")),
+        ];
+        let groups = group_by_epic(&sparks);
+        assert_eq!(groups.len(), 2);
+
+        let outer = &groups[0];
+        assert_eq!(outer.epic.id, "outer");
+        let outer_children: Vec<&str> =
+            outer.children.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(outer_children, vec!["inner"]);
+
+        let inner = &groups[1];
+        assert_eq!(inner.epic.id, "inner");
+        let inner_children: Vec<&str> =
+            inner.children.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(inner_children, vec!["leaf"]);
+    }
+
+    #[test]
+    fn group_by_epic_preserves_input_order_for_children() {
+        // The renderer relies on group_by_epic pushing children in the
+        // exact order they appear in the input vec, so the upstream
+        // default sort (priority, type, status, id) flows through.
+        let sparks = vec![
+            mk_spark("e1", "epic", None),
+            mk_spark("t_b", "task", Some("e1")),
+            mk_spark("t_a", "task", Some("e1")),
+            mk_spark("t_c", "task", Some("e1")),
+        ];
+        let groups = group_by_epic(&sparks);
+        let ids: Vec<&str> = groups[0].children.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["t_b", "t_a", "t_c"]);
+    }
+
+    #[test]
+    fn group_by_epic_drops_orphan_non_epic_sparks() {
+        // A non-epic with no parent (or a missing parent) must never
+        // appear at top level. Upstream is expected to assign a parent,
+        // but we defensively drop rather than render outside a group.
+        let sparks = vec![
+            mk_spark("e1", "epic", None),
+            mk_spark("orphan", "task", None),
+            mk_spark("stray", "task", Some("nope")),
+        ];
+        let groups = group_by_epic(&sparks);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].children.is_empty());
+    }
+
+    #[test]
+    fn collapsed_epics_toggle_is_symmetric() {
+        let mut c = CollapsedEpics::default();
+        assert!(!c.is_collapsed("e1"));
+        c.toggle("e1");
+        assert!(c.is_collapsed("e1"));
+        c.toggle("e1");
+        assert!(!c.is_collapsed("e1"));
     }
 
     #[test]

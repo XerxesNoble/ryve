@@ -2538,6 +2538,11 @@ impl App {
                             }
                         }
                     }
+                    screen::sparks::Message::ToggleEpicCollapse(spark_id) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.spark_collapsed_epics.toggle(&spark_id);
+                        }
+                    }
                     screen::sparks::Message::CloseSparkWithReason(spark_id, reason) => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.spark_status_menu.dismiss();
@@ -4686,6 +4691,7 @@ impl App {
                     has_bg,
                     &ws.spark_create_form,
                     &ws.spark_status_menu,
+                    &ws.spark_collapsed_epics,
                 )
                 .map(Message::Sparks)
             }
@@ -4697,6 +4703,7 @@ impl App {
                 has_bg,
                 &ws.spark_create_form,
                 &ws.spark_status_menu,
+                &ws.spark_collapsed_epics,
             )
             .map(Message::Sparks)
         };
