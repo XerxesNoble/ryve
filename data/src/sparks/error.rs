@@ -38,4 +38,10 @@ pub enum SparksError {
 
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    #[error("invalid semver: {0}")]
+    InvalidSemver(String),
+
+    #[error("spark {spark_id} already belongs to another open release")]
+    EpicAlreadyInOpenRelease { spark_id: String },
 }
