@@ -702,9 +702,10 @@ mod tests {
         bench.create_tab(1, "Hand (claude)".into(), TabKind::Terminal);
         assert!(!bench.tabs[0].is_atlas);
 
-        // Atlas tab via dedicated constructor.
+        // Atlas tab via dedicated constructor — pinned to front (index 0).
         bench.create_atlas_tab(2, "Atlas (claude)".into(), TabKind::Terminal);
-        assert!(bench.tabs[1].is_atlas);
+        assert!(bench.tabs[0].is_atlas);
+        assert_eq!(bench.tabs[0].id, 2);
 
         // Both render without panic.
         let pal = Palette::dark();
