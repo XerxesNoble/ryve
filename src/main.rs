@@ -3795,7 +3795,11 @@ impl App {
         // to boot. Coding agents like claude/codex pick up `--system-prompt`
         // via flag too, but the existing infra here uses the typed-prompt
         // path so we stay consistent and avoid having to fork the spawn API.
-        let prompt = agent_prompts::compose_head_prompt(epic_id.as_deref(), epic_title.as_deref());
+        let prompt = agent_prompts::compose_head_prompt(
+            agent_prompts::HeadArchetype::Build,
+            epic_id.as_deref(),
+            epic_title.as_deref(),
+        );
         let prompt_tab_id = tab_id;
         tasks.push(Task::perform(
             async move {

@@ -27,12 +27,16 @@
 use std::path::{Path, PathBuf};
 
 use data::ryve_dir::RyveDir;
-use data::sparks::types::{AssignmentRole, NewAgentSession, NewHandAssignment, Spark, SparkFilter};
+use data::sparks::types::{
+    AssignmentRole, NewAgentSession, NewCrew, NewHandAssignment, Spark, SparkFilter,
+};
 use data::sparks::{agent_session_repo, assignment_repo, crew_repo, spark_repo};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::agent_prompts::{compose_hand_prompt, compose_merger_prompt};
+use crate::agent_prompts::{
+    HeadArchetype, compose_hand_prompt, compose_head_prompt, compose_merger_prompt,
+};
 use crate::coding_agents::CodingAgent;
 use crate::workshop;
 
@@ -61,6 +65,21 @@ impl HandKind {
 pub struct SpawnedHand {
     pub session_id: String,
     pub spark_id: String,
+    pub worktree_path: PathBuf,
+    pub log_path: PathBuf,
+    pub child_pid: Option<u32>,
+}
+
+/// Outcome of a successful [`spawn_head`]. Mirrors [`SpawnedHand`] but
+/// carries the Crew id the new Head is registered on instead of a spark
+/// assignment (Heads do not claim sparks — their crew is how the workgraph
+/// locates them).
+#[derive(Debug, Clone)]
+pub struct SpawnedHead {
+    pub session_id: String,
+    pub epic_id: String,
+    pub crew_id: String,
+    pub archetype: HeadArchetype,
     pub worktree_path: PathBuf,
     pub log_path: PathBuf,
     pub child_pid: Option<u32>,
@@ -228,6 +247,152 @@ pub async fn spawn_hand(
     })
 }
 
+/// Spawn a **Head** — an orchestrator coding-agent subprocess that
+/// decomposes an epic into child sparks and manages a Crew of Hands.
+///
+/// Unlike a Hand, a Head does *not* claim a spark (no `hand_assignments`
+/// row). Its relationship to the workgraph is carried by a Crew row whose
+/// `head_session_id` points at the new session. The Head is also added as
+/// a `crew_members` row with role `head` so the membership table lists it
+/// alongside the Hands it will spawn.
+///
+/// If `crew_id` is `None`, a fresh Crew is created with
+/// `parent_spark_id = epic_id`. If `crew_id` is given, the existing Crew's
+/// head is updated in place — this is how Atlas can hand an already-created
+/// Crew over to a newly spawned Head.
+///
+/// `parent_session_id` records lineage when Atlas (or another Head) spawns
+/// this one; passed through unchanged onto `agent_sessions.parent_session_id`.
+///
+/// Spark ryve-e4cadc03.
+pub async fn spawn_head(
+    workshop_dir: &Path,
+    pool: &SqlitePool,
+    agent: &CodingAgent,
+    epic_id: &str,
+    archetype: HeadArchetype,
+    crew_id: Option<&str>,
+    parent_session_id: Option<&str>,
+) -> Result<SpawnedHead, HandSpawnError> {
+    // Validate the epic up front so a typo fails fast *before* we create
+    // a worktree, a session row, or a crew. Also gives us the title for
+    // the archetype prompt.
+    let epic = spark_repo::get(pool, epic_id).await?;
+
+    let ryve_dir = RyveDir::new(workshop_dir);
+    ryve_dir.ensure_exists().await.map_err(HandSpawnError::Io)?;
+
+    // 1. New session id + worktree. The Head runs in its own worktree for
+    //    the same reason Hands do — so its scratch files, prompt, and any
+    //    agent-local state stay out of the main checkout.
+    let session_id = Uuid::new_v4().to_string();
+    let worktree_path = workshop::create_hand_worktree(workshop_dir, &ryve_dir, &session_id)
+        .await
+        .map_err(HandSpawnError::Worktree)?;
+
+    let logs_dir = ryve_dir.root().join("logs");
+    tokio::fs::create_dir_all(&logs_dir).await?;
+    let log_path = logs_dir.join(format!("head-{session_id}.log"));
+
+    // 2. Persist the agent session row with `session_label = "head"`. The
+    //    UI's Hands panel, the delegation-trace view, and any future
+    //    archetype-aware trace rendering rely on this label being exactly
+    //    "head" (see `src/screen/agents.rs` and `delegation_trace.rs`).
+    let new_session = NewAgentSession {
+        id: session_id.clone(),
+        workshop_id: workshop_id_for(workshop_dir),
+        agent_name: agent.display_name.clone(),
+        agent_command: agent.command.clone(),
+        agent_args: agent.args.clone(),
+        session_label: Some("head".to_string()),
+        child_pid: None,
+        resume_id: None,
+        log_path: Some(log_path.to_string_lossy().into_owned()),
+        parent_session_id: parent_session_id.map(|s| s.to_string()),
+    };
+    agent_session_repo::create(pool, &new_session).await?;
+
+    // 3. Resolve the Crew: either reuse the caller-supplied one (point its
+    //    head_session_id at this new session) or create a fresh Crew
+    //    parented on the epic. Then register the Head as a crew member
+    //    with role "head".
+    let crew_id_resolved = match crew_id {
+        Some(cid) => {
+            crew_repo::set_head(pool, cid, Some(&session_id)).await?;
+            cid.to_string()
+        }
+        None => {
+            let crew = crew_repo::create(
+                pool,
+                NewCrew {
+                    name: format!("{} ({})", epic.title, archetype.as_str()),
+                    purpose: Some(epic.title.clone()),
+                    workshop_id: workshop_id_for(workshop_dir),
+                    head_session_id: Some(session_id.clone()),
+                    parent_spark_id: Some(epic_id.to_string()),
+                },
+            )
+            .await?;
+            crew.id
+        }
+    };
+    crew_repo::add_member(pool, &crew_id_resolved, &session_id, Some("head")).await?;
+
+    // 4. Compose the archetype-specific prompt. The first paragraph names
+    //    the archetype so the "identity at boot" invariant from
+    //    docs/HEAD_ARCHETYPES.md holds for both fresh and resumed runs.
+    let prompt = compose_head_prompt(archetype, Some(epic_id), Some(&epic.title));
+
+    let prompts_dir = ryve_dir.root().join("prompts");
+    tokio::fs::create_dir_all(&prompts_dir).await?;
+    let prompt_path = prompts_dir.join(format!("head-{session_id}.md"));
+    tokio::fs::write(&prompt_path, &prompt).await?;
+
+    // 5. Build argv via the same headless-mode helper Hands use so the
+    //    prompt is delivered as a *user message*, not just a system
+    //    prompt. Regression guarded for Hands under spark ryve-b3ad7bd1
+    //    and it applies equally to Heads.
+    let cmd_args = agent.build_headless_args(&prompt, &prompt_path);
+
+    // 6. Env: inherit the workshop env so the Head's own `ryve` calls
+    //    resolve the workgraph without cd'ing, and stamp the new session
+    //    id so any nested `ryve hand spawn` the Head makes records its
+    //    lineage back to this Head.
+    let mut env_vars = workshop::hand_env_vars(workshop_dir);
+    env_vars.push(("RYVE_HAND_SESSION_ID".to_string(), session_id.clone()));
+
+    // 7. Spawn detached. On failure, end the session so the row does not
+    //    linger as a phantom Head that never actually ran. The crew row
+    //    we created is kept — the caller can retry with `--crew <id>`.
+    let child_pid = match launch_detached(
+        &agent.command,
+        &cmd_args,
+        &worktree_path,
+        &env_vars,
+        &log_path,
+    ) {
+        Ok(pid) => pid,
+        Err(err) => {
+            let _ = agent_session_repo::end_session(pool, &session_id).await;
+            return Err(err);
+        }
+    };
+
+    if let Some(pid) = child_pid {
+        let _ = agent_session_repo::set_child_pid(pool, &session_id, pid).await;
+    }
+
+    Ok(SpawnedHead {
+        session_id,
+        epic_id: epic_id.to_string(),
+        crew_id: crew_id_resolved,
+        archetype,
+        worktree_path,
+        log_path,
+        child_pid,
+    })
+}
+
 /// Spawn a child process detached from the parent. stdout/stderr go to
 /// `log_path`; stdin is /dev/null. On Unix we call `setsid` so closing the
 /// parent terminal does not propagate SIGHUP. Returns the child PID.
@@ -332,15 +497,21 @@ mod tests {
         run_git(&["init", "-q", "-b", "main"]);
         run_git(&["commit", "-q", "--allow-empty", "-m", "init"]);
 
-        // Stub agent: prints its argv to a file. We point the file at
-        // `<base>/agent-out.txt` via an env var so the test can poll it.
+        // Stub agent: prints its argv to a file. The output path is
+        // hardcoded into the script body so parallel tests cannot clobber
+        // each other via a shared env var — an earlier version used
+        // `$RYVE_TEST_AGENT_OUT` and flaked whenever two of these tests
+        // ran in parallel (their env overwrite raced).
         let out_path = base.join("agent-out.txt");
         let stub_path = base.join("stub-agent.sh");
         std::fs::write(
             &stub_path,
-            "#!/bin/sh\n\
-             # Record argv so the test can verify the prompt was delivered.\n\
-             printf '%s\\n' \"$@\" > \"$RYVE_TEST_AGENT_OUT\"\n",
+            format!(
+                "#!/bin/sh\n\
+                 # Record argv so the test can verify the prompt was delivered.\n\
+                 printf '%s\\n' \"$@\" > \"{}\"\n",
+                out_path.display()
+            ),
         )
         .unwrap();
         #[cfg(unix)]
@@ -388,16 +559,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        // Make the stub script's output path visible to the child via env.
-        // `launch_detached` inherits the parent env on top of the explicit
-        // pairs from `hand_env_vars`, so setting it here is sufficient.
-        // SAFETY: tests run single-threaded per #[tokio::test] runtime, but
-        // env mutation is process-global. This is a leaf test that doesn't
-        // race with other env consumers.
-        unsafe {
-            std::env::set_var("RYVE_TEST_AGENT_OUT", &out_path);
-        }
 
         let agent = CodingAgent {
             display_name: "stub".into(),
@@ -452,6 +613,199 @@ mod tests {
         );
 
         // Cleanup — best effort, don't fail the test on filesystem hiccups.
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+
+    /// Acceptance criteria for spark ryve-e4cadc03:
+    ///   - spawning a Head creates an `agent_sessions` row with
+    ///     `session_label = "head"`;
+    ///   - it links to a new Crew whose `head_session_id` points at that
+    ///     session (via `head_session_id`, the schema column named on the
+    ///     `crews` table);
+    ///   - the archetype prompt template is handed to the spawned
+    ///     subprocess verbatim (detected by the archetype name + epic id
+    ///     appearing in the stub agent's recorded argv).
+    #[tokio::test]
+    async fn spawn_head_creates_session_and_crew_and_delivers_prompt() {
+        let (workshop_dir, pool, out_path) = setup_workshop().await;
+        let stub_path = workshop_dir.join("stub-agent.sh");
+
+        let workshop_id = workshop_id_for(&workshop_dir);
+        let epic = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "epic under test".into(),
+                description: "verify Head spawn wiring".into(),
+                spark_type: SparkType::Epic,
+                priority: 1,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent = CodingAgent {
+            display_name: "stub".into(),
+            command: stub_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            resume: ResumeStrategy::None,
+            compatibility: crate::coding_agents::CompatStatus::Unknown,
+        };
+
+        let spawned = spawn_head(
+            &workshop_dir,
+            &pool,
+            &agent,
+            &epic.id,
+            HeadArchetype::Build,
+            None, // no pre-existing crew — helper must create one
+            None,
+        )
+        .await
+        .expect("spawn_head should succeed against the stub agent");
+
+        assert!(spawned.child_pid.is_some(), "child pid should be reported");
+        assert_eq!(spawned.epic_id, epic.id);
+
+        // 1. Session row exists with label "head".
+        let sessions = agent_session_repo::list_for_workshop(&pool, &workshop_id)
+            .await
+            .expect("list sessions");
+        let head_row = sessions
+            .iter()
+            .find(|s| s.id == spawned.session_id)
+            .expect("session row for spawned head");
+        assert_eq!(head_row.session_label.as_deref(), Some("head"));
+
+        // 2. Crew exists and its head_session_id points at the new session.
+        let crew = crew_repo::get(&pool, &spawned.crew_id)
+            .await
+            .expect("crew row for spawned head");
+        assert_eq!(crew.head_session_id.as_deref(), Some(spawned.session_id.as_str()));
+        assert_eq!(crew.parent_spark_id.as_deref(), Some(epic.id.as_str()));
+
+        // 3. Subprocess received the archetype prompt. Poll for the stub's
+        //    recorded argv and assert it includes both the archetype name
+        //    (identity-at-boot invariant) and the epic id it was given.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let recorded = loop {
+            if out_path.exists()
+                && let Ok(s) = std::fs::read_to_string(&out_path)
+                && !s.is_empty()
+            {
+                break s;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "stub agent never wrote {} — Head failed to launch.\nlog: {}",
+                    out_path.display(),
+                    std::fs::read_to_string(&spawned.log_path).unwrap_or_default()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            recorded.contains("build Head"),
+            "archetype identity missing from prompt:\n{recorded}"
+        );
+        assert!(
+            recorded.contains(&epic.id),
+            "epic id missing from prompt:\n{recorded}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+
+    /// When a `--crew` id is supplied, `spawn_head` must reuse that crew
+    /// and update its `head_session_id` in place rather than creating a
+    /// new crew. This is the path Atlas takes when it has already minted
+    /// a crew for the goal.
+    #[tokio::test]
+    async fn spawn_head_reuses_existing_crew() {
+        let (workshop_dir, pool, _out_path) = setup_workshop().await;
+        let stub_path = workshop_dir.join("stub-agent.sh");
+
+        let workshop_id = workshop_id_for(&workshop_dir);
+        let epic = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "existing-crew epic".into(),
+                description: String::new(),
+                spark_type: SparkType::Epic,
+                priority: 2,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Pre-create a crew that intentionally has NO head_session_id.
+        // `spawn_head` must set it.
+        let crew = crew_repo::create(
+            &pool,
+            NewCrew {
+                name: "pre-existing crew".into(),
+                purpose: None,
+                workshop_id: workshop_id.clone(),
+                head_session_id: None,
+                parent_spark_id: Some(epic.id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent = CodingAgent {
+            display_name: "stub".into(),
+            command: stub_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            resume: ResumeStrategy::None,
+            compatibility: crate::coding_agents::CompatStatus::Unknown,
+        };
+
+        let spawned = spawn_head(
+            &workshop_dir,
+            &pool,
+            &agent,
+            &epic.id,
+            HeadArchetype::Research,
+            Some(&crew.id),
+            None,
+        )
+        .await
+        .expect("spawn_head should succeed with an existing crew");
+
+        assert_eq!(spawned.crew_id, crew.id, "must reuse the supplied crew");
+
+        let reloaded = crew_repo::get(&pool, &crew.id).await.unwrap();
+        assert_eq!(
+            reloaded.head_session_id.as_deref(),
+            Some(spawned.session_id.as_str()),
+            "head_session_id must be updated in place"
+        );
+
+        let members = crew_repo::members(&pool, &crew.id).await.unwrap();
+        assert!(
+            members.iter().any(|m| m.session_id == spawned.session_id
+                && m.role.as_deref() == Some("head")),
+            "head must be registered as a crew member with role=head"
+        );
+
         let _ = std::fs::remove_dir_all(&workshop_dir);
     }
 }
