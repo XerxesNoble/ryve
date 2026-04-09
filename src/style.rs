@@ -80,6 +80,12 @@ pub struct Palette {
     pub tab_active: Color,
     /// Modal overlay backdrop.
     pub overlay: Color,
+    /// Atlas tab background (inactive) — tinted to distinguish from normal tabs.
+    pub atlas_tab_bg: Color,
+    /// Atlas tab background (active).
+    pub atlas_tab_active: Color,
+    /// Atlas tab border when active.
+    pub atlas_border_active: Color,
 }
 
 impl Palette {
@@ -187,6 +193,26 @@ impl Palette {
                 b: 0.0,
                 a: 0.5,
             },
+            // Atlas tabs use a warm amber/gold tint to stand out from the
+            // cool-neutral palette of regular tabs.
+            atlas_tab_bg: Color {
+                r: 0.918,
+                g: 0.702,
+                b: 0.220,
+                a: 0.10,
+            },
+            atlas_tab_active: Color {
+                r: 0.918,
+                g: 0.702,
+                b: 0.220,
+                a: 0.22,
+            },
+            atlas_border_active: Color {
+                r: 0.918,
+                g: 0.702,
+                b: 0.220,
+                a: 0.40,
+            },
         }
     }
 
@@ -289,6 +315,24 @@ impl Palette {
                 b: 0.0,
                 a: 0.35,
             },
+            atlas_tab_bg: Color {
+                r: 0.780,
+                g: 0.580,
+                b: 0.100,
+                a: 0.10,
+            },
+            atlas_tab_active: Color {
+                r: 0.780,
+                g: 0.580,
+                b: 0.100,
+                a: 0.18,
+            },
+            atlas_border_active: Color {
+                r: 0.780,
+                g: 0.580,
+                b: 0.100,
+                a: 0.35,
+            },
         }
     }
 }
@@ -377,6 +421,31 @@ pub fn tab_pill(pal: &Palette, active: bool) -> container::Style {
     } else {
         container::Style {
             background: Some(Background::Color(pal.tab_bg)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// Atlas director tab pill — warm amber tint to distinguish from normal tabs.
+pub fn atlas_tab_pill(pal: &Palette, active: bool) -> container::Style {
+    if active {
+        container::Style {
+            background: Some(Background::Color(pal.atlas_tab_active)),
+            border: Border {
+                color: pal.atlas_border_active,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        }
+    } else {
+        container::Style {
+            background: Some(Background::Color(pal.atlas_tab_bg)),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 1.0,

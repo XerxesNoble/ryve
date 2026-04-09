@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use data::ryve_dir::AgentDef;
 use iced::widget::{
-    Space, button, column, container, mouse_area, row, scrollable, text, text_input, tooltip,
+    Space, button, column, container, mouse_area, row, scrollable, svg, text, text_input, tooltip,
 };
 use iced::{Color, Element, Length, Theme};
 
@@ -25,6 +25,9 @@ pub struct Tab {
     /// hidden and [`Message::CloseTab`] is a no-op. Used for the Atlas
     /// Director tab (spark ryve-59983890).
     pub pinned: bool,
+    /// When true, this tab hosts the Atlas director session and receives
+    /// distinct visual treatment (tinted background, logo icon, "Atlas" label).
+    pub is_atlas: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +154,21 @@ impl BenchState {
             title,
             kind,
             pinned: false,
+            is_atlas: false,
+        });
+        self.active_tab = Some(id);
+        self.dropdown_open = false;
+    }
+
+    /// Create a tab marked as the Atlas director session. Receives distinct
+    /// visual treatment in the tab bar (tinted pill, logo icon, "Atlas" label).
+    pub fn create_atlas_tab(&mut self, id: u64, title: String, kind: TabKind) {
+        self.tabs.push(Tab {
+            id,
+            title,
+            kind,
+            pinned: true,
+            is_atlas: true,
         });
         self.active_tab = Some(id);
         self.dropdown_open = false;
@@ -195,15 +213,35 @@ impl BenchState {
                 }
             };
 
-            let mut tab_content = row![
-                text(kind_icon).size(FONT_ICON_SM).color(text_color),
-                button(text(&tab.title).size(FONT_BODY).color(text_color))
-                    .style(button::text)
-                    .padding(0)
-                    .on_press(Message::SelectTab(tab.id)),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
+            let is_atlas = tab.is_atlas;
+
+            // Atlas tabs use logo.svg icon and "Atlas" label; others use the
+            // text glyph determined above.
+            let mut tab_content = if is_atlas {
+                let logo = svg(svg::Handle::from_path("assets/logo.svg"))
+                    .width(14)
+                    .height(14)
+                    .style(crate::icons::ui_icon_color(text_color));
+                row![
+                    logo,
+                    button(text("Atlas").size(FONT_BODY).color(text_color))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::SelectTab(tab.id)),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+            } else {
+                row![
+                    text(kind_icon).size(FONT_ICON_SM).color(text_color),
+                    button(text(&tab.title).size(FONT_BODY).color(text_color))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::SelectTab(tab.id)),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+            };
 
             if !tab.pinned {
                 tab_content = tab_content.push(
@@ -216,7 +254,13 @@ impl BenchState {
 
             let pill = container(tab_content)
                 .padding([4, 10])
-                .style(move |_theme: &Theme| style::tab_pill(&pal, is_active));
+                .style(move |_theme: &Theme| {
+                    if is_atlas {
+                        style::atlas_tab_pill(&pal, is_active)
+                    } else {
+                        style::tab_pill(&pal, is_active)
+                    }
+                });
 
             tab_row = tab_row.push(
                 tooltip(
@@ -566,6 +610,34 @@ mod tests {
         assert!(matches!(Message::NewHead, Message::NewHead));
         assert!(matches!(Message::NewHand, Message::NewHand));
         assert!(matches!(Message::NewTerminal, Message::NewTerminal));
+    }
+
+    /// Spark ryve-682f4b02 — Atlas tabs are visually distinct from normal
+    /// CodingAgent tabs: `is_atlas` flag, different pill style, and the tab
+    /// bar renders without panicking when an Atlas tab is present.
+    #[test]
+    fn atlas_tab_has_distinct_style_and_renders() {
+        let mut bench = BenchState::new();
+        // Normal agent tab.
+        bench.create_tab(1, "Hand (claude)".into(), TabKind::Terminal);
+        assert!(!bench.tabs[0].is_atlas);
+
+        // Atlas tab via dedicated constructor.
+        bench.create_atlas_tab(2, "Atlas (claude)".into(), TabKind::Terminal);
+        assert!(bench.tabs[1].is_atlas);
+
+        // Both render without panic.
+        let pal = Palette::dark();
+        let _element = bench.view_tab_bar(&pal);
+
+        // Atlas pill style differs from the normal pill.
+        let normal = style::tab_pill(&pal, true);
+        let atlas = style::atlas_tab_pill(&pal, true);
+        // Background colors must be different.
+        assert_ne!(
+            format!("{:?}", normal.background),
+            format!("{:?}", atlas.background),
+        );
     }
 
     #[test]

@@ -1007,6 +1007,31 @@ impl Workshop {
         session_id: String,
         full_auto: bool,
     ) -> u64 {
+        self.begin_hand_terminal_inner(title, kind, next_terminal_id, session_id, full_auto, false)
+    }
+
+    /// Like [`begin_hand_terminal`] but marks the resulting tab as the Atlas
+    /// director so the tab bar renders it with distinct visual treatment.
+    pub fn begin_atlas_terminal(
+        &mut self,
+        title: String,
+        kind: PendingTerminalKind,
+        next_terminal_id: &mut u64,
+        session_id: String,
+        full_auto: bool,
+    ) -> u64 {
+        self.begin_hand_terminal_inner(title, kind, next_terminal_id, session_id, full_auto, true)
+    }
+
+    fn begin_hand_terminal_inner(
+        &mut self,
+        title: String,
+        kind: PendingTerminalKind,
+        next_terminal_id: &mut u64,
+        session_id: String,
+        full_auto: bool,
+        is_atlas: bool,
+    ) -> u64 {
         let tab_kind = match &kind {
             PendingTerminalKind::Agent(a) => TabKind::CodingAgent(a.clone()),
             PendingTerminalKind::CustomAgent(def) => TabKind::CodingAgent(CodingAgent {
@@ -1020,7 +1045,11 @@ impl Workshop {
 
         let tab_id = *next_terminal_id;
         *next_terminal_id += 1;
-        self.bench.create_tab(tab_id, title, tab_kind);
+        if is_atlas {
+            self.bench.create_atlas_tab(tab_id, title, tab_kind);
+        } else {
+            self.bench.create_tab(tab_id, title, tab_kind);
+        }
 
         // Pre-resolve the system-prompt file (for built-in agents that
         // support `--system-prompt`). Reading it now lets stage 2 stay

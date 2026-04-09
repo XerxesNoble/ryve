@@ -5116,7 +5116,7 @@ impl App {
             .get(&agent.command)
             .is_some_and(|s| s.full_auto);
 
-        let tab_id = ws.begin_hand_terminal(
+        let tab_id = ws.begin_atlas_terminal(
             title.clone(),
             workshop::PendingTerminalKind::Agent(agent.clone()),
             &mut self.next_terminal_id,
