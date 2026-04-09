@@ -92,14 +92,11 @@ pub enum Message {
     /// Open (or focus) the Home / multi-Hand coordination dashboard tab.
     /// Singleton per workshop.
     OpenHome,
-    /// Spawn **Atlas** — Ryve's primary user-facing Director agent. This is
-    /// the **default entry point** for top-level user requests
-    /// (spark ryve-acdb248a). Atlas talks to the user, classifies their
-    /// intent, and delegates to a Head or a Hand instead of executing code
-    /// itself. New Hand / New Head / New Terminal remain as documented
-    /// bypass paths for advanced flows that want to skip routing through
-    /// Atlas; see `docs/ATLAS.md`.
-    NewAtlas,
+    /// Focus the pinned Atlas tab. Atlas is auto-spawned on workshop open
+    /// (spark ryve-fa0f8f93); this message switches the bench to show it.
+    /// If no Atlas tab exists yet (e.g. no agents installed at boot),
+    /// this is a no-op.
+    FocusAtlas,
     /// BYPASS: open the spark+agent picker for spawning a regular Hand on
     /// a spark directly, without going through Atlas. For advanced users
     /// who already know which spark they want to claim.
@@ -332,19 +329,12 @@ impl BenchState {
                 .on_press(Message::OpenHome),
         );
 
-        // Spark ryve-acdb248a — Atlas is the **default entry point** for
-        // top-level user requests. It is the first item in the dropdown
-        // (immediately after Home) so the user's eye lands on it before
-        // the bypass options. Atlas itself is a coding agent launched with
-        // the Director system prompt; it delegates to Heads / Hands rather
-        // than editing code, so the only thing the user has to choose at
-        // this point is whether they want Atlas at all — agent selection
-        // happens automatically (we pick the first compatible coding agent).
-        // Users who want fine control bypass Atlas via New Hand / New Head /
-        // New Terminal below.
+        // Spark ryve-fa0f8f93 — Atlas is auto-spawned as a pinned
+        // leftmost tab on workshop open. The dropdown entry now focuses
+        // that existing tab instead of spawning a new one.
         let any_agent_available = !available_agents.is_empty();
 
-        let atlas_button = button(text("Ask Atlas...").size(FONT_BODY).color(
+        let atlas_button = button(text("Focus Atlas").size(FONT_BODY).color(
             if any_agent_available {
                 pal.text_primary
             } else {
@@ -354,7 +344,7 @@ impl BenchState {
         .style(button::text)
         .width(Length::Fill);
         let atlas_button = if any_agent_available {
-            atlas_button.on_press(Message::NewAtlas)
+            atlas_button.on_press(Message::FocusAtlas)
         } else {
             atlas_button
         };
@@ -530,18 +520,42 @@ mod tests {
         assert!(!bench.terminal_search.contains_key(&7));
     }
 
-    /// Spark ryve-acdb248a — confirm `Message::NewAtlas` exists as a
-    /// distinct routing variant. The default entry point for user-originated
-    /// requests must produce this message so the app can dispatch it to the
-    /// Atlas spawn handler instead of the bypass paths.
+    /// Spark ryve-fa0f8f93 — confirm `Message::FocusAtlas` exists. Atlas
+    /// is auto-spawned on workshop open; the dropdown sends FocusAtlas to
+    /// switch the bench to the pinned Atlas tab.
     #[test]
-    fn new_atlas_message_variant_exists() {
-        let m = Message::NewAtlas;
-        assert!(matches!(m, Message::NewAtlas));
+    fn focus_atlas_message_variant_exists() {
+        let m = Message::FocusAtlas;
+        assert!(matches!(m, Message::FocusAtlas));
         // The bypass variants must remain available for advanced flows.
         assert!(matches!(Message::NewHead, Message::NewHead));
         assert!(matches!(Message::NewHand, Message::NewHand));
         assert!(matches!(Message::NewTerminal, Message::NewTerminal));
+    }
+
+    /// Spark ryve-fa0f8f93 — Atlas tab is pinned at position 0 (leftmost).
+    /// When the Atlas tab is appended and then moved to index 0, it must
+    /// become the first tab in the bar.
+    #[test]
+    fn atlas_tab_pinned_at_leftmost_position() {
+        let mut bench = BenchState::new();
+        // Pre-existing tabs from tab restore.
+        bench.create_tab(1, "Terminal".into(), TabKind::Terminal);
+        bench.create_tab(2, "File".into(), TabKind::Terminal);
+        // Atlas tab appended by spawn_atlas (via begin_hand_terminal).
+        bench.create_tab(3, "Atlas (Claude Code)".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs.len(), 3);
+        assert_eq!(bench.tabs[2].id, 3); // appended at end
+
+        // The pinned logic moves it to position 0.
+        let pos = bench.tabs.iter().position(|t| t.id == 3).unwrap();
+        let tab = bench.tabs.remove(pos);
+        bench.tabs.insert(0, tab);
+
+        assert_eq!(bench.tabs[0].id, 3);
+        assert_eq!(bench.tabs[0].title, "Atlas (Claude Code)");
+        assert_eq!(bench.tabs[1].id, 1);
+        assert_eq!(bench.tabs[2].id, 2);
     }
 
     #[test]

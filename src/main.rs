@@ -1470,6 +1470,7 @@ impl App {
                             log_path: p.log_path.map(PathBuf::from),
                             last_output_at: None,
                             parent_session_id: p.parent_session_id,
+                            session_label: p.session_label.clone(),
                         });
                     }
 
@@ -1647,6 +1648,26 @@ impl App {
                 // SparksPoll tick).
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     ws.tabs_restored = true;
+                }
+
+                // Spark ryve-fa0f8f93 — Auto-spawn a pinned Atlas tab as
+                // the leftmost tab if no active Atlas session already
+                // exists and at least one coding agent is available.
+                let has_atlas = self.workshops[idx]
+                    .agent_sessions
+                    .iter()
+                    .any(|s| s.session_label.as_deref() == Some("atlas") && s.active);
+                let atlas_agent = if !has_atlas {
+                    self.available_agents
+                        .iter()
+                        .find(|a| !a.compatibility.is_unsupported())
+                        .cloned()
+                } else {
+                    None
+                };
+                if let Some(agent) = atlas_agent {
+                    let atlas_task = self.spawn_atlas_pinned(idx, agent);
+                    follow_up.push(atlas_task);
                 }
 
                 if follow_up.is_empty() {
@@ -3830,6 +3851,7 @@ impl App {
                             log_path: None,
                             last_output_at: None,
                             parent_session_id: None,
+                            session_label: Some("auto-detected".to_string()),
                         });
 
                         if let Some(ref pool) = ws.sparks_db {
@@ -4583,27 +4605,19 @@ impl App {
                 ws.bench.dropdown_open = false;
                 ws.pending_head_spawn = Some(screen::head_picker::PickerState::default());
             }
-            screen::bench::Message::NewAtlas => {
-                // Spark ryve-acdb248a — Atlas is the **default entry point**
-                // for top-level user requests. Atlas is conversational and
-                // delegates downward, so we don't open a picker here: the
-                // user has not yet expressed a goal. We pick the first
-                // compatible coding agent automatically and spawn it with
-                // the Atlas Director system prompt. The user types their
-                // request into the resulting bench tab and Atlas decides
-                // whether to delegate to a Head or a Hand.
+            screen::bench::Message::FocusAtlas => {
+                // Spark ryve-fa0f8f93 — Atlas is auto-spawned on workshop
+                // open. This message focuses the existing pinned Atlas tab.
                 let ws = &mut self.workshops[idx];
                 ws.bench.dropdown_open = false;
-                let agent = match self
-                    .available_agents
+                if let Some(atlas_tab_id) = ws
+                    .agent_sessions
                     .iter()
-                    .find(|a| !a.compatibility.is_unsupported())
-                    .cloned()
+                    .find(|s| s.session_label.as_deref() == Some("atlas") && s.active)
+                    .and_then(|s| s.tab_id)
                 {
-                    Some(a) => a,
-                    None => return Task::none(),
-                };
-                return self.spawn_atlas(idx, agent);
+                    ws.bench.active_tab = Some(atlas_tab_id);
+                }
             }
             screen::bench::Message::NewCustomAgent(agent_idx) => {
                 let ws = &mut self.workshops[idx];
@@ -4888,6 +4902,7 @@ impl App {
             log_path: None,
             last_output_at: None,
             parent_session_id: None,
+            session_label: None,
         });
 
         // Persist session to DB + optional spark assignment
@@ -4997,6 +5012,7 @@ impl App {
             log_path: None,
             last_output_at: None,
             parent_session_id: None,
+            session_label: Some("head".to_string()),
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
@@ -5051,12 +5067,31 @@ impl App {
         Task::batch(tasks)
     }
 
+    /// Spawn Atlas as a pinned leftmost tab without stealing focus.
+    /// Used by the auto-spawn logic in `OpenTabsLoaded` (spark ryve-fa0f8f93).
+    fn spawn_atlas_pinned(&mut self, workshop_idx: usize, agent: CodingAgent) -> Task<Message> {
+        let prev_active = self.workshops[workshop_idx].bench.active_tab;
+        let task = self.spawn_atlas(workshop_idx, agent);
+        let ws = &mut self.workshops[workshop_idx];
+        // Move the newly-appended Atlas tab to position 0.
+        if let Some(pos) = ws.bench.tabs.iter().position(|t| {
+            ws.agent_sessions
+                .iter()
+                .any(|s| s.tab_id == Some(t.id) && s.session_label.as_deref() == Some("atlas"))
+        }) {
+            let tab = ws.bench.tabs.remove(pos);
+            ws.bench.tabs.insert(0, tab);
+        }
+        // Restore previous focus (or default to Atlas if nothing was active).
+        ws.bench.active_tab = prev_active.or(ws.bench.tabs.first().map(|t| t.id));
+        task
+    }
+
     /// Spawn **Atlas** — a coding agent launched with the Atlas Director
-    /// system prompt. Spark ryve-acdb248a: Atlas is the default entry point
-    /// for user-originated requests. It has no spark assignment of its own
-    /// and creates no Crew up front; its job is to talk to the user and
-    /// delegate to a Head (multi-spark goal) or a Hand (single spark) via
-    /// the `ryve` CLI.
+    /// system prompt. Atlas is the default entry point for user-originated
+    /// requests. It has no spark assignment of its own and creates no Crew
+    /// up front; its job is to talk to the user and delegate to a Head
+    /// (multi-spark goal) or a Hand (single spark) via the `ryve` CLI.
     ///
     /// Mechanically nearly identical to `spawn_head`: only the session
     /// label and the injected prompt differ.
@@ -5095,6 +5130,7 @@ impl App {
             last_output_at: None,
             // Atlas is the top of the hierarchy — no parent.
             parent_session_id: None,
+            session_label: Some("atlas".to_string()),
         });
 
         let mut tasks: Vec<Task<Message>> = Vec::new();

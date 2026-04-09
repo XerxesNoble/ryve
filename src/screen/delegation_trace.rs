@@ -370,6 +370,7 @@ mod tests {
             log_path: None,
             last_output_at: None,
             parent_session_id: parent.map(|s| s.to_string()),
+            session_label: None,
         }
     }
 

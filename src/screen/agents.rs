@@ -121,6 +121,9 @@ pub struct AgentSession {
     /// uses this to render Head → solo-Hand attribution when the child
     /// isn't a member of any of the Head's crews.
     pub parent_session_id: Option<String>,
+    /// `agent_sessions.session_label` — role label for this session
+    /// (e.g. "atlas", "head", "hand"). Used to identify pinned Atlas tabs.
+    pub session_label: Option<String>,
 }
 
 /// High-level display state for an active Hand, used to pick its indicator color.
@@ -1089,6 +1092,7 @@ mod tests {
             log_path: None,
             last_output_at: None,
             parent_session_id: None,
+            session_label: None,
         }
     }
 
@@ -1112,6 +1116,7 @@ mod tests {
             log_path: None,
             last_output_at: None,
             parent_session_id: parent.map(|s| s.to_string()),
+            session_label: None,
         }
     }
 
@@ -1508,6 +1513,7 @@ mod tests {
             log_path: None,
             last_output_at: None,
             parent_session_id: None,
+            session_label: None,
         }
     }
 
