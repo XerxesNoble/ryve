@@ -24,6 +24,45 @@
 
 use data::sparks::types::Spark;
 
+/// Head archetype selected by Atlas when delegating a goal. Determines the
+/// flavour of the system prompt composed by [`compose_head_prompt`]: which
+/// sparks the Head may create, which Hands it may spawn, and what "done"
+/// looks like. The canonical contract for each archetype lives in
+/// `docs/HEAD_ARCHETYPES.md`; this enum is the code-level anchor (spark
+/// ryve-e4cadc03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadArchetype {
+    /// Ship code that satisfies an epic's acceptance criteria via a Crew of
+    /// implementer Hands and exactly one Merger.
+    Build,
+    /// Reduce uncertainty before code is written. Read-only investigator
+    /// Hands; no Merger, no PRs.
+    Research,
+    /// Critique existing code / design / PR. Read-only reviewer Hands;
+    /// output is a structured review comment, not code.
+    Review,
+}
+
+impl HeadArchetype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Research => "research",
+            Self::Review => "review",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "build" => Some(Self::Build),
+            "research" => Some(Self::Research),
+            "review" => Some(Self::Review),
+            _ => None,
+        }
+    }
+}
+
 /// Compose the initial system prompt for **Atlas**, Ryve's primary
 /// user-facing Director agent.
 ///
@@ -73,10 +112,10 @@ pub fn compose_atlas_prompt() -> String {
             and natural-language conversation with the user.\n\
          3. SELECT HEADS. For each goal, decide which Head archetype is the right \
             fit and delegate to it. Spawn a Head with \
-            `ryve hand spawn <epic_id> --role head --agent claude` (Heads are \
-            spawned through the same `ryve hand spawn` CLI as Hands, distinguished \
-            by `--role head`), and pass them the parent epic id you created for \
-            the goal. Prefer one Head per coherent goal; do not fan out work \
+            `ryve head spawn <epic_id> --archetype <build|research|review> \
+             --agent claude`, passing the parent epic id you created for the \
+            goal. The archetype is a hard contract — see `docs/HEAD_ARCHETYPES.md` \
+            for the standard set. Prefer one Head per coherent goal; do not fan out work \
             across Heads that should belong together. If no archetype fits \
             cleanly, ask the user a clarifying question rather than guessing.\n\
          4. OWN FINAL COHERENCE. The user's deliverable is one coherent answer \
@@ -165,10 +204,19 @@ pub fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
 /// Compose the initial system prompt for a Head — a coding agent that
 /// orchestrates a Crew of Hands.
 ///
+/// `archetype` selects one of the standard Head archetypes defined in
+/// `docs/HEAD_ARCHETYPES.md`. The first paragraph of the returned prompt
+/// declares the archetype by name, per the cross-archetype "identity at
+/// boot" invariant in that document.
+///
 /// If `epic_id` is provided, the Head is told to decompose that existing
 /// epic into child sparks instead of creating a new one. Otherwise it
 /// waits for the user to type a goal in the terminal.
-pub fn compose_head_prompt(epic_id: Option<&str>, epic_title: Option<&str>) -> String {
+pub fn compose_head_prompt(
+    archetype: HeadArchetype,
+    epic_id: Option<&str>,
+    epic_title: Option<&str>,
+) -> String {
     let goal_block = match (epic_id, epic_title) {
         (Some(id), Some(title)) => {
             format!("decompose existing epic `{id}` — \"{title}\" — into child sparks")
@@ -179,15 +227,49 @@ pub fn compose_head_prompt(epic_id: Option<&str>, epic_title: Option<&str>) -> S
             .to_string(),
     };
 
+    let archetype_name = archetype.as_str();
     let mut prompt = String::new();
-    prompt.push_str(
-        "You are the **Head** of a Crew of Hands inside a Ryve workshop. You are an \
-         LLM-powered orchestrator running as a coding-agent subprocess. Your job is \
-         to take a user's high-level goal, decompose it into sparks (work items), \
-         spawn one Hand per spark to execute the work in parallel git worktrees, \
-         monitor progress, reassign on failure, and finally spawn a Merger Hand \
-         that integrates everything into a single PR for human review.\n\n",
-    );
+    prompt.push_str(&format!(
+        "You are the **{archetype_name} Head** of a Crew of Hands inside a Ryve \
+         workshop. You are an LLM-powered orchestrator running as a coding-agent \
+         subprocess. Your archetype is `{archetype_name}` (see \
+         `docs/HEAD_ARCHETYPES.md`). Declare this archetype in your first reply to \
+         the user so traces and the UI can label you correctly.\n\n",
+    ));
+
+    // Archetype-specific charter. Each block is the condensed version of
+    // the corresponding section in `docs/HEAD_ARCHETYPES.md` — kept short
+    // so the whole prompt fits comfortably in an initial agent turn.
+    match archetype {
+        HeadArchetype::Build => prompt.push_str(
+            "CHARTER — BUILD. Take the parent epic and drive it to a single \
+             reviewable PR. Decompose the epic into 2–8 implementer sparks, spawn \
+             one Hand per spark in parallel git worktrees, monitor progress, \
+             reassign on failure, and finally spawn exactly one Merger Hand that \
+             integrates every member branch into one PR for human review.\n\n",
+        ),
+        HeadArchetype::Research => prompt.push_str(
+            "CHARTER — RESEARCH. Reduce uncertainty before any code is written. \
+             Decompose the parent spark into 1–4 investigation spikes, spawn \
+             read-only investigator Hands, aggregate their findings into one \
+             recommendation comment on the parent spark, and exit. You may NOT \
+             spawn a Merger, open a PR, or edit source code. Every claim in your \
+             final recommendation must cite a file path, command output, doc URL, \
+             or comment id.\n\n",
+        ),
+        HeadArchetype::Review => prompt.push_str(
+            "CHARTER — REVIEW. Critique the artifact referenced by the parent \
+             spark (PR, files, design doc) against project standards, the spark's \
+             acceptance criteria, and the architectural constraints listed by \
+             `ryve constraint list`. Decompose into 1–3 review focus sparks, \
+             spawn read-only reviewer Hands, and aggregate their findings into \
+             one structured review comment with sections: Blocking, Should-fix, \
+             Nits, Praise — each item referencing a file:line. You may NOT spawn \
+             a Merger, open a PR, push commits, or edit the artifact under \
+             review. Findings are advisory unless backed by a violated \
+             architectural constraint or failing contract — those are blocking.\n\n",
+        ),
+    }
 
     prompt.push_str(&format!("USER GOAL:\n{goal_block}\n\n"));
 
@@ -419,10 +501,10 @@ mod tests {
         // Hierarchy: Atlas → Head/Hand
         assert!(p.contains("Head"));
         assert!(p.contains("Hand"));
-        // Routing uses the real `ryve hand spawn ... --role head` CLI surface;
-        // there is no separate `ryve head spawn` command.
-        assert!(p.contains("ryve hand spawn"));
-        assert!(!p.contains("ryve head spawn"));
+        // Routing uses the dedicated `ryve head spawn ... --archetype <name>`
+        // CLI surface (spark ryve-e4cadc03).
+        assert!(p.contains("ryve head spawn"));
+        assert!(p.contains("--archetype"));
         // Atlas must never execute work itself.
         assert!(
             p.contains("never edit") || p.contains("DO NOT EXECUTE") || p.contains("not execute")
@@ -431,8 +513,12 @@ mod tests {
 
     #[test]
     fn head_prompt_explains_workflow() {
-        let p = compose_head_prompt(Some("sp-abcd"), Some("User profile editing"));
-        assert!(p.contains("You are the **Head**"));
+        let p = compose_head_prompt(
+            HeadArchetype::Build,
+            Some("sp-abcd"),
+            Some("User profile editing"),
+        );
+        assert!(p.contains("**build Head**"));
         assert!(p.contains("sp-abcd"));
         assert!(p.contains("User profile editing"));
         assert!(p.contains("PARENT EPIC"));
@@ -444,10 +530,45 @@ mod tests {
 
     #[test]
     fn head_prompt_handles_no_epic() {
-        let p = compose_head_prompt(None, None);
+        let p = compose_head_prompt(HeadArchetype::Build, None, None);
         assert!(p.contains("no epic selected"));
         assert!(p.contains("wait for the user"));
         assert!(!p.contains("PARENT EPIC"));
+    }
+
+    /// sp-ryve-e4cadc03: each archetype must declare its identity in the
+    /// first paragraph and the archetype-specific charter must appear
+    /// verbatim so the Head cannot quietly act out-of-archetype.
+    #[test]
+    fn head_prompt_includes_archetype_charter() {
+        let build = compose_head_prompt(HeadArchetype::Build, Some("sp-1"), None);
+        assert!(build.contains("**build Head**"));
+        assert!(build.contains("CHARTER — BUILD"));
+        assert!(build.contains("Merger Hand"));
+
+        let research = compose_head_prompt(HeadArchetype::Research, Some("sp-2"), None);
+        assert!(research.contains("**research Head**"));
+        assert!(research.contains("CHARTER — RESEARCH"));
+        assert!(research.contains("may NOT"));
+
+        let review = compose_head_prompt(HeadArchetype::Review, Some("sp-3"), None);
+        assert!(review.contains("**review Head**"));
+        assert!(review.contains("CHARTER — REVIEW"));
+        assert!(review.contains("Blocking"));
+    }
+
+    #[test]
+    fn head_archetype_round_trip() {
+        for a in [
+            HeadArchetype::Build,
+            HeadArchetype::Research,
+            HeadArchetype::Review,
+        ] {
+            assert_eq!(HeadArchetype::from_str(a.as_str()), Some(a));
+        }
+        assert_eq!(HeadArchetype::from_str("nope"), None);
+        // Case-insensitive.
+        assert_eq!(HeadArchetype::from_str("Build"), Some(HeadArchetype::Build));
     }
 
     /// sp-ryve-9972f264: the Atlas system prompt must reinforce the four

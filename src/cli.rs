@@ -20,6 +20,7 @@ use data::sparks::{
     constraint_helpers, contract_repo, crew_repo, ember_repo, event_repo, spark_repo, stamp_repo,
 };
 
+use crate::agent_prompts::HeadArchetype;
 use crate::coding_agents::{self, CodingAgent};
 use crate::hand_spawn::{self, HandKind};
 use crate::worktree_cleanup::{
@@ -272,8 +273,9 @@ fn print_usage() {
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
     eprintln!();
-    eprintln!("  head spawn <epic_id> [--agent <name>] [--crew <id>]");
-    eprintln!("                                       Spawn a Head (crew orchestrator) on an epic");
+    eprintln!("  head spawn <epic_id> --archetype <build|research|review> \\");
+    eprintln!("            [--agent <name>] [--crew <id>]");
+    eprintln!("                                       Spawn a Head subprocess on an epic");
     eprintln!("  head list                            List active Head sessions");
     eprintln!("  head archetype list                  List registered Head archetypes");
     eprintln!("  head --help                          Long-form Head documentation");
@@ -2132,6 +2134,186 @@ async fn handle_head(
         other => die(&format!(
             "unknown head subcommand '{other}'. Try `ryve head --help`."
         )),
+    }
+}
+
+// ── Heads ─────────────────────────────────────────────
+
+/// Print `ryve head --help`. Listed as its own function so both the
+/// `head --help` path and the "no subcommand" error path render the same
+/// text — acceptance criterion for spark ryve-e4cadc03 ("ryve head --help
+/// lists spawn and any subcommands").
+fn print_head_usage() {
+    eprintln!("ryve head — manage Head orchestrator subprocesses\n");
+    eprintln!("USAGE: ryve head <subcommand> [args...]\n");
+    eprintln!("SUBCOMMANDS:");
+    eprintln!("  spawn <epic_id> --archetype <build|research|review> \\");
+    eprintln!("        [--agent <name>] [--crew <id>]");
+    eprintln!("        Spawn a Head subprocess on an existing epic spark.");
+    eprintln!("        Creates (or reuses) a Crew and registers the Head as");
+    eprintln!("        its head_session_id. See docs/HEAD_ARCHETYPES.md.");
+    eprintln!();
+    eprintln!("  list");
+    eprintln!("        List active Head sessions in this workshop.");
+    eprintln!();
+    eprintln!("  help, --help, -h");
+    eprintln!("        Show this help text.");
+}
+
+
+/// `ryve head spawn <epic_id> --archetype <name> [--crew <id>] [--agent <name>]`
+/// and `ryve head list`.
+///
+/// Dispatches to [`hand_spawn::spawn_head`] for the actual worktree +
+/// session + crew wiring; this handler is just argv parsing and output
+/// rendering. Spark ryve-e4cadc03.
+async fn handle_head(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    args: &[String],
+    json_mode: bool,
+) {
+    if args.is_empty() {
+        print_head_usage();
+        process::exit(1);
+    }
+    match args[0].as_str() {
+        "help" | "--help" | "-h" => {
+            print_head_usage();
+            return;
+        }
+        "spawn" => {
+            if args.len() < 2 {
+                die(
+                    "head spawn requires <epic_id> --archetype <build|research|review> [--agent <name>] [--crew <id>]",
+                );
+            }
+            let epic_id = args[1].clone();
+            let mut archetype_name: Option<String> = None;
+            let mut agent_name: Option<String> = None;
+            let mut crew_id: Option<String> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--archetype" => {
+                        i += 1;
+                        if i < args.len() {
+                            archetype_name = Some(args[i].clone());
+                        }
+                    }
+                    "--agent" => {
+                        i += 1;
+                        if i < args.len() {
+                            agent_name = Some(args[i].clone());
+                        }
+                    }
+                    "--crew" => {
+                        i += 1;
+                        if i < args.len() {
+                            crew_id = Some(args[i].clone());
+                        }
+                    }
+                    other => die(&format!("unknown head spawn flag '{other}'")),
+                }
+                i += 1;
+            }
+
+            let archetype = match archetype_name.as_deref() {
+                Some(name) => HeadArchetype::from_str(name).unwrap_or_else(|| {
+                    die(&format!(
+                        "invalid archetype '{name}' (build|research|review)"
+                    ))
+                }),
+                None => die(
+                    "head spawn requires --archetype <build|research|review> (see docs/HEAD_ARCHETYPES.md)",
+                ),
+            };
+
+            let agent = resolve_agent(agent_name.as_deref());
+
+            // Lineage: if the spawning process is itself a Hand/Head, its
+            // session id is injected via `RYVE_HAND_SESSION_ID` by the
+            // parent spawn. Atlas (running as a coding-agent subprocess
+            // under the UI) will set this too.
+            let parent_session_id = std::env::var("RYVE_HAND_SESSION_ID").ok();
+
+            match hand_spawn::spawn_head(
+                workshop_root,
+                pool,
+                &agent,
+                &epic_id,
+                archetype,
+                crew_id.as_deref(),
+                parent_session_id.as_deref(),
+            )
+            .await
+            {
+                Ok(spawned) => {
+                    if json_mode {
+                        let payload = serde_json::json!({
+                            "session_id": spawned.session_id,
+                            "epic_id": spawned.epic_id,
+                            "crew_id": spawned.crew_id,
+                            "archetype": spawned.archetype.as_str(),
+                            "worktree": spawned.worktree_path,
+                            "log": spawned.log_path,
+                            "pid": spawned.child_pid,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    } else {
+                        println!(
+                            "spawned {} head {} on epic {} (crew {}, pid {:?})",
+                            spawned.archetype.as_str(),
+                            spawned.session_id,
+                            spawned.epic_id,
+                            spawned.crew_id,
+                            spawned.child_pid
+                        );
+                        println!("  worktree: {}", spawned.worktree_path.display());
+                        println!("  log:      {}", spawned.log_path.display());
+                    }
+                }
+                Err(e) => die(&format!("{e}")),
+            }
+        }
+        "list" | "ls" => {
+            let workshop_id = workshop_root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match agent_session_repo::list_for_workshop(pool, &workshop_id).await {
+                Ok(sessions) => {
+                    let heads: Vec<_> = sessions
+                        .into_iter()
+                        .filter(|s| s.session_label.as_deref() == Some("head"))
+                        .collect();
+                    if json_mode {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&heads).unwrap_or_default()
+                        );
+                    } else if heads.is_empty() {
+                        println!("No Head sessions.");
+                    } else {
+                        println!("{:<36} {:<20} {:<10} STARTED", "SESSION", "AGENT", "STATUS");
+                        let sep = "-".repeat(90);
+                        println!("{sep}");
+                        for s in &heads {
+                            println!(
+                                "{:<36} {:<20} {:<10} {}",
+                                s.id, s.agent_name, s.status, s.started_at
+                            );
+                        }
+                    }
+                }
+                Err(e) => die(&format!("{e}")),
+            }
+        }
+        other => die(&format!("unknown head subcommand '{other}'")),
     }
 }
 
