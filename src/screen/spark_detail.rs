@@ -3,9 +3,130 @@
 
 //! Spark detail view — shown when a spark is selected in the workgraph panel.
 
+use std::collections::HashMap;
+
 use data::sparks::types::{Bond, Contract, ContractEnforcement, ContractKind, Spark};
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Theme};
+
+// ── Inline edit state ────────────────────────────────
+//
+// The detail view will gain per-field inline editing across the rest of
+// the epic (ryve-82e1102f). Every field needs the same basic state:
+//
+//   1. A draft value the user is currently typing.
+//   2. An "in flight" value that has been committed to the DB but whose
+//      write has not yet confirmed — used so the UI can render the
+//      optimistic value while the async task runs, and so a failure can
+//      roll the field back cleanly.
+//
+// Centralising that here (instead of letting every field invent its own)
+// is the entire point of this foundation spark. Non-goal: any actual
+// field-level UI — that lands in the follow-up sparks.
+
+/// Fields on a [`Spark`] that can be edited inline in the detail view.
+/// The indexed variants (`Acceptance`, `Invariant`, `NonGoal`) identify
+/// a specific list item by position so multiple items in the same list
+/// can be edited independently without colliding in the draft map.
+// Variants beyond `Title` are consumed by follow-up sparks in the
+// ryve-82e1102f epic — allow dead_code on the foundation spark so
+// the build stays clean until those land.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum Field {
+    Title,
+    Description,
+    Priority,
+    Type,
+    Assignee,
+    Problem,
+    Acceptance(usize),
+    Invariant(usize),
+    NonGoal(usize),
+}
+
+/// A committed-but-not-yet-persisted field edit. The update loop turns
+/// one of these into the actual DB write task; holding it in a
+/// dedicated type (rather than a raw tuple) lets the follow-up sparks
+/// pattern-match on `field` to dispatch to the correct repo function.
+#[allow(dead_code)] // consumed by follow-up sparks in the ryve-82e1102f epic
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimisticWrite {
+    pub spark_id: String,
+    pub field: Field,
+    pub value: String,
+}
+
+/// Per-spark inline-edit state held on [`crate::workshop::Workshop`].
+///
+/// * `drafts` — fields the user has opened for editing but not yet
+///   committed. The value is whatever they've typed so far.
+/// * `in_flight` — fields whose commit has been dispatched to the DB
+///   but whose confirmation hasn't come back yet. The UI renders these
+///   optimistically; a rollback wipes them if the write fails.
+///
+/// Invariant (enforced by [`crate::workshop::Workshop`]): at most one
+/// `SparkEdit` exists per workshop at a time. Selecting a different
+/// spark clears it.
+#[derive(Debug, Clone)]
+pub struct SparkEdit {
+    #[allow(dead_code)] // read by follow-up sparks that dispatch the DB write
+    pub spark_id: String,
+    pub drafts: HashMap<Field, String>,
+    pub in_flight: HashMap<Field, String>,
+}
+
+#[allow(dead_code)] // public API surface for the ryve-82e1102f epic
+impl SparkEdit {
+    pub fn new(spark_id: impl Into<String>) -> Self {
+        Self {
+            spark_id: spark_id.into(),
+            drafts: HashMap::new(),
+            in_flight: HashMap::new(),
+        }
+    }
+
+    /// True when there is any unsaved user input — either a draft the
+    /// user is still typing or a commit that hasn't confirmed yet. The
+    /// selection-change path uses this to decide whether to surface a
+    /// "discard unsaved changes?" prompt.
+    pub fn is_dirty(&self) -> bool {
+        !self.drafts.is_empty() || !self.in_flight.is_empty()
+    }
+
+    /// Open `field` for editing, seeding a draft entry if one doesn't
+    /// already exist. Calling this on a field with an existing draft is
+    /// a no-op so the user's in-progress text isn't clobbered if they
+    /// re-enter the field.
+    pub fn begin_edit(&mut self, field: Field) {
+        self.drafts.entry(field).or_default();
+    }
+
+    /// Replace the draft value for `field`. Called on every keystroke.
+    pub fn update_draft(&mut self, field: Field, value: String) {
+        self.drafts.insert(field, value);
+    }
+
+    /// Move a draft into `in_flight` and return the write the update
+    /// loop should dispatch. Returns `None` if `begin_edit` was never
+    /// called for this field (callers should treat that as a no-op).
+    pub fn commit(&mut self, field: Field) -> Option<OptimisticWrite> {
+        let value = self.drafts.remove(&field)?;
+        self.in_flight.insert(field.clone(), value.clone());
+        Some(OptimisticWrite {
+            spark_id: self.spark_id.clone(),
+            field,
+            value,
+        })
+    }
+
+    /// Discard any in-flight or draft value for `field`. Called when a
+    /// DB write fails (rollback) or when the user cancels an edit.
+    pub fn rollback(&mut self, field: Field) {
+        self.in_flight.remove(&field);
+        self.drafts.remove(&field);
+    }
+}
 
 use crate::screen::delegation_trace::DelegationTrace;
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_LABEL, FONT_SMALL, Palette};
@@ -948,6 +1069,84 @@ mod tests {
         let bonds = vec![make_bond(1, "sp-b", "sp-me", "conditional_blocks")];
         let (_, blocked_by, _) = classify_bonds(&me, &bonds, &all);
         assert_eq!(blocked_by.len(), 1);
+    }
+
+    #[test]
+    fn spark_edit_begin_edit_records_empty_draft() {
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Title);
+        assert!(edit.drafts.contains_key(&Field::Title));
+        assert_eq!(edit.drafts[&Field::Title], "");
+        assert!(edit.is_dirty());
+    }
+
+    #[test]
+    fn spark_edit_begin_edit_preserves_existing_draft() {
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Title);
+        edit.update_draft(Field::Title, "hello".into());
+        // Re-entering the field must not wipe in-progress text.
+        edit.begin_edit(Field::Title);
+        assert_eq!(edit.drafts[&Field::Title], "hello");
+    }
+
+    #[test]
+    fn spark_edit_commit_moves_draft_to_in_flight() {
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Description);
+        edit.update_draft(Field::Description, "new body".into());
+        let write = edit.commit(Field::Description).expect("commit");
+        assert_eq!(write.spark_id, "sp-1");
+        assert_eq!(write.field, Field::Description);
+        assert_eq!(write.value, "new body");
+        assert!(!edit.drafts.contains_key(&Field::Description));
+        assert_eq!(edit.in_flight[&Field::Description], "new body");
+        assert!(edit.is_dirty(), "in-flight counts as dirty");
+    }
+
+    #[test]
+    fn spark_edit_commit_without_draft_returns_none() {
+        let mut edit = SparkEdit::new("sp-1");
+        assert!(edit.commit(Field::Title).is_none());
+        assert!(!edit.is_dirty());
+    }
+
+    #[test]
+    fn spark_edit_rollback_discards_in_flight() {
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Priority);
+        edit.update_draft(Field::Priority, "0".into());
+        let _ = edit.commit(Field::Priority);
+        assert!(edit.in_flight.contains_key(&Field::Priority));
+        edit.rollback(Field::Priority);
+        assert!(!edit.in_flight.contains_key(&Field::Priority));
+        assert!(!edit.drafts.contains_key(&Field::Priority));
+        assert!(!edit.is_dirty());
+    }
+
+    #[test]
+    fn spark_edit_rollback_discards_draft_too() {
+        // Rollback from an uncommitted draft (user cancelled) should
+        // also clear the draft, not just the in-flight slot.
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Assignee);
+        edit.update_draft(Field::Assignee, "alice".into());
+        edit.rollback(Field::Assignee);
+        assert!(!edit.drafts.contains_key(&Field::Assignee));
+    }
+
+    #[test]
+    fn spark_edit_indexed_fields_are_independent() {
+        // Acceptance(0) and Acceptance(1) must hash differently so two
+        // list items can be edited at once without colliding.
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Acceptance(0));
+        edit.update_draft(Field::Acceptance(0), "first".into());
+        edit.begin_edit(Field::Acceptance(1));
+        edit.update_draft(Field::Acceptance(1), "second".into());
+        assert_eq!(edit.drafts.len(), 2);
+        assert_eq!(edit.drafts[&Field::Acceptance(0)], "first");
+        assert_eq!(edit.drafts[&Field::Acceptance(1)], "second");
     }
 
     #[test]
