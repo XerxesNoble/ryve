@@ -18,8 +18,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Locate the system tmux binary, or skip the test.
-fn tmux_binary() -> PathBuf {
+/// Locate the system tmux binary, or return `None` so the test can be skipped.
+fn tmux_binary() -> Option<PathBuf> {
     // Check common locations.
     for candidate in &[
         "/opt/homebrew/bin/tmux",
@@ -28,7 +28,7 @@ fn tmux_binary() -> PathBuf {
     ] {
         let p = PathBuf::from(candidate);
         if p.exists() {
-            return p;
+            return Some(p);
         }
     }
     // Try PATH via `which`.
@@ -37,11 +37,11 @@ fn tmux_binary() -> PathBuf {
         if out.status.success() {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !path.is_empty() {
-                return PathBuf::from(path);
+                return Some(PathBuf::from(path));
             }
         }
     }
-    panic!("tmux not found — skipping integration test");
+    None
 }
 
 /// Run a tmux command against the given private socket.
@@ -53,7 +53,10 @@ fn tmux_cmd(binary: &PathBuf, socket: &PathBuf) -> Command {
 
 #[test]
 fn tmux_session_lifecycle() {
-    let binary = tmux_binary();
+    let Some(binary) = tmux_binary() else {
+        eprintln!("tmux not found — skipping integration test");
+        return;
+    };
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let socket = tmp.path().join("tmux.sock");
     let session_name = "ryve-integration-test";

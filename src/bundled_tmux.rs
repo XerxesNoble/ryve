@@ -53,6 +53,12 @@ pub fn bundled_tmux_path() -> Option<PathBuf> {
     None
 }
 
+/// Non-unix stub: tmux is not supported on non-unix platforms.
+#[cfg(not(unix))]
+pub fn bundled_tmux_path() -> Option<PathBuf> {
+    None
+}
+
 /// Returns the expected installed-layout path: `<exe_dir>/bin/tmux`.
 fn exe_relative_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;

@@ -1447,6 +1447,14 @@ impl App {
                     let known_ids: std::collections::HashSet<String> =
                         ws.agent_sessions.iter().map(|s| s.id.clone()).collect();
 
+                    // Cache the set of live tmux session names once per
+                    // poll so we avoid shelling out per-session.
+                    // Spark: copilot review comment #10.
+                    let live_tmux_names: std::collections::HashSet<String> = {
+                        let live = tmux::list_sessions_sync(&ws.directory);
+                        live.into_iter().map(|s| s.name).collect()
+                    };
+
                     // Use the tmux wrapper to diff tracked sessions against
                     // the process snapshot, collecting session IDs to feed
                     // into the per-session classification below.
@@ -1511,7 +1519,7 @@ impl App {
                                 let label = s.session_label.as_deref().unwrap_or("hand");
                                 let tmux_name = tmux::session_name_for(label, &s.id);
                                 s.tmux_session_live =
-                                    s.active && tmux::has_session(&ws.directory, &tmux_name);
+                                    s.active && live_tmux_names.contains(&tmux_name);
                             }
                             continue;
                         }
@@ -1533,7 +1541,7 @@ impl App {
                         let tmux_live = if is_active {
                             let label = p.session_label.as_deref().unwrap_or("hand");
                             let tmux_name = tmux::session_name_for(label, &p.id);
-                            tmux::has_session(&ws.directory, &tmux_name)
+                            live_tmux_names.contains(&tmux_name)
                         } else {
                             false
                         };
@@ -2402,7 +2410,16 @@ impl App {
 
                             // Create the iced_term::Terminal with the tmux
                             // attach command as the backend program.
-                            let (program, args) = tmux::attach_command(&ws.directory, &tmux_name);
+                            let (program, args) =
+                                match tmux::attach_command(&ws.directory, &tmux_name) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        log::error!(
+                                            "Cannot attach to tmux session '{tmux_name}': {e}"
+                                        );
+                                        return Task::none();
+                                    }
+                                };
                             let (shell, shell_args) =
                                 workshop::wrap_command_with_bottom_pin(&program, &args);
 

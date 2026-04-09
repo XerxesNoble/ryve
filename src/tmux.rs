@@ -24,7 +24,17 @@ use std::process::{Output, Stdio};
 use data::sparks::types::PersistedAgentSession;
 use sqlx::SqlitePool;
 
+use crate::bundled_tmux;
 use crate::process_snapshot::ProcessSnapshot;
+
+/// Shell-quote a path by wrapping it in single quotes and escaping any
+/// embedded single quotes (`'` -> `'\''`). This prevents injection when
+/// the path is interpolated into a shell command string.
+fn shell_quote_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
 
 // ── Errors ────────────────────────────────────────────────
 
@@ -159,9 +169,17 @@ impl<R: CommandRunner> TmuxClient<R> {
         let mut all_args: Vec<&str> = base.iter().map(String::as_str).collect();
         all_args.extend_from_slice(subcmd_args);
 
-        let output = self
-            .runner
-            .run(self.tmux_bin.to_str().unwrap_or("tmux"), &all_args)?;
+        let bin_str = self.tmux_bin.to_str().ok_or_else(|| {
+            TmuxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tmux binary path is not valid UTF-8: {}",
+                    self.tmux_bin.display()
+                ),
+            ))
+        })?;
+
+        let output = self.runner.run(bin_str, &all_args)?;
 
         Ok(output)
     }
@@ -246,8 +264,8 @@ impl<R: CommandRunner> TmuxClient<R> {
         if !self.has_session(name)? {
             return Err(TmuxError::SessionNotFound(name.to_string()));
         }
-        let log_str = log_path.to_string_lossy();
-        let pipe_cmd = format!("cat >> {log_str}");
+        let quoted = shell_quote_path(log_path);
+        let pipe_cmd = format!("cat >> {quoted}");
         self.run_tmux_ok(&["pipe-pane", "-t", name, &pipe_cmd])?;
         Ok(())
     }
@@ -306,15 +324,30 @@ impl<R: CommandRunner> TmuxClient<R> {
 }
 
 /// Resolve the tmux binary path. Checks (in order):
-/// 1. `RYVE_TMUX_BIN` env var
-/// 2. `tmux` on PATH via `which`
+/// 1. `RYVE_TMUX_PATH` env var (set by workshop env for Hands)
+/// 2. `RYVE_TMUX_BIN` env var (backward compat)
+/// 3. Bundled tmux via `bundled_tmux::bundled_tmux_path()`
+/// 4. `tmux` on PATH via `which`
 pub fn resolve_tmux_bin() -> Option<PathBuf> {
+    // 1. RYVE_TMUX_PATH (preferred, set by workshop env)
+    if let Ok(val) = std::env::var("RYVE_TMUX_PATH") {
+        let p = PathBuf::from(val);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // 2. RYVE_TMUX_BIN (backward compat)
     if let Ok(val) = std::env::var("RYVE_TMUX_BIN") {
         let p = PathBuf::from(val);
         if p.exists() {
             return Some(p);
         }
     }
+    // 3. Bundled tmux
+    if let Some(p) = bundled_tmux::bundled_tmux_path() {
+        return Some(p);
+    }
+    // 4. System tmux on PATH
     which_tmux()
 }
 
@@ -337,11 +370,12 @@ fn which_tmux() -> Option<PathBuf> {
 // ── Session naming ───────────────────────────────────────
 
 /// The canonical tmux session name for a given agent session.
-/// Format: `<label>-<short_id>` where short_id is the first 8 chars.
+/// Format: `<label>-<session_id>` using the full session ID to match
+/// the naming convention used by `session_name_for` and the rest of the
+/// codebase.
 pub fn session_name(session_label: Option<&str>, session_id: &str) -> String {
     let label = session_label.unwrap_or("hand");
-    let short = &session_id[..8.min(session_id.len())];
-    format!("{label}-{short}")
+    format!("{label}-{session_id}")
 }
 
 /// Returns true if `name` looks like a Ryve-managed tmux session.
@@ -358,12 +392,18 @@ pub struct TmuxSession {
 }
 
 /// List all tmux sessions on the workshop's private socket (async).
+///
+/// Uses the same socket-path derivation as `TmuxClient::new` so that
+/// long workshop paths that fall back to `/tmp/ryve-<hash>.sock` are
+/// handled correctly.
 pub async fn list_sessions_async(workshop_dir: &Path) -> Vec<TmuxSession> {
-    let sock = workshop_dir.join(".ryve").join("tmux.sock");
+    let state_dir = workshop_dir.join(".ryve");
+    let sock = short_socket_path(&state_dir);
     if !sock.exists() {
         return Vec::new();
     }
-    let output = tokio::process::Command::new("tmux")
+    let tmux_bin = resolve_tmux_bin().unwrap_or_else(|| PathBuf::from("tmux"));
+    let output = tokio::process::Command::new(&tmux_bin)
         .args([
             "-S",
             &sock.to_string_lossy(),
@@ -442,6 +482,16 @@ pub async fn reconcile_sessions(
                 s.id
             );
             let _ = data::sparks::agent_session_repo::end_session(pool, &s.id).await;
+            // Also abandon any active hand_assignments so sparks are
+            // freed for re-assignment.
+            let assignments = data::sparks::assignment_repo::list_for_session(pool, &s.id)
+                .await
+                .unwrap_or_default();
+            for a in assignments {
+                if a.status == "active" {
+                    let _ = data::sparks::assignment_repo::abandon(pool, &s.id, &a.spark_id).await;
+                }
+            }
             result.marked_stopped.push(s.id.clone());
         }
     }
@@ -469,19 +519,53 @@ pub fn session_name_for(label: &str, session_id: &str) -> String {
     format!("{label}-{session_id}")
 }
 
-/// Check whether a tmux session exists on the Ryve-private socket.
-pub fn has_session(workshop_dir: &Path, session_name: &str) -> bool {
-    let Some(bin) = resolve_tmux_bin() else {
-        return false;
-    };
-    let client = TmuxClient::new(bin, &workshop_dir.join(".ryve"));
-    client.has_session(session_name).unwrap_or(false)
+/// List all tmux sessions on the workshop's private socket (sync).
+///
+/// Returns the same `TmuxSession` vec as the async variant but blocks.
+/// Used by the poll loop to cache the full session list once per tick
+/// instead of shelling out per-session.
+pub fn list_sessions_sync(workshop_dir: &Path) -> Vec<TmuxSession> {
+    let state_dir = workshop_dir.join(".ryve");
+    let sock = short_socket_path(&state_dir);
+    if !sock.exists() {
+        return Vec::new();
+    }
+    let tmux_bin = resolve_tmux_bin().unwrap_or_else(|| PathBuf::from("tmux"));
+    let output = std::process::Command::new(&tmux_bin)
+        .args([
+            "-S",
+            &sock.to_string_lossy(),
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| TmuxSession {
+                    name: l.trim().to_string(),
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Build a command that attaches to the named tmux session.
-/// Returns `(program, args)` suitable for spawning.
-pub fn attach_command(workshop_dir: &Path, session_name: &str) -> (String, Vec<String>) {
-    let bin = resolve_tmux_bin().unwrap_or_else(|| PathBuf::from("tmux"));
+/// Returns `Ok((program, args))` suitable for spawning, or `Err` if no
+/// tmux binary could be resolved.
+pub fn attach_command(
+    workshop_dir: &Path,
+    session_name: &str,
+) -> Result<(String, Vec<String>), TmuxError> {
+    let bin = resolve_tmux_bin().ok_or_else(|| TmuxError::BinaryMissing(PathBuf::from("tmux")))?;
     let client = TmuxClient::new(bin, &workshop_dir.join(".ryve"));
     let cmd = client.attach_command(session_name);
     let program = cmd.get_program().to_string_lossy().into_owned();
@@ -489,7 +573,7 @@ pub fn attach_command(workshop_dir: &Path, session_name: &str) -> (String, Vec<S
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    (program, args)
+    Ok((program, args))
 }
 
 // ── PID-based liveness detection ─────────────────────────
@@ -497,10 +581,20 @@ pub fn attach_command(workshop_dir: &Path, session_name: &str) -> (String, Vec<S
 /// Diff tracked sessions against a process snapshot and return session IDs
 /// whose process has disappeared. Each entry in `tracked` is
 /// `(session_id, child_pid)`.
+///
+/// Sessions with `child_pid = None` are tmux-managed and have no PID to
+/// check against the snapshot; they are excluded from the dead set since
+/// their liveness is determined by tmux reconciliation instead.
 pub fn dead_sessions(tracked: &[(String, Option<i64>)], snapshot: &ProcessSnapshot) -> Vec<String> {
     tracked
         .iter()
-        .filter(|(_, pid)| !pid.map(|p| snapshot.is_alive(p)).unwrap_or(false))
+        .filter(|(_, pid)| {
+            match pid {
+                Some(p) => !snapshot.is_alive(*p),
+                // No PID to check — tmux-managed; skip.
+                None => false,
+            }
+        })
         .map(|(id, _)| id.clone())
         .collect()
 }

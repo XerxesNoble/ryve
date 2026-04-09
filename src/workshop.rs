@@ -1454,7 +1454,8 @@ pub(crate) fn hand_env_vars(workshop_dir: &Path) -> Vec<(String, String)> {
     }
 
     // Expose the bundled tmux path and version so Hands can locate it
-    // without $PATH.
+    // without $PATH. Only meaningful on unix where tmux is available.
+    #[cfg(unix)]
     if let Some(tmux) = crate::bundled_tmux::bundled_tmux_path() {
         vars.push((
             "RYVE_TMUX_PATH".to_string(),
