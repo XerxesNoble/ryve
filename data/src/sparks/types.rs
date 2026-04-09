@@ -1043,6 +1043,95 @@ pub struct NewDelegationTrace {
     pub delegated_target_kind: ActorKind,
 }
 
+// ── Release ────────────────────────────────────────────
+
+/// A release bundles one or more epic sparks into a shippable unit with its
+/// own lifecycle. See migration `011_releases.sql` and `release_repo`.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Release {
+    pub id: String,
+    pub version: String,
+    pub status: String,
+    pub branch_name: Option<String>,
+    pub created_at: String,
+    pub cut_at: Option<String>,
+    pub tag: Option<String>,
+    pub artifact_path: Option<String>,
+    pub problem: Option<String>,
+    pub acceptance_json: String,
+    pub notes: Option<String>,
+}
+
+impl Release {
+    /// Parse the stored `acceptance_json` blob into a vector of criteria.
+    /// Returns an empty vec on any parse error — callers that care should
+    /// validate on write before persistence, as `release_repo::create`
+    /// serializes `NewRelease.acceptance` directly.
+    pub fn acceptance(&self) -> Vec<String> {
+        serde_json::from_str(&self.acceptance_json).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NewRelease {
+    pub version: String,
+    pub branch_name: Option<String>,
+    pub problem: Option<String>,
+    pub acceptance: Vec<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseStatus {
+    Planning,
+    InProgress,
+    Ready,
+    Cut,
+    Closed,
+    Abandoned,
+}
+
+impl ReleaseStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::InProgress => "in_progress",
+            Self::Ready => "ready",
+            Self::Cut => "cut",
+            Self::Closed => "closed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "planning" => Some(Self::Planning),
+            "in_progress" => Some(Self::InProgress),
+            "ready" => Some(Self::Ready),
+            "cut" => Some(Self::Cut),
+            "closed" => Some(Self::Closed),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+
+    /// An "open" release is one that still blocks other releases from
+    /// claiming the same epic. Matches the invariant enforced by the
+    /// `release_epics_single_open_insert` trigger.
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Planning | Self::InProgress | Self::Ready)
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ReleaseEpic {
+    pub release_id: String,
+    pub spark_id: String,
+    pub added_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

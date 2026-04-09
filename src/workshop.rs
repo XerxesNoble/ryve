@@ -154,6 +154,12 @@ pub struct Workshop {
     pub blocked_spark_ids: HashSet<String>,
     /// Inline contract-create form for the spark detail view.
     pub contract_create_form: crate::screen::spark_detail::ContractCreateForm,
+    /// Whether the releases panel is shown instead of the sparks panel.
+    pub show_releases: bool,
+    /// Cached release view data for display. Refreshed alongside sparks.
+    pub release_view_data: Vec<crate::screen::releases::ReleaseViewData>,
+    /// UI state for the releases panel.
+    pub releases_state: crate::screen::releases::ReleasesState,
     /// Whether the background image is dark (for adaptive font color).
     /// `None` means no background or not yet computed.
     pub bg_is_dark: Option<bool>,
@@ -231,6 +237,9 @@ impl Workshop {
             selected_spark_bonds: Vec::new(),
             blocked_spark_ids: HashSet::new(),
             contract_create_form: Default::default(),
+            show_releases: false,
+            release_view_data: Vec::new(),
+            releases_state: Default::default(),
             bg_is_dark: None,
             pending_agent_spawn: None,
             pending_head_spawn: None,
