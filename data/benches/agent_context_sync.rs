@@ -12,9 +12,9 @@
 //!
 //! Spark ryve-5b9c5d93 — Performance regression harness.
 
-use criterion::{Criterion, criterion_group, criterion_main};
 use std::sync::Mutex;
 
+use criterion::{Criterion, criterion_group, criterion_main};
 use data::agent_context::{self, SyncCache};
 use data::ryve_dir::{RyveDir, WorkshopConfig};
 use tempfile::TempDir;
