@@ -50,6 +50,9 @@ pub struct HomeData<'a> {
     pub assignments: &'a [HandAssignment],
     pub failing_contracts: &'a [Contract],
     pub embers: &'a [Ember],
+    /// UTC clock snapshot from the frame, so per-row time formatting avoids
+    /// calling `Utc::now()` per row. Spark ryve-252c5b6e.
+    pub utc_now: chrono::DateTime<chrono::Utc>,
 }
 
 // ── View ─────────────────────────────────────────────
@@ -81,7 +84,7 @@ pub fn view<'a>(data: HomeData<'a>, pal: &Palette, has_bg: bool) -> Element<'a, 
         section_assigned_sparks(&data, &pal),
         section_blocked_sparks(&data, &pal),
         section_failing_contracts(data.failing_contracts, &pal),
-        section_active_embers(data.embers, &pal),
+        section_active_embers(data.embers, &pal, data.utc_now),
     ]
     .spacing(14)
     .padding(iced::Padding {
@@ -144,7 +147,7 @@ fn section_active_hands<'a>(data: &HomeData<'a>, pal: &Palette) -> Element<'a, M
                 .color(claim_color)
                 .width(Length::FillPortion(3)),
             Space::new().width(Length::Fill),
-            text(format_relative_time(&session.started_at))
+            text(format_relative_time(&session.started_at, data.utc_now))
                 .size(FONT_SMALL)
                 .color(pal.text_tertiary),
         ]
@@ -304,7 +307,11 @@ fn section_failing_contracts<'a>(failing: &'a [Contract], pal: &Palette) -> Elem
     col.into()
 }
 
-fn section_active_embers<'a>(embers: &'a [Ember], pal: &Palette) -> Element<'a, Message> {
+fn section_active_embers<'a>(
+    embers: &'a [Ember],
+    pal: &Palette,
+    utc_now: chrono::DateTime<chrono::Utc>,
+) -> Element<'a, Message> {
     let pal = *pal;
     let mut col = column![section_header("Active Embers", embers.len(), &pal)].spacing(4);
 
@@ -327,7 +334,7 @@ fn section_active_embers<'a>(embers: &'a [Ember], pal: &Palette) -> Element<'a, 
                 .size(FONT_BODY)
                 .color(pal.text_primary),
             Space::new().width(Length::Fill),
-            text(format_relative_time(&ember.created_at))
+            text(format_relative_time(&ember.created_at, utc_now))
                 .size(FONT_SMALL)
                 .color(pal.text_tertiary),
         ]
@@ -458,6 +465,7 @@ mod tests {
             assignments: &[],
             failing_contracts: &[],
             embers: &[],
+            utc_now: chrono::Utc::now(),
         };
         let _ = view(data, &Palette::dark(), false);
     }
@@ -504,6 +512,7 @@ mod tests {
             assignments: &assignments,
             failing_contracts: &failing,
             embers: &embers,
+            utc_now: chrono::Utc::now(),
         };
         let _ = view(data, &Palette::dark(), true);
     }
@@ -533,6 +542,7 @@ mod tests {
             assignments: &assignments,
             failing_contracts: &[],
             embers: &[],
+            utc_now: chrono::Utc::now(),
         };
 
         let matches: Vec<&Spark> = data

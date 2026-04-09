@@ -372,6 +372,18 @@ pub struct Workshop {
     /// the panel survives restart; stale IDs (epics deleted between runs)
     /// are pruned on load. Spark ryve-926870a9.
     pub collapsed_epics: HashSet<String>,
+    /// Cached spark summary for the status bar. Recomputed on `SparksLoaded`
+    /// instead of every frame. Spark ryve-252c5b6e.
+    pub cached_spark_summary: crate::screen::status_bar::SparkSummary,
+    /// Cached git diff stats for the status bar. Recomputed on `FilesScanned`
+    /// instead of every frame. Spark ryve-252c5b6e.
+    pub cached_git_stats: crate::screen::status_bar::GitStats,
+    /// Cached active-hand count for the status bar. Recomputed on
+    /// `AgentSessionsLoaded` instead of every frame. Spark ryve-252c5b6e.
+    pub cached_active_hands: usize,
+    /// Cached total (non-stale) hand count for the status bar. Recomputed on
+    /// `AgentSessionsLoaded` instead of every frame. Spark ryve-252c5b6e.
+    pub cached_total_hands: usize,
 }
 
 impl Workshop {
@@ -442,7 +454,49 @@ impl Workshop {
             terminal_font_family: None,
             agent_context_sync_cache: Arc::new(Mutex::new(AgentContextSyncCache::new())),
             collapsed_epics: HashSet::new(),
+            cached_spark_summary: Default::default(),
+            cached_git_stats: Default::default(),
+            cached_active_hands: 0,
+            cached_total_hands: 0,
         }
+    }
+
+    // ── Cached aggregations (spark ryve-252c5b6e) ──────────
+
+    /// Recompute the spark summary from `self.sparks`. Call after
+    /// `SparksLoaded` replaces the spark list.
+    pub fn recompute_spark_summary(&mut self) {
+        let mut s = crate::screen::status_bar::SparkSummary::default();
+        for spark in &self.sparks {
+            match spark.status.as_str() {
+                "open" => s.open += 1,
+                "in_progress" => s.in_progress += 1,
+                "blocked" => s.blocked += 1,
+                "deferred" => s.deferred += 1,
+                "closed" => s.closed += 1,
+                _ => {}
+            }
+        }
+        self.cached_spark_summary = s;
+    }
+
+    /// Recompute git diff stats from the file explorer state. Call after
+    /// `FilesScanned` replaces git_statuses/diff_stats.
+    pub fn recompute_git_stats(&mut self) {
+        let mut gs = crate::screen::status_bar::GitStats::default();
+        for stat in self.file_explorer.diff_stats.values() {
+            gs.additions += stat.additions;
+            gs.deletions += stat.deletions;
+        }
+        gs.changed_files = self.file_explorer.git_statuses.len();
+        self.cached_git_stats = gs;
+    }
+
+    /// Recompute active/total hand counts from agent sessions. Call after
+    /// `AgentSessionsLoaded` updates the session list.
+    pub fn recompute_hand_counts(&mut self) {
+        self.cached_active_hands = self.agent_sessions.iter().filter(|a| a.active).count();
+        self.cached_total_hands = self.agent_sessions.iter().filter(|a| !a.stale).count();
     }
 
     // ── Sort mode (spark ryve-6f24ef2a) ─────────────────────

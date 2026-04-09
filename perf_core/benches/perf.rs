@@ -11,10 +11,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use data::git::FileStatus;
+use data::git::{DiffStat, FileStatus};
 use perf_core::{
     KeyDispatch, KeyKind, KeyModifiers, NodeKind, SessionLike, classify_key_event,
-    count_active_sessions, file_git_status, process_is_alive,
+    count_active_sessions, file_git_status, precompute_diff_stat_map, precompute_git_status_map,
+    process_is_alive,
 };
 
 // ── Fixtures ─────────────────────────────────────────────
@@ -62,6 +63,20 @@ fn make_sessions(n: usize) -> Vec<FakeSession> {
             stale: i.is_multiple_of(7),
         })
         .collect()
+}
+
+fn make_diff_stat_map(n: usize) -> HashMap<PathBuf, DiffStat> {
+    let mut m = HashMap::with_capacity(n);
+    for i in 0..n {
+        m.insert(
+            PathBuf::from(format!("src/module_{i:04}/file_{i:04}.rs")),
+            DiffStat {
+                additions: (i as u32 % 20) + 1,
+                deletions: (i as u32 % 10),
+            },
+        );
+    }
+    m
 }
 
 // ── Benchmarks ───────────────────────────────────────────
@@ -116,11 +131,71 @@ fn bench_classify_key_event(c: &mut Criterion) {
     });
 }
 
+// ── Precomputed map benchmarks (spark ryve-252c5b6e) ────
+
+fn bench_precompute_git_status_map(c: &mut Criterion) {
+    let statuses = make_status_map(512);
+    c.bench_function("precompute_git_status_map_512", |b| {
+        b.iter(|| {
+            let map = precompute_git_status_map(std::hint::black_box(&statuses));
+            std::hint::black_box(map);
+        });
+    });
+}
+
+fn bench_precompute_diff_stat_map(c: &mut Criterion) {
+    let diff_stats = make_diff_stat_map(512);
+    c.bench_function("precompute_diff_stat_map_512", |b| {
+        b.iter(|| {
+            let map = precompute_diff_stat_map(std::hint::black_box(&diff_stats));
+            std::hint::black_box(map);
+        });
+    });
+}
+
+/// Compare the old per-node directory scan (`file_git_status` called N
+/// times) against a single precomputed map lookup. The difference shows
+/// the improvement `view_workshop` gets from caching. Spark ryve-252c5b6e.
+fn bench_view_workshop_status_lookups(c: &mut Criterion) {
+    let statuses = make_status_map(512);
+    let precomputed = precompute_git_status_map(&statuses);
+    let dirs: Vec<PathBuf> = (0..50)
+        .map(|i| PathBuf::from(format!("src/module_{i:04}")))
+        .collect();
+
+    // Old path: O(files) per directory lookup.
+    c.bench_function("view_workshop_old_dir_scan_50x512", |b| {
+        b.iter(|| {
+            for dir in &dirs {
+                let s = file_git_status(
+                    std::hint::black_box(dir),
+                    NodeKind::Directory,
+                    std::hint::black_box(&statuses),
+                );
+                std::hint::black_box(s);
+            }
+        });
+    });
+
+    // New path: O(1) lookup from precomputed map.
+    c.bench_function("view_workshop_new_map_lookup_50", |b| {
+        b.iter(|| {
+            for dir in &dirs {
+                let s = precomputed.get(std::hint::black_box(dir));
+                std::hint::black_box(s);
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_process_is_alive,
     bench_session_filter,
     bench_file_git_status,
     bench_classify_key_event,
+    bench_precompute_git_status_map,
+    bench_precompute_diff_stat_map,
+    bench_view_workshop_status_lookups,
 );
 criterion_main!(benches);

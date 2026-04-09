@@ -61,6 +61,14 @@ pub struct FileExplorerState {
     pub branch: Option<String>,
     /// Currently selected file path.
     pub selected: Option<PathBuf>,
+    /// Precomputed git status map covering files (direct lookup) and
+    /// directories (aggregated). Rebuilt on every `FilesScanned` event.
+    /// Spark ryve-252c5b6e.
+    pub precomputed_git_statuses: HashMap<PathBuf, FileStatus>,
+    /// Precomputed diff stat map covering files (direct lookup) and
+    /// directories (aggregated). Rebuilt on every `FilesScanned` event.
+    /// Spark ryve-252c5b6e.
+    pub precomputed_diff_stats: HashMap<PathBuf, DiffStat>,
 }
 
 impl FileExplorerState {
@@ -72,7 +80,17 @@ impl FileExplorerState {
             diff_stats: HashMap::new(),
             branch: None,
             selected: None,
+            precomputed_git_statuses: HashMap::new(),
+            precomputed_diff_stats: HashMap::new(),
         }
+    }
+
+    /// Rebuild the precomputed status/diff maps from the raw git data.
+    /// Call after `git_statuses` or `diff_stats` are updated.
+    /// Spark ryve-252c5b6e.
+    pub fn rebuild_precomputed_maps(&mut self) {
+        self.precomputed_git_statuses = perf_core::precompute_git_status_map(&self.git_statuses);
+        self.precomputed_diff_stats = perf_core::precompute_diff_stat_map(&self.diff_stats);
     }
 }
 
@@ -255,12 +273,10 @@ fn collect_nodes<'a>(
     let is_expanded = state.expanded.contains(&node.path);
     let is_selected = state.selected.as_ref() == Some(&node.path);
 
-    // Determine git status for this entry. The aggregation is non-trivial
-    // for directories (it walks every entry in `git_statuses`), so we
-    // compute it ONCE here and derive both the foreground color and the
-    // letter badge from the same value.
+    // Look up git status and diff stats from precomputed maps (O(1) per
+    // node instead of O(files) for directories). Spark ryve-252c5b6e.
     let rel_path = node.path.strip_prefix(root).unwrap_or(&node.path);
-    let git_status = file_git_status(rel_path, &node.kind, &state.git_statuses);
+    let git_status = state.precomputed_git_statuses.get(rel_path).copied();
     let git_color = match git_status {
         Some(status) => status_color(status),
         None => pal.text_primary,
@@ -272,8 +288,11 @@ fn collect_nodes<'a>(
     };
     let icon_widget = svg(icon_handle).width(16).height(16);
 
-    // Diff stats: for files look up directly, for directories aggregate children
-    let diff = file_diff_stat(rel_path, &node.kind, &state.diff_stats);
+    let diff = state
+        .precomputed_diff_stats
+        .get(rel_path)
+        .copied()
+        .unwrap_or_default();
 
     let mut label = row![
         Space::new().width(indent),
@@ -354,7 +373,9 @@ fn collect_nodes<'a>(
 // ── Git status colors ─────────────────────────────────
 
 /// Convert the local file-explorer node kind into the perf_core variant
-/// the shared aggregation functions expect.
+/// the shared aggregation functions expect. Only used in tests now that
+/// the view uses precomputed maps. Spark ryve-252c5b6e.
+#[cfg(test)]
 fn perf_node_kind(kind: &NodeKind) -> perf_core::NodeKind {
     match kind {
         NodeKind::File => perf_core::NodeKind::File,
@@ -366,6 +387,8 @@ fn perf_node_kind(kind: &NodeKind) -> perf_core::NodeKind {
 ///
 /// Implementation lives in `perf_core` so the regression harness benches
 /// the same code path the UI hits on every redraw. Spark ryve-5b9c5d93.
+/// Only used in tests now that the view uses precomputed maps.
+#[cfg(test)]
 fn file_git_status(
     rel_path: &Path,
     kind: &NodeKind,
@@ -377,6 +400,8 @@ fn file_git_status(
 /// Get aggregated diff stats for a file or directory.
 ///
 /// Implementation lives in `perf_core` (see [`file_git_status`]).
+/// Only used in tests now that the view uses precomputed maps.
+#[cfg(test)]
 fn file_diff_stat(
     rel_path: &Path,
     kind: &NodeKind,

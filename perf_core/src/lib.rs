@@ -102,6 +102,62 @@ pub fn file_diff_stat(
     total
 }
 
+// ── Precomputed git-status/diff maps ────────────────────
+
+/// Build a lookup map that resolves both files (direct) and directories
+/// (aggregated) in O(1). For each file entry we also insert aggregated
+/// values for every ancestor directory.
+///
+/// This replaces the per-node O(files) scan that `file_git_status` did
+/// for directories on every frame. Spark ryve-252c5b6e.
+pub fn precompute_git_status_map(
+    statuses: &HashMap<PathBuf, FileStatus>,
+) -> HashMap<PathBuf, FileStatus> {
+    let mut map: HashMap<PathBuf, FileStatus> = HashMap::with_capacity(statuses.len() * 2);
+    for (path, &status) in statuses {
+        // File entry — direct.
+        map.insert(path.clone(), status);
+        // Propagate to every ancestor directory.
+        let mut ancestor = path.as_path();
+        while let Some(parent) = ancestor.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            let entry = map.entry(PathBuf::from(parent)).or_insert(status);
+            *entry = higher_priority_status(*entry, status);
+            ancestor = parent;
+        }
+    }
+    map
+}
+
+/// Build a lookup map that resolves both files (direct) and directories
+/// (summed additions/deletions) in O(1). Mirrors
+/// [`precompute_git_status_map`] for diff stats.
+pub fn precompute_diff_stat_map(
+    diff_stats: &HashMap<PathBuf, DiffStat>,
+) -> HashMap<PathBuf, DiffStat> {
+    let mut map: HashMap<PathBuf, DiffStat> = HashMap::with_capacity(diff_stats.len() * 2);
+    for (path, stat) in diff_stats {
+        // File entry — direct.
+        let file_entry = map.entry(path.clone()).or_default();
+        file_entry.additions += stat.additions;
+        file_entry.deletions += stat.deletions;
+        // Propagate to every ancestor directory.
+        let mut ancestor = path.as_path();
+        while let Some(parent) = ancestor.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            let dir_entry = map.entry(PathBuf::from(parent)).or_default();
+            dir_entry.additions += stat.additions;
+            dir_entry.deletions += stat.deletions;
+            ancestor = parent;
+        }
+    }
+    map
+}
+
 fn higher_priority_status(a: FileStatus, b: FileStatus) -> FileStatus {
     fn rank(s: FileStatus) -> u8 {
         match s {
@@ -267,6 +323,58 @@ mod tests {
         fn is_stale(&self) -> bool {
             self.stale
         }
+    }
+
+    #[test]
+    fn precompute_git_status_map_aggregates_ancestors() {
+        let mut statuses = HashMap::new();
+        statuses.insert(PathBuf::from("src/a.rs"), FileStatus::Modified);
+        statuses.insert(PathBuf::from("src/b.rs"), FileStatus::Added);
+        statuses.insert(PathBuf::from("other/c.rs"), FileStatus::Untracked);
+
+        let map = precompute_git_status_map(&statuses);
+
+        // Files: direct lookup.
+        assert_eq!(map.get(Path::new("src/a.rs")), Some(&FileStatus::Modified));
+        assert_eq!(map.get(Path::new("src/b.rs")), Some(&FileStatus::Added));
+        // Directory: highest priority child (Added > Modified).
+        assert_eq!(map.get(Path::new("src")), Some(&FileStatus::Added));
+        // Other directory.
+        assert_eq!(map.get(Path::new("other")), Some(&FileStatus::Untracked));
+    }
+
+    #[test]
+    fn precompute_git_status_map_no_sibling_bleed() {
+        let mut statuses = HashMap::new();
+        statuses.insert(PathBuf::from("src2/foo.rs"), FileStatus::Modified);
+        let map = precompute_git_status_map(&statuses);
+        // `src` must NOT appear — only `src2` is an ancestor.
+        assert_eq!(map.get(Path::new("src")), None);
+        assert_eq!(map.get(Path::new("src2")), Some(&FileStatus::Modified));
+    }
+
+    #[test]
+    fn precompute_diff_stat_map_sums_ancestors() {
+        let mut diff_stats = HashMap::new();
+        diff_stats.insert(
+            PathBuf::from("src/a.rs"),
+            DiffStat {
+                additions: 5,
+                deletions: 2,
+            },
+        );
+        diff_stats.insert(
+            PathBuf::from("src/b.rs"),
+            DiffStat {
+                additions: 3,
+                deletions: 1,
+            },
+        );
+
+        let map = precompute_diff_stat_map(&diff_stats);
+        let src = map.get(Path::new("src")).unwrap();
+        assert_eq!(src.additions, 8);
+        assert_eq!(src.deletions, 3);
     }
 
     #[test]

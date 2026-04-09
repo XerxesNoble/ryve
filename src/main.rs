@@ -1176,6 +1176,9 @@ impl App {
                     // Spark ryve-6f24ef2a.
                     ws.sort_sparks();
                     ws.recompute_filtered_sparks();
+                    // Cache the spark summary so view() doesn't
+                    // recompute it per frame. Spark ryve-252c5b6e.
+                    ws.recompute_spark_summary();
                     // Clear the Refresh-button indicator now that the
                     // refetch has landed. Both the explicit Refresh and
                     // the 3s poll route through this handler; clearing
@@ -1597,6 +1600,9 @@ impl App {
                     // (spark ryve-baca34b0).
                     ws.agent_session_names =
                         ws.agent_sessions.iter().map(|s| s.name.clone()).collect();
+                    // Cache hand counts so view() doesn't recompute per
+                    // frame. Spark ryve-252c5b6e.
+                    ws.recompute_hand_counts();
 
                     // First time we see agent_sessions for this workshop:
                     // chain into load_open_tabs so the persisted snapshot
@@ -1857,6 +1863,13 @@ impl App {
                     ws.file_explorer.git_statuses = statuses;
                     ws.file_explorer.diff_stats = diff_stats;
                     ws.file_explorer.branch = branch;
+                    // Rebuild precomputed per-path maps so the file
+                    // explorer view uses O(1) lookups instead of O(n)
+                    // scans per directory node. Spark ryve-252c5b6e.
+                    ws.file_explorer.rebuild_precomputed_maps();
+                    // Cache git stats so view() doesn't recompute per
+                    // frame. Spark ryve-252c5b6e.
+                    ws.recompute_git_stats();
                     // Start collapsed — user expands directories on demand
                 }
                 Task::none()
@@ -2288,7 +2301,10 @@ impl App {
                                 started_at,
                                 can_resume,
                             } => {
-                                let when = screen::agents::format_relative_time(&started_at);
+                                let when = screen::agents::format_relative_time(
+                                    &started_at,
+                                    chrono::Utc::now(),
+                                );
                                 let body = if can_resume {
                                     format!(
                                         "Past session started {when}. Click \u{25B6} to resume."
@@ -6481,6 +6497,11 @@ impl App {
             None => self.appearance.palette(),
         };
 
+        // Compute clock snapshots once per frame so row renderers avoid
+        // per-row Instant::now() / Utc::now() calls. Spark ryve-252c5b6e.
+        let frame_now = std::time::Instant::now();
+        let frame_utc_now = chrono::Utc::now();
+
         // -- Left sidebar: files (top) + agents (bottom) --
         let files_view =
             file_explorer::view(&ws.file_explorer, &ws.directory, &pal).map(Message::FileExplorer);
@@ -6490,7 +6511,7 @@ impl App {
             .height(Length::FillPortion((ws.sidebar_split() * 100.0) as u16))
             .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg));
 
-        let agents_panel = container(self.view_agents(ws, has_bg, &pal))
+        let agents_panel = container(self.view_agents(ws, has_bg, &pal, frame_now, frame_utc_now))
             .width(Length::Fill)
             .height(Length::FillPortion(
                 ((1.0 - ws.sidebar_split()) * 100.0) as u16,
@@ -6508,7 +6529,7 @@ impl App {
             .height(Length::Fill);
 
         // -- Center: bench (tabbed area) --
-        let bench = self.view_bench(ws, has_bg, &pal);
+        let bench = self.view_bench(ws, has_bg, &pal, frame_utc_now);
 
         // -- Right: sparks panel (or detail view) --
         // Derive the delegation trace on demand so it always reflects the
@@ -6612,31 +6633,12 @@ impl App {
             widget::splitter::vertical(Message::SplitterPressed(SplitterKind::SparksLeft), &pal);
 
         // -- Bottom: status bar --
-        let spark_summary = {
-            let mut s = screen::status_bar::SparkSummary::default();
-            for spark in &ws.sparks {
-                match spark.status.as_str() {
-                    "open" => s.open += 1,
-                    "in_progress" => s.in_progress += 1,
-                    "blocked" => s.blocked += 1,
-                    "deferred" => s.deferred += 1,
-                    "closed" => s.closed += 1,
-                    _ => {}
-                }
-            }
-            s
-        };
-        let git_stats = {
-            let mut gs = screen::status_bar::GitStats::default();
-            for stat in ws.file_explorer.diff_stats.values() {
-                gs.additions += stat.additions;
-                gs.deletions += stat.deletions;
-            }
-            gs.changed_files = ws.file_explorer.git_statuses.len();
-            gs
-        };
-        let active_hands = ws.agent_sessions.iter().filter(|a| a.active).count();
-        let total_hands = ws.agent_sessions.iter().filter(|a| !a.stale).count();
+        // Use pre-cached aggregations instead of recomputing per frame.
+        // Spark ryve-252c5b6e.
+        let spark_summary = &ws.cached_spark_summary;
+        let git_stats = &ws.cached_git_stats;
+        let active_hands = ws.cached_active_hands;
+        let total_hands = ws.cached_total_hands;
 
         // Build file viewer info if the active bench tab is a file viewer.
         let file_info = ws.bench.active_tab.and_then(|tab_id| {
@@ -6653,8 +6655,8 @@ impl App {
         let status_bar = screen::status_bar::view(
             ws.file_explorer.branch.as_deref(),
             &ws.directory,
-            &spark_summary,
-            &git_stats,
+            spark_summary,
+            git_stats,
             active_hands,
             total_hands,
             ws.failing_contracts,
@@ -6797,6 +6799,8 @@ impl App {
         ws: &'a Workshop,
         _has_bg: bool,
         pal: &style::Palette,
+        now: std::time::Instant,
+        utc_now: chrono::DateTime<chrono::Utc>,
     ) -> Element<'a, Message> {
         screen::agents::view(
             &ws.agent_sessions,
@@ -6806,6 +6810,8 @@ impl App {
             &ws.sparks,
             &ws.agents_panel,
             *pal,
+            now,
+            utc_now,
         )
         .map(Message::Agents)
     }
@@ -6815,6 +6821,7 @@ impl App {
         ws: &'a Workshop,
         has_bg: bool,
         pal: &style::Palette,
+        utc_now: chrono::DateTime<chrono::Utc>,
     ) -> Element<'a, Message> {
         let tab_bar = ws.bench.view_tab_bar(pal).map(Message::Bench);
 
@@ -6833,6 +6840,7 @@ impl App {
                         assignments: &ws.hand_assignments,
                         failing_contracts: &ws.failing_contracts_list,
                         embers: &ws.embers,
+                        utc_now,
                     },
                     pal,
                     has_bg,
