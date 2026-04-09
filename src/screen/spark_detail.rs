@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 
 use data::sparks::types::{Bond, Contract, ContractEnforcement, ContractKind, Spark};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::{Element, Length, Theme};
+use iced::widget::{
+    Space, button, column, container, mouse_area, row, scrollable, text, text_input, tooltip,
+};
+use iced::{Background, Border, Element, Length, Theme};
 
 // ── Inline edit state ────────────────────────────────
 //
@@ -29,8 +31,7 @@ use iced::{Element, Length, Theme};
 /// a specific list item by position so multiple items in the same list
 /// can be edited independently without colliding in the draft map.
 // Variants beyond `Title` are consumed by follow-up sparks in the
-// ryve-82e1102f epic — allow dead_code on the foundation spark so
-// the build stays clean until those land.
+// ryve-82e1102f epic — allow dead_code until those land.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Field {
@@ -49,7 +50,6 @@ pub enum Field {
 /// one of these into the actual DB write task; holding it in a
 /// dedicated type (rather than a raw tuple) lets the follow-up sparks
 /// pattern-match on `field` to dispatch to the correct repo function.
-#[allow(dead_code)] // consumed by follow-up sparks in the ryve-82e1102f epic
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptimisticWrite {
     pub spark_id: String,
@@ -70,13 +70,12 @@ pub struct OptimisticWrite {
 /// spark clears it.
 #[derive(Debug, Clone)]
 pub struct SparkEdit {
-    #[allow(dead_code)] // read by follow-up sparks that dispatch the DB write
     pub spark_id: String,
     pub drafts: HashMap<Field, String>,
     pub in_flight: HashMap<Field, String>,
 }
 
-#[allow(dead_code)] // public API surface for the ryve-82e1102f epic
+#[allow(dead_code)] // indexed-field helpers consumed by follow-up sparks
 impl SparkEdit {
     pub fn new(spark_id: impl Into<String>) -> Self {
         Self {
@@ -232,6 +231,17 @@ pub enum Message {
         spark_id: String,
         contract_id: i64,
     },
+    // ── Title inline editing (spark ryve-f58d0492) ───────
+    /// User clicked the title text — enter edit mode and seed the draft
+    /// from the on-disk value.
+    TitleBeginEdit,
+    /// Keystroke in the title text_input: replace the draft.
+    TitleChanged(String),
+    /// Enter pressed in the title text_input — commit.
+    TitleSubmit,
+    /// User clicked outside the title text_input (mouse_area blur) —
+    /// commit whatever's in the draft.
+    TitleBlur,
 }
 
 // ── View ─────────────────────────────────────────────
@@ -244,6 +254,7 @@ pub fn view<'a>(
     all_sparks: &'a [Spark],
     delegation: &DelegationTrace,
     create_form: &'a ContractCreateForm,
+    spark_edit: Option<&'a SparkEdit>,
     pal: &Palette,
     has_bg: bool,
 ) -> Element<'a, Message> {
@@ -266,12 +277,8 @@ pub fn view<'a>(
         .spacing(4)
         .padding([8, 10]);
 
-    // Title
-    let title = text(&spark.title)
-        .size(FONT_HEADER + 4.0)
-        .color(pal.text_primary);
-
-    let title_row = container(title).padding([4, 10]);
+    // Title — click to inline-edit. Spark ryve-f58d0492.
+    let title_row = view_title(spark, spark_edit, &pal);
 
     // Status / Priority / Type badges
     let status_indicator = status_symbol(&spark.status);
@@ -475,11 +482,163 @@ pub fn view<'a>(
     .width(Length::Fill)
     .height(Length::Fill);
 
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg))
+    // If the title is currently being edited, wrap the panel in a
+    // mouse_area that fires TitleBlur on clicks the text_input didn't
+    // capture — that's how blur-to-save works in iced 0.14, which has
+    // no native on_blur hook.
+    let editing_title = spark_edit
+        .map(|e| e.drafts.contains_key(&Field::Title) || e.in_flight.contains_key(&Field::Title))
+        .unwrap_or(false);
+
+    let body: Element<'a, Message> = if editing_title {
+        mouse_area(
+            container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg)),
+        )
+        .on_press(Message::TitleBlur)
         .into()
+    } else {
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg))
+            .into()
+    };
+
+    body
+}
+
+// ── Inline title edit ─────────────────────────────────
+
+/// Render the spark title row. When the title is not being edited, it
+/// shows a button-styled text that enters edit mode on click. When a
+/// draft exists in `spark_edit`, it renders a `text_input` with the
+/// draft value, save-on-submit, and keystroke-to-draft wiring. While a
+/// save is in flight, the input renders disabled with a subtle spinner
+/// glyph. Empty drafts get a red border + tooltip so the user sees why
+/// the save won't fire. Spark ryve-f58d0492.
+fn view_title<'a>(
+    spark: &'a Spark,
+    spark_edit: Option<&'a SparkEdit>,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    let draft = spark_edit.and_then(|e| e.drafts.get(&Field::Title));
+    let in_flight = spark_edit.and_then(|e| e.in_flight.get(&Field::Title));
+
+    if draft.is_none() && in_flight.is_none() {
+        // Read-only mode: clicking the title enters edit mode.
+        let title_text = text(&spark.title)
+            .size(FONT_HEADER + 4.0)
+            .color(pal.text_primary);
+        let btn = button(title_text)
+            .style(button::text)
+            .padding([4, 10])
+            .on_press(Message::TitleBeginEdit);
+        return container(btn).into();
+    }
+
+    // One of `draft` or `in_flight` is Some — prefer the in-flight
+    // value (the optimistic save) while a write is dispatched. An
+    // empty on-submit is rejected inline (see below) so an empty
+    // value only reaches `in_flight` through a draft rollback — in
+    // which case we still show it so the user can fix it.
+    let showing_in_flight = in_flight.is_some() && draft.is_none();
+    let value: &str = draft.map(String::as_str).or(in_flight.map(String::as_str)).unwrap_or("");
+    let is_empty = value.trim().is_empty();
+
+    let mut input = text_input("Title", value)
+        .size(FONT_HEADER + 4.0)
+        .padding([4, 8]);
+
+    if showing_in_flight {
+        // In-flight: leave `on_input`/`on_submit` unset so the widget
+        // renders disabled — the user can't type over an optimistic
+        // save mid-flight.
+        input = input.style(move |_theme: &Theme, status| {
+            title_input_style(status, &pal, false, true)
+        });
+    } else {
+        input = input
+            .on_input(Message::TitleChanged)
+            .on_submit(Message::TitleSubmit)
+            .style(move |_theme: &Theme, status| {
+                title_input_style(status, &pal, is_empty, false)
+            });
+    }
+
+    // Right-side adornment: spinner while the save is in flight.
+    let input_row: Element<'a, Message> = if showing_in_flight {
+        // Subtle spinner glyph — iced 0.14 has no animated spinner,
+        // but a dim ⟳ is enough to signal "working".
+        row![
+            input,
+            text("\u{27F3}").size(FONT_LABEL).color(pal.text_tertiary),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .into()
+    } else {
+        row![input].spacing(8).align_y(iced::Alignment::Center).into()
+    };
+
+    // Empty-title validation: show a tooltip on the row so the user
+    // sees why their save was rejected. Not persisted — see handler.
+    let framed: Element<'a, Message> = if is_empty && !showing_in_flight {
+        tooltip(
+            input_row,
+            text("Title cannot be empty").size(FONT_SMALL).color(pal.danger),
+            tooltip::Position::Bottom,
+        )
+        .into()
+    } else {
+        input_row
+    };
+
+    container(framed).padding([4, 10]).into()
+}
+
+/// Compute the text_input style for the title field. `invalid` draws a
+/// red border + danger tint for the empty-draft case; `disabled` draws
+/// a dimmer appearance for in-flight saves.
+fn title_input_style(
+    status: text_input::Status,
+    pal: &Palette,
+    invalid: bool,
+    disabled: bool,
+) -> text_input::Style {
+    let border_color = if invalid {
+        pal.danger
+    } else {
+        match status {
+            text_input::Status::Focused { .. } => pal.accent,
+            text_input::Status::Hovered => pal.text_secondary,
+            _ => pal.separator,
+        }
+    };
+    let value_color = if disabled {
+        pal.text_tertiary
+    } else {
+        pal.text_primary
+    };
+    text_input::Style {
+        background: Background::Color(iced::Color::TRANSPARENT),
+        border: Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        icon: pal.text_tertiary,
+        placeholder: pal.text_tertiary,
+        value: value_color,
+        selection: iced::Color {
+            a: 0.3,
+            ..pal.accent
+        },
+    }
 }
 
 // ── Bonds section ────────────────────────────────────
@@ -1147,6 +1306,55 @@ mod tests {
         assert_eq!(edit.drafts.len(), 2);
         assert_eq!(edit.drafts[&Field::Acceptance(0)], "first");
         assert_eq!(edit.drafts[&Field::Acceptance(1)], "second");
+    }
+
+    // ── Title inline edit (spark ryve-f58d0492) ─────────
+
+    #[test]
+    fn title_edit_draft_roundtrip_through_commit() {
+        // Begin-edit → draft present; commit → draft moved to in_flight;
+        // the resulting OptimisticWrite carries the trimmed draft value.
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Title);
+        edit.update_draft(Field::Title, "New title".into());
+        let write = edit.commit(Field::Title).expect("draft exists");
+        assert_eq!(write.spark_id, "sp-1");
+        assert_eq!(write.field, Field::Title);
+        assert_eq!(write.value, "New title");
+        assert!(edit.in_flight.contains_key(&Field::Title));
+        assert!(!edit.drafts.contains_key(&Field::Title));
+    }
+
+    #[test]
+    fn title_invalid_border_uses_danger_color() {
+        // Empty drafts get a red border so the user sees why save was
+        // rejected. The helper returns danger regardless of focus state.
+        let pal = Palette::dark();
+        let style = title_input_style(text_input::Status::Active, &pal, true, false);
+        assert_eq!(style.border.color, pal.danger);
+    }
+
+    #[test]
+    fn title_disabled_style_dims_the_value_color() {
+        // In-flight saves render the value with text_tertiary so the
+        // input reads as disabled while the async write is pending.
+        let pal = Palette::dark();
+        let style = title_input_style(text_input::Status::Active, &pal, false, true);
+        assert_eq!(style.value, pal.text_tertiary);
+    }
+
+    #[test]
+    fn title_valid_focused_style_uses_accent_border() {
+        // Non-empty, non-disabled, focused input gets the accent border
+        // so it reads as the active edit target.
+        let pal = Palette::dark();
+        let style = title_input_style(
+            text_input::Status::Focused { is_hovered: false },
+            &pal,
+            false,
+            false,
+        );
+        assert_eq!(style.border.color, pal.accent);
     }
 
     #[test]

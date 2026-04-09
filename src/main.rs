@@ -2260,6 +2260,101 @@ impl App {
                             );
                         }
                     }
+                    // ── Title inline edit (spark ryve-f58d0492) ─────────
+                    screen::spark_detail::Message::TitleBeginEdit => {
+                        let Some(ws) = self.workshops.get_mut(idx) else {
+                            return Task::none();
+                        };
+                        let Some(spark_id) = ws.selected_spark.clone() else {
+                            return Task::none();
+                        };
+                        let seed = ws
+                            .sparks
+                            .iter()
+                            .find(|s| s.id == spark_id)
+                            .map(|s| s.title.clone())
+                            .unwrap_or_default();
+                        // A save in flight for this field is authoritative;
+                        // don't clobber it by re-opening a draft.
+                        let edit = ws.spark_edit.get_or_insert_with(|| {
+                            screen::spark_detail::SparkEdit::new(spark_id.clone())
+                        });
+                        if !edit
+                            .in_flight
+                            .contains_key(&screen::spark_detail::Field::Title)
+                            && !edit
+                                .drafts
+                                .contains_key(&screen::spark_detail::Field::Title)
+                        {
+                            edit.update_draft(screen::spark_detail::Field::Title, seed);
+                        }
+                    }
+                    screen::spark_detail::Message::TitleChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx)
+                            && let Some(ref mut edit) = ws.spark_edit
+                        {
+                            edit.update_draft(screen::spark_detail::Field::Title, val);
+                        }
+                    }
+                    screen::spark_detail::Message::TitleSubmit
+                    | screen::spark_detail::Message::TitleBlur => {
+                        let Some(ws) = self.workshops.get_mut(idx) else {
+                            return Task::none();
+                        };
+                        let Some(ref mut edit) = ws.spark_edit else {
+                            return Task::none();
+                        };
+                        // No draft → nothing to save (already persisted
+                        // or never entered). Blur on a clean view is a
+                        // harmless no-op.
+                        let Some(draft) = edit
+                            .drafts
+                            .get(&screen::spark_detail::Field::Title)
+                            .cloned()
+                        else {
+                            return Task::none();
+                        };
+                        let trimmed = draft.trim().to_string();
+                        if trimmed.is_empty() {
+                            // Empty title rejected inline — don't persist.
+                            // Leave the draft in place so the red border +
+                            // tooltip stay visible until the user fixes it
+                            // or hits Escape.
+                            return Task::none();
+                        }
+                        // No-op save (draft matches on-disk value): drop
+                        // the draft without dispatching a DB write so we
+                        // don't churn the event log.
+                        let current = ws
+                            .sparks
+                            .iter()
+                            .find(|s| s.id == edit.spark_id)
+                            .map(|s| s.title.clone());
+                        if current.as_deref() == Some(trimmed.as_str()) {
+                            edit.rollback(screen::spark_detail::Field::Title);
+                            return Task::none();
+                        }
+                        // Move draft into in_flight and emit SparkUpdate.
+                        // We overwrite the draft with the trimmed value so
+                        // `commit` captures the trimmed string.
+                        edit.update_draft(
+                            screen::spark_detail::Field::Title,
+                            trimmed.clone(),
+                        );
+                        let Some(write) = edit.commit(screen::spark_detail::Field::Title)
+                        else {
+                            return Task::none();
+                        };
+                        let patch = SparkPatch {
+                            title: Some(write.value),
+                            ..Default::default()
+                        };
+                        return self.update(Message::SparkUpdate {
+                            workshop_id: self.workshops[idx].id,
+                            id: write.spark_id,
+                            patch,
+                        });
+                    }
                 }
                 Task::none()
             }
@@ -2369,6 +2464,18 @@ impl App {
                 let Some(idx) = self.active_workshop else {
                     return Task::none();
                 };
+                // Escape also reverts any in-progress title edit to the
+                // on-disk value. Spark ryve-f58d0492. Skips in-flight
+                // slots — rolling back an already-dispatched save would
+                // race the async handler.
+                if let Some(ws) = self.workshops.get_mut(idx)
+                    && let Some(ref mut edit) = ws.spark_edit
+                {
+                    edit.drafts.remove(&screen::spark_detail::Field::Title);
+                    if !edit.is_dirty() {
+                        ws.spark_edit = None;
+                    }
+                }
                 let ws = &self.workshops[idx];
                 let mut tasks: Vec<Task<Message>> = Vec::new();
                 if let Some(active_id) = ws.bench.active_tab
@@ -3138,11 +3245,20 @@ impl App {
                     },
                 )
             }
-            Message::SparkUpdateApplied { .. } => {
+            Message::SparkUpdateApplied { workshop_id, id } => {
                 // Durable write succeeded; the optimistic cache is now the
-                // source of truth. The per-field in-flight slot will clear
-                // here once `SparkEdit` (spark ryve-1d8c2847) lands in this
-                // branch — until then there is nothing to reconcile.
+                // source of truth. Clear any per-field in-flight slots on
+                // the matching SparkEdit so the UI drops the disabled
+                // spinner treatment and re-enables input.
+                if let Some(idx) = self.workshops.iter().position(|ws| ws.id == workshop_id)
+                    && let Some(ref mut edit) = self.workshops[idx].spark_edit
+                    && edit.spark_id == id
+                {
+                    edit.in_flight.clear();
+                    if !edit.is_dirty() {
+                        self.workshops[idx].spark_edit = None;
+                    }
+                }
                 Task::none()
             }
             Message::SparkUpdateFailed {
@@ -3158,6 +3274,18 @@ impl App {
                 if let Some(idx) = self.workshops.iter().position(|ws| ws.id == workshop_id) {
                     let ws = &mut self.workshops[idx];
                     ws.apply_spark_patch(&id, &prior);
+                    // Move any in-flight slots back into drafts so the user
+                    // can see what they tried to save and either fix it or
+                    // re-submit. Spark ryve-f58d0492 requires the field to
+                    // return to the draft value on failure.
+                    if let Some(ref mut edit) = ws.spark_edit
+                        && edit.spark_id == id
+                    {
+                        let in_flight: Vec<_> = edit.in_flight.drain().collect();
+                        for (field, value) in in_flight {
+                            edit.drafts.insert(field, value);
+                        }
+                    }
                 }
                 self.push_toast(
                     format!("Could not save {id}"),
@@ -4814,6 +4942,7 @@ impl App {
                     &ws.sparks,
                     &delegation,
                     &ws.contract_create_form,
+                    ws.spark_edit.as_ref(),
                     &pal,
                     has_bg,
                 )
