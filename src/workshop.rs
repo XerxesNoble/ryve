@@ -23,6 +23,7 @@ use crate::screen::bench::{BenchState, TabKind};
 use crate::screen::file_explorer::FileExplorerState;
 use crate::screen::file_viewer::FileViewerState;
 use crate::screen::log_tail::LogTailState;
+use crate::sparks_filter::SparksFilter;
 use crate::style::{Appearance, Palette};
 
 const BOTTOM_PIN_NEWLINES: usize = 20;
@@ -360,6 +361,10 @@ pub struct Workshop {
     /// the panel survives restart; stale IDs (epics deleted between runs)
     /// are pruned on load. Spark ryve-926870a9.
     pub collapsed_epics: HashSet<String>,
+    /// Filter + sort state for the sparks panel. Initialised to default
+    /// (show all non-closed sparks, sorted by priority→type→status).
+    /// Spark ryve-d6916c7e.
+    pub sparks_filter: SparksFilter,
 }
 
 impl Workshop {
@@ -425,6 +430,7 @@ impl Workshop {
             terminal_font_family: None,
             agent_context_sync_cache: Arc::new(Mutex::new(AgentContextSyncCache::new())),
             collapsed_epics: HashSet::new(),
+            sparks_filter: SparksFilter::default(),
         }
     }
 

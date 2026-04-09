@@ -14,6 +14,7 @@ mod icons;
 mod process_snapshot;
 mod release_artifact;
 mod screen;
+mod sparks_filter;
 mod style;
 mod widget;
 mod workshop;
