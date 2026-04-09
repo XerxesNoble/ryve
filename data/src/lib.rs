@@ -8,6 +8,7 @@ pub mod db;
 pub mod git;
 pub mod github;
 pub mod migrations;
+pub mod release_version;
 pub mod ryve_dir;
 pub mod sparks;
 pub mod unsplash;
