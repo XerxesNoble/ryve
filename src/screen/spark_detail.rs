@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 
 use data::sparks::types::{Bond, Contract, ContractEnforcement, ContractKind, Spark};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{
+    Space, button, column, container, mouse_area, row, scrollable, text, text_editor, text_input,
+};
 use iced::{Element, Length, Theme};
 
 // ── Inline edit state ────────────────────────────────
@@ -232,6 +234,33 @@ pub enum Message {
         spark_id: String,
         contract_id: i64,
     },
+
+    // -- Description editing (ryve-4742d98b) --
+    /// User clicked on the description area — open the inline editor.
+    /// Seeds the draft (and the `text_editor::Content` held on the
+    /// workshop) with the persisted value.
+    DescriptionClicked,
+    /// A `text_editor::Action` from the description editor. The handler
+    /// applies it to the live `Content` and mirrors the resulting text
+    /// into the `SparkEdit` draft so the dirty indicator stays accurate.
+    DescriptionAction(text_editor::Action),
+    /// The user clicked outside the editor (or another blur source
+    /// fired). Commit the draft: dispatch a `SparkUpdate` with the new
+    /// value and clear the edit state. A no-op if the draft equals the
+    /// persisted value.
+    DescriptionBlur,
+    /// User pressed Escape while the editor was focused. Throw away the
+    /// draft — the persisted value is untouched. The next view pass
+    /// will fall back to the static render.
+    DescriptionRevert,
+    /// User chose "Save" in the "unsaved changes" dialog raised when
+    /// navigating away from a spark with a dirty description draft.
+    NavPromptSave,
+    /// User chose "Discard" in the unsaved-changes dialog.
+    NavPromptDiscard,
+    /// User dismissed the unsaved-changes dialog with "Cancel" — stay
+    /// on the current spark, keep the draft intact.
+    NavPromptCancel,
 }
 
 // ── View ─────────────────────────────────────────────
@@ -244,6 +273,18 @@ pub fn view<'a>(
     all_sparks: &'a [Spark],
     delegation: &DelegationTrace,
     create_form: &'a ContractCreateForm,
+    // `description_editor`: live `text_editor::Content` when editing
+    // the description inline, `None` otherwise. Owned on the workshop
+    // — see `Workshop::description_editor`. Spark ryve-4742d98b.
+    description_editor: Option<&'a text_editor::Content>,
+    // `description_draft`: current draft value (from `SparkEdit::drafts`),
+    // if any. Used to decide whether to show the "unsaved changes" pill
+    // without walking the editor content on every frame.
+    description_draft: Option<&'a str>,
+    // `nav_prompt`: pending unsaved-changes prompt raised by a deferred
+    // navigation — when `Some` the view overlays a save/discard/cancel
+    // dialog. Spark ryve-4742d98b.
+    nav_prompt: Option<&'a crate::workshop::PendingNavPrompt>,
     pal: &Palette,
     has_bg: bool,
 ) -> Element<'a, Message> {
@@ -321,22 +362,19 @@ pub fn view<'a>(
             ..Default::default()
         });
 
-    // Description
+    // Description — editable inline (spark ryve-4742d98b). Renders the
+    // persisted value as a clickable MouseArea when not editing, and
+    // swaps to a multi-line `text_editor` when editing. Blur saves,
+    // Escape reverts, Enter inserts a newline. Empty descriptions are
+    // allowed (unlike the title) so there is no static "no description"
+    // fallback — the click target shows a placeholder instead.
     let mut body = column![].spacing(12).padding([8, 10]);
-
-    if !spark.description.is_empty() {
-        body = body.push(
-            column![
-                text("Description")
-                    .size(FONT_LABEL)
-                    .color(pal.text_tertiary),
-                text(&spark.description)
-                    .size(FONT_BODY)
-                    .color(pal.text_primary),
-            ]
-            .spacing(4),
-        );
-    }
+    body = body.push(view_description_section(
+        spark,
+        description_editor,
+        description_draft,
+        &pal,
+    ));
 
     // Intent section — intent() returns an owned struct, so we extract
     // owned strings to avoid lifetime issues with the view tree.
@@ -475,11 +513,212 @@ pub fn view<'a>(
     .width(Length::Fill)
     .height(Length::Fill);
 
-    container(content)
+    // Wrap the whole detail view in a `mouse_area`. Clicks inside the
+    // description `text_editor` are captured by the editor (see iced
+    // 0.14 `text_editor::from_event`), so the outer `on_press` only
+    // fires for clicks *outside* the editor — exactly the blur signal
+    // we want. Spark ryve-4742d98b.
+    //
+    // When a nav-away dialog is up we leave the outer mouse_area off
+    // so clicks on the dialog buttons aren't shadowed by a spurious
+    // blur publish (the editor isn't the focus target then anyway).
+    let detail_body = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg))
-        .into()
+        .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg));
+
+    let detail_body: Element<'a, Message> = if nav_prompt.is_some() {
+        detail_body.into()
+    } else if description_editor.is_some() {
+        mouse_area(detail_body)
+            .on_press(Message::DescriptionBlur)
+            .into()
+    } else {
+        detail_body.into()
+    };
+
+    // Overlay the unsaved-changes dialog on top of the detail view
+    // when a deferred navigation is waiting on the user.
+    if let Some(prompt) = nav_prompt {
+        let dialog: Element<'a, Message> = view_nav_prompt_dialog(prompt, &pal);
+        iced::widget::stack![detail_body, dialog].into()
+    } else {
+        detail_body
+    }
+}
+
+// ── Description section (ryve-4742d98b) ──────────────
+
+fn view_description_section<'a>(
+    spark: &'a Spark,
+    editor: Option<&'a text_editor::Content>,
+    draft: Option<&'a str>,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    // Header row shows "Description" plus a dirty-state pill whenever
+    // the live draft differs from the persisted value. The pill is the
+    // user-visible "unsaved changes" indicator required by the spark's
+    // acceptance criteria.
+    let is_dirty = draft.is_some_and(|d| d != spark.description);
+    let mut header = row![
+        text("Description")
+            .size(FONT_LABEL)
+            .color(pal.text_tertiary),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+    if is_dirty {
+        header = header.push(
+            container(
+                text("unsaved changes")
+                    .size(FONT_SMALL)
+                    .color(pal.accent),
+            )
+            .padding([1, 6])
+            .style(move |_t: &Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    a: 0.10,
+                    ..pal.accent
+                })),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    width: 0.0,
+                    color: iced::Color::TRANSPARENT,
+                },
+                ..Default::default()
+            }),
+        );
+    }
+
+    // Editing: render a multi-line `text_editor` with a key-binding
+    // override that turns Escape into a `DescriptionRevert` message
+    // rather than the default silent "Unfocus" (see iced 0.14
+    // `text_editor::Binding::from_key_press`). Enter falls through to
+    // the default `Binding::Enter`, which inserts a newline — that's
+    // what the spark wants ("Enter adds a newline").
+    if let Some(content) = editor {
+        let editor_widget = text_editor(content)
+            .placeholder("Add a description…")
+            .padding([8, 10])
+            .size(FONT_BODY)
+            .min_height(120.0)
+            .on_action(Message::DescriptionAction)
+            .key_binding(|kp| {
+                use iced::keyboard::{Key, key::Named};
+                match kp.key.as_ref() {
+                    Key::Named(Named::Escape) => {
+                        Some(text_editor::Binding::Custom(Message::DescriptionRevert))
+                    }
+                    _ => text_editor::Binding::from_key_press(kp),
+                }
+            });
+
+        return column![header, editor_widget].spacing(6).into();
+    }
+
+    // Not editing: render the persisted value (or a placeholder when
+    // empty — empty descriptions are allowed, so we still need a
+    // click target). Wrap in a mouse_area so a click opens the editor.
+    let body_text: Element<'a, Message> = if spark.description.is_empty() {
+        text("Add a description…")
+            .size(FONT_BODY)
+            .color(pal.text_tertiary)
+            .into()
+    } else {
+        text(&spark.description)
+            .size(FONT_BODY)
+            .color(pal.text_primary)
+            .into()
+    };
+
+    let clickable = mouse_area(
+        container(body_text)
+            .padding([4, 0])
+            .width(Length::Fill),
+    )
+    .on_press(Message::DescriptionClicked);
+
+    column![header, clickable].spacing(4).into()
+}
+
+// ── Unsaved-changes nav-away dialog (ryve-4742d98b) ──
+
+fn view_nav_prompt_dialog<'a>(
+    prompt: &'a crate::workshop::PendingNavPrompt,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    let title = text("Unsaved changes")
+        .size(FONT_HEADER)
+        .color(pal.text_primary);
+    let body = text(format!(
+        "You have unsaved edits to the description of {}. What would you like to do?",
+        prompt.dirty_spark_id
+    ))
+    .size(FONT_BODY)
+    .color(pal.text_secondary);
+
+    let save_btn = button(text("Save").size(FONT_LABEL).color(pal.accent))
+        .padding([6, 14])
+        .style(button::text)
+        .on_press(Message::NavPromptSave);
+    let discard_btn = button(text("Discard").size(FONT_LABEL).color(pal.danger))
+        .padding([6, 14])
+        .style(button::text)
+        .on_press(Message::NavPromptDiscard);
+    let cancel_btn = button(
+        text("Cancel")
+            .size(FONT_LABEL)
+            .color(pal.text_secondary),
+    )
+    .padding([6, 14])
+    .style(button::text)
+    .on_press(Message::NavPromptCancel);
+
+    let actions = row![
+        Space::new().width(Length::Fill),
+        cancel_btn,
+        discard_btn,
+        save_btn,
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+
+    let card = container(column![title, body, actions].spacing(12))
+        .padding(20)
+        .max_width(420)
+        .style(move |_t: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(pal.window_bg)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: pal.separator,
+            },
+            ..Default::default()
+        });
+
+    // Full-screen scrim that also catches stray clicks and maps them
+    // to "Cancel" — clicking outside the card is the standard dismiss
+    // gesture for modals.
+    mouse_area(
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(move |_t: &Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    a: 0.55,
+                    ..iced::Color::BLACK
+                })),
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::NavPromptCancel)
+    .into()
 }
 
 // ── Bonds section ────────────────────────────────────

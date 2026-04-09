@@ -2018,8 +2018,13 @@ impl App {
                     screen::agents::Message::OpenSpark(spark_id) => {
                         // Mirror screen::sparks::Message::SelectSpark — set the
                         // selected spark and load its contracts + bonds so the
-                        // right panel hydrates immediately.
-                        let _discarded = ws.change_selected_spark(Some(spark_id.clone()));
+                        // right panel hydrates immediately. Honour the
+                        // description-draft guard (ryve-4742d98b): a pending
+                        // unsaved edit defers the selection change and
+                        // surfaces a save/discard/cancel dialog instead.
+                        if !ws.try_change_selected_spark(Some(spark_id.clone())) {
+                            return Task::none();
+                        }
                         ws.selected_spark_contracts.clear();
                         ws.selected_spark_bonds.clear();
                         ws.contract_create_form.reset();
@@ -2073,7 +2078,12 @@ impl App {
                 match msg {
                     screen::spark_detail::Message::Back => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
-                            let _discarded = ws.change_selected_spark(None);
+                            // ryve-4742d98b: dirty description draft? Defer
+                            // the back-navigation until the user answers
+                            // the save/discard/cancel prompt.
+                            if !ws.try_change_selected_spark(None) {
+                                return Task::none();
+                            }
                             ws.selected_spark_contracts.clear();
                             ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
@@ -2222,6 +2232,128 @@ impl App {
                                 spark_id: spark_id.clone(),
                             },
                         );
+                    }
+                    // -- Description inline edit (ryve-4742d98b) --
+                    screen::spark_detail::Message::DescriptionClicked => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.begin_description_edit();
+                        }
+                    }
+                    screen::spark_detail::Message::DescriptionAction(action) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            // Apply the action to the live `Content`,
+                            // then mirror the resulting text into the
+                            // SparkEdit draft so the "unsaved" pill
+                            // reflects reality on the next frame.
+                            if let Some(ref mut content) = ws.description_editor {
+                                content.perform(action);
+                                let text = content.text();
+                                // iced's `Content::text()` appends a
+                                // trailing newline that wasn't in the
+                                // source — strip it so round-tripping
+                                // an unchanged draft stays "clean".
+                                let stripped =
+                                    text.strip_suffix('\n').unwrap_or(&text).to_string();
+                                if let Some(ref mut edit) = ws.spark_edit {
+                                    edit.drafts.insert(
+                                        screen::spark_detail::Field::Description,
+                                        stripped,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    screen::spark_detail::Message::DescriptionBlur => {
+                        // Blur = commit. If the draft equals the
+                        // persisted value we just close the editor;
+                        // otherwise we dispatch a SparkUpdate through
+                        // the shared write path (ryve-90174007).
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            let Some((spark_id, draft)) = ws.take_description_draft() else {
+                                return Task::none();
+                            };
+                            let current = ws
+                                .sparks
+                                .iter()
+                                .find(|s| s.id == spark_id)
+                                .map(|s| s.description.clone())
+                                .unwrap_or_default();
+                            if draft == current {
+                                return Task::none();
+                            }
+                            let workshop_id = ws.id;
+                            return Task::done(Message::SparkUpdate {
+                                workshop_id,
+                                id: spark_id,
+                                patch: SparkPatch {
+                                    description: Some(draft),
+                                    ..Default::default()
+                                },
+                            });
+                        }
+                    }
+                    screen::spark_detail::Message::DescriptionRevert => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.revert_description_edit();
+                        }
+                    }
+                    screen::spark_detail::Message::NavPromptSave => {
+                        // Commit the draft, then finish the deferred
+                        // navigation. SparkUpdate applies optimistically,
+                        // so we can navigate immediately without waiting
+                        // on the async write to confirm.
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            let Some(prompt) = ws.pending_nav_prompt.take() else {
+                                return Task::none();
+                            };
+                            let mut follow_up: Vec<Task<Message>> = Vec::new();
+                            if let Some((spark_id, draft)) = ws.take_description_draft() {
+                                let current = ws
+                                    .sparks
+                                    .iter()
+                                    .find(|s| s.id == spark_id)
+                                    .map(|s| s.description.clone())
+                                    .unwrap_or_default();
+                                if draft != current {
+                                    let workshop_id = ws.id;
+                                    follow_up.push(Task::done(Message::SparkUpdate {
+                                        workshop_id,
+                                        id: spark_id,
+                                        patch: SparkPatch {
+                                            description: Some(draft),
+                                            ..Default::default()
+                                        },
+                                    }));
+                                }
+                            }
+                            // `change_selected_spark` (not the gated
+                            // `try_` variant) — we already handled the
+                            // dirty state by committing or discarding.
+                            let _ = ws.change_selected_spark(prompt.target);
+                            ws.selected_spark_contracts.clear();
+                            ws.selected_spark_bonds.clear();
+                            ws.contract_create_form.reset();
+                            if !follow_up.is_empty() {
+                                return Task::batch(follow_up);
+                            }
+                        }
+                    }
+                    screen::spark_detail::Message::NavPromptDiscard => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            let Some(prompt) = ws.pending_nav_prompt.take() else {
+                                return Task::none();
+                            };
+                            ws.revert_description_edit();
+                            let _ = ws.change_selected_spark(prompt.target);
+                            ws.selected_spark_contracts.clear();
+                            ws.selected_spark_bonds.clear();
+                            ws.contract_create_form.reset();
+                        }
+                    }
+                    screen::spark_detail::Message::NavPromptCancel => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.pending_nav_prompt = None;
+                        }
                     }
                     screen::spark_detail::Message::CycleStatus(spark_id, new_status) => {
                         if let Some(ws) = self.workshops.get(idx)
@@ -2401,7 +2533,11 @@ impl App {
                     }
                     screen::sparks::Message::SelectSpark(spark_id) => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
-                            let _discarded = ws.change_selected_spark(Some(spark_id.clone()));
+                            // ryve-4742d98b: defer selection change if
+                            // the current spark has a dirty description.
+                            if !ws.try_change_selected_spark(Some(spark_id.clone())) {
+                                return Task::none();
+                            }
                             ws.selected_spark_contracts.clear();
                             ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
@@ -3185,7 +3321,10 @@ impl App {
         let ws = &mut self.workshops[idx];
         match msg {
             screen::home::Message::SelectSpark(id) => {
-                let _discarded = ws.change_selected_spark(Some(id.clone()));
+                // ryve-4742d98b: guard on dirty description draft.
+                if !ws.try_change_selected_spark(Some(id.clone())) {
+                    return Task::none();
+                }
                 if let Some(ref pool) = ws.sparks_db {
                     let pool = pool.clone();
                     let ws_id = ws.id;
@@ -4807,6 +4946,14 @@ impl App {
             .unwrap_or_default();
         let sparks_panel = if let Some(ref selected_id) = ws.selected_spark {
             if let Some(spark) = ws.sparks.iter().find(|s| s.id == *selected_id) {
+                let description_draft = ws
+                    .spark_edit
+                    .as_ref()
+                    .and_then(|e| {
+                        e.drafts
+                            .get(&screen::spark_detail::Field::Description)
+                    })
+                    .map(|s| s.as_str());
                 screen::spark_detail::view(
                     spark,
                     &ws.selected_spark_contracts,
@@ -4814,6 +4961,9 @@ impl App {
                     &ws.sparks,
                     &delegation,
                     &ws.contract_create_form,
+                    ws.description_editor.as_ref(),
+                    description_draft,
+                    ws.pending_nav_prompt.as_ref(),
                     &pal,
                     has_bg,
                 )

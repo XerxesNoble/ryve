@@ -155,6 +155,22 @@ impl SparkPatch {
     }
 }
 
+/// A deferred selection change, held on the workshop while the user
+/// decides what to do with an unsaved description draft. Produced by
+/// [`Workshop::try_change_selected_spark`] when the current spark has
+/// a dirty description draft; consumed when the user resolves the
+/// "Save / Discard / Cancel" dialog. Spark ryve-4742d98b.
+#[derive(Debug, Clone)]
+pub struct PendingNavPrompt {
+    /// The selection the user was trying to move to. `None` means
+    /// "back to the sparks panel".
+    pub target: Option<String>,
+    /// The id of the spark whose description is dirty. Kept separately
+    /// so the dialog can still name the spark even if the underlying
+    /// `selected_spark` has already changed for any reason.
+    pub dirty_spark_id: String,
+}
+
 pub struct Workshop {
     pub id: Uuid,
     pub directory: PathBuf,
@@ -251,6 +267,20 @@ pub struct Workshop {
     /// time — see [`Workshop::change_selected_spark`]. Spark
     /// ryve-1d8c2847.
     pub spark_edit: Option<crate::screen::spark_detail::SparkEdit>,
+    /// Live `text_editor::Content` backing the description inline editor.
+    /// `None` when the description is rendered as a static click target.
+    /// Set in [`Workshop::begin_description_edit`] and cleared on
+    /// commit / revert. Held here (rather than in `SparkEdit`) because
+    /// `Content` carries internal renderer state that is not part of the
+    /// draft snapshot and must outlive individual view passes.
+    /// Spark ryve-4742d98b.
+    pub description_editor: Option<iced::widget::text_editor::Content>,
+    /// Set when a navigation action was attempted while the description
+    /// draft differs from the persisted value. The detail view renders a
+    /// modal save/discard/cancel dialog while this is `Some` and
+    /// suppresses the underlying selection change until the user
+    /// answers. Spark ryve-4742d98b.
+    pub pending_nav_prompt: Option<PendingNavPrompt>,
     /// Whether the background image is dark (for adaptive font color).
     /// `None` means no background or not yet computed.
     pub bg_is_dark: Option<bool>,
@@ -329,6 +359,8 @@ impl Workshop {
             blocked_spark_ids: HashSet::new(),
             contract_create_form: Default::default(),
             spark_edit: None,
+            description_editor: None,
+            pending_nav_prompt: None,
             bg_is_dark: None,
             pending_agent_spawn: None,
             pending_head_spawn: None,
@@ -383,8 +415,114 @@ impl Workshop {
             .spark_edit
             .take()
             .filter(crate::screen::spark_detail::SparkEdit::is_dirty);
+        self.description_editor = None;
         self.selected_spark = new;
         discarded
+    }
+
+    /// Attempt to change the selected spark. If the current spark has a
+    /// dirty description draft, the change is deferred and a
+    /// [`PendingNavPrompt`] is stashed so the UI can render a
+    /// save/discard/cancel dialog. Returns `true` if the navigation
+    /// happened immediately, `false` if the dialog is now blocking.
+    /// Spark ryve-4742d98b.
+    pub fn try_change_selected_spark(&mut self, new: Option<String>) -> bool {
+        if let Some(dirty_id) = self.dirty_description_spark_id() {
+            self.pending_nav_prompt = Some(PendingNavPrompt {
+                target: new,
+                dirty_spark_id: dirty_id,
+            });
+            return false;
+        }
+        let _ = self.change_selected_spark(new);
+        true
+    }
+
+    /// Return the id of the currently selected spark **if** it has a
+    /// description draft that differs from the persisted value. The
+    /// "differs from persisted" check is what makes the navigation
+    /// guard Free of false positives: opening the editor and typing
+    /// nothing should not trap the user. Spark ryve-4742d98b.
+    pub fn dirty_description_spark_id(&self) -> Option<String> {
+        let edit = self.spark_edit.as_ref()?;
+        let draft = edit
+            .drafts
+            .get(&crate::screen::spark_detail::Field::Description)?;
+        let spark = self.sparks.iter().find(|s| s.id == edit.spark_id)?;
+        if draft != &spark.description {
+            Some(edit.spark_id.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Begin a description edit on the currently-selected spark.
+    /// Idempotent: calling it when the editor is already open leaves
+    /// the existing draft and `Content` alone so re-entering the field
+    /// does not wipe in-progress text. Spark ryve-4742d98b.
+    pub fn begin_description_edit(&mut self) {
+        let Some(ref selected) = self.selected_spark else {
+            return;
+        };
+        let selected = selected.clone();
+        let Some(spark) = self.sparks.iter().find(|s| s.id == selected) else {
+            return;
+        };
+        let current = spark.description.clone();
+
+        // Make sure SparkEdit exists for this spark (replace if it was
+        // left behind by a different spark for any reason).
+        let need_new = self
+            .spark_edit
+            .as_ref()
+            .is_none_or(|e| e.spark_id != selected);
+        if need_new {
+            self.spark_edit = Some(crate::screen::spark_detail::SparkEdit::new(selected.clone()));
+        }
+        let edit = self.spark_edit.as_mut().expect("just inserted");
+
+        // Seed the draft if this is the first time the field is opened.
+        // Re-entering an already-open field must not clobber in-progress
+        // text — mirror the `begin_edit` invariant covered by the
+        // ryve-1d8c2847 tests.
+        let seeded = edit
+            .drafts
+            .entry(crate::screen::spark_detail::Field::Description)
+            .or_insert_with(|| current.clone())
+            .clone();
+
+        // Create the `text_editor::Content` if it doesn't already exist.
+        // If a content already exists we leave it alone so the cursor
+        // and any in-progress text survive re-entry.
+        if self.description_editor.is_none() {
+            self.description_editor = Some(iced::widget::text_editor::Content::with_text(&seeded));
+        }
+    }
+
+    /// Drop the description draft and close the inline editor. Called
+    /// from the Escape handler and from "Discard" in the nav-away
+    /// dialog. Spark ryve-4742d98b.
+    pub fn revert_description_edit(&mut self) {
+        self.description_editor = None;
+        if let Some(edit) = self.spark_edit.as_mut() {
+            edit.drafts
+                .remove(&crate::screen::spark_detail::Field::Description);
+            edit.in_flight
+                .remove(&crate::screen::spark_detail::Field::Description);
+        }
+    }
+
+    /// Return the description draft value if one is live, else `None`.
+    /// Used by the blur handler to decide whether to dispatch a
+    /// `SparkUpdate`. Spark ryve-4742d98b.
+    pub fn take_description_draft(&mut self) -> Option<(String, String)> {
+        let edit = self.spark_edit.as_mut()?;
+        let draft = edit
+            .drafts
+            .remove(&crate::screen::spark_detail::Field::Description)?;
+        let spark_id = edit.spark_id.clone();
+        self.description_editor = None;
+        Some((spark_id, draft))
     }
 
     /// Effective palette for this workshop, honoring an adaptive
@@ -1510,6 +1648,179 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    // ── Description inline edit (ryve-4742d98b) ──────────────────────────
+    //
+    // These tests pin the state-machine invariants behind the blur-to-save
+    // description editor: begin_description_edit must seed the draft from
+    // the persisted value, the dirty check must ignore unchanged drafts,
+    // the nav guard must defer a selection change when dirty and fall
+    // through when not, and revert must leave `spark_edit` in a clean
+    // state so the next open is a fresh seed.
+
+    use crate::screen::spark_detail::Field;
+
+    #[test]
+    fn begin_description_edit_seeds_draft_from_persisted() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        ws.selected_spark = Some("sp-1".to_string());
+        ws.begin_description_edit();
+
+        // SparkEdit exists and carries the persisted value as the draft.
+        let edit = ws.spark_edit.as_ref().expect("edit created");
+        assert_eq!(edit.spark_id, "sp-1");
+        assert_eq!(edit.drafts.get(&Field::Description).map(String::as_str), Some("old body"));
+        // Editor content is seeded with the same value.
+        assert!(ws.description_editor.is_some());
+    }
+
+    #[test]
+    fn begin_description_edit_is_idempotent() {
+        // Re-clicking the description mid-edit must not clobber the
+        // user's in-progress text. Mirrors the same guard that
+        // SparkEdit::begin_edit enforces on the draft map.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        ws.selected_spark = Some("sp-1".to_string());
+        ws.begin_description_edit();
+        // Simulate typing: mirror what DescriptionAction does.
+        if let Some(ref mut edit) = ws.spark_edit {
+            edit.drafts
+                .insert(Field::Description, "mid-edit draft".to_string());
+        }
+        ws.begin_description_edit();
+        assert_eq!(
+            ws.spark_edit
+                .as_ref()
+                .unwrap()
+                .drafts
+                .get(&Field::Description)
+                .map(String::as_str),
+            Some("mid-edit draft")
+        );
+    }
+
+    #[test]
+    fn dirty_description_requires_change_from_persisted() {
+        // Opening the editor without typing anything must NOT count as
+        // dirty — that would trap the user in a prompt on every click.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        ws.selected_spark = Some("sp-1".to_string());
+        ws.begin_description_edit();
+        assert!(ws.dirty_description_spark_id().is_none());
+
+        // Now modify the draft: dirty.
+        if let Some(ref mut edit) = ws.spark_edit {
+            edit.drafts
+                .insert(Field::Description, "new body".to_string());
+        }
+        assert_eq!(ws.dirty_description_spark_id().as_deref(), Some("sp-1"));
+    }
+
+    #[test]
+    fn try_change_selected_spark_defers_when_dirty() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        ws.sparks.push(test_spark("sp-2"));
+        ws.selected_spark = Some("sp-1".to_string());
+        ws.begin_description_edit();
+        if let Some(ref mut edit) = ws.spark_edit {
+            edit.drafts
+                .insert(Field::Description, "dirty".to_string());
+        }
+
+        let moved = ws.try_change_selected_spark(Some("sp-2".to_string()));
+        assert!(!moved, "nav should be deferred");
+        assert_eq!(ws.selected_spark.as_deref(), Some("sp-1"));
+        let prompt = ws.pending_nav_prompt.as_ref().expect("prompt staged");
+        assert_eq!(prompt.target.as_deref(), Some("sp-2"));
+        assert_eq!(prompt.dirty_spark_id, "sp-1");
+    }
+
+    #[test]
+    fn try_change_selected_spark_proceeds_when_not_dirty() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        ws.sparks.push(test_spark("sp-2"));
+        ws.selected_spark = Some("sp-1".to_string());
+        // Open the editor but don't type anything — not dirty.
+        ws.begin_description_edit();
+
+        let moved = ws.try_change_selected_spark(Some("sp-2".to_string()));
+        assert!(moved);
+        assert_eq!(ws.selected_spark.as_deref(), Some("sp-2"));
+        assert!(ws.pending_nav_prompt.is_none());
+        // Selection change wipes the editor and any lingering draft.
+        assert!(ws.description_editor.is_none());
+    }
+
+    #[test]
+    fn revert_description_edit_clears_draft_and_editor() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        ws.selected_spark = Some("sp-1".to_string());
+        ws.begin_description_edit();
+        if let Some(ref mut edit) = ws.spark_edit {
+            edit.drafts
+                .insert(Field::Description, "unwanted".to_string());
+        }
+        ws.revert_description_edit();
+        assert!(ws.description_editor.is_none());
+        let edit = ws.spark_edit.as_ref().expect("spark_edit still present");
+        assert!(edit.drafts.get(&Field::Description).is_none());
+        // Reverting a draft with no persisted change should leave the
+        // edit wrapper clean (not dirty) so subsequent nav is free.
+        assert!(ws.dirty_description_spark_id().is_none());
+    }
+
+    #[test]
+    fn take_description_draft_consumes_draft_and_closes_editor() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        ws.selected_spark = Some("sp-1".to_string());
+        ws.begin_description_edit();
+        if let Some(ref mut edit) = ws.spark_edit {
+            edit.drafts
+                .insert(Field::Description, "committed".to_string());
+        }
+
+        let taken = ws.take_description_draft().expect("draft exists");
+        assert_eq!(taken.0, "sp-1");
+        assert_eq!(taken.1, "committed");
+        assert!(ws.description_editor.is_none());
+        assert!(
+            ws.spark_edit
+                .as_ref()
+                .unwrap()
+                .drafts
+                .get(&Field::Description)
+                .is_none()
+        );
+        assert!(ws.take_description_draft().is_none());
+    }
+
+    #[test]
+    fn empty_description_is_permitted_as_committed_draft() {
+        // Acceptance criterion: "Empty description is permitted
+        // (unlike title)". A draft that clears the description to ""
+        // must round-trip through take_description_draft and be
+        // distinguishable from a no-op.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        ws.selected_spark = Some("sp-1".to_string());
+        ws.begin_description_edit();
+        if let Some(ref mut edit) = ws.spark_edit {
+            edit.drafts.insert(Field::Description, String::new());
+        }
+        // An empty draft against a non-empty persisted value IS dirty.
+        assert_eq!(ws.dirty_description_spark_id().as_deref(), Some("sp-1"));
+
+        let (id, draft) = ws.take_description_draft().expect("draft exists");
+        assert_eq!(id, "sp-1");
+        assert_eq!(draft, "");
     }
 
     #[test]
