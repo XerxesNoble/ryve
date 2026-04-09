@@ -59,6 +59,9 @@ pub const CLI_COMMANDS: &[&str] = &[
     "hot",
     "status",
     "init",
+    "backup",
+    "backups",
+    "restore",
     "help",
     "--help",
     "-h",
@@ -92,6 +95,22 @@ pub async fn run(args: Vec<String>) {
     if args_clean.get(1).map(|s| s.as_str()) == Some("init") {
         let ryve_dir = RyveDir::new(&cwd);
         handle_init(&ryve_dir, &cwd).await;
+        return;
+    }
+
+    // Special: `restore` must NOT open the sparks database first — it's
+    // about to replace it. Resolve the workshop root ourselves and
+    // dispatch without opening a pool. If the live database is missing
+    // or corrupted, the standard dispatch path below would die before
+    // restore could run, which is exactly the scenario we need to
+    // support.
+    if args_clean.get(1).map(|s| s.as_str()) == Some("restore") {
+        let workshop_root = match resolve_workshop_root_for_restore(&cwd) {
+            Some(r) => r,
+            None => die("no .ryve/ directory found — run `ryve init` first or pass an absolute snapshot path inside a workshop"),
+        };
+        let ryve_dir = RyveDir::new(&workshop_root);
+        handle_restore(&ryve_dir, &args_clean[2..]).await;
         return;
     }
 
@@ -146,6 +165,9 @@ pub async fn run(args: Vec<String>) {
         }
         "hot" => handle_hot(&pool, &ws_id, json_mode).await,
         "status" => handle_status(&pool, &ws_id).await,
+        "backup" | "backups" => {
+            handle_backup(&pool, &workshop_root, &args_clean[2..], json_mode).await
+        }
         other => {
             eprintln!("error: unknown command '{other}'");
             print_usage();
@@ -187,6 +209,11 @@ fn print_usage() {
     eprintln!("  init                                Initialize .ryve/ in current directory");
     eprintln!("  status                              Show workshop summary");
     eprintln!("  hot                                 List hot (ready-to-work) sparks");
+    eprintln!();
+    eprintln!("  backup create                       Snapshot sparks.db to .ryve/backups/");
+    eprintln!("  backup list                         List existing snapshots");
+    eprintln!("  backup prune [--keep=N]             Prune old snapshots (keep newest N)");
+    eprintln!("  restore <snapshot>                  Restore sparks.db from a snapshot");
     eprintln!();
     eprintln!("  spark list [--all]                  List sparks (active by default)");
     eprintln!("  spark create <title>                Create a task spark (P2)");
@@ -261,6 +288,149 @@ async fn handle_init(ryve_dir: &RyveDir, cwd: &Path) {
         die(&format!("failed to create database: {e}"));
     }
     println!("initialized .ryve/ in {}", cwd.display());
+}
+
+// ── Backup / Restore ─────────────────────────────────
+
+/// Walk up from `start` looking for a directory that contains a
+/// `.ryve/` dir — used by `restore` because the live sparks.db may be
+/// missing or corrupt (so [`find_workshop_root`]'s existence check on
+/// the DB file itself won't work).
+fn resolve_workshop_root_for_restore(start: &std::path::Path) -> Option<PathBuf> {
+    let mut current = start.canonicalize().ok()?;
+    loop {
+        if current.join(".ryve").is_dir() {
+            return Some(current);
+        }
+        current = current.parent()?.to_path_buf();
+    }
+}
+
+async fn handle_backup(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    args: &[String],
+    json_mode: bool,
+) {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("create");
+    let ryve_dir = RyveDir::new(workshop_root);
+    match sub {
+        "create" | "now" | "snapshot" => {
+            match data::backup::snapshot_and_retain(
+                pool,
+                &ryve_dir,
+                data::backup::DEFAULT_BACKUP_RETENTION,
+            )
+            .await
+            {
+                Ok(path) => {
+                    if json_mode {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "snapshot": path.display().to_string() })
+                        );
+                    } else {
+                        println!("snapshot written: {}", path.display());
+                    }
+                }
+                Err(e) => die(&format!("backup failed: {e}")),
+            }
+        }
+        "list" | "ls" => match data::backup::list_snapshots(&ryve_dir).await {
+            Ok(snaps) => {
+                if json_mode {
+                    let json: Vec<_> = snaps
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "path": s.path.display().to_string(),
+                                "name": s.file_name(),
+                                "taken_at": s.taken_at.map(|t| t.to_rfc3339()),
+                                "size": s.size,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                } else if snaps.is_empty() {
+                    println!("No snapshots in {}", ryve_dir.backups_dir().display());
+                } else {
+                    println!("{:<40} {:>10}  TAKEN", "NAME", "SIZE");
+                    println!("{}", "-".repeat(72));
+                    for s in snaps.iter().rev() {
+                        let taken = s
+                            .taken_at
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_else(|| "(unparsed)".to_string());
+                        println!("{:<40} {:>10}  {}", s.file_name(), s.size, taken);
+                    }
+                }
+            }
+            Err(e) => die(&format!("list failed: {e}")),
+        },
+        "prune" => {
+            let keep = args
+                .iter()
+                .skip(1)
+                .find_map(|a| a.strip_prefix("--keep="))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(data::backup::DEFAULT_BACKUP_RETENTION);
+            match data::backup::apply_retention(&ryve_dir, keep).await {
+                Ok(deleted) => {
+                    if json_mode {
+                        let json: Vec<_> = deleted
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect();
+                        println!("{}", serde_json::to_string(&json).unwrap_or_default());
+                    } else {
+                        println!("pruned {} snapshot(s) (keep={keep})", deleted.len());
+                    }
+                }
+                Err(e) => die(&format!("prune failed: {e}")),
+            }
+        }
+        "--help" | "-h" | "help" => {
+            eprintln!("backup [create|list|prune]\n");
+            eprintln!("  backup create                Take a snapshot now + prune to retention");
+            eprintln!("  backup list                  List all snapshots in .ryve/backups/");
+            eprintln!("  backup prune [--keep=N]      Prune old snapshots (default keep={})",
+                data::backup::DEFAULT_BACKUP_RETENTION);
+        }
+        other => die(&format!("unknown backup subcommand '{other}'")),
+    }
+}
+
+async fn handle_restore(ryve_dir: &RyveDir, args: &[String]) {
+    if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h" | "help") {
+        eprintln!("restore <snapshot>\n");
+        eprintln!("  <snapshot>  Either a filename inside .ryve/backups/ or an absolute path");
+        eprintln!();
+        eprintln!("The current sparks.db (and its WAL/SHM sidecars) are moved aside to");
+        eprintln!("sparks.db.pre-restore-<stamp>.bak before the snapshot is copied into place,");
+        eprintln!("so a bad restore can be undone manually.");
+        eprintln!();
+        eprintln!("IMPORTANT: shut down the Ryve UI for this workshop before running restore.");
+        if args.is_empty() {
+            process::exit(1);
+        }
+        return;
+    }
+    let snapshot = PathBuf::from(&args[0]);
+    match data::backup::restore_snapshot(ryve_dir, &snapshot).await {
+        Ok(outcome) => {
+            println!("restored {}", outcome.restored_db.display());
+            println!("  from:     {}", outcome.snapshot.display());
+            if let Some(prev) = outcome.previous_db_backup {
+                println!("  previous: {}", prev.display());
+                println!(
+                    "  (kept as a safety copy — delete once you've verified the restore)"
+                );
+            } else {
+                println!("  previous: <no existing sparks.db>");
+            }
+        }
+        Err(e) => die(&format!("restore failed: {e}")),
+    }
 }
 
 // ── Status ───────────────────────────────────────────

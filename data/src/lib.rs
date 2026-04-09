@@ -2,6 +2,7 @@
 // Copyright 2026 Loomantix
 
 pub mod agent_context;
+pub mod backup;
 pub mod config;
 pub mod db;
 pub mod git;
