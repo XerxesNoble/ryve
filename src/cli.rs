@@ -53,6 +53,8 @@ pub const CLI_COMMANDS: &[&str] = &[
     "crews",
     "hand",
     "hands",
+    "head",
+    "heads",
     "worktree",
     "worktrees",
     "wt",
@@ -162,6 +164,9 @@ pub async fn run(args: Vec<String>) {
         "commit" | "commits" => handle_commit(&pool, &args_clean[2..], &ws_id, json_mode).await,
         "crew" | "crews" => handle_crew(&pool, &args_clean[2..], &ws_id, json_mode).await,
         "hand" | "hands" => handle_hand(&pool, &workshop_root, &args_clean[2..], json_mode).await,
+        "head" | "heads" => {
+            handle_head(&pool, &workshop_root, &ws_id, &args_clean[2..], json_mode).await
+        }
         "worktree" | "worktrees" | "wt" => {
             handle_worktree(&pool, &workshop_root, &args_clean[2..], json_mode).await
         }
@@ -268,6 +273,12 @@ fn print_usage() {
     eprintln!("  hand spawn <spark_id> [--agent <name>] [--role owner|merger] [--crew <id>]");
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
+    eprintln!();
+    eprintln!("  head orchestrate <parent_spark> --children <csv>");
+    eprintln!("      [--merge-spark <id>] [--crew-name <name>] [--purpose <text>]");
+    eprintln!("      [--agent <name>] [--stall-seconds N] [--poll-seconds M] [--max-cycles N]");
+    eprintln!("                                       Drive a Head→Crew loop via");
+    eprintln!("                                       the shared orchestration module");
     eprintln!();
     eprintln!(
         "  worktree prune [--yes]               Prune stale hand worktrees (dry-run by default)"
@@ -1742,6 +1753,270 @@ async fn handle_hand(
             Err(e) => die(&format!("{e}")),
         },
         other => die(&format!("unknown hand subcommand '{other}'")),
+    }
+}
+
+// ── Head orchestration ───────────────────────────────
+//
+// `ryve head orchestrate` is the CLI wrapper around the shared
+// `head::orchestrator` module. It is the entry point a Head coding
+// agent (PerfHead, Build Head, …) is expected to call instead of
+// re-implementing the poll/reassign/merger loop in its prompt. See
+// spark ryve-85945fa3 [sp-fbf2a519].
+
+async fn handle_head(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    ws_id: &str,
+    args: &[String],
+    json_mode: bool,
+) {
+    if args.is_empty() {
+        die("head subcommand required (orchestrate)");
+    }
+    match args[0].as_str() {
+        "orchestrate" => {
+            handle_head_orchestrate(pool, workshop_root, ws_id, &args[1..], json_mode).await;
+        }
+        other => die(&format!("unknown head subcommand '{other}'")),
+    }
+}
+
+async fn handle_head_orchestrate(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    ws_id: &str,
+    args: &[String],
+    json_mode: bool,
+) {
+    use crate::head::orchestrator::{self, OrchestrationConfig};
+
+    if args.is_empty() {
+        die(
+            "head orchestrate requires <parent_spark_id> [--children <csv>] \
+             [--merge-spark <id>] [--crew-name <name>] [--purpose <text>] \
+             [--agent <name>] [--stall-seconds N] [--poll-seconds M] [--max-cycles N]",
+        );
+    }
+    let parent_spark_id = args[0].clone();
+
+    let mut children: Vec<String> = Vec::new();
+    let mut merge_spark: Option<String> = None;
+    let mut crew_name: Option<String> = None;
+    let mut purpose: Option<String> = None;
+    let mut agent_name: Option<String> = None;
+    let mut cfg = OrchestrationConfig::default();
+    let mut max_cycles: u32 = 120; // default ~2h at 60s poll
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--children" => {
+                i += 1;
+                if i < args.len() {
+                    children = args[i]
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+            "--merge-spark" => {
+                i += 1;
+                if i < args.len() {
+                    merge_spark = Some(args[i].clone());
+                }
+            }
+            "--crew-name" => {
+                i += 1;
+                if i < args.len() {
+                    crew_name = Some(args[i].clone());
+                }
+            }
+            "--purpose" => {
+                i += 1;
+                if i < args.len() {
+                    purpose = Some(args[i].clone());
+                }
+            }
+            "--agent" => {
+                i += 1;
+                if i < args.len() {
+                    agent_name = Some(args[i].clone());
+                }
+            }
+            "--stall-seconds" => {
+                i += 1;
+                if i < args.len()
+                    && let Ok(n) = args[i].parse::<u64>()
+                {
+                    cfg.stall_after = std::time::Duration::from_secs(n);
+                }
+            }
+            "--poll-seconds" => {
+                i += 1;
+                if i < args.len()
+                    && let Ok(n) = args[i].parse::<u64>()
+                {
+                    cfg.poll_interval = std::time::Duration::from_secs(n);
+                }
+            }
+            "--max-cycles" => {
+                i += 1;
+                if i < args.len()
+                    && let Ok(n) = args[i].parse::<u32>()
+                {
+                    max_cycles = n;
+                }
+            }
+            other => die(&format!("unknown head orchestrate flag '{other}'")),
+        }
+        i += 1;
+    }
+
+    if children.is_empty() {
+        die("head orchestrate requires --children <spark_id[,spark_id...]>");
+    }
+
+    let agent = resolve_agent(agent_name.as_deref());
+    let head_session_id = std::env::var("RYVE_HAND_SESSION_ID").ok();
+    let name = crew_name.unwrap_or_else(|| format!("crew-{parent_spark_id}"));
+
+    // 1. spawn_crew
+    let mut crew = match orchestrator::spawn_crew(
+        workshop_root,
+        pool,
+        &agent,
+        ws_id,
+        &name,
+        purpose.as_deref(),
+        Some(&parent_spark_id),
+        &children,
+        head_session_id.as_deref(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => die(&format!("spawn_crew failed: {e}")),
+    };
+
+    if !json_mode {
+        println!(
+            "spawned crew {} with {} member(s)",
+            crew.crew_id,
+            crew.spark_ids.len()
+        );
+    }
+
+    // 2. poll / reassign loop
+    let mut respawn_counts: std::collections::HashMap<String, u32> = Default::default();
+    let mut cycles = 0u32;
+    let final_report = loop {
+        if let Err(e) = orchestrator::drop_closed_siblings(pool, &mut crew).await {
+            eprintln!("warn: drop_closed_siblings failed: {e}");
+        }
+        let report = match orchestrator::poll_crew(pool, &crew, &cfg).await {
+            Ok(r) => r,
+            Err(e) => die(&format!("poll_crew failed: {e}")),
+        };
+
+        if !json_mode {
+            println!(
+                "[cycle {cycles}] total={} done={} stalled={} unassigned={}",
+                report.total(),
+                report.done(),
+                report.stalled_spark_ids().len(),
+                report.unassigned_spark_ids().len()
+            );
+        }
+
+        if report.all_done() {
+            break report;
+        }
+
+        if !report.stalled_spark_ids().is_empty() || !report.unassigned_spark_ids().is_empty() {
+            match orchestrator::reassign_stalled(
+                workshop_root,
+                pool,
+                &agent,
+                &mut crew,
+                &report,
+                &cfg,
+                &mut respawn_counts,
+                head_session_id.as_deref(),
+            )
+            .await
+            {
+                Ok(r) => {
+                    if !json_mode && !r.respawned.is_empty() {
+                        println!("  reassigned {} hand(s)", r.respawned.len());
+                    }
+                    if !r.capped.is_empty() {
+                        eprintln!("  respawn cap reached for: {:?}", r.capped);
+                    }
+                }
+                Err(e) => die(&format!("reassign_stalled failed: {e}")),
+            }
+        }
+
+        cycles += 1;
+        if cycles >= max_cycles {
+            eprintln!("max-cycles ({max_cycles}) reached; exiting loop");
+            break report;
+        }
+        tokio::time::sleep(cfg.poll_interval).await;
+    };
+
+    // 3. finalize_with_merger (optional — Head may not have a merge spark yet)
+    let merger_info = if final_report.all_done() {
+        match merge_spark.as_deref() {
+            Some(msid) => match orchestrator::finalize_with_merger(
+                workshop_root,
+                pool,
+                &agent,
+                &crew,
+                msid,
+                head_session_id.as_deref(),
+            )
+            .await
+            {
+                Ok(spawned) => {
+                    if !json_mode {
+                        println!(
+                            "spawned merger session {} on merge spark {}",
+                            spawned.session_id, spawned.spark_id
+                        );
+                    }
+                    Some(spawned)
+                }
+                Err(e) => die(&format!("finalize_with_merger failed: {e}")),
+            },
+            None => {
+                eprintln!(
+                    "all sparks done but --merge-spark not provided; skipping merger spawn"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if json_mode {
+        let payload = serde_json::json!({
+            "crew_id": crew.crew_id,
+            "parent_spark_id": crew.parent_spark_id,
+            "spark_ids": crew.spark_ids,
+            "owners": crew.owners,
+            "cycles": cycles,
+            "all_done": final_report.all_done(),
+            "total": final_report.total(),
+            "done": final_report.done(),
+            "merger_session_id": merger_info.as_ref().map(|m| m.session_id.clone()),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
     }
 }
 

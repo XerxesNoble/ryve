@@ -7,6 +7,7 @@ mod coding_agents;
 mod delegation;
 mod font_intern;
 mod hand_spawn;
+mod head;
 mod icons;
 mod process_snapshot;
 mod screen;

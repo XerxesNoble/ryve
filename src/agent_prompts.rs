@@ -264,6 +264,109 @@ pub fn compose_head_prompt(epic_id: Option<&str>, epic_title: Option<&str>) -> S
     prompt
 }
 
+/// Compose the initial system prompt for a **Perf Head** — a
+/// performance-focused Build Head whose job is to drive a crew of Hands
+/// that ship a measurable performance improvement.
+///
+/// Unlike the generic [`compose_head_prompt`], PerfHead does NOT
+/// re-implement the decomposition → fan-out → poll → reassign → finalize
+/// loop in natural language. It delegates the mechanical parts of the
+/// loop to the shared orchestration module (`src/head/orchestrator.rs`)
+/// via the `ryve head orchestrate` CLI entry point, so the stall
+/// threshold, respawn cap, and merger hand-off policy live in one place
+/// instead of drifting across archetype prompts. See spark
+/// `ryve-85945fa3` for the rationale.
+///
+/// The prompt therefore focuses only on the parts a Perf Head must
+/// *decide* — which sparks to create, what acceptance criteria to write,
+/// what "perf win" means for this epic — and offloads the rest to
+/// `ryve head orchestrate`.
+// Not yet wired into the UI head-picker (which currently spawns a generic
+// Build Head via `compose_head_prompt`). Exposed now so `ryve head spawn`
+// / head-picker archetype wiring can adopt it without another round trip.
+// Spark ryve-85945fa3.
+#[allow(dead_code)]
+pub fn compose_perf_head_prompt(epic_id: Option<&str>, epic_title: Option<&str>) -> String {
+    let goal_block = match (epic_id, epic_title) {
+        (Some(id), Some(title)) => {
+            format!("decompose existing perf epic `{id}` — \"{title}\" — into child sparks")
+        }
+        (Some(id), None) => format!("decompose existing perf epic `{id}` into child sparks"),
+        _ => "(no epic selected — wait for the user to type a perf goal in this terminal \
+              before creating any sparks or spawning any Hands)"
+            .to_string(),
+    };
+
+    let mut prompt = String::new();
+    prompt.push_str(
+        "You are the **Perf Head** of a Crew of Hands inside a Ryve workshop. You \
+         are an LLM-powered orchestrator running as a coding-agent subprocess. Your \
+         single responsibility is to take a performance goal (hot-path regression, \
+         budget bust, profile-driven improvement) and drive a crew of Hands to a \
+         single PR that delivers a **measurable** performance win.\n\n\
+         IDENTITY: perf-head. Declare this explicitly if asked what kind of Head \
+         you are so delegation traces can label you correctly.\n\n",
+    );
+
+    prompt.push_str(&format!("USER GOAL:\n{goal_block}\n\n"));
+
+    if let Some(id) = epic_id {
+        prompt.push_str(&format!(
+            "PARENT EPIC: `{id}` is already created. Start by running \
+             `ryve spark show {id}` to read its problem statement and acceptance \
+             criteria before decomposing.\n\n"
+        ));
+    }
+
+    prompt.push_str(
+        "WORKFLOW — IMPORTANT: do NOT re-implement the poll / reassign / merger loop \
+         in this prompt. The policy lives in the shared orchestration module \
+         (`src/head/orchestrator.rs`) and is exposed to you via a single CLI command:\n\
+         \n    ryve head orchestrate <crew_id> [--stall-seconds N] [--poll-seconds M]\n\n\
+         That command runs `spawn_crew` / `poll_crew` / `reassign_stalled` / \
+         `finalize_with_merger` for you, including automatic release of \
+         heartbeat-stalled Hands and automatic respawn up to the configured cap. Your \
+         job is only the parts the module can't decide for you: what sparks to \
+         create, what acceptance criteria to attach, and when the work is genuinely \
+         done.\n\n\
+         Steps:\n\
+         1. Read the epic with `ryve spark show <epic_id>`. Confirm it has a \
+            measurable acceptance criterion (e.g. \"p99 < 25ms on bench X\"); if it \
+            does not, post a clarifying comment and stop.\n\
+         2. Decompose the epic into 2–6 child task sparks, each one a discrete perf \
+            fix or benchmark. Use `ryve spark create --type task --priority 2 \
+            --acceptance '<measurable criterion>' '<title>'` and bond each to the \
+            parent with `ryve bond create <parent> <child> parent_child`.\n\
+         3. Hand the list of child spark ids to the orchestration helper:\n\
+            `ryve head orchestrate <epic_id> --children <child1>,<child2>,...`\n\
+            The helper will create the crew, spawn one Hand per spark, and drive the \
+            poll / reassign loop until every child closes completed. You do not have \
+            to run `ryve crew create` or `ryve hand spawn` manually — those calls \
+            come from `orchestrator::spawn_crew`.\n\
+         4. When the helper reports `all_done`, it will also spawn the Merger Hand \
+            via `orchestrator::finalize_with_merger`. Wait for the Merger to post a \
+            PR URL (comment on the merge spark), then relay the URL to the user and \
+            comment it on the parent epic.\n\n",
+    );
+
+    prompt.push_str(
+        "HARD RULES:\n\
+         - You are a Head. You NEVER edit source code yourself. Every file change \
+           goes through a Hand spawned by `orchestrator::spawn_crew`.\n\
+         - Do NOT re-implement stall detection, respawn, or merger spawn in this \
+           prompt — the orchestration module owns that policy. If the module is \
+           missing a feature you need, open a spark against it; do not work around \
+           it in natural language.\n\
+         - Use `ryve` for ALL workgraph operations.\n\
+         - Reference the parent epic id `[sp-xxxx]` in any comments you leave.\n\
+         - Never make architectural decisions on the user's behalf. If the goal is \
+           ambiguous, comment on the parent epic and wait.\n\n\
+         Begin now. If the user goal above is empty, wait for them to type one.\n",
+    );
+
+    prompt
+}
+
 /// Compose the initial prompt for a Merger Hand — a Hand whose only job is
 /// to integrate the worktree branches of every other Hand in its Crew into
 /// one PR for review.
@@ -507,6 +610,47 @@ mod tests {
             p.contains("synthes"),
             "must require Atlas to synthesise Head outputs"
         );
+    }
+
+    /// sp-fbf2a519 / ryve-85945fa3: PerfHead must delegate its loop to
+    /// the shared orchestration helper rather than re-implementing poll
+    /// / reassign / merger logic inline. If a future edit puts the
+    /// policy back into prose, these assertions break so the regression
+    /// is caught at build time.
+    #[test]
+    fn perf_head_prompt_delegates_to_orchestration_module() {
+        let p = compose_perf_head_prompt(Some("sp-perf1"), Some("reduce startup p99"));
+        // Identity: declares itself as a Perf Head.
+        assert!(p.contains("Perf Head"));
+        assert!(p.contains("perf-head"));
+        // Must point at the shared orchestration entry point.
+        assert!(
+            p.contains("ryve head orchestrate"),
+            "perf head must hand the loop to `ryve head orchestrate`, not re-run it in prose"
+        );
+        assert!(p.contains("orchestrator::spawn_crew"));
+        assert!(p.contains("orchestrator::finalize_with_merger"));
+        // Must NOT re-describe the stall threshold, respawn, merger
+        // spawn sequence — those all live in the Rust module now.
+        assert!(
+            !p.contains("ryve assign release"),
+            "perf head should not hand-roll `ryve assign release`; the orchestrator does it"
+        );
+        assert!(
+            !p.contains("ryve hand spawn <child"),
+            "perf head should not manually spawn Hands; orchestrator::spawn_crew does it"
+        );
+        // The epic plumbing should still be present.
+        assert!(p.contains("sp-perf1"));
+        assert!(p.contains("reduce startup p99"));
+        assert!(p.contains("HARD RULES"));
+    }
+
+    #[test]
+    fn perf_head_prompt_handles_no_epic() {
+        let p = compose_perf_head_prompt(None, None);
+        assert!(p.contains("no epic selected"));
+        assert!(!p.contains("PARENT EPIC"));
     }
 
     #[test]
