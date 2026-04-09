@@ -2886,6 +2886,73 @@ impl App {
                             ws.pending_nav_prompt = None;
                         }
                     }
+                    // -- Editable problem statement (ryve-a5997352) --
+                    screen::spark_detail::Message::BeginEditProblem(spark_id) => {
+                        let ws = &mut self.workshops[idx];
+                        // Don't blow away an in-flight editor for the same
+                        // spark on a double-click; keep the existing content
+                        // so the user's cursor stays put.
+                        if ws
+                            .problem_edit
+                            .as_ref()
+                            .is_some_and(|e| e.spark_id == spark_id)
+                        {
+                            return Task::none();
+                        }
+                        let current = ws
+                            .sparks
+                            .iter()
+                            .find(|s| s.id == spark_id)
+                            .and_then(|s| s.intent().problem_statement)
+                            .unwrap_or_default();
+                        ws.problem_edit = Some(
+                            screen::spark_detail::ProblemEditState::new(
+                                spark_id, &current,
+                            ),
+                        );
+                    }
+                    screen::spark_detail::Message::ProblemAction(action) => {
+                        if let Some(ws) = self.workshops.get_mut(idx)
+                            && let Some(edit) = ws.problem_edit.as_mut()
+                        {
+                            edit.content.perform(action);
+                        }
+                    }
+                    screen::spark_detail::Message::CancelProblem => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.problem_edit = None;
+                        }
+                    }
+                    screen::spark_detail::Message::CommitProblem => {
+                        let ws = &mut self.workshops[idx];
+                        let Some(edit) = ws.problem_edit.take() else {
+                            return Task::none();
+                        };
+                        // Normalize: text_editor::Content::text() appends a
+                        // trailing newline for non-empty content. Strip a
+                        // single trailing \n so a user typing "hello"
+                        // doesn't get "hello\n" persisted, which would
+                        // re-dirty the editor on every open.
+                        let mut new_value = edit.content.text();
+                        if new_value.ends_with('\n') {
+                            new_value.pop();
+                        }
+                        if new_value == edit.original {
+                            // No-op commit (e.g. clicked outside without
+                            // typing) — silently drop the editor.
+                            return Task::none();
+                        }
+                        let workshop_id = ws.id;
+                        let spark_id = edit.spark_id.clone();
+                        return Task::done(Message::SparkUpdate {
+                            workshop_id,
+                            id: spark_id,
+                            patch: SparkPatch {
+                                problem_statement: Some(new_value),
+                                ..Default::default()
+                            },
+                        });
+                    }
                     screen::spark_detail::Message::CycleStatus(spark_id, new_status) => {
                         if let Some(ws) = self.workshops.get(idx)
                             && let Some(ref pool) = ws.sparks_db
@@ -3909,7 +3976,18 @@ impl App {
                         ToastKind::Error,
                     );
                 };
-                let upd = patch.to_update_spark();
+                let mut upd = patch.to_update_spark();
+                // `problem_statement` lives in metadata JSON — it can't be
+                // represented in `to_update_spark`'s stateless translation
+                // because merging requires the spark's existing metadata.
+                // apply_spark_patch has already mutated ws.sparks[idx].metadata
+                // to the post-merge value, so read it back here and ship the
+                // whole blob to the DB (spark ryve-a5997352).
+                if patch.problem_statement.is_some()
+                    && let Some(s) = ws.sparks.iter().find(|s| s.id == id)
+                {
+                    upd.metadata = Some(s.metadata.clone());
+                }
                 let id_for_task = id.clone();
                 Task::perform(
                     async move {
@@ -5705,6 +5783,7 @@ impl App {
                     ws.description_editor.as_ref(),
                     description_draft,
                     ws.pending_nav_prompt.as_ref(),
+                    ws.problem_edit.as_ref(),
                     &pal,
                     has_bg,
                 )

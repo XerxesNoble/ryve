@@ -139,6 +139,29 @@ impl SparkEdit {
     }
 }
 
+/// Inline-edit state for the `problem_statement` multi-line field. Lives
+/// on [`crate::workshop::Workshop`] because iced's [`text_editor::Content`]
+/// is stateful (cursor, selection) and must outlive a single view frame.
+///
+/// `original` is the snapshot taken when editing began; Escape reverts to
+/// it. The spark_id binds this editor to a specific cached spark so a
+/// selection change immediately discards the editor. Spark ryve-a5997352.
+pub struct ProblemEditState {
+    pub spark_id: String,
+    pub content: text_editor::Content,
+    pub original: String,
+}
+
+impl ProblemEditState {
+    pub fn new(spark_id: impl Into<String>, initial: &str) -> Self {
+        Self {
+            spark_id: spark_id.into(),
+            content: text_editor::Content::with_text(initial),
+            original: initial.to_string(),
+        }
+    }
+}
+
 use crate::screen::delegation_trace::DelegationTrace;
 use crate::screen::intent_list_editor::{self, IntentListDrafts};
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_LABEL, FONT_SMALL, Palette};
@@ -844,6 +867,20 @@ pub enum Message {
     /// User dismissed the unsaved-changes dialog with "Cancel" — stay
     /// on the current spark, keep the draft intact.
     NavPromptCancel,
+
+    /// Begin inline-editing the problem statement for `spark_id`.
+    /// Initializes a fresh `ProblemEditState` seeded from the spark's
+    /// current value. Spark ryve-a5997352.
+    BeginEditProblem(String),
+    /// Forwarded `text_editor::Action` from the active problem editor.
+    ProblemAction(text_editor::Action),
+    /// Save the current editor buffer via `SparkUpdate`. Fired by blur
+    /// (clicks outside the editor) and by the key binding on no-op
+    /// paths. Idempotent: does nothing when no editor is active.
+    CommitProblem,
+    /// Discard the editor and revert to the pre-edit snapshot. Fired by
+    /// Escape via the editor key binding.
+    CancelProblem,
 }
 
 // ── Dropdown option lists ────────────────────────────
@@ -889,21 +926,19 @@ pub fn view<'a>(
     edit_session: &'a SparkEditSession,
     spark_edit: Option<&'a SparkEdit>,
     assignee_edit: &'a AssigneeEditState,
-    // `description_editor`: live `text_editor::Content` when editing
-    // the description inline, `None` otherwise. Owned on the workshop
-    // — see `Workshop::description_editor`. Spark ryve-4742d98b.
     description_editor: Option<&'a text_editor::Content>,
-    // `description_draft`: current draft value (from `SparkEdit::drafts`),
-    // if any. Used to decide whether to show the "unsaved changes" pill
-    // without walking the editor content on every frame.
     description_draft: Option<&'a str>,
-    // `nav_prompt`: pending unsaved-changes prompt raised by a deferred
-    // navigation — when `Some` the view overlays a save/discard/cancel
-    // dialog. Spark ryve-4742d98b.
     nav_prompt: Option<&'a crate::workshop::PendingNavPrompt>,
+    problem_edit: Option<&'a ProblemEditState>,
     pal: &Palette,
     has_bg: bool,
 ) -> Element<'a, Message> {
+    // Does an active problem editor apply to the currently displayed spark?
+    // Keeping this binding local means the view can ignore a stale editor
+    // (e.g. selection change mid-flight) without panicking on a mismatched
+    // spark_id.
+    let active_problem_edit =
+        problem_edit.filter(|e| e.spark_id == spark.id);
     let pal = *pal;
 
     // Back button + header row
@@ -1002,19 +1037,17 @@ pub fn view<'a>(
     // owned strings to avoid lifetime issues with the view tree.
     let intent = spark.intent();
 
-    if let Some(problem) = intent.problem_statement
-        && !problem.is_empty()
-    {
-        body = body.push(
-            column![
-                text("Problem Statement")
-                    .size(FONT_LABEL)
-                    .color(pal.text_tertiary),
-                text(problem).size(FONT_BODY).color(pal.text_primary),
-            ]
-            .spacing(4),
-        );
-    }
+    // Problem Statement section. Always rendered so the user has an
+    // affordance to *add* a problem statement when none exists — empty
+    // is allowed (ryve-a5997352). Clicking it begins inline edit; while
+    // editing, it renders as a multi-line text_editor with blur-to-save /
+    // Escape-revert.
+    body = body.push(view_problem_statement_section(
+        spark,
+        intent.problem_statement.clone().unwrap_or_default(),
+        active_problem_edit,
+        &pal,
+    ));
 
     // Invariants + non-goals render through the shared row-list widget
     // in `intent_list_editor`. The drafts are kept on the Workshop and
@@ -1105,15 +1138,23 @@ pub fn view<'a>(
 
     body = body.push(meta);
 
-    let content = column![
-        header,
-        title_row,
-        badges,
-        sep,
-        scrollable(body).height(Length::Fill),
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill);
+    // When the problem editor is active, clicking anywhere on inert
+    // content (text, labels, whitespace) blurs the editor and commits
+    // the current buffer. Interactive children (the text_editor itself,
+    // buttons) capture events in their own update paths so mouse_area's
+    // on_press does not fire for them — see iced_widget mouse_area:
+    // `if shell.is_event_captured() { return; }`. This gives us the
+    // spark's required "blur-to-save" behavior without a modal overlay.
+    let scrollable_body: Element<'_, Message> = if active_problem_edit.is_some() {
+        mouse_area(scrollable(body).height(Length::Fill))
+            .on_press(Message::CommitProblem)
+            .into()
+    } else {
+        scrollable(body).height(Length::Fill).into()
+    };
+    let content = column![header, title_row, badges, sep, scrollable_body,]
+        .width(Length::Fill)
+        .height(Length::Fill);
 
     // Blur-wrapping: if a field is being edited inline, wrap the panel
     // in a mouse_area so clicks outside the widget commit the draft.
@@ -1532,6 +1573,65 @@ fn view_nav_prompt_dialog<'a>(
     )
     .on_press(Message::NavPromptCancel)
     .into()
+}
+
+// ── Problem Statement section (ryve-a5997352) ────────
+
+fn view_problem_statement_section<'a>(
+    spark: &'a Spark,
+    current: String,
+    edit: Option<&'a ProblemEditState>,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+    let label = text("Problem Statement")
+        .size(FONT_LABEL)
+        .color(pal.text_tertiary);
+
+    if let Some(state) = edit {
+        // Multi-line editable view. Enter inserts a newline (default
+        // text_editor binding); Escape triggers Message::CancelProblem
+        // to revert. Blur-to-save is driven by the mouse_area wrapper
+        // around the scrollable body in `view()`.
+        let editor = text_editor(&state.content)
+            .placeholder("Why does this spark exist?")
+            .on_action(Message::ProblemAction)
+            .padding(8)
+            .key_binding(problem_editor_key_binding);
+        let hint = text("Click outside to save  ·  Esc to revert")
+            .size(FONT_SMALL)
+            .color(pal.text_tertiary);
+        return column![label, editor, hint].spacing(4).into();
+    }
+
+    // Read-only, click-to-edit affordance. An empty problem statement
+    // still renders a clickable placeholder so the user can add one.
+    let display_text = current;
+    let display = if display_text.is_empty() {
+        text("(click to add a problem statement)")
+            .size(FONT_BODY)
+            .color(pal.text_tertiary)
+    } else {
+        text(display_text).size(FONT_BODY).color(pal.text_primary)
+    };
+    let clickable = button(column![label, display].spacing(4))
+        .style(button::text)
+        .padding(0)
+        .on_press(Message::BeginEditProblem(spark.id.clone()));
+    clickable.into()
+}
+
+/// Escape → cancel (revert); everything else falls through to the
+/// default iced text_editor bindings (Enter inserts newline, etc.).
+fn problem_editor_key_binding(
+    kp: text_editor::KeyPress,
+) -> Option<text_editor::Binding<Message>> {
+    use iced::keyboard::Key;
+    use iced::keyboard::key::Named;
+    if matches!(kp.key, Key::Named(Named::Escape)) {
+        return Some(text_editor::Binding::Custom(Message::CancelProblem));
+    }
+    text_editor::Binding::from_key_press(kp)
 }
 
 // ── Bonds section ────────────────────────────────────
@@ -2818,5 +2918,82 @@ mod tests {
         assert_eq!(pass_icon, "\u{25CF}");
         assert_eq!(fail_icon, "\u{25CF}");
         assert_eq!(pending_icon, "\u{25CB}");
+    }
+
+    // ── Problem statement editor (ryve-a5997352) ─────────
+
+    #[test]
+    fn problem_edit_state_seeds_content_and_original() {
+        let state = ProblemEditState::new("sp-1", "existing problem");
+        assert_eq!(state.spark_id, "sp-1");
+        assert_eq!(state.original, "existing problem");
+        // text_editor::Content::text() appends a trailing newline for
+        // non-empty content; strip it for comparison.
+        let content = state.content.text();
+        let normalized = content.strip_suffix('\n').unwrap_or(&content);
+        assert_eq!(normalized, "existing problem");
+    }
+
+    #[test]
+    fn problem_edit_state_handles_empty_initial() {
+        // Empty problem_statement is allowed (acceptance criterion).
+        let state = ProblemEditState::new("sp-1", "");
+        assert!(state.original.is_empty());
+        assert!(state.content.text().is_empty() || state.content.text() == "\n");
+    }
+
+    #[test]
+    fn problem_edit_state_preserves_newlines_in_buffer() {
+        // Newlines in the seed must round-trip so multi-line editing
+        // doesn't lose data on first render.
+        let state = ProblemEditState::new("sp-1", "line1\nline2\nline3");
+        let text = state.content.text();
+        let normalized = text.strip_suffix('\n').unwrap_or(&text);
+        assert_eq!(normalized, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn problem_editor_key_binding_escape_cancels() {
+        use iced::keyboard;
+        use iced::keyboard::key::{Named, Physical};
+        use iced::widget::text_editor::{KeyPress, Status};
+        let kp = KeyPress {
+            key: keyboard::Key::Named(Named::Escape),
+            modified_key: keyboard::Key::Named(Named::Escape),
+            physical_key: Physical::Code(keyboard::key::Code::Escape),
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        };
+        let binding = problem_editor_key_binding(kp);
+        match binding {
+            Some(text_editor::Binding::Custom(Message::CancelProblem)) => {}
+            other => panic!("expected CancelProblem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn problem_editor_key_binding_other_keys_pass_through() {
+        // Pressing a normal key (e.g. 'a') should fall through to the
+        // default binding so typing still works.
+        use iced::keyboard;
+        use iced::keyboard::key::{Code, Physical};
+        use iced::widget::text_editor::{KeyPress, Status};
+        let kp = KeyPress {
+            key: keyboard::Key::Character("a".into()),
+            modified_key: keyboard::Key::Character("a".into()),
+            physical_key: Physical::Code(Code::KeyA),
+            modifiers: keyboard::Modifiers::default(),
+            text: Some("a".into()),
+            status: Status::Focused { is_hovered: false },
+        };
+        let binding = problem_editor_key_binding(kp);
+        // Should NOT be CancelProblem; anything else (including None) is fine.
+        match binding {
+            Some(text_editor::Binding::Custom(Message::CancelProblem)) => {
+                panic!("escape binding should not fire for 'a'")
+            }
+            _ => {}
+        }
     }
 }
