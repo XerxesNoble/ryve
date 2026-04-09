@@ -8,6 +8,7 @@ before closing the spark with `ryve-cli spark close <id>`.
 - [ ] Code compiles cleanly (no new warnings introduced)
 - [ ] No `todo!()`, `unimplemented!()`, or stub functions left behind
 - [ ] No debug prints, `dbg!`, or commented-out code
+- [ ] No `#[allow(...)]` attributes added to suppress clippy or compiler warnings — fix the code instead
 
 ## Tests
 - [ ] New behavior has at least one test (unit or integration)
