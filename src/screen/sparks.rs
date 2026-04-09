@@ -67,6 +67,63 @@ impl CreateForm {
     }
 }
 
+// ── Default sort ─────────────────────────────────────
+
+/// Canonical ordering of `spark_type` values for the default sort. Any
+/// value not in this list sorts after every listed type but stably
+/// relative to other unknown types (via the string tiebreaker).
+const SPARK_TYPE_ORDER: &[&str] = &[
+    "epic",
+    "bug",
+    "feature",
+    "task",
+    "spike",
+    "chore",
+    "milestone",
+];
+
+/// Canonical ordering of `status` values for the default sort. Same
+/// "unknown sinks to the end" rule as [`SPARK_TYPE_ORDER`].
+const STATUS_ORDER: &[&str] = &[
+    "in_progress",
+    "blocked",
+    "open",
+    "deferred",
+    "completed",
+    "closed",
+];
+
+fn spark_type_rank(ty: &str) -> usize {
+    SPARK_TYPE_ORDER
+        .iter()
+        .position(|t| *t == ty)
+        .unwrap_or(SPARK_TYPE_ORDER.len())
+}
+
+fn status_rank(status: &str) -> usize {
+    STATUS_ORDER
+        .iter()
+        .position(|s| *s == status)
+        .unwrap_or(STATUS_ORDER.len())
+}
+
+/// Pure function: return `sparks` ordered by priority ASC, then by
+/// `spark_type` (fixed order), then `status` (fixed order), then `id`
+/// ASC as a deterministic tiebreaker. The input slice is not mutated.
+///
+/// Two consecutive calls with identical input produce identical output.
+pub fn default_sort(sparks: &[Spark]) -> Vec<&Spark> {
+    let mut sorted: Vec<&Spark> = sparks.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| spark_type_rank(&a.spark_type).cmp(&spark_type_rank(&b.spark_type)))
+            .then_with(|| status_rank(&a.status).cmp(&status_rank(&b.status)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    sorted
+}
+
 // ── Status menu ──────────────────────────────────────
 
 /// Inline status popover state. Tracks which spark (if any) currently
@@ -186,7 +243,10 @@ pub fn view<'a>(
                 .color(pal.text_tertiary),
         );
     } else {
-        for spark in sparks {
+        // Apply the default (priority, type, status, id) sort before
+        // rendering so users can scan for high-priority work. Done in
+        // the UI layer so filters and grouping compose with it later.
+        for spark in default_sort(sparks) {
             let is_blocked = blocked_ids.contains(&spark.id);
             list = list.push(view_spark_row(spark, is_blocked, &pal, status_menu));
         }
@@ -538,6 +598,118 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_spark(id: &str, priority: i32, spark_type: &str, status: &str) -> Spark {
+        Spark {
+            id: id.to_string(),
+            title: String::new(),
+            description: String::new(),
+            status: status.to_string(),
+            priority,
+            spark_type: spark_type.to_string(),
+            assignee: None,
+            owner: None,
+            parent_id: None,
+            workshop_id: String::new(),
+            estimated_minutes: None,
+            github_issue_number: None,
+            github_repo: None,
+            metadata: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            closed_at: None,
+            closed_reason: None,
+            due_at: None,
+            defer_until: None,
+            risk_level: None,
+            scope_boundary: None,
+        }
+    }
+
+    #[test]
+    fn default_sort_orders_by_priority_then_type_then_status_then_id() {
+        // Fixture mixes priorities, types, and statuses. Insertion order
+        // deliberately scrambles every sort key so a stable sort alone
+        // would not produce the expected output.
+        let sparks = vec![
+            mk_spark("sp-e", 2, "task", "open"),
+            mk_spark("sp-a", 0, "bug", "in_progress"),
+            mk_spark("sp-b", 0, "epic", "open"),
+            mk_spark("sp-d", 1, "feature", "blocked"),
+            mk_spark("sp-c", 0, "bug", "in_progress"),
+            mk_spark("sp-f", 2, "task", "open"),
+            mk_spark("sp-g", 0, "bug", "blocked"),
+            mk_spark("sp-h", 1, "feature", "open"),
+        ];
+
+        let sorted = default_sort(&sparks);
+        let ids: Vec<&str> = sorted.iter().map(|s| s.id.as_str()).collect();
+
+        // Expected:
+        // P0 epic open            -> sp-b
+        // P0 bug in_progress      -> sp-a, sp-c (by id)
+        // P0 bug blocked          -> sp-g
+        // P1 feature blocked      -> sp-d
+        // P1 feature open         -> sp-h
+        // P2 task open            -> sp-e, sp-f (by id)
+        assert_eq!(
+            ids,
+            vec!["sp-b", "sp-a", "sp-c", "sp-g", "sp-d", "sp-h", "sp-e", "sp-f"]
+        );
+    }
+
+    #[test]
+    fn default_sort_is_deterministic_across_calls() {
+        let sparks = vec![
+            mk_spark("sp-2", 1, "task", "open"),
+            mk_spark("sp-1", 1, "task", "open"),
+            mk_spark("sp-3", 0, "bug", "blocked"),
+        ];
+        let a: Vec<&str> = default_sort(&sparks).iter().map(|s| s.id.as_str()).collect();
+        let b: Vec<&str> = default_sort(&sparks).iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn default_sort_type_order_is_fixed() {
+        let sparks = vec![
+            mk_spark("a", 0, "milestone", "open"),
+            mk_spark("b", 0, "chore", "open"),
+            mk_spark("c", 0, "spike", "open"),
+            mk_spark("d", 0, "task", "open"),
+            mk_spark("e", 0, "feature", "open"),
+            mk_spark("f", 0, "bug", "open"),
+            mk_spark("g", 0, "epic", "open"),
+        ];
+        let ids: Vec<&str> = default_sort(&sparks).iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["g", "f", "e", "d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn default_sort_status_order_is_fixed() {
+        let sparks = vec![
+            mk_spark("a", 0, "task", "closed"),
+            mk_spark("b", 0, "task", "completed"),
+            mk_spark("c", 0, "task", "deferred"),
+            mk_spark("d", 0, "task", "open"),
+            mk_spark("e", 0, "task", "blocked"),
+            mk_spark("f", 0, "task", "in_progress"),
+        ];
+        let ids: Vec<&str> = default_sort(&sparks).iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["f", "e", "d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn default_sort_unknown_type_and_status_sink_to_end() {
+        let sparks = vec![
+            mk_spark("a", 0, "zzz", "open"),
+            mk_spark("b", 0, "task", "open"),
+            mk_spark("c", 0, "task", "zzz"),
+        ];
+        let ids: Vec<&str> = default_sort(&sparks).iter().map(|s| s.id.as_str()).collect();
+        // Known type before unknown; within task, known status before unknown.
+        assert_eq!(ids, vec!["b", "c", "a"]);
+    }
 
     #[test]
     fn status_menu_dismiss_clears_state() {
