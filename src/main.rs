@@ -2223,6 +2223,145 @@ impl App {
                             },
                         );
                     }
+                    screen::spark_detail::Message::SetPriority(spark_id, label) => {
+                        // Parse the label back into the integer the data
+                        // layer stores. Anything outside P0..P4 is rejected
+                        // with a toast — that should be impossible from the
+                        // pick_list, but we're at a trust boundary.
+                        let Some(new_priority) =
+                            screen::spark_detail::parse_priority_label(&label)
+                        else {
+                            return self.push_toast(
+                                "Invalid priority",
+                                format!("'{label}' is not a valid priority"),
+                                ToastKind::Error,
+                            );
+                        };
+                        let Some(ws) = self.workshops.get_mut(idx) else {
+                            return Task::none();
+                        };
+                        // No-op if the value didn't actually change. Avoids
+                        // a pointless write/event.
+                        if ws
+                            .sparks
+                            .iter()
+                            .find(|s| s.id == spark_id)
+                            .is_some_and(|s| s.priority == new_priority)
+                        {
+                            return Task::none();
+                        }
+                        // Optimistic local update so the dropdown reflects
+                        // the choice immediately even before the DB ack.
+                        if let Some(s) = ws.sparks.iter_mut().find(|s| s.id == spark_id) {
+                            s.priority = new_priority;
+                        }
+                        let Some(ref pool) = ws.sparks_db else {
+                            return Task::none();
+                        };
+                        let pool = pool.clone();
+                        let ws_id = ws.workshop_id();
+                        let id = ws.id;
+                        return Task::perform(
+                            async move {
+                                let upd = data::sparks::types::UpdateSpark {
+                                    priority: Some(new_priority),
+                                    ..Default::default()
+                                };
+                                let _ = data::sparks::spark_repo::update(
+                                    &pool, &spark_id, upd, "user",
+                                )
+                                .await;
+                                load_sparks(pool, ws_id).await
+                            },
+                            move |sparks| Message::SparksLoaded(id, sparks),
+                        );
+                    }
+                    screen::spark_detail::Message::SetType(spark_id, new_type_label) => {
+                        // Translate label → enum, rejecting unknown values.
+                        let new_type = match new_type_label.as_str() {
+                            "bug" => data::sparks::types::SparkType::Bug,
+                            "feature" => data::sparks::types::SparkType::Feature,
+                            "task" => data::sparks::types::SparkType::Task,
+                            "epic" => data::sparks::types::SparkType::Epic,
+                            "chore" => data::sparks::types::SparkType::Chore,
+                            "spike" => data::sparks::types::SparkType::Spike,
+                            "milestone" => data::sparks::types::SparkType::Milestone,
+                            _ => {
+                                return self.push_toast(
+                                    "Invalid type",
+                                    format!("'{new_type_label}' is not a valid spark type"),
+                                    ToastKind::Error,
+                                );
+                            }
+                        };
+                        let Some(ws) = self.workshops.get_mut(idx) else {
+                            return Task::none();
+                        };
+                        // Snapshot the current type and check the
+                        // no-orphan invariant before mutating anything.
+                        let Some(current) = ws.sparks.iter().find(|s| s.id == spark_id) else {
+                            return Task::none();
+                        };
+                        if current.spark_type == new_type_label {
+                            return Task::none();
+                        }
+                        let was_epic = current.spark_type == "epic";
+                        let becoming_non_epic = new_type_label != "epic";
+                        if was_epic && becoming_non_epic {
+                            // Demoting an epic: refuse if it has any
+                            // children, since they'd be orphaned (their
+                            // parent would no longer be an epic).
+                            let child_count = ws
+                                .sparks
+                                .iter()
+                                .filter(|s| s.parent_id.as_deref() == Some(spark_id.as_str()))
+                                .count();
+                            if child_count > 0 {
+                                return self.push_toast(
+                                    "Type change rejected",
+                                    format!(
+                                        "Cannot demote epic to {new_type_label}: {child_count} child spark(s) would be orphaned"
+                                    ),
+                                    ToastKind::Error,
+                                );
+                            }
+                            // The spark itself would also become an
+                            // orphan if it has no parent. Block that.
+                            if current.parent_id.is_none() {
+                                return self.push_toast(
+                                    "Type change rejected",
+                                    format!(
+                                        "Cannot demote epic to {new_type_label}: spark has no parent"
+                                    ),
+                                    ToastKind::Error,
+                                );
+                            }
+                        }
+                        // Optimistic local update.
+                        if let Some(s) = ws.sparks.iter_mut().find(|s| s.id == spark_id) {
+                            s.spark_type = new_type_label.clone();
+                        }
+                        let Some(ref pool) = ws.sparks_db else {
+                            return Task::none();
+                        };
+                        let pool = pool.clone();
+                        let ws_id = ws.workshop_id();
+                        let id = ws.id;
+                        return Task::perform(
+                            async move {
+                                let upd = data::sparks::types::UpdateSpark {
+                                    spark_type: Some(new_type),
+                                    ..Default::default()
+                                };
+                                let _ = data::sparks::spark_repo::update(
+                                    &pool, &spark_id, upd, "user",
+                                )
+                                .await;
+                                load_sparks(pool, ws_id).await
+                            },
+                            move |sparks| Message::SparksLoaded(id, sparks),
+                        );
+                    }
                     screen::spark_detail::Message::CycleStatus(spark_id, new_status) => {
                         if let Some(ws) = self.workshops.get(idx)
                             && let Some(ref pool) = ws.sparks_db

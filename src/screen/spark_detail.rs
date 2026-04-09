@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use data::sparks::types::{Bond, Contract, ContractEnforcement, ContractKind, Spark};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, pick_list, row, scrollable, text, text_input};
 use iced::{Element, Length, Theme};
 
 // ── Inline edit state ────────────────────────────────
@@ -232,6 +232,39 @@ pub enum Message {
         spark_id: String,
         contract_id: i64,
     },
+    /// Set priority via dropdown — writes immediately. Carries the
+    /// label string ("P0".."P4") so the view can stay String-typed.
+    SetPriority(String, String),
+    /// Set spark_type via dropdown — writes immediately.
+    SetType(String, String),
+}
+
+// ── Dropdown option lists ────────────────────────────
+
+/// Priority labels rendered in the priority pick_list. Index in this
+/// slice equals the underlying integer priority (P0 → 0).
+pub const PRIORITY_OPTIONS: [&str; 5] = ["P0", "P1", "P2", "P3", "P4"];
+
+/// All spark_type values the dropdown surfaces. Order is intentional:
+/// most-frequently-used first.
+pub const TYPE_OPTIONS: [&str; 7] = [
+    "task",
+    "bug",
+    "feature",
+    "epic",
+    "spike",
+    "chore",
+    "milestone",
+];
+
+/// Parse a priority label like "P3" back into the integer the data
+/// layer stores. Returns `None` for anything outside P0..P4 so the
+/// caller can refuse to write a malformed value.
+pub fn parse_priority_label(label: &str) -> Option<i32> {
+    PRIORITY_OPTIONS
+        .iter()
+        .position(|p| *p == label)
+        .map(|i| i as i32)
 }
 
 // ── View ─────────────────────────────────────────────
@@ -292,22 +325,32 @@ pub fn view<'a>(
     .padding([3, 8])
     .on_press(Message::CycleStatus(spark.id.clone(), next.to_string()));
 
-    let priority_color = priority_color(spark.priority, &pal);
-    let priority_pill = container(
-        text(format!("P{}", spark.priority))
-            .size(FONT_LABEL)
-            .color(priority_color),
+    // Priority dropdown — pick_list seeded with the persisted value so
+    // it renders correctly on first paint and after every reload.
+    let priority_spark_id = spark.id.clone();
+    let priority_options: Vec<String> = PRIORITY_OPTIONS.iter().map(|s| (*s).to_string()).collect();
+    let priority_selected = Some(format!("P{}", spark.priority));
+    let priority_dropdown = pick_list(
+        priority_options,
+        priority_selected,
+        move |label: String| Message::SetPriority(priority_spark_id.clone(), label),
     )
-    .padding([3, 8]);
+    .text_size(FONT_LABEL)
+    .padding([2, 6]);
 
-    let type_pill = container(
-        text(&spark.spark_type)
-            .size(FONT_LABEL)
-            .color(pal.text_secondary),
+    // Type dropdown — same shape, seeded with the persisted spark_type.
+    let type_spark_id = spark.id.clone();
+    let type_options: Vec<String> = TYPE_OPTIONS.iter().map(|s| (*s).to_string()).collect();
+    let type_selected = Some(spark.spark_type.clone());
+    let type_dropdown = pick_list(
+        type_options,
+        type_selected,
+        move |label: String| Message::SetType(type_spark_id.clone(), label),
     )
-    .padding([3, 8]);
+    .text_size(FONT_LABEL)
+    .padding([2, 6]);
 
-    let badges = row![status_pill, priority_pill, type_pill]
+    let badges = row![status_pill, priority_dropdown, type_dropdown]
         .spacing(6)
         .padding([4, 10])
         .align_y(iced::Alignment::Center);
@@ -919,22 +962,6 @@ fn format_status(status: &str) -> &'static str {
     }
 }
 
-fn priority_color(priority: i32, pal: &Palette) -> iced::Color {
-    match priority {
-        0 => pal.danger, // P0 — critical
-        1 => iced::Color {
-            // P1 — orange-ish
-            r: 1.0,
-            g: 0.6,
-            b: 0.0,
-            a: 1.0,
-        },
-        2 => pal.accent,         // P2 — normal
-        3 => pal.text_secondary, // P3 — low
-        _ => pal.text_tertiary,  // P4+ — minimal
-    }
-}
-
 /// Cycle: open -> in_progress -> closed -> open
 fn next_status_str(current: &str) -> &'static str {
     match current {
@@ -968,6 +995,113 @@ mod tests {
             toggle_enforcement(toggle_enforcement(e)),
             ContractEnforcement::Required
         );
+    }
+
+    #[test]
+    fn parse_priority_label_round_trips_p0_through_p4() {
+        // Every label rendered by the dropdown must round-trip back to
+        // the integer the data layer stores. If this regresses, the
+        // dropdown will silently write the wrong priority.
+        for (i, label) in PRIORITY_OPTIONS.iter().enumerate() {
+            assert_eq!(parse_priority_label(label), Some(i as i32));
+        }
+    }
+
+    #[test]
+    fn parse_priority_label_rejects_garbage() {
+        assert_eq!(parse_priority_label("P5"), None);
+        assert_eq!(parse_priority_label("p0"), None);
+        assert_eq!(parse_priority_label(""), None);
+        assert_eq!(parse_priority_label("normal"), None);
+    }
+
+    #[test]
+    fn type_options_cover_every_spark_type() {
+        // The dropdown must offer every value the data layer accepts.
+        // Drift here would let users edit a spark and lose access to a
+        // valid type.
+        for expected in [
+            "task",
+            "bug",
+            "feature",
+            "epic",
+            "spike",
+            "chore",
+            "milestone",
+        ] {
+            assert!(
+                TYPE_OPTIONS.contains(&expected),
+                "TYPE_OPTIONS missing {expected}"
+            );
+        }
+        assert_eq!(TYPE_OPTIONS.len(), 7);
+    }
+
+    /// Mirror of the no-orphan check in main.rs::SparkDetail::SetType.
+    /// Kept here as pure data so the rule can be unit-tested without
+    /// pulling in the whole iced runtime.
+    fn would_orphan_on_demote(
+        spark: &Spark,
+        new_type: &str,
+        all_sparks: &[Spark],
+    ) -> Option<&'static str> {
+        if spark.spark_type != "epic" || new_type == "epic" {
+            return None;
+        }
+        let has_children = all_sparks
+            .iter()
+            .any(|s| s.parent_id.as_deref() == Some(spark.id.as_str()));
+        if has_children {
+            return Some("would orphan children");
+        }
+        if spark.parent_id.is_none() {
+            return Some("would orphan self");
+        }
+        None
+    }
+
+    #[test]
+    fn demote_epic_with_children_is_rejected() {
+        let mut epic = make_spark("sp-epic", "open");
+        epic.spark_type = "epic".to_string();
+        epic.parent_id = Some("sp-root".to_string());
+        let mut child = make_spark("sp-child", "open");
+        child.parent_id = Some("sp-epic".to_string());
+        let all = vec![epic.clone(), child];
+        assert_eq!(
+            would_orphan_on_demote(&epic, "task", &all),
+            Some("would orphan children")
+        );
+    }
+
+    #[test]
+    fn demote_childless_rooted_epic_is_allowed() {
+        let mut epic = make_spark("sp-epic", "open");
+        epic.spark_type = "epic".to_string();
+        epic.parent_id = Some("sp-root".to_string());
+        let all = vec![epic.clone()];
+        assert_eq!(would_orphan_on_demote(&epic, "task", &all), None);
+    }
+
+    #[test]
+    fn demote_childless_unparented_epic_is_rejected() {
+        let mut epic = make_spark("sp-epic", "open");
+        epic.spark_type = "epic".to_string();
+        epic.parent_id = None;
+        let all = vec![epic.clone()];
+        assert_eq!(
+            would_orphan_on_demote(&epic, "task", &all),
+            Some("would orphan self")
+        );
+    }
+
+    #[test]
+    fn promote_to_epic_is_always_allowed_by_orphan_check() {
+        let mut task = make_spark("sp-t", "open");
+        task.spark_type = "task".to_string();
+        task.parent_id = None;
+        let all = vec![task.clone()];
+        assert_eq!(would_orphan_on_demote(&task, "epic", &all), None);
     }
 
     #[test]
