@@ -103,6 +103,16 @@ Workgraph syncs bidirectionally with GitHub Issues via `octocrab`:
 | **Watch** | Cyclic monitoring pattern | Parallel |
 | **Chain** | Sequential pipeline | Sequential |
 
+## Concurrent writes
+
+`.ryve/sparks.db` is written to by many independent processes (GUI, CLI
+invocations, Hand subprocesses) at once. The full write-discipline policy
+— WAL mode, 5 s busy timeout, `with_busy_retry` defensive wrapper, and
+the single-entry-point rule — is documented in
+[`docs/WRITE_DISCIPLINE.md`](WRITE_DISCIPLINE.md). Stress coverage lives
+in `data/tests/concurrency_stress.rs` (in-process) and
+`tests/concurrent_cli_writers.rs` (multi-process, ≥8 real CLI writers).
+
 ## Sidecars must never be tracked
 
 `.ryve/sparks.db` is a SQLite database running in WAL mode. At any moment
