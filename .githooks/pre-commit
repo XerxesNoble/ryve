@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Ryve pre-commit hook.
+#
+# Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# Refuses commits that would stage sparks.db or any of its SQLite sidecars.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+exec "$repo_root/scripts/check-sparks-db-not-tracked.sh" --staged

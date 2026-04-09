@@ -10,6 +10,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  workgraph-hygiene:
+    name: Workgraph hygiene (no tracked sparks.db)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse tracked sparks.db / sidecars
+        run: ./scripts/check-sparks-db-not-tracked.sh
+
   check:
     name: Check
     runs-on: ubuntu-latest
