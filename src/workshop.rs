@@ -64,6 +64,97 @@ pub enum PendingTerminalKind {
     CustomAgent(AgentDef),
 }
 
+/// A set of field edits to apply to a [`Spark`]. Each `Some` field is a
+/// write; `None` means "leave alone". Produced by the detail view (and
+/// anything else that edits a spark), then handed to
+/// `Message::SparkUpdate` for optimistic apply + durable persist.
+///
+/// Spark ryve-90174007: every editable field goes through this single
+/// patch type so the UI can apply the write optimistically to
+/// `Workshop::sparks` and, on async failure, restore the prior values
+/// from a symmetric patch (see [`Workshop::apply_spark_patch`]).
+///
+/// Field types mirror the cached [`Spark`] representation — strings for
+/// status / spark_type / risk_level — so patches can round-trip through
+/// the cache without an enum re-parse on every apply. The async handler
+/// converts to `data::sparks::types::UpdateSpark` at the DB boundary via
+/// [`SparkPatch::to_update_spark`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SparkPatch {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub priority: Option<i32>,
+    pub spark_type: Option<String>,
+    pub assignee: Option<Option<String>>,
+    pub owner: Option<Option<String>>,
+    pub risk_level: Option<Option<String>>,
+    pub scope_boundary: Option<Option<String>>,
+}
+
+impl SparkPatch {
+    /// Returns true when no fields are set — nothing to write.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.description.is_none()
+            && self.status.is_none()
+            && self.priority.is_none()
+            && self.spark_type.is_none()
+            && self.assignee.is_none()
+            && self.owner.is_none()
+            && self.risk_level.is_none()
+            && self.scope_boundary.is_none()
+    }
+
+    /// Convert the patch into a `data::sparks::types::UpdateSpark` suitable
+    /// for `spark_repo::update`. Unknown enum values (a status string that
+    /// does not match any `SparkStatus`, a spark_type string that does not
+    /// match any `SparkType`, etc.) are dropped rather than persisted — the
+    /// optimistic apply already validated the cache shape, and the DB
+    /// constraint would reject garbage anyway.
+    pub fn to_update_spark(&self) -> data::sparks::types::UpdateSpark {
+        use data::sparks::types::{RiskLevel, SparkStatus, SparkType, UpdateSpark};
+        let spark_type = self.spark_type.as_deref().and_then(|s| match s {
+            "bug" => Some(SparkType::Bug),
+            "feature" => Some(SparkType::Feature),
+            "task" => Some(SparkType::Task),
+            "epic" => Some(SparkType::Epic),
+            "chore" => Some(SparkType::Chore),
+            "spike" => Some(SparkType::Spike),
+            "milestone" => Some(SparkType::Milestone),
+            _ => None,
+        });
+        // risk_level is `Option<Option<String>>`: outer Some means "write this
+        // field", inner None means "clear it". Only the write case needs a
+        // parse; the clear case is passed through unchanged. We can't express
+        // "clear" with the current `UpdateSpark::risk_level` shape
+        // (`Option<RiskLevel>`), so clearing is a no-op here — risk_level is
+        // stored as NOT NULL with a 'normal' default, so clearing is not a
+        // meaningful operation and the UI does not expose it.
+        let risk_level = self.risk_level.as_ref().and_then(|o| {
+            o.as_deref().and_then(|s| match s {
+                "trivial" => Some(RiskLevel::Trivial),
+                "normal" => Some(RiskLevel::Normal),
+                "elevated" => Some(RiskLevel::Elevated),
+                "critical" => Some(RiskLevel::Critical),
+                _ => None,
+            })
+        });
+        UpdateSpark {
+            title: self.title.clone(),
+            description: self.description.clone(),
+            status: self.status.as_deref().and_then(SparkStatus::from_str),
+            priority: self.priority,
+            spark_type,
+            assignee: self.assignee.clone(),
+            owner: self.owner.clone(),
+            risk_level,
+            scope_boundary: self.scope_boundary.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 pub struct Workshop {
     pub id: Uuid,
     pub directory: PathBuf,
@@ -782,6 +873,71 @@ impl Workshop {
 
         found
     }
+
+    /// Apply a [`SparkPatch`] to the cached spark with `id`, returning the
+    /// *prior* values of any field the patch overwrote (as another patch).
+    /// The returned prior-patch, when re-applied via `apply_spark_patch`,
+    /// restores the spark to its pre-edit state — this is how
+    /// `Message::SparkUpdate` rolls back when the async DB write fails.
+    ///
+    /// Returns `None` if no spark with `id` exists in the cache. Fields in
+    /// `patch` that are `None` are left untouched (and absent from the
+    /// returned prior); fields whose new value equals the current value
+    /// are also skipped so the prior-patch only carries real changes.
+    ///
+    /// Spark ryve-90174007.
+    pub fn apply_spark_patch(&mut self, id: &str, patch: &SparkPatch) -> Option<SparkPatch> {
+        let spark = self.sparks.iter_mut().find(|s| s.id == id)?;
+        let mut prior = SparkPatch::default();
+        if let Some(new) = patch.title.as_ref()
+            && *new != spark.title
+        {
+            prior.title = Some(std::mem::replace(&mut spark.title, new.clone()));
+        }
+        if let Some(new) = patch.description.as_ref()
+            && *new != spark.description
+        {
+            prior.description = Some(std::mem::replace(&mut spark.description, new.clone()));
+        }
+        if let Some(new) = patch.status.as_ref()
+            && *new != spark.status
+        {
+            prior.status = Some(std::mem::replace(&mut spark.status, new.clone()));
+        }
+        if let Some(new) = patch.priority
+            && new != spark.priority
+        {
+            prior.priority = Some(spark.priority);
+            spark.priority = new;
+        }
+        if let Some(new) = patch.spark_type.as_ref()
+            && *new != spark.spark_type
+        {
+            prior.spark_type = Some(std::mem::replace(&mut spark.spark_type, new.clone()));
+        }
+        if let Some(new) = patch.assignee.as_ref()
+            && *new != spark.assignee
+        {
+            prior.assignee = Some(std::mem::replace(&mut spark.assignee, new.clone()));
+        }
+        if let Some(new) = patch.owner.as_ref()
+            && *new != spark.owner
+        {
+            prior.owner = Some(std::mem::replace(&mut spark.owner, new.clone()));
+        }
+        if let Some(new) = patch.risk_level.as_ref()
+            && *new != spark.risk_level
+        {
+            prior.risk_level = Some(std::mem::replace(&mut spark.risk_level, new.clone()));
+        }
+        if let Some(new) = patch.scope_boundary.as_ref()
+            && *new != spark.scope_boundary
+        {
+            prior.scope_boundary =
+                Some(std::mem::replace(&mut spark.scope_boundary, new.clone()));
+        }
+        Some(prior)
+    }
 }
 
 fn wrap_command_with_bottom_pin(program: &str, args: &[String]) -> (String, Vec<String>) {
@@ -1183,6 +1339,177 @@ mod tests {
         // (<= 30) so scroll-up history isn't drowned in blank lines.
         const _: () = assert!(BOTTOM_PIN_NEWLINES <= 30);
         const _: () = assert!(BOTTOM_PIN_NEWLINES >= 10);
+    }
+
+    // ── SparkPatch / apply_spark_patch (ryve-90174007) ───────────────────
+    //
+    // These tests exercise the optimistic-write + rollback primitive that
+    // `Message::SparkUpdate` is built on. The invariant under test: applying
+    // a patch then applying the returned prior-patch is an identity
+    // operation on the cached spark.
+
+    fn test_spark(id: &str) -> data::sparks::types::Spark {
+        data::sparks::types::Spark {
+            id: id.to_string(),
+            title: "old title".to_string(),
+            description: "old body".to_string(),
+            status: "open".to_string(),
+            priority: 2,
+            spark_type: "task".to_string(),
+            assignee: None,
+            owner: Some("owner-a".to_string()),
+            parent_id: None,
+            workshop_id: "test-ws".to_string(),
+            estimated_minutes: None,
+            github_issue_number: None,
+            github_repo: None,
+            metadata: "{}".to_string(),
+            created_at: "2026-04-09T00:00:00Z".to_string(),
+            updated_at: "2026-04-09T00:00:00Z".to_string(),
+            closed_at: None,
+            closed_reason: None,
+            due_at: None,
+            defer_until: None,
+            risk_level: Some("normal".to_string()),
+            scope_boundary: Some("src/lib.rs".to_string()),
+        }
+    }
+
+    #[test]
+    fn apply_spark_patch_writes_fields_and_returns_prior() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+
+        let patch = SparkPatch {
+            title: Some("new title".to_string()),
+            priority: Some(0),
+            status: Some("in_progress".to_string()),
+            assignee: Some(Some("alice".to_string())),
+            ..Default::default()
+        };
+
+        let prior = ws
+            .apply_spark_patch("sp-1", &patch)
+            .expect("spark exists");
+
+        // Cache reflects the new values.
+        let spark = &ws.sparks[0];
+        assert_eq!(spark.title, "new title");
+        assert_eq!(spark.priority, 0);
+        assert_eq!(spark.status, "in_progress");
+        assert_eq!(spark.assignee.as_deref(), Some("alice"));
+
+        // Prior-patch carries only the changed fields, with their old values.
+        assert_eq!(prior.title.as_deref(), Some("old title"));
+        assert_eq!(prior.priority, Some(2));
+        assert_eq!(prior.status.as_deref(), Some("open"));
+        assert_eq!(prior.assignee, Some(None));
+        // Untouched fields stay None in the prior-patch.
+        assert!(prior.description.is_none());
+        assert!(prior.spark_type.is_none());
+    }
+
+    #[test]
+    fn apply_spark_patch_then_prior_is_identity() {
+        // Core rollback invariant: patch ∘ prior == no-op. Without this
+        // property `SparkUpdateFailed` can't restore the pre-edit state.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+        let before = ws.sparks[0].clone();
+
+        let patch = SparkPatch {
+            title: Some("edited".to_string()),
+            description: Some("new description".to_string()),
+            priority: Some(4),
+            spark_type: Some("bug".to_string()),
+            assignee: Some(Some("bob".to_string())),
+            owner: Some(None),
+            scope_boundary: Some(Some("src/main.rs".to_string())),
+            risk_level: Some(Some("critical".to_string())),
+            status: Some("blocked".to_string()),
+        };
+        let prior = ws.apply_spark_patch("sp-1", &patch).expect("spark exists");
+        ws.apply_spark_patch("sp-1", &prior).expect("spark exists");
+
+        let after = &ws.sparks[0];
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.description, before.description);
+        assert_eq!(after.priority, before.priority);
+        assert_eq!(after.spark_type, before.spark_type);
+        assert_eq!(after.assignee, before.assignee);
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.scope_boundary, before.scope_boundary);
+        assert_eq!(after.risk_level, before.risk_level);
+        assert_eq!(after.status, before.status);
+    }
+
+    #[test]
+    fn apply_spark_patch_skips_unchanged_fields() {
+        // Fields whose new value equals the current value must not appear
+        // in the prior-patch — otherwise `is_empty` would always be false
+        // and the handler would churn the DB on no-op edits.
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.sparks.push(test_spark("sp-1"));
+
+        let patch = SparkPatch {
+            title: Some("old title".to_string()), // unchanged
+            priority: Some(7),                    // changed
+            ..Default::default()
+        };
+        let prior = ws.apply_spark_patch("sp-1", &patch).expect("spark exists");
+
+        assert!(prior.title.is_none());
+        assert_eq!(prior.priority, Some(2));
+        assert!(!prior.is_empty());
+    }
+
+    #[test]
+    fn apply_spark_patch_returns_none_for_missing_spark() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        let patch = SparkPatch {
+            title: Some("whatever".to_string()),
+            ..Default::default()
+        };
+        assert!(ws.apply_spark_patch("sp-missing", &patch).is_none());
+    }
+
+    #[test]
+    fn spark_patch_to_update_spark_translates_enums() {
+        // Catch typos/drift between SparkPatch's string representation and
+        // the enum variants in `data::sparks::types`.
+        let patch = SparkPatch {
+            title: Some("t".to_string()),
+            status: Some("in_progress".to_string()),
+            spark_type: Some("bug".to_string()),
+            risk_level: Some(Some("elevated".to_string())),
+            ..Default::default()
+        };
+        let upd = patch.to_update_spark();
+        assert_eq!(upd.title.as_deref(), Some("t"));
+        assert!(matches!(
+            upd.status,
+            Some(data::sparks::types::SparkStatus::InProgress)
+        ));
+        assert!(matches!(
+            upd.spark_type,
+            Some(data::sparks::types::SparkType::Bug)
+        ));
+        assert!(matches!(
+            upd.risk_level,
+            Some(data::sparks::types::RiskLevel::Elevated)
+        ));
+    }
+
+    #[test]
+    fn spark_patch_is_empty_detects_no_op() {
+        assert!(SparkPatch::default().is_empty());
+        assert!(
+            !SparkPatch {
+                title: Some("x".to_string()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
     }
 
     #[test]
