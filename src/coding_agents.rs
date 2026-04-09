@@ -495,6 +495,46 @@ pub fn known_agents() -> Vec<CodingAgent> {
     KNOWN_AGENTS.iter().map(def_to_agent).collect()
 }
 
+/// Atlas-specific agent fallback order: Claude Code → Codex → OpenCode.
+/// Aider is excluded because it lacks the interactive conversation style
+/// Atlas requires.
+const ATLAS_FALLBACK_ORDER: &[&str] = &["claude", "codex", "opencode"];
+
+/// Resolve the coding agent for Atlas.
+///
+/// 1. If `config_value` is `Some`, look it up in the detected agents.
+/// 2. Otherwise, walk [`ATLAS_FALLBACK_ORDER`] and pick the first
+///    compatible (non-unsupported) agent found in `available`.
+///
+/// Returns `None` when no suitable agent is detected.
+pub fn resolve_atlas_agent(
+    config_value: Option<&str>,
+    available: &[CodingAgent],
+) -> Option<CodingAgent> {
+    // Honour explicit config first.
+    if let Some(name) = config_value {
+        if let Some(agent) = available
+            .iter()
+            .find(|a| a.command == name || a.display_name.eq_ignore_ascii_case(name))
+        {
+            if !agent.compatibility.is_unsupported() {
+                return Some(agent.clone());
+            }
+        }
+    }
+
+    // Fallback: walk the Atlas-specific order.
+    for cmd in ATLAS_FALLBACK_ORDER {
+        if let Some(agent) = available.iter().find(|a| a.command == *cmd) {
+            if !agent.compatibility.is_unsupported() {
+                return Some(agent.clone());
+            }
+        }
+    }
+
+    None
+}
+
 fn def_to_agent(def: &AgentDef) -> CodingAgent {
     CodingAgent {
         display_name: def.name.to_string(),
@@ -797,6 +837,97 @@ mod tests {
             }
             .is_unsupported()
         );
+    }
+
+    // ── Atlas agent resolution tests (spark ryve-b85b8059) ──────────────
+
+    /// Helper: build a compatible agent stub for a given command.
+    fn compatible_agent(cmd: &str) -> CodingAgent {
+        let mut a = agent_for(cmd);
+        a.compatibility = CompatStatus::Compatible {
+            version: "1.0.0".into(),
+        };
+        a
+    }
+
+    /// Helper: build an unsupported agent stub for a given command.
+    fn unsupported_agent(cmd: &str) -> CodingAgent {
+        let mut a = agent_for(cmd);
+        a.compatibility = CompatStatus::Unsupported {
+            version: "0.1.0".into(),
+            reason: "too old".into(),
+        };
+        a
+    }
+
+    #[test]
+    fn atlas_fallback_order_claude_first() {
+        let available = vec![
+            compatible_agent("opencode"),
+            compatible_agent("codex"),
+            compatible_agent("claude"),
+        ];
+        let resolved = resolve_atlas_agent(None, &available).unwrap();
+        assert_eq!(resolved.command, "claude");
+    }
+
+    #[test]
+    fn atlas_fallback_skips_unsupported_claude() {
+        let available = vec![
+            unsupported_agent("claude"),
+            compatible_agent("codex"),
+            compatible_agent("opencode"),
+        ];
+        let resolved = resolve_atlas_agent(None, &available).unwrap();
+        assert_eq!(resolved.command, "codex");
+    }
+
+    #[test]
+    fn atlas_fallback_to_opencode_when_others_missing() {
+        let available = vec![compatible_agent("opencode")];
+        let resolved = resolve_atlas_agent(None, &available).unwrap();
+        assert_eq!(resolved.command, "opencode");
+    }
+
+    #[test]
+    fn atlas_fallback_skips_aider() {
+        // Aider is not in the Atlas fallback order.
+        let available = vec![compatible_agent("aider")];
+        let resolved = resolve_atlas_agent(None, &available);
+        assert!(resolved.is_none(), "aider should not be picked for Atlas");
+    }
+
+    #[test]
+    fn atlas_fallback_returns_none_when_empty() {
+        let resolved = resolve_atlas_agent(None, &[]);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn atlas_config_overrides_fallback_order() {
+        let available = vec![
+            compatible_agent("claude"),
+            compatible_agent("codex"),
+            compatible_agent("opencode"),
+        ];
+        let resolved = resolve_atlas_agent(Some("opencode"), &available).unwrap();
+        assert_eq!(resolved.command, "opencode");
+    }
+
+    #[test]
+    fn atlas_config_falls_back_when_configured_agent_unsupported() {
+        let available = vec![unsupported_agent("opencode"), compatible_agent("codex")];
+        // Config says opencode but it's unsupported — fallback kicks in.
+        let resolved = resolve_atlas_agent(Some("opencode"), &available).unwrap();
+        assert_eq!(resolved.command, "codex");
+    }
+
+    #[test]
+    fn atlas_config_falls_back_when_configured_agent_missing() {
+        let available = vec![compatible_agent("codex")];
+        // Config says claude but it's not installed.
+        let resolved = resolve_atlas_agent(Some("claude"), &available).unwrap();
+        assert_eq!(resolved.command, "codex");
     }
 
     #[test]

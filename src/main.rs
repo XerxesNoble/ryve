@@ -4587,22 +4587,37 @@ impl App {
                 // Spark ryve-acdb248a — Atlas is the **default entry point**
                 // for top-level user requests. Atlas is conversational and
                 // delegates downward, so we don't open a picker here: the
-                // user has not yet expressed a goal. We pick the first
-                // compatible coding agent automatically and spawn it with
-                // the Atlas Director system prompt. The user types their
-                // request into the resulting bench tab and Atlas decides
-                // whether to delegate to a Head or a Hand.
+                // user has not yet expressed a goal. We resolve the agent
+                // via config (atlas_agent) or the default fallback order
+                // (Claude Code → Codex → OpenCode), spawn it with the Atlas
+                // Director system prompt, and persist the resolved agent to
+                // config on first spawn so subsequent launches are stable.
                 let ws = &mut self.workshops[idx];
                 ws.bench.dropdown_open = false;
-                let agent = match self
-                    .available_agents
-                    .iter()
-                    .find(|a| !a.compatibility.is_unsupported())
-                    .cloned()
-                {
-                    Some(a) => a,
-                    None => return Task::none(),
-                };
+                let config_pref = ws.config.atlas_agent.as_deref();
+                let agent =
+                    match coding_agents::resolve_atlas_agent(config_pref, &self.available_agents) {
+                        Some(a) => a,
+                        None => return Task::none(),
+                    };
+
+                // Persist the resolved agent on first successful resolution
+                // so the choice is stable across restarts.
+                if ws.config.atlas_agent.is_none() {
+                    ws.config.atlas_agent = Some(agent.command.clone());
+                    let ryve_dir = ws.ryve_dir.clone();
+                    let config = ws.config.clone();
+                    return Task::batch([
+                        self.spawn_atlas(idx, agent),
+                        Task::perform(
+                            async move {
+                                data::ryve_dir::save_config(&ryve_dir, &config).await.ok();
+                            },
+                            |_| Message::BackgroundConfigSaved,
+                        ),
+                    ]);
+                }
+
                 return self.spawn_atlas(idx, agent);
             }
             screen::bench::Message::NewCustomAgent(agent_idx) => {

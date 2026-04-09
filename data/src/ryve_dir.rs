@@ -142,6 +142,13 @@ pub struct WorkshopConfig {
     /// Agent context injection settings.
     #[serde(default)]
     pub agents: AgentsConfig,
+
+    /// Preferred coding agent for Atlas (the Director). When set, Atlas
+    /// spawns with this agent instead of probing PATH. When unset,
+    /// resolution follows Claude Code → Codex → OpenCode order and the
+    /// resolved name is persisted here on first successful Atlas spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atlas_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
