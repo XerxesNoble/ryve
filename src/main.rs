@@ -7,6 +7,7 @@ mod coding_agents;
 mod delegation;
 mod hand_spawn;
 mod icons;
+mod process_snapshot;
 mod screen;
 mod style;
 mod widget;
@@ -15,6 +16,7 @@ mod worktree_cleanup;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use coding_agents::CodingAgent;
 use data::sparks::types::{
@@ -24,11 +26,11 @@ use iced::widget::{Space, button, column, container, row, stack, text};
 use iced::{
     Color, Element, Length, Point, Size, Subscription, Task, Theme, event, keyboard, mouse, window,
 };
+use process_snapshot::ProcessSnapshot;
 use screen::agents::AgentSession;
 use screen::toast::{self, Toast, ToastKind};
 use screen::{file_explorer, file_viewer, log_tail};
 use style::Appearance;
-use sysinfo::{Pid, ProcessesToUpdate, System};
 use uuid::Uuid;
 use widget::splitter::{self, SplitterDrag, SplitterKind};
 use workshop::Workshop;
@@ -113,16 +115,6 @@ fn ipc_subscription_stream() -> iced::futures::stream::BoxStream<'static, Messag
             }
         },
     ))
-}
-
-fn process_is_alive(child_pid: i64) -> bool {
-    let Ok(pid) = u32::try_from(child_pid) else {
-        return false;
-    };
-
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    system.process(Pid::from_u32(pid)).is_some()
 }
 
 fn main() -> iced::Result {
@@ -226,6 +218,11 @@ struct App {
     next_terminal_id: u64,
     /// Guard: true while a SparksPoll load is in flight
     poll_in_flight: bool,
+    /// Latest process snapshot captured for the running poll. Refreshed at
+    /// most once per [`Message::SparksPoll`] tick (off the UI thread via
+    /// `tokio::task::spawn_blocking`) and shared by every liveness /
+    /// auto-detect check that runs in the same tick. Spark `ryve-a5b9e4a1`.
+    last_process_snapshot: Option<Arc<ProcessSnapshot>>,
     /// Whether the Shift key is currently held (for shift-click line selection).
     shift_held: bool,
     /// Active drag-to-resize state, if any.
@@ -354,6 +351,12 @@ enum Message {
     AgentContextSynced,
     /// Periodic sparks poll tick
     SparksPoll,
+    /// A `SparksPoll` tick captured a fresh [`ProcessSnapshot`] off the UI
+    /// thread. The handler caches it on `App` and then runs the rest of the
+    /// poll body — auto-detect, persisted-session reload, log tails, sparks
+    /// reload — all reading liveness from this single snapshot. Spark
+    /// `ryve-a5b9e4a1`.
+    ProcessSnapshotReady(Arc<ProcessSnapshot>),
     /// Spawn a new Hand with the default agent (Cmd+H)
     NewDefaultHand,
     HandAssignmentSaved,
@@ -500,6 +503,7 @@ impl std::fmt::Debug for Message {
             Self::BackgroundConfigSaved => write!(f, "BackgroundConfigSaved"),
             Self::AgentContextSynced => write!(f, "AgentContextSynced"),
             Self::SparksPoll => write!(f, "SparksPoll"),
+            Self::ProcessSnapshotReady(_) => write!(f, "ProcessSnapshotReady"),
             Self::NewDefaultHand => write!(f, "NewDefaultHand"),
             Self::HandAssignmentSaved => write!(f, "HandAssignmentSaved"),
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
@@ -545,6 +549,7 @@ impl App {
             active_workshop: None,
             next_terminal_id: 1,
             poll_in_flight: false,
+            last_process_snapshot: None,
             shift_held: false,
             splitter_drag: None,
             window_size: Size::new(1400.0, 900.0),
@@ -1105,6 +1110,12 @@ impl App {
                     return Task::none();
                 };
                 let mut chain_open_tabs: Option<Task<Message>> = None;
+                // Read liveness from the cached snapshot the current poll
+                // captured. At workshop init time (the very first
+                // `AgentSessionsLoaded`) there is no snapshot yet — every
+                // PID falls back to "not alive", and the next 3-second
+                // poll re-classifies them. Spark `ryve-a5b9e4a1`.
+                let snapshot = self.last_process_snapshot.clone();
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     let available = &self.available_agents;
                     let known_ids: std::collections::HashSet<String> =
@@ -1116,10 +1127,14 @@ impl App {
                             .iter()
                             .find(|s| s.id == p.id)
                             .and_then(|s| s.tab_id);
+                        let child_alive = match (snapshot.as_ref(), p.child_pid) {
+                            (Some(snap), Some(pid)) => snap.is_alive(pid),
+                            _ => false,
+                        };
                         let display_state = screen::agents::classify_session(
                             p.ended_at.is_some(),
                             existing_tab_id.is_some(),
-                            p.child_pid.is_some_and(process_is_alive),
+                            child_alive,
                         );
 
                         if known_ids.contains(&p.id) {
@@ -2584,7 +2599,7 @@ impl App {
                     .iter_mut()
                     .filter_map(|ws| ws.take_worktree_warning())
                     .collect();
-                let mut warning_tasks: Vec<Task<Message>> = warnings
+                let warning_tasks: Vec<Task<Message>> = warnings
                     .into_iter()
                     .map(|w| self.push_toast("Worktree fallback", w, ToastKind::Warning))
                     .collect();
@@ -2593,11 +2608,40 @@ impl App {
                     return Task::batch(warning_tasks);
                 }
 
-                let mut tasks: Vec<Task<Message>> = std::mem::take(&mut warning_tasks);
+                // Spark `ryve-a5b9e4a1`: snapshot the OS process table once
+                // per tick on a blocking thread, then resume the rest of the
+                // poll body inside `ProcessSnapshotReady` so the UI thread
+                // never calls `System::new_all` itself. Marking the poll
+                // in-flight here keeps the next tick from racing this one
+                // even though the work hasn't started yet.
+                self.poll_in_flight = true;
+                let snapshot_task = Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(ProcessSnapshot::capture)
+                            .await
+                            .unwrap_or_default()
+                    },
+                    |snap| Message::ProcessSnapshotReady(Arc::new(snap)),
+                );
+                let mut all = warning_tasks;
+                all.push(snapshot_task);
+                Task::batch(all)
+            }
 
-                // Auto-detect agent processes in plain terminals
+            Message::ProcessSnapshotReady(snapshot) => {
+                // Cache the snapshot so any handler that fires on the back
+                // half of this tick (`AgentSessionsLoaded`, `SparksLoaded`,
+                // …) can read liveness from the same scan instead of taking
+                // its own. Spark `ryve-a5b9e4a1`.
+                self.last_process_snapshot = Some(snapshot.clone());
+
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+
+                // Auto-detect agent processes in plain terminals, sharing
+                // the snapshot with `detect_untracked_agents` instead of
+                // letting it walk /proc itself.
                 for ws in self.workshops.iter_mut() {
-                    let detected = ws.detect_untracked_agents();
+                    let detected = ws.detect_untracked_agents(&snapshot);
                     for (tab_id, agent) in detected {
                         let session_id = Uuid::new_v4().to_string();
                         let name = agent.display_name.clone();
@@ -2707,11 +2751,13 @@ impl App {
                     .collect();
                 tasks.extend(spark_tasks);
 
-                if !tasks.is_empty() {
-                    self.poll_in_flight = true;
-                    return Task::batch(tasks);
+                if tasks.is_empty() {
+                    // Nothing to wait on — release the in-flight gate now,
+                    // otherwise the next 3-second tick would early-return.
+                    self.poll_in_flight = false;
+                    return Task::none();
                 }
-                Task::none()
+                Task::batch(tasks)
             }
             Message::NewDefaultHand => {
                 let Some(_idx) = self.active_workshop else {

@@ -14,6 +14,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::coding_agents::CodingAgent;
+use crate::process_snapshot::ProcessSnapshot;
 use crate::screen::agents::AgentSession;
 use crate::screen::background_picker::PickerState;
 use crate::screen::bench::{BenchState, TabKind};
@@ -718,7 +719,12 @@ impl Workshop {
 
     /// Scan terminals for agent processes that aren't yet tracked as sessions.
     /// Returns `(tab_id, agent)` pairs for newly detected agents.
-    pub fn detect_untracked_agents(&self) -> Vec<(u64, CodingAgent)> {
+    ///
+    /// Reads from a shared [`ProcessSnapshot`] captured once per
+    /// `SparksPoll` tick (spark `ryve-a5b9e4a1`) — this used to take its
+    /// own `System::new()` + `refresh_processes` per untracked terminal,
+    /// on the UI thread.
+    pub fn detect_untracked_agents(&self, snapshot: &ProcessSnapshot) -> Vec<(u64, CodingAgent)> {
         // Collect tab IDs that already have an agent session
         let tracked_tabs: HashSet<u64> = self
             .agent_sessions
@@ -734,57 +740,13 @@ impl Workshop {
             }
 
             let shell_pid = term.child_pid();
-            if let Some(agent) = detect_agent_in_process_tree(shell_pid) {
+            if let Some(agent) = snapshot.detect_agent_in_tree(shell_pid) {
                 found.push((tab_id, agent));
             }
         }
 
         found
     }
-}
-
-/// Walk the process tree rooted at `shell_pid` looking for a known coding agent.
-fn detect_agent_in_process_tree(shell_pid: u32) -> Option<CodingAgent> {
-    use sysinfo::{Pid, ProcessesToUpdate, System};
-
-    use crate::coding_agents::ResumeStrategy;
-
-    let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
-
-    // Known agent binary names → CodingAgent constructors
-    let known: &[(&str, &str, ResumeStrategy)] = &[
-        ("claude", "Claude Code", ResumeStrategy::ResumeFlag),
-        ("codex", "Codex", ResumeStrategy::ResumeFlag),
-        ("aider", "Aider", ResumeStrategy::None),
-        ("opencode", "OpenCode", ResumeStrategy::None),
-    ];
-
-    let root = Pid::from_u32(shell_pid);
-
-    // BFS through children of the shell process
-    let mut queue = vec![root];
-    while let Some(pid) = queue.pop() {
-        for (child_pid, proc_info) in sys.processes() {
-            if proc_info.parent() == Some(pid) {
-                let name = proc_info.name().to_string_lossy();
-                for &(cmd, display, ref resume) in known {
-                    if name == cmd {
-                        return Some(CodingAgent {
-                            display_name: display.to_string(),
-                            command: cmd.to_string(),
-                            args: Vec::new(),
-                            resume: resume.clone(),
-                            compatibility: crate::coding_agents::CompatStatus::Unknown,
-                        });
-                    }
-                }
-                queue.push(*child_pid);
-            }
-        }
-    }
-
-    None
 }
 
 fn wrap_command_with_bottom_pin(program: &str, args: &[String]) -> (String, Vec<String>) {
