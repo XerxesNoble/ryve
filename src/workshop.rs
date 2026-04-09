@@ -218,7 +218,7 @@ impl Workshop {
     pub fn terminal_font_settings(&self) -> iced_term::settings::FontSettings {
         let font_type = match &self.terminal_font_family {
             Some(name) => iced::Font {
-                family: iced::font::Family::Name(Box::leak(name.clone().into_boxed_str())),
+                family: iced::font::Family::Name(crate::font_intern::intern(name)),
                 ..iced::Font::MONOSPACE
             },
             None => iced::Font::MONOSPACE,
