@@ -7,6 +7,7 @@ mod coding_agents;
 mod delegation;
 mod font_intern;
 mod hand_spawn;
+mod head_archetype;
 mod icons;
 mod process_snapshot;
 mod release_artifact;
@@ -335,8 +336,12 @@ enum Message {
     SparkDetail(screen::spark_detail::Message),
     SparkPicker(screen::spark_picker::Message),
     HeadPicker(screen::head_picker::Message),
+    Releases(screen::releases::Message),
     Background(screen::background_picker::Message),
     StatusBar(screen::status_bar::Message),
+
+    /// Release data loaded from DB (all releases + member epic IDs).
+    ReleasesLoaded(Uuid, Vec<data::sparks::types::Release>, Vec<(String, Vec<String>)>),
 
     /// Background image loaded from disk
     BackgroundLoaded(Uuid, Option<Vec<u8>>),
@@ -556,6 +561,8 @@ impl std::fmt::Debug for Message {
             Self::EmberBar(m) => write!(f, "EmberBar({m:?})"),
             Self::EmberDismissed { ember_id, .. } => write!(f, "EmberDismissed({ember_id})"),
             Self::OpenUrl(url) => write!(f, "OpenUrl({url})"),
+            Self::Releases(m) => write!(f, "Releases({m:?})"),
+            Self::ReleasesLoaded(id, _, _) => write!(f, "ReleasesLoaded({id})"),
         }
     }
 }
@@ -2376,6 +2383,38 @@ impl App {
                             }
                         }
                     }
+                    screen::sparks::Message::ShowReleases => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.show_releases = true;
+                            // Trigger a releases load from the DB.
+                            if let Some(ref pool) = ws.sparks_db {
+                                let pool = pool.clone();
+                                let id = ws.id;
+                                return Task::perform(
+                                    async move {
+                                        let releases =
+                                            data::sparks::release_repo::list(&pool, None)
+                                                .await
+                                                .unwrap_or_default();
+                                        let mut epic_ids = Vec::new();
+                                        for r in &releases {
+                                            let ids =
+                                                data::sparks::release_repo::list_member_epics(
+                                                    &pool, &r.id,
+                                                )
+                                                .await
+                                                .unwrap_or_default();
+                                            epic_ids.push((r.id.clone(), ids));
+                                        }
+                                        (releases, epic_ids)
+                                    },
+                                    move |(releases, epic_ids)| {
+                                        Message::ReleasesLoaded(id, releases, epic_ids)
+                                    },
+                                );
+                            }
+                        }
+                    }
                     screen::sparks::Message::ShowCreateForm => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.spark_create_form.reset();
@@ -2559,6 +2598,60 @@ impl App {
                             }
                         }
                     }
+                }
+                Task::none()
+            }
+
+            // ── Releases ─────────────────────────────────
+            Message::Releases(msg) => {
+                let Some(idx) = self.active_workshop else {
+                    return Task::none();
+                };
+                match msg {
+                    screen::releases::Message::Back => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.show_releases = false;
+                        }
+                    }
+                    screen::releases::Message::TogglePastReleases => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.releases_state.past_expanded = !ws.releases_state.past_expanded;
+                        }
+                    }
+                    screen::releases::Message::RequestClose(release_id) => {
+                        // Emit a toast prompting the user to spawn a Release
+                        // Manager via Atlas if none is running. The workshop
+                        // update loop does not mutate release state directly —
+                        // the Release Manager archetype owns the close flow.
+                        return self.push_toast(
+                            "Release close requested",
+                            format!(
+                                "Ask Atlas to spawn a Release Manager to close release {release_id}."
+                            ),
+                            ToastKind::Info,
+                        );
+                    }
+                }
+                Task::none()
+            }
+            Message::ReleasesLoaded(id, releases, epic_ids_per_release) => {
+                if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
+                    let mut view_data = Vec::new();
+                    for (i, release) in releases.into_iter().enumerate() {
+                        let epic_ids = epic_ids_per_release
+                            .get(i)
+                            .map(|(_, ids)| ids.as_slice())
+                            .unwrap_or(&[]);
+                        let member_epics: Vec<_> = epic_ids
+                            .iter()
+                            .filter_map(|eid| ws.sparks.iter().find(|s| s.id == *eid).cloned())
+                            .collect();
+                        view_data.push(screen::releases::ReleaseViewData {
+                            release,
+                            member_epics,
+                        });
+                    }
+                    ws.release_view_data = view_data;
                 }
                 Task::none()
             }
@@ -3796,7 +3889,11 @@ impl App {
         // to boot. Coding agents like claude/codex pick up `--system-prompt`
         // via flag too, but the existing infra here uses the typed-prompt
         // path so we stay consistent and avoid having to fork the spawn API.
-        let prompt = agent_prompts::compose_head_prompt(epic_id.as_deref(), epic_title.as_deref());
+        let prompt = agent_prompts::compose_head_prompt(
+            agent_prompts::HeadArchetype::Build,
+            epic_id.as_deref(),
+            epic_title.as_deref(),
+        );
         let prompt_tab_id = tab_id;
         tasks.push(Task::perform(
             async move {
@@ -4666,7 +4763,15 @@ impl App {
                 )
             })
             .unwrap_or_default();
-        let sparks_panel = if let Some(ref selected_id) = ws.selected_spark {
+        let sparks_panel = if ws.show_releases {
+            screen::releases::view(
+                &ws.release_view_data,
+                &ws.releases_state,
+                &pal,
+                has_bg,
+            )
+            .map(Message::Releases)
+        } else if let Some(ref selected_id) = ws.selected_spark {
             if let Some(spark) = ws.sparks.iter().find(|s| s.id == *selected_id) {
                 screen::spark_detail::view(
                     spark,

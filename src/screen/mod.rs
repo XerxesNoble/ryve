@@ -12,6 +12,7 @@ pub mod file_viewer;
 pub mod head_picker;
 pub mod home;
 pub mod log_tail;
+pub mod releases;
 pub mod spark_detail;
 pub mod spark_picker;
 pub mod sparks;
