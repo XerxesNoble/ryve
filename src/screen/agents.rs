@@ -53,6 +53,10 @@ pub enum Message {
     ToggleHeadExpanded(String),
     /// Toggle expand/collapse for a Crew node in the Active tree.
     ToggleCrewExpanded(String),
+    /// Open a read-only log view for a past/dead session. Fired from the
+    /// "View Log" button on History rows that have a `log_path`. Spark
+    /// `ryve-a677498c`.
+    ViewLog(String),
 }
 
 /// How many History rows to render per "page". A "Load more…" button at
@@ -955,7 +959,17 @@ fn render_history_row<'a>(
         row_widget = row_widget.push(spark_chip(&s.id, pal));
     }
 
-    // Delete is the only mutation allowed on a history row.
+    // Spark `ryve-a677498c`: dead sessions with a log file show a "View
+    // Log" button so the user can inspect the agent's last output instead
+    // of the row being entirely inert.
+    if session.log_path.is_some() {
+        let log_btn = button(text("\u{1F4C4}").size(FONT_ICON_SM).color(pal.accent))
+            .style(button::text)
+            .padding([2, 4])
+            .on_press(Message::ViewLog(session.id.clone()));
+        row_widget = row_widget.push(log_btn);
+    }
+
     let delete_btn = button(text("\u{00D7}").size(FONT_ICON).color(pal.text_tertiary))
         .style(button::text)
         .padding([2, 4])

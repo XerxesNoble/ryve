@@ -15,6 +15,7 @@ mod process_snapshot;
 mod release_artifact;
 mod screen;
 mod style;
+mod tmux;
 mod widget;
 mod workshop;
 mod worktree_cleanup;
@@ -328,6 +329,10 @@ enum Message {
     AgentSessionsLoaded(Uuid, Vec<PersistedAgentSession>),
     /// Agent session saved to DB
     AgentSessionSaved,
+    /// Dead-session reconciliation completed. Carries the session IDs whose
+    /// `agent_sessions` rows were ended and `hand_assignments` were
+    /// abandoned. Spark `ryve-a677498c`.
+    DeadSessionsReconciled(Vec<String>),
     /// Persisted open-tabs snapshot loaded from DB. Each entry is replayed
     /// against the bench to restore the user's prior tab list.
     OpenTabsLoaded(Uuid, Vec<data::sparks::open_tab_repo::PersistedTab>),
@@ -554,6 +559,9 @@ impl std::fmt::Debug for Message {
                 write!(f, "AgentSessionsLoaded({id}, {} sessions)", s.len())
             }
             Self::AgentSessionSaved => write!(f, "AgentSessionSaved"),
+            Self::DeadSessionsReconciled(ids) => {
+                write!(f, "DeadSessionsReconciled({} sessions)", ids.len())
+            }
             Self::OpenTabsLoaded(id, t) => {
                 write!(f, "OpenTabsLoaded({id}, {} tabs)", t.len())
             }
@@ -1409,17 +1417,39 @@ impl App {
                 let Some(idx) = ws_idx else {
                     return Task::none();
                 };
-                let mut chain_open_tabs: Option<Task<Message>> = None;
+                let mut chain_tasks: Vec<Task<Message>> = Vec::new();
                 // Read liveness from the cached snapshot the current poll
                 // captured. At workshop init time (the very first
                 // `AgentSessionsLoaded`) there is no snapshot yet — every
                 // PID falls back to "not alive", and the next 3-second
                 // poll re-classifies them. Spark `ryve-a5b9e4a1`.
                 let snapshot = self.last_process_snapshot.clone();
+
+                // Spark `ryve-a677498c`: collect sessions whose process has
+                // died but whose DB row is still active (ended_at IS NULL).
+                // These need reconciliation: end the session + abandon
+                // assignments so the Activity panel reflects reality.
+                let mut dead_session_ids: Vec<String> = Vec::new();
+
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     let available = &self.available_agents;
                     let known_ids: std::collections::HashSet<String> =
                         ws.agent_sessions.iter().map(|s| s.id.clone()).collect();
+
+                    // Use the tmux wrapper to diff tracked sessions against
+                    // the process snapshot, collecting session IDs to feed
+                    // into the per-session classification below.
+                    let tracked: Vec<(String, Option<i64>)> = persisted
+                        .iter()
+                        .filter(|p| p.ended_at.is_none())
+                        .map(|p| (p.id.clone(), p.child_pid))
+                        .collect();
+                    let dead_set: std::collections::HashSet<String> =
+                        if let Some(ref snap) = snapshot {
+                            tmux::dead_sessions(&tracked, snap).into_iter().collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        };
 
                     for p in persisted {
                         let existing_tab_id = ws
@@ -1436,6 +1466,16 @@ impl App {
                             existing_tab_id.is_some(),
                             child_alive,
                         );
+
+                        // Spark `ryve-a677498c`: if the DB row is still
+                        // active but the process is gone (and no live
+                        // terminal tab), queue it for reconciliation.
+                        if p.ended_at.is_none()
+                            && dead_set.contains(&p.id)
+                            && existing_tab_id.is_none()
+                        {
+                            dead_session_ids.push(p.id.clone());
+                        }
 
                         if known_ids.contains(&p.id) {
                             // Already in memory — preserve tab_id, but refresh liveness.
@@ -1483,13 +1523,32 @@ impl App {
                         let pool = pool.clone();
                         let ws_id = ws.workshop_id();
                         let id_copy = id;
-                        chain_open_tabs =
-                            Some(Task::perform(load_open_tabs(pool, ws_id), move |tabs| {
-                                Message::OpenTabsLoaded(id_copy, tabs)
-                            }));
+                        chain_tasks.push(Task::perform(load_open_tabs(pool, ws_id), move |tabs| {
+                            Message::OpenTabsLoaded(id_copy, tabs)
+                        }));
+                    }
+
+                    // Spark `ryve-a677498c`: fire off async reconciliation
+                    // for sessions whose process disappeared. This ends
+                    // their agent_sessions row and abandons their active
+                    // hand_assignments so the next poll classifies them as
+                    // History instead of Stale.
+                    if !dead_session_ids.is_empty()
+                        && let Some(ref pool) = ws.sparks_db
+                    {
+                        let pool = pool.clone();
+                        let ids = dead_session_ids;
+                        chain_tasks.push(Task::perform(
+                            reconcile_dead_sessions(pool, ids),
+                            Message::DeadSessionsReconciled,
+                        ));
                     }
                 }
-                chain_open_tabs.unwrap_or_else(Task::none)
+                if chain_tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(chain_tasks)
+                }
             }
 
             Message::CrewsLoaded(id, crews, members) => {
@@ -1501,6 +1560,20 @@ impl App {
             }
 
             Message::AgentSessionSaved => Task::none(),
+
+            Message::DeadSessionsReconciled(session_ids) => {
+                // The DB rows are already updated — the next poll cycle's
+                // `AgentSessionsLoaded` will reclassify these sessions as
+                // History (ended_at is now set). Log for observability.
+                if !session_ids.is_empty() {
+                    log::info!(
+                        "Reconciled {} dead session(s): {:?}",
+                        session_ids.len(),
+                        session_ids
+                    );
+                }
+                Task::none()
+            }
 
             Message::OpenTabsLoaded(id, persisted) => {
                 // Replay the persisted snapshot against the bench. Tabs are
@@ -2059,11 +2132,24 @@ impl App {
                                 _ => Outcome::Stale { name: session.name },
                             },
                             Some(session) => {
-                                let can_resume = session.can_resume();
-                                Outcome::Past {
-                                    name: session.name,
-                                    started_at: session.started_at,
-                                    can_resume,
+                                // Spark `ryve-a677498c`: dead sessions with
+                                // a log file open the spy view on click so
+                                // the user can inspect the last output.
+                                if session.log_path.is_some() {
+                                    let log_path = session.log_path.clone().unwrap();
+                                    let (tab_id, _) = ws.open_log_tab(
+                                        &session_id,
+                                        log_path.clone(),
+                                        &mut self.next_terminal_id,
+                                    );
+                                    Outcome::Spying { tab_id, log_path }
+                                } else {
+                                    let can_resume = session.can_resume();
+                                    Outcome::Past {
+                                        name: session.name,
+                                        started_at: session.started_at,
+                                        can_resume,
+                                    }
                                 }
                             }
                         };
@@ -2227,6 +2313,28 @@ impl App {
                     screen::agents::Message::ToggleCrewExpanded(crew_id) => {
                         if !ws.agents_panel.collapsed_crews.remove(&crew_id) {
                             ws.agents_panel.collapsed_crews.insert(crew_id);
+                        }
+                    }
+                    screen::agents::Message::ViewLog(session_id) => {
+                        // Spark `ryve-a677498c`: open a read-only log view
+                        // for a dead/ended session. Mirrors the Spying
+                        // outcome in SelectAgent but is reachable from the
+                        // explicit "View Log" button on History rows.
+                        if let Some(log_path) = ws
+                            .agent_sessions
+                            .iter()
+                            .find(|s| s.id == session_id)
+                            .and_then(|s| s.log_path.clone())
+                        {
+                            let (tab_id, _) = ws.open_log_tab(
+                                &session_id,
+                                log_path.clone(),
+                                &mut self.next_terminal_id,
+                            );
+                            return Task::perform(
+                                log_tail::load_tail(tab_id, log_path),
+                                Message::LogTail,
+                            );
                         }
                     }
                 }
@@ -6531,6 +6639,42 @@ async fn load_embers(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Ember> 
         .unwrap_or_default()
 }
 
+/// Reconcile dead agent sessions: for each session whose process has
+/// disappeared, mark the `agent_sessions` row as ended and transition all
+/// active `hand_assignments` for that session to "abandoned".
+///
+/// Returns the list of session IDs that were reconciled. Errors on
+/// individual sessions are logged but do not abort the rest of the batch.
+///
+/// Spark `ryve-a677498c`.
+async fn reconcile_dead_sessions(pool: sqlx::SqlitePool, session_ids: Vec<String>) -> Vec<String> {
+    let mut reconciled = Vec::new();
+    for session_id in &session_ids {
+        // 1. End the agent_sessions row.
+        if let Err(e) = data::sparks::agent_session_repo::end_session(&pool, session_id).await {
+            log::warn!("Failed to end dead session {session_id}: {e}");
+            continue;
+        }
+        // 2. Abandon all active assignments for this session.
+        let assignments = data::sparks::assignment_repo::list_for_session(&pool, session_id)
+            .await
+            .unwrap_or_default();
+        for a in assignments {
+            if a.status == "active"
+                && let Err(e) =
+                    data::sparks::assignment_repo::abandon(&pool, session_id, &a.spark_id).await
+            {
+                log::warn!(
+                    "Failed to abandon assignment for session {session_id} on spark {}: {e}",
+                    a.spark_id
+                );
+            }
+        }
+        reconciled.push(session_id.clone());
+    }
+    reconciled
+}
+
 /// Auto-create an ember in response to a state transition detected during
 /// the 3-second poll. Failures are logged but swallowed — missing a
 /// notification must never break the poll loop. Spark sp-ux0008.
@@ -6644,5 +6788,130 @@ mod tests {
             unsplash_photographer_url: None,
         };
         assert!(unsplash_attribution_label(&bg).is_none());
+    }
+
+    /// Spark `ryve-a677498c` acceptance criterion: create session, kill
+    /// session externally, next reconcile pass marks the row stopped.
+    ///
+    /// This test exercises the full reconciliation flow:
+    ///   1. Creates a workshop DB with an active agent session and an
+    ///      active hand assignment.
+    ///   2. Feeds the session's child_pid into `tmux::dead_sessions`
+    ///      against an empty ProcessSnapshot (no processes alive).
+    ///   3. Runs `reconcile_dead_sessions` with the detected dead IDs.
+    ///   4. Asserts the `agent_sessions` row now has `ended_at` set, and
+    ///      the `hand_assignments` row has `status = 'abandoned'`.
+    #[tokio::test]
+    async fn dead_session_reconciliation_marks_assignment_abandoned() {
+        use data::sparks::types::{
+            AssignmentRole, NewAgentSession, NewHandAssignment, NewSpark, SparkType,
+        };
+        use data::sparks::{agent_session_repo, assignment_repo, spark_repo};
+
+        // 1. Set up a temporary workshop directory and DB.
+        let tmp = std::env::temp_dir().join(format!("ryve-tmux-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pool = data::db::open_sparks_db(&tmp).await.unwrap();
+
+        let ws_id = tmp.file_name().unwrap().to_string_lossy().into_owned();
+
+        // Create a spark for the assignment.
+        let spark = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "dead-session test spark".into(),
+                description: String::new(),
+                spark_type: SparkType::Epic,
+                priority: 2,
+                workshop_id: ws_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Create an active agent session with a fake child_pid that is
+        // definitely not running (PID 2 on macOS is always a kernel
+        // process that won't match; on Linux it's kthreadd which the
+        // default sysinfo snapshot won't include in user-space).
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let dead_pid: i64 = 999_999_999; // certainly not alive
+        agent_session_repo::create(
+            &pool,
+            &NewAgentSession {
+                id: session_id.clone(),
+                workshop_id: ws_id.clone(),
+                agent_name: "stub".into(),
+                agent_command: "stub".into(),
+                agent_args: Vec::new(),
+                session_label: Some("hand".into()),
+                child_pid: Some(dead_pid),
+                resume_id: None,
+                log_path: Some("/tmp/fake.log".into()),
+                parent_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Create an active assignment.
+        assignment_repo::assign(
+            &pool,
+            NewHandAssignment {
+                session_id: session_id.clone(),
+                spark_id: spark.id.clone(),
+                role: AssignmentRole::Owner,
+            },
+        )
+        .await
+        .unwrap();
+
+        // 2. Use tmux::dead_sessions against a default (empty) snapshot —
+        //    no process is alive, so the session should be reported dead.
+        let tracked = vec![(session_id.clone(), Some(dead_pid))];
+        let empty_snap = process_snapshot::ProcessSnapshot::default();
+        let dead = tmux::dead_sessions(&tracked, &empty_snap);
+        assert_eq!(
+            dead,
+            vec![session_id.clone()],
+            "session must be reported dead"
+        );
+
+        // 3. Run the reconciliation.
+        let reconciled = reconcile_dead_sessions(pool.clone(), dead).await;
+        assert_eq!(reconciled, vec![session_id.clone()]);
+
+        // 4. Verify: session ended, assignment abandoned.
+        let sessions = agent_session_repo::list_for_workshop(&pool, &ws_id)
+            .await
+            .unwrap();
+        let sess = sessions.iter().find(|s| s.id == session_id).unwrap();
+        assert!(
+            sess.ended_at.is_some(),
+            "agent_sessions.ended_at must be set after reconciliation"
+        );
+        assert_eq!(
+            sess.status, "ended",
+            "agent_sessions.status must be 'ended'"
+        );
+
+        let assignments = assignment_repo::list_for_session(&pool, &session_id)
+            .await
+            .unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].status, "abandoned",
+            "hand_assignments.status must be 'abandoned' after reconciliation"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
