@@ -368,6 +368,13 @@ enum Message {
     /// can never accidentally re-trigger an expensive `SparksPoll`.
     /// Spark ryve-5b9c5d93 (perf regression harness).
     Noop,
+    /// Periodic backup tick — take a `.backup` snapshot of each open
+    /// workshop's sparks.db into `.ryve/backups/`. Also fires once on
+    /// graceful workshop close. Spark ryve-7c8573c4.
+    BackupTick,
+    /// A backup snapshot finished. `Ok(path)` on success so the UI can
+    /// log where it landed; `Err(msg)` for failures, which are logged.
+    BackupFinished(Result<PathBuf, String>),
     /// Spawn a new Hand with the default agent (Cmd+H)
     NewDefaultHand,
     HandAssignmentSaved,
@@ -516,6 +523,11 @@ impl std::fmt::Debug for Message {
             Self::SparksPoll => write!(f, "SparksPoll"),
             Self::ProcessSnapshotReady(_) => write!(f, "ProcessSnapshotReady"),
             Self::Noop => write!(f, "Noop"),
+            Self::BackupTick => write!(f, "BackupTick"),
+            Self::BackupFinished(r) => match r {
+                Ok(p) => write!(f, "BackupFinished(ok={})", p.display()),
+                Err(e) => write!(f, "BackupFinished(err={e})"),
+            },
             Self::NewDefaultHand => write!(f, "NewDefaultHand"),
             Self::HandAssignmentSaved => write!(f, "HandAssignmentSaved"),
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
@@ -596,13 +608,67 @@ impl App {
         self.active_workshop.and_then(|i| self.workshops.get(i))
     }
 
+    /// Build a Task that takes a final `.backup` snapshot of every open
+    /// workshop's sparks.db. Called by [`Self::subscription`] on the
+    /// periodic timer and by [`Self::do_close_workshop`] (via
+    /// [`Self::snapshot_workshop`]) on graceful shutdown so the user
+    /// never loses more than one polling interval of work.
+    /// Spark ryve-7c8573c4.
+    fn snapshot_all_workshops(&self) -> Task<Message> {
+        let tasks: Vec<Task<Message>> = self
+            .workshops
+            .iter()
+            .filter_map(|ws| ws.sparks_db.clone().map(|p| (p, ws.directory.clone())))
+            .map(|(pool, dir)| Self::snapshot_task(pool, dir))
+            .collect();
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
+        }
+    }
+
+    /// Construct a single snapshot Task: take a `.backup` of `pool`
+    /// into `dir/.ryve/backups/` and prune to the default retention.
+    fn snapshot_task(pool: sqlx::SqlitePool, dir: PathBuf) -> Task<Message> {
+        Task::perform(
+            async move {
+                let ryve_dir = data::ryve_dir::RyveDir::new(&dir);
+                data::backup::snapshot_and_retain(
+                    &pool,
+                    &ryve_dir,
+                    data::backup::DEFAULT_BACKUP_RETENTION,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            },
+            Message::BackupFinished,
+        )
+    }
+
     /// Tear down the workshop at `idx` and fix up `active_workshop` so the
     /// tab bar still points at a valid index. Spark sp-ux0021: extracted so
     /// the no-confirm fast path and the confirmed-close path stay in sync.
-    fn do_close_workshop(&mut self, idx: usize) {
+    ///
+    /// Returns a Task that captures a final backup snapshot before the
+    /// workshop's pool is dropped. Callers MUST spawn the returned task
+    /// (don't discard it) — spark ryve-7c8573c4 requires a snapshot on
+    /// graceful close so a crashing post-close write never leaves the
+    /// workgraph without a recent backup.
+    #[must_use = "the returned Task writes the graceful-shutdown snapshot; spawn it"]
+    fn do_close_workshop(&mut self, idx: usize) -> Task<Message> {
         if idx >= self.workshops.len() {
-            return;
+            return Task::none();
         }
+        // Snapshot BEFORE removing the workshop so the pool is still
+        // live. We clone the pool into the task; dropping the Workshop
+        // immediately after is fine because the pool is refcounted.
+        let snapshot = self
+            .workshops
+            .get(idx)
+            .and_then(|ws| ws.sparks_db.clone().map(|p| (p, ws.directory.clone())))
+            .map(|(pool, dir)| Self::snapshot_task(pool, dir))
+            .unwrap_or(Task::none());
         self.workshops.remove(idx);
         if self.workshops.is_empty() {
             self.active_workshop = None;
@@ -613,6 +679,7 @@ impl App {
                 self.active_workshop = Some(idx.min(self.workshops.len() - 1));
             }
         }
+        snapshot
     }
 
     /// Push a new toast onto the stack and return a `Task` that will
@@ -701,13 +768,11 @@ impl App {
                         return Task::none();
                     }
                 }
-                self.do_close_workshop(idx);
-                Task::none()
+                self.do_close_workshop(idx)
             }
             Message::ConfirmCloseWorkshop(idx) => {
                 self.pending_close_workshop = None;
-                self.do_close_workshop(idx);
-                Task::none()
+                self.do_close_workshop(idx)
             }
             Message::CancelCloseWorkshop => {
                 self.pending_close_workshop = None;
@@ -2617,6 +2682,29 @@ impl App {
             Message::BackgroundConfigSaved => Task::none(),
             Message::AgentContextSynced => Task::none(),
             Message::Noop => Task::none(),
+            Message::BackupTick => {
+                // Spark ryve-7c8573c4: periodic snapshot of every open
+                // workshop's sparks.db so a crash or corruption leaves
+                // at most `DEFAULT_BACKUP_INTERVAL_SECS` worth of work
+                // unrecoverable.
+                self.snapshot_all_workshops()
+            }
+            Message::BackupFinished(result) => {
+                match result {
+                    Ok(path) => {
+                        log::info!("backup: wrote {}", path.display());
+                        Task::none()
+                    }
+                    Err(err) => {
+                        // Loud in logs, but don't spam a toast on every
+                        // tick — quiet failure is preferable to a
+                        // user-facing interruption. The next successful
+                        // snapshot restores the invariant.
+                        log::warn!("backup: snapshot failed: {err}");
+                        Task::none()
+                    }
+                }
+            }
             Message::SparksPoll => {
                 // Opportunistically surface any worktree warnings that the
                 // synchronous spawn paths accumulated since the last tick.
@@ -4057,6 +4145,14 @@ impl App {
         let poll =
             iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::SparksPoll);
 
+        // Spark ryve-7c8573c4: periodic `.backup` snapshot of every
+        // open workshop so a crash or corruption leaves at most one
+        // interval's worth of work unrecoverable.
+        let backup_tick = iced::time::every(std::time::Duration::from_secs(
+            data::backup::DEFAULT_BACKUP_INTERVAL_SECS,
+        ))
+        .map(|_| Message::BackupTick);
+
         // Translate Iced keyboard events into the framework-agnostic
         // [`perf_core::KeyKind`] / [`perf_core::KeyModifiers`] pair so the
         // routing decision lives in [`perf_core::classify_key_event`]. The
@@ -4137,6 +4233,7 @@ impl App {
         let mut subs: Vec<Subscription<Message>> = term_subs
             .into_iter()
             .chain(std::iter::once(poll))
+            .chain(std::iter::once(backup_tick))
             .chain(std::iter::once(hotkeys))
             .chain(std::iter::once(resizes))
             .chain(std::iter::once(file_drops))

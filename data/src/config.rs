@@ -304,8 +304,10 @@ mod tests {
     fn delegation_visibility_round_trips_through_toml() {
         // Persistence is the whole point — make sure the snake_case
         // serde representation survives a save/load cycle.
-        let mut cfg = Config::default();
-        cfg.delegation_visibility = DelegationVisibility::FullTrace;
+        let cfg = Config {
+            delegation_visibility: DelegationVisibility::FullTrace,
+            ..Config::default()
+        };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(serialized.contains("delegation_visibility = \"full_trace\""));
         let restored: Config = toml::from_str(&serialized).expect("deserialize");

@@ -12,8 +12,10 @@
 //!
 //! Spark ryve-5b9c5d93 — Performance regression harness.
 
+use std::sync::Mutex;
+
 use criterion::{Criterion, criterion_group, criterion_main};
-use data::agent_context;
+use data::agent_context::{self, SyncCache};
 use data::ryve_dir::{RyveDir, WorkshopConfig};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -28,17 +30,18 @@ fn bench_agent_context_sync_noop(c: &mut Criterion) {
     let workshop_dir = tmp.path().to_path_buf();
     let ryve_dir = RyveDir::new(&workshop_dir);
     let config = WorkshopConfig::default();
+    let cache = Mutex::new(SyncCache::new());
 
     rt.block_on(async {
         ryve_dir.ensure_exists().await.expect("ensure_exists");
-        agent_context::sync(&workshop_dir, &ryve_dir, &config)
+        agent_context::sync(&workshop_dir, &ryve_dir, &config, &cache)
             .await
             .expect("initial sync");
     });
 
     c.bench_function("agent_context_sync_noop", |b| {
         b.to_async(&rt).iter(|| async {
-            agent_context::sync(&workshop_dir, &ryve_dir, &config)
+            agent_context::sync(&workshop_dir, &ryve_dir, &config, &cache)
                 .await
                 .expect("noop sync");
         });

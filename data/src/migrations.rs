@@ -286,8 +286,10 @@ mod tests {
 
         // Simulate a workshop touched by a newer binary.
         ryve_dir.ensure_exists().await.unwrap();
-        let mut cfg = WorkshopConfig::default();
-        cfg.workshop_schema_version = CURRENT_SCHEMA_VERSION + 99;
+        let cfg = WorkshopConfig {
+            workshop_schema_version: CURRENT_SCHEMA_VERSION + 99,
+            ..WorkshopConfig::default()
+        };
         save_config(&ryve_dir, &cfg).await.unwrap();
 
         let (config, log) = migrate_workshop(&ryve_dir).await.expect("migrate");

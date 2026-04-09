@@ -33,7 +33,7 @@ async fn make_spark_with(
             pool,
             &spark.id,
             UpdateSpark {
-                status: SparkStatus::from_str(status).map(|s| s),
+                status: SparkStatus::from_str(status),
                 ..Default::default()
             },
             "test",

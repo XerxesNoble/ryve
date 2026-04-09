@@ -60,6 +60,12 @@ impl RyveDir {
         self.root.join("backgrounds")
     }
 
+    /// Directory holding timestamped SQLite snapshots of `sparks.db`.
+    /// See [`crate::backup`].
+    pub fn backups_dir(&self) -> PathBuf {
+        self.root.join("backups")
+    }
+
     pub fn workshop_md_path(&self) -> PathBuf {
         self.root.join("WORKSHOP.md")
     }
@@ -78,6 +84,7 @@ impl RyveDir {
         tokio::fs::create_dir_all(self.agents_dir()).await?;
         tokio::fs::create_dir_all(self.context_dir()).await?;
         tokio::fs::create_dir_all(self.backgrounds_dir()).await?;
+        tokio::fs::create_dir_all(self.backups_dir()).await?;
         tokio::fs::create_dir_all(self.checklists_dir()).await?;
         Ok(())
     }

@@ -102,7 +102,7 @@ async fn test_non_blocking_bond_allows_cycle(pool: sqlx::SqlitePool) {
 }
 
 #[sqlx::test]
-async fn test_topological_order(pool: sqlx::SqlitePool) {
+async fn test_topological_order(_pool: sqlx::SqlitePool) {
     let edges = vec![
         ("A".to_string(), "B".to_string()),
         ("B".to_string(), "C".to_string()),

@@ -19,6 +19,13 @@ Cargo.lock
 
 # Database
 *.db
+# SQLite sidecars (WAL + shared-memory). These MUST NOT be versioned:
+# SQLite treats sparks.db, sparks.db-wal, sparks.db-shm as a single atomic
+# unit. Tracking the sidecars while .ryve/sparks.db is ignored produces
+# torn state on stash/checkout and corrupts the workgraph. See
+# docs/WORKGRAPH.md (Sidecars must never be tracked).
+.ryve/sparks.db
+.ryve/sparks.db-*
 **/worktrees/
 
 # Ryve runtime artifacts (per-Hand prompts and logs)
