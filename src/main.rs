@@ -34,7 +34,7 @@ use screen::{file_explorer, file_viewer, log_tail};
 use style::Appearance;
 use uuid::Uuid;
 use widget::splitter::{self, SplitterDrag, SplitterKind};
-use workshop::Workshop;
+use workshop::{SparkPatch, Workshop};
 
 /// Slot the std `UnixListener` returned by `ipc::acquire` waits in until
 /// the iced subscription wakes up and takes ownership of it. We can't
@@ -442,6 +442,51 @@ enum Message {
     /// Open a URL in the user's default browser. Used by the Unsplash
     /// attribution chip (spark sp-ux0033) to credit the photographer.
     OpenUrl(String),
+
+    /// Apply a field-level edit to a spark. The handler mutates
+    /// `ws.sparks` optimistically via `Workshop::apply_spark_patch`, then
+    /// dispatches an async `spark_repo::update` that reports back with
+    /// [`Message::SparkUpdateApplied`] on success or
+    /// [`Message::SparkUpdateFailed`] on error. This is the single write
+    /// path every editable field in the detail view is wired through —
+    /// spark ryve-90174007.
+    //
+    // Dead-code allowed: this variant is the shared write path for every
+    // field-level edit in the detail-view epic (ryve-82e1102f). Those
+    // sparks (ryve-f58d0492, ryve-4742d98b, ryve-99528556, ...) land in
+    // sibling branches and will wire view widgets to emit this message.
+    // Until they merge there are no in-tree callers, but removing the
+    // variant would just force each of them to invent its own duplicate.
+    #[allow(dead_code)]
+    SparkUpdate {
+        workshop_id: Uuid,
+        id: String,
+        patch: SparkPatch,
+    },
+    /// Async `spark_repo::update` for spark `id` succeeded. The optimistic
+    /// values already applied to `ws.sparks` are now durable; the handler
+    /// is a no-op placeholder today (no per-field in-flight map exists in
+    /// this branch yet — spark ryve-1d8c2847 introduces `SparkEdit` in a
+    /// sibling branch). The message still exists so every field-edit
+    /// caller has a symmetric success signal to plug into once the
+    /// in-flight map lands.
+    SparkUpdateApplied {
+        #[allow(dead_code)]
+        workshop_id: Uuid,
+        #[allow(dead_code)]
+        id: String,
+    },
+    /// Async `spark_repo::update` for spark `id` failed. `prior` is the
+    /// inverse patch captured at dispatch time; re-applying it restores
+    /// `ws.sparks` to the pre-edit state. The handler also pushes an
+    /// error toast with the failure reason so the user sees why the write
+    /// was rejected. Spark ryve-90174007.
+    SparkUpdateFailed {
+        workshop_id: Uuid,
+        id: String,
+        prior: SparkPatch,
+        error: String,
+    },
 }
 
 impl std::fmt::Debug for Message {
@@ -555,6 +600,11 @@ impl std::fmt::Debug for Message {
             Self::EmberBar(m) => write!(f, "EmberBar({m:?})"),
             Self::EmberDismissed { ember_id, .. } => write!(f, "EmberDismissed({ember_id})"),
             Self::OpenUrl(url) => write!(f, "OpenUrl({url})"),
+            Self::SparkUpdate { id, .. } => write!(f, "SparkUpdate({id})"),
+            Self::SparkUpdateApplied { id, .. } => write!(f, "SparkUpdateApplied({id})"),
+            Self::SparkUpdateFailed { id, error, .. } => {
+                write!(f, "SparkUpdateFailed({id}, {error})")
+            }
         }
     }
 }
@@ -1969,7 +2019,7 @@ impl App {
                         // Mirror screen::sparks::Message::SelectSpark — set the
                         // selected spark and load its contracts + bonds so the
                         // right panel hydrates immediately.
-                        ws.selected_spark = Some(spark_id.clone());
+                        let _discarded = ws.change_selected_spark(Some(spark_id.clone()));
                         ws.selected_spark_contracts.clear();
                         ws.selected_spark_bonds.clear();
                         ws.contract_create_form.reset();
@@ -2023,7 +2073,7 @@ impl App {
                 match msg {
                     screen::spark_detail::Message::Back => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
-                            ws.selected_spark = None;
+                            let _discarded = ws.change_selected_spark(None);
                             ws.selected_spark_contracts.clear();
                             ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
@@ -2351,7 +2401,7 @@ impl App {
                     }
                     screen::sparks::Message::SelectSpark(spark_id) => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
-                            ws.selected_spark = Some(spark_id.clone());
+                            let _discarded = ws.change_selected_spark(Some(spark_id.clone()));
                             ws.selected_spark_contracts.clear();
                             ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
@@ -3025,6 +3075,96 @@ impl App {
                 }
                 Task::none()
             }
+
+            // -- Spark field edits (ryve-90174007) --
+            Message::SparkUpdate {
+                workshop_id,
+                id,
+                patch,
+            } => {
+                if patch.is_empty() {
+                    return Task::none();
+                }
+                let Some(idx) = self.workshops.iter().position(|ws| ws.id == workshop_id) else {
+                    return Task::none();
+                };
+                let ws = &mut self.workshops[idx];
+                // Optimistic write: mutate the cached spark immediately so
+                // the UI reflects the edit without waiting on the DB. The
+                // returned `prior` is the inverse patch used for rollback
+                // if the async write fails.
+                let Some(prior) = ws.apply_spark_patch(&id, &patch) else {
+                    // Spark isn't in the cache — nothing to roll back, nothing
+                    // to persist. This happens if the detail view still holds
+                    // a stale selection across a workshop reload.
+                    return Task::none();
+                };
+                if prior.is_empty() {
+                    // No-op edit (every field already matched) — don't churn
+                    // the DB or the write-amplifying event log.
+                    return Task::none();
+                }
+                let Some(pool) = ws.sparks_db.clone() else {
+                    // Pool not ready yet (workshop still initializing). Roll
+                    // back the optimistic apply and surface a toast so the
+                    // user isn't staring at a stale cached value.
+                    ws.apply_spark_patch(&id, &prior);
+                    return self.push_toast(
+                        "Save failed",
+                        "Workshop is still initializing",
+                        ToastKind::Error,
+                    );
+                };
+                let upd = patch.to_update_spark();
+                let id_for_task = id.clone();
+                Task::perform(
+                    async move {
+                        data::sparks::spark_repo::update(&pool, &id_for_task, upd, "user")
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    },
+                    move |res| match res {
+                        Ok(()) => Message::SparkUpdateApplied {
+                            workshop_id,
+                            id: id.clone(),
+                        },
+                        Err(error) => Message::SparkUpdateFailed {
+                            workshop_id,
+                            id: id.clone(),
+                            prior: prior.clone(),
+                            error,
+                        },
+                    },
+                )
+            }
+            Message::SparkUpdateApplied { .. } => {
+                // Durable write succeeded; the optimistic cache is now the
+                // source of truth. The per-field in-flight slot will clear
+                // here once `SparkEdit` (spark ryve-1d8c2847) lands in this
+                // branch — until then there is nothing to reconcile.
+                Task::none()
+            }
+            Message::SparkUpdateFailed {
+                workshop_id,
+                id,
+                prior,
+                error,
+            } => {
+                // Restore the pre-edit values. If the spark has since
+                // disappeared from the cache (e.g. workshop closed mid-flight)
+                // the rollback silently no-ops — we still push the toast so
+                // the user knows the write didn't land.
+                if let Some(idx) = self.workshops.iter().position(|ws| ws.id == workshop_id) {
+                    let ws = &mut self.workshops[idx];
+                    ws.apply_spark_patch(&id, &prior);
+                }
+                self.push_toast(
+                    format!("Could not save {id}"),
+                    error,
+                    ToastKind::Error,
+                )
+            }
         }
     }
 
@@ -3045,7 +3185,7 @@ impl App {
         let ws = &mut self.workshops[idx];
         match msg {
             screen::home::Message::SelectSpark(id) => {
-                ws.selected_spark = Some(id.clone());
+                let _discarded = ws.change_selected_spark(Some(id.clone()));
                 if let Some(ref pool) = ws.sparks_db {
                     let pool = pool.clone();
                     let ws_id = ws.id;
