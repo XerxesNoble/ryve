@@ -21,6 +21,10 @@ pub struct Tab {
     pub id: u64,
     pub title: String,
     pub kind: TabKind,
+    /// True when this tab hosts the Atlas Director agent. Used by the
+    /// tab bar to show a refresh button that kills and relaunches the
+    /// subprocess in-place (spark ryve-71c3ec9f).
+    pub is_atlas: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +127,10 @@ pub enum Message {
     /// Jump to the next / previous match in the active terminal.
     TerminalSearchNext,
     TerminalSearchPrev,
+    /// Kill the Atlas subprocess and relaunch it in-place. The tab id,
+    /// position, and label remain stable across refresh
+    /// (spark ryve-71c3ec9f).
+    RefreshAtlas(u64),
 }
 
 impl BenchState {
@@ -142,7 +150,12 @@ impl BenchState {
 
     /// Create a tab with an externally-assigned ID.
     pub fn create_tab(&mut self, id: u64, title: String, kind: TabKind) {
-        self.tabs.push(Tab { id, title, kind });
+        self.tabs.push(Tab {
+            id,
+            title,
+            kind,
+            is_atlas: false,
+        });
         self.active_tab = Some(id);
         self.dropdown_open = false;
     }
@@ -178,19 +191,33 @@ impl BenchState {
                 }
             };
 
-            let tab_content = row![
+            let mut tab_content = row![
                 text(kind_icon).size(FONT_ICON_SM).color(text_color),
                 button(text(&tab.title).size(FONT_BODY).color(text_color))
                     .style(button::text)
                     .padding(0)
                     .on_press(Message::SelectTab(tab.id)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+
+            // Atlas tabs get a refresh button that kills and relaunches the
+            // subprocess in-place (spark ryve-71c3ec9f).
+            if tab.is_atlas {
+                tab_content = tab_content.push(
+                    button(text("\u{21BB}").size(FONT_ICON_SM).color(pal.text_tertiary))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::RefreshAtlas(tab.id)),
+                );
+            }
+
+            tab_content = tab_content.push(
                 button(text("\u{00D7}").size(FONT_ICON).color(pal.text_tertiary))
                     .style(button::text)
                     .padding(0)
                     .on_press(Message::CloseTab(tab.id)),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
+            );
 
             let pill = container(tab_content)
                 .padding([4, 10])
@@ -542,6 +569,25 @@ mod tests {
         assert!(matches!(Message::NewHead, Message::NewHead));
         assert!(matches!(Message::NewHand, Message::NewHand));
         assert!(matches!(Message::NewTerminal, Message::NewTerminal));
+    }
+
+    /// Spark ryve-71c3ec9f — `RefreshAtlas` message variant exists and the
+    /// `is_atlas` flag is correctly managed on tabs.
+    #[test]
+    fn refresh_atlas_message_and_flag() {
+        // Message variant exists.
+        let m = Message::RefreshAtlas(1);
+        assert!(matches!(m, Message::RefreshAtlas(1)));
+
+        // create_tab defaults is_atlas to false.
+        let mut bench = BenchState::new();
+        bench.create_tab(1, "Terminal".into(), TabKind::Terminal);
+        assert!(!bench.tabs[0].is_atlas);
+
+        // Setting is_atlas survives — tab identity is stable.
+        bench.tabs[0].is_atlas = true;
+        assert!(bench.tabs[0].is_atlas);
+        assert_eq!(bench.tabs[0].id, 1);
     }
 
     #[test]

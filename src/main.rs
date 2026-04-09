@@ -4719,6 +4719,114 @@ impl App {
                 entry.current_match = Some(next);
                 term.focus_match(&matches[next]);
             }
+            screen::bench::Message::RefreshAtlas(tab_id) => {
+                // Kill the current Atlas subprocess and relaunch a fresh
+                // one in-place. Tab id, position, and label stay stable.
+                // Spark ryve-71c3ec9f.
+                let ws = &mut self.workshops[idx];
+                let full_auto = ws
+                    .agent_sessions
+                    .iter()
+                    .find(|s| s.tab_id == Some(tab_id) && s.active)
+                    .and_then(|s| {
+                        self.global_config
+                            .agent_settings
+                            .get(&s.agent.command)
+                            .map(|cfg| cfg.full_auto)
+                    })
+                    .unwrap_or(false);
+
+                let new_session_id = Uuid::new_v4().to_string();
+                let Some(agent) =
+                    ws.prepare_atlas_refresh(tab_id, new_session_id.clone(), full_auto)
+                else {
+                    return Task::none();
+                };
+
+                // Dispatch the worktree task (idempotent — reuses existing
+                // worktree directory).
+                let worktree_task =
+                    Self::dispatch_worktree_task(ws, tab_id, new_session_id.clone());
+
+                // Register the new session in memory.
+                let title = format!("Atlas ({})", agent.display_name);
+                let agent_command = agent.command.clone();
+                let agent_args = agent.args.clone();
+                ws.agent_sessions.push(AgentSession {
+                    id: new_session_id.clone(),
+                    name: title.clone(),
+                    agent,
+                    tab_id: Some(tab_id),
+                    active: true,
+                    stale: false,
+                    resume_id: None,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    log_path: None,
+                    last_output_at: None,
+                    parent_session_id: None,
+                });
+
+                let mut tasks: Vec<Task<Message>> = vec![worktree_task];
+
+                // Persist the new session + end the old one(s) in DB.
+                if let Some(ref pool) = self.workshops[idx].sparks_db {
+                    let pool_end = pool.clone();
+                    let pool_create = pool.clone();
+                    let ws_id = self.workshops[idx].workshop_id();
+
+                    // End old sessions for this tab in DB.
+                    let ended: Vec<String> = self.workshops[idx]
+                        .agent_sessions
+                        .iter()
+                        .filter(|s| !s.active && s.tab_id.is_none())
+                        .map(|s| s.id.clone())
+                        .collect();
+                    for sid in ended {
+                        let p = pool_end.clone();
+                        tasks.push(Task::perform(
+                            async move {
+                                let _ =
+                                    data::sparks::agent_session_repo::end_session(&p, &sid).await;
+                            },
+                            |_| Message::AgentSessionSaved,
+                        ));
+                    }
+
+                    let new_session = data::sparks::types::NewAgentSession {
+                        id: new_session_id.clone(),
+                        workshop_id: ws_id,
+                        agent_name: title,
+                        agent_command,
+                        agent_args,
+                        session_label: Some("atlas".to_string()),
+                        child_pid: None,
+                        resume_id: None,
+                        log_path: None,
+                        parent_session_id: None,
+                    };
+                    tasks.push(Task::perform(
+                        async move {
+                            let _ = data::sparks::agent_session_repo::create(
+                                &pool_create,
+                                &new_session,
+                            )
+                            .await;
+                        },
+                        |_| Message::AgentSessionSaved,
+                    ));
+                }
+
+                // Re-inject the Atlas Director prompt after a boot delay.
+                let prompt = agent_prompts::compose_atlas_prompt();
+                tasks.push(Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    },
+                    move |_| Message::SendSparkPrompt { tab_id, prompt },
+                ));
+
+                return Task::batch(tasks);
+            }
         }
         Task::none()
     }
@@ -5080,6 +5188,11 @@ impl App {
             session_id.clone(),
             full_auto,
         );
+        // Mark the tab so the bench UI can show a refresh button
+        // (spark ryve-71c3ec9f).
+        if let Some(tab) = ws.bench.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.is_atlas = true;
+        }
         let worktree_task = Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
         ws.agent_sessions.push(AgentSession {
