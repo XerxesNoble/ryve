@@ -218,9 +218,9 @@ fn print_usage() {
     eprintln!("  restore <snapshot>                  Restore sparks.db from a snapshot");
     eprintln!();
     eprintln!("  spark list [--all]                  List sparks (active by default)");
-    eprintln!("  spark create <title>                Create a task spark (P2)");
-    eprintln!("  spark create --type bug --priority 0 --problem 'desc' <title>");
-    eprintln!("  spark create --help                 Show all create flags (intent, risk, etc.)");
+    eprintln!("  spark create --parent <epic-id> <title>   Create a task spark under an epic");
+    eprintln!("  spark create --type epic <title>          Create a top-level epic");
+    eprintln!("  spark create --help                       Show all create flags (intent, risk, etc.)");
     eprintln!("  spark show <id>                     Show spark details + intent");
     eprintln!("  spark status <id> <new_status>      Update status");
     eprintln!("  spark close <id> [reason]           Close a spark");
@@ -550,6 +550,9 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                 eprintln!(
                     "  --type, -t <type>           bug|feature|task|epic|chore|spike|milestone (default: task)"
                 );
+                eprintln!(
+                    "  --parent <spark-id>         Parent epic id. Required for any non-epic spark."
+                );
                 eprintln!("  --priority, -p <0-4>        P0=critical, P4=negligible (default: 2)");
                 eprintln!("  --risk, -r <level>          trivial|normal|elevated|critical");
                 eprintln!("  --scope, -s <boundary>      Scope boundary (e.g. 'src/auth/')");
@@ -571,12 +574,12 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
             let mut priority = 2i32;
             let mut risk = None;
             let mut scope = None;
-            let mut parent_id: Option<String> = None;
             let mut description = String::new();
             let mut problem: Option<String> = None;
             let mut invariants: Vec<String> = Vec::new();
             let mut non_goals: Vec<String> = Vec::new();
             let mut acceptance: Vec<String> = Vec::new();
+            let mut parent: Option<String> = None;
             let mut title_parts: Vec<&str> = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -603,12 +606,6 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                         i += 1;
                         if i < args.len() {
                             scope = Some(args[i].clone());
-                        }
-                    }
-                    "--parent" => {
-                        i += 1;
-                        if i < args.len() {
-                            parent_id = Some(args[i].clone());
                         }
                     }
                     "--description" | "-d" => {
@@ -641,6 +638,12 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                             acceptance.push(args[i].clone());
                         }
                     }
+                    "--parent" => {
+                        i += 1;
+                        if i < args.len() {
+                            parent = Some(args[i].clone());
+                        }
+                    }
                     _ => title_parts.push(&args[i]),
                 }
                 i += 1;
@@ -648,6 +651,33 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
             let title = title_parts.join(" ");
             if title.is_empty() {
                 die("spark create requires a title. Use `spark create --help` for options.");
+            }
+
+            // Enforce the no-orphan rule at the CLI layer with a friendly message.
+            // The data layer is the source of truth; this is a usability shim that
+            // surfaces the rule before we hit a raw error from the repo.
+            if spark_type != SparkType::Epic && parent.is_none() {
+                die(&format!(
+                    "non-epic spark requires a parent epic.\n  \
+                     use --parent <epic-id> to nest under an existing epic, or\n  \
+                     use --type epic if you intended a top-level spark.\n  \
+                     run `ryve spark list --type epic` to find an epic id."
+                ));
+            }
+
+            // Validate the parent: must exist and be of type 'epic'.
+            if let Some(ref pid) = parent {
+                match spark_repo::get(pool, pid).await {
+                    Ok(p) => {
+                        if p.spark_type != SparkType::Epic.as_str() {
+                            die(&format!(
+                                "--parent {pid} resolves to a {} spark; only epics may be parents.",
+                                p.spark_type
+                            ));
+                        }
+                    }
+                    Err(_) => die(&format!("--parent {pid}: spark not found")),
+                }
             }
 
             // Build metadata JSON with intent if any intent fields provided
@@ -677,7 +707,7 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
                 workshop_id: ws_id.to_string(),
                 assignee: None,
                 owner: None,
-                parent_id,
+                parent_id: parent.clone(),
                 due_at: None,
                 estimated_minutes: None,
                 metadata,
@@ -686,6 +716,16 @@ async fn handle_spark(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
             };
             match spark_repo::create(pool, new).await {
                 Ok(spark) => {
+                    // Mirror the parent linkage as a parent_child bond so the bond
+                    // graph and the spark.parent_id column stay in sync.
+                    if let Some(ref pid) = parent {
+                        if let Err(e) = bond_repo::create(pool, pid, &spark.id, BondType::ParentChild).await {
+                            die(&format!(
+                                "spark {} created but parent_child bond from {pid} failed: {e}",
+                                spark.id
+                            ));
+                        }
+                    }
                     if json_mode {
                         println!(
                             "{}",
