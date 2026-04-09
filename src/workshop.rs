@@ -283,6 +283,8 @@ pub struct Workshop {
     pub background_handle: Option<iced::widget::image::Handle>,
     /// Background picker modal state.
     pub background_picker: PickerState,
+    /// Status filter for the sparks panel. Pill state mirrors this directly.
+    pub sparks_filter: crate::screen::sparks::SparksFilter,
     /// Inline spark create form state.
     pub spark_create_form: crate::screen::sparks::CreateForm,
     /// Inline status popover state for the workgraph panel.
@@ -402,6 +404,7 @@ impl Workshop {
             agent_context: None,
             background_handle: None,
             background_picker: PickerState::new(),
+            sparks_filter: Default::default(),
             spark_create_form: Default::default(),
             spark_status_menu: Default::default(),
             selected_spark: None,

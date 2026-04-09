@@ -13,6 +13,60 @@ use crate::style::{
     self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_ICON_SM, FONT_LABEL, FONT_SMALL, Palette,
 };
 
+// ── Filter state ────────────────────────────────────────
+
+/// All status values that can appear as filter pills.
+pub const FILTER_STATUSES: &[(&str, &str)] = &[
+    ("open", "Open"),
+    ("in_progress", "In Progress"),
+    ("blocked", "Blocked"),
+    ("deferred", "Deferred"),
+    ("completed", "Completed"),
+];
+
+/// Filter state for the sparks panel. The `status` set holds statuses
+/// the user has explicitly selected; an empty set means "show all".
+/// `show_closed` is a separate toggle because closed sparks are hidden
+/// by default regardless of the status filter.
+///
+/// Invariant: pill state is a direct mirror of this struct — no separate
+/// UI-only flag.
+#[derive(Debug, Clone, Default)]
+pub struct SparksFilter {
+    pub status: HashSet<String>,
+    pub show_closed: bool,
+}
+
+impl SparksFilter {
+    /// Toggle a status in the filter. Returns `true` if the status is now
+    /// selected.
+    pub fn toggle_status(&mut self, status: &str) -> bool {
+        if !self.status.remove(status) {
+            self.status.insert(status.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a spark should be visible given the current filter state.
+    pub fn matches(&self, spark_status: &str) -> bool {
+        // Closed sparks obey their own toggle regardless of the status set.
+        if spark_status == "closed" {
+            return self.show_closed;
+        }
+        // Completed is treated like closed when show_closed is false.
+        if spark_status == "completed" && !self.show_closed && self.status.is_empty() {
+            return true;
+        }
+        // Empty status set means "show all (minus closed unless toggled)".
+        if self.status.is_empty() {
+            return true;
+        }
+        self.status.contains(spark_status)
+    }
+}
+
 // ── State ────────────────────────────────────────────
 
 /// Inline create form state, held on the Workshop. The form enforces a
@@ -210,7 +264,6 @@ pub fn group_by_epic<'a>(sparks: &'a [Spark]) -> Vec<EpicGroup<'a>> {
         let Some(pid) = s.parent_id.as_deref() else {
             continue;
         };
-        // Skip self-reference (shouldn't happen, but be defensive).
         if pid == s.id {
             continue;
         }
@@ -296,6 +349,10 @@ pub enum Message {
     BeginCloseFlow(String),
     /// Close the spark with a specific reason.
     CloseSparkWithReason(String, String),
+    /// Toggle a status in the filter pill row.
+    ToggleStatusFilter(String),
+    /// Toggle visibility of closed sparks.
+    ToggleShowClosed,
     /// Toggle the collapsed/expanded state of an epic group in the
     /// workgraph panel. The workshop persists the new state to
     /// `.ryve/ui_state.json` so the decision survives restart.
@@ -331,6 +388,20 @@ pub struct ViewCtx<'a> {
     pub status_menu: &'a StatusMenu,
     pub collapsed: &'a HashSet<String>,
     pub refreshing: bool,
+    pub filter: &'a SparksFilter,
+}
+
+/// Map a spark status to its canonical palette color.
+pub fn status_color(status: &str, pal: &Palette) -> iced::Color {
+    match status {
+        "open" => pal.text_secondary,
+        "in_progress" => pal.accent,
+        "blocked" => pal.danger,
+        "deferred" => pal.text_tertiary,
+        "completed" => pal.success,
+        "closed" => pal.text_tertiary,
+        _ => pal.text_secondary,
+    }
 }
 
 pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
@@ -343,6 +414,7 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
         status_menu,
         collapsed,
         refreshing,
+        filter,
     } = ctx;
 
     // Refresh button: dim the glyph and swap it for an ellipsis while a
@@ -373,9 +445,12 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
     .spacing(4)
     .padding([8, 10]);
 
+    // ── Filter pills ──
+    let filter_row = view_filter_pills(filter, &pal);
+
     let mut list = column![].spacing(2).padding([0, 10]);
 
-    // Inline create form
+    // Inline create form (uses unfiltered sparks for epic picker).
     if create_form.visible {
         list = list.push(view_create_form(sparks, create_form, &pal));
     }
@@ -387,7 +462,19 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
                 .color(pal.text_tertiary),
         );
     } else {
-        let groups = group_by_epic(sparks);
+        let all_groups = group_by_epic(sparks);
+        // Apply filter: keep only groups whose epic or children match.
+        let groups: Vec<EpicGroup<'_>> = all_groups
+            .into_iter()
+            .filter_map(|mut g| {
+                g.children.retain(|c| filter.matches(&c.status));
+                if filter.matches(&g.epic.status) || !g.children.is_empty() {
+                    Some(g)
+                } else {
+                    None
+                }
+            })
+            .collect();
         let epic_ids: HashSet<&str> = groups.iter().map(|g| g.epic.id.as_str()).collect();
         // Top-level groups are those whose epic has no epic-group parent;
         // nested epics are rendered inline under their parent group instead.
@@ -413,7 +500,7 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
         }
     }
 
-    let content = column![header, scrollable(list).height(Length::Fill)]
+    let content = column![header, filter_row, scrollable(list).height(Length::Fill)]
         .width(Length::Fill)
         .height(Length::Fill);
 
@@ -421,6 +508,72 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg))
+        .into()
+}
+
+// ── Filter pills view ───────────────────────────────
+
+fn view_filter_pills<'a>(filter: &SparksFilter, pal: &Palette) -> Element<'a, Message> {
+    let pal = *pal;
+    let mut pills = row![].spacing(4).align_y(iced::Alignment::Center);
+
+    for (key, label) in FILTER_STATUSES {
+        let selected = filter.status.contains(*key);
+        let color = status_color(key, &pal);
+        let key_owned = (*key).to_string();
+        pills = pills.push(filter_pill(label, selected, color, &pal, move || {
+            Message::ToggleStatusFilter(key_owned.clone())
+        }));
+    }
+
+    // "Closed" pill at the end — separate toggle.
+    pills = pills.push(filter_pill(
+        "Closed",
+        filter.show_closed,
+        status_color("closed", &pal),
+        &pal,
+        || Message::ToggleShowClosed,
+    ));
+
+    container(pills).padding([2, 10]).width(Length::Fill).into()
+}
+
+fn filter_pill<'a, F>(
+    label: &str,
+    selected: bool,
+    active_color: iced::Color,
+    pal: &Palette,
+    on_press: F,
+) -> Element<'a, Message>
+where
+    F: 'a + Fn() -> Message,
+{
+    let pal = *pal;
+    let (text_color, bg) = if selected {
+        (pal.window_bg, active_color)
+    } else {
+        // Dimmed: use the status color at reduced opacity for the text.
+        (
+            iced::Color {
+                a: 0.45,
+                ..active_color
+            },
+            pal.surface,
+        )
+    };
+    button(text(label.to_string()).size(FONT_LABEL).color(text_color))
+        .style(move |_t: &Theme, _s| button::Style {
+            background: Some(iced::Background::Color(bg)),
+            text_color,
+            border: iced::Border {
+                color: if selected { active_color } else { pal.border },
+                width: 1.0,
+                radius: iced::border::Radius::from(10.0),
+            },
+            ..button::Style::default()
+        })
+        .padding([2, 8])
+        .on_press_with(on_press)
         .into()
 }
 
@@ -1303,5 +1456,113 @@ mod tests {
         assert_ne!(status_symbol("open"), status_symbol("in_progress"));
         assert_ne!(status_symbol("blocked"), status_symbol("deferred"));
         assert_ne!(status_symbol("closed"), status_symbol("open"));
+    }
+
+    // ── SparksFilter tests ───────────────────────────────
+
+    #[test]
+    fn filter_default_shows_all_except_closed() {
+        let f = SparksFilter::default();
+        assert!(f.matches("open"));
+        assert!(f.matches("in_progress"));
+        assert!(f.matches("blocked"));
+        assert!(f.matches("deferred"));
+        assert!(f.matches("completed"));
+        assert!(!f.matches("closed"));
+    }
+
+    #[test]
+    fn filter_toggle_adds_and_removes_status() {
+        let mut f = SparksFilter::default();
+        assert!(f.toggle_status("blocked"));
+        assert!(f.status.contains("blocked"));
+        assert!(!f.toggle_status("blocked"));
+        assert!(!f.status.contains("blocked"));
+    }
+
+    #[test]
+    fn filter_with_selected_status_only_shows_selected() {
+        let mut f = SparksFilter::default();
+        f.toggle_status("in_progress");
+        assert!(f.matches("in_progress"));
+        assert!(!f.matches("open"));
+        assert!(!f.matches("blocked"));
+        assert!(!f.matches("deferred"));
+        assert!(!f.matches("closed"));
+    }
+
+    #[test]
+    fn filter_show_closed_includes_closed_sparks() {
+        let mut f = SparksFilter::default();
+        assert!(!f.matches("closed"));
+        f.show_closed = true;
+        assert!(f.matches("closed"));
+    }
+
+    #[test]
+    fn filter_empty_status_set_is_show_all() {
+        let f = SparksFilter::default();
+        assert!(f.status.is_empty());
+        assert!(f.matches("open"));
+        assert!(f.matches("in_progress"));
+        assert!(f.matches("blocked"));
+        assert!(f.matches("deferred"));
+    }
+
+    #[test]
+    fn filter_multiple_statuses_selected() {
+        let mut f = SparksFilter::default();
+        f.toggle_status("open");
+        f.toggle_status("blocked");
+        assert!(f.matches("open"));
+        assert!(f.matches("blocked"));
+        assert!(!f.matches("in_progress"));
+        assert!(!f.matches("deferred"));
+    }
+
+    #[test]
+    fn filter_closed_obeys_own_toggle_even_when_status_selected() {
+        let mut f = SparksFilter::default();
+        f.toggle_status("in_progress");
+        assert!(!f.matches("closed"));
+        f.show_closed = true;
+        assert!(f.matches("closed"));
+    }
+
+    #[test]
+    fn filter_pill_state_mirrors_sparks_filter() {
+        // Invariant: pill state is a direct mirror of SparksFilter.
+        let mut f = SparksFilter::default();
+        f.toggle_status("blocked");
+        assert!(f.status.contains("blocked"));
+        assert_eq!(f.status.len(), 1);
+        f.toggle_status("blocked");
+        assert!(f.status.is_empty());
+    }
+
+    #[test]
+    fn filter_statuses_cover_expected_values() {
+        let keys: Vec<&str> = FILTER_STATUSES.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec!["open", "in_progress", "blocked", "deferred", "completed"]
+        );
+    }
+
+    #[test]
+    fn status_color_returns_distinct_colors_for_key_statuses() {
+        let pal = crate::style::Palette::dark();
+        assert_ne!(
+            status_color("open", &pal),
+            status_color("in_progress", &pal)
+        );
+        assert_ne!(
+            status_color("blocked", &pal),
+            status_color("deferred", &pal)
+        );
+        assert_ne!(
+            status_color("in_progress", &pal),
+            status_color("blocked", &pal)
+        );
     }
 }
