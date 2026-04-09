@@ -1035,6 +1035,11 @@ impl App {
                     // choices. Stale IDs are pruned once sparks finish
                     // loading (see SparksLoaded below). Spark ryve-926870a9.
                     ws.collapsed_epics = ui_state.collapsed_epics.clone();
+                    // Rehydrate the persisted sparks-panel filter so the
+                    // user returns to the same view. Spark ryve-27e33825.
+                    ws.sparks_filter = crate::screen::sparks::SparksFilter::from_persisted(
+                        &ui_state.sparks_filter,
+                    );
                     // Hand off the warm hash cache from init_workshop so the
                     // first SparksLoaded sync tick is a no-op on disk.
                     // Spark ryve-86b0b326.
@@ -3599,6 +3604,23 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.sparks_filter.search.clear();
                             ws.recompute_filtered_sparks();
+                        }
+                    }
+                    screen::sparks::Message::SparksFilterChanged => {
+                        // Persist the updated filter state to
+                        // `.ryve/ui_state.json`. Fire-and-forget — a
+                        // failed write is logged but never blocks the UI.
+                        // Spark ryve-27e33825.
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            let ryve_dir = ws.ryve_dir.clone();
+                            let snapshot = ws.ui_state_snapshot();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await
+                                {
+                                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                                }
+                            });
                         }
                     }
                     screen::sparks::Message::CloseSparkWithReason(spark_id, reason) => {

@@ -127,6 +127,31 @@ impl SparksFilter {
     pub fn set_assignee(&mut self, assignee: Option<String>) {
         self.assignee = assignee;
     }
+
+    /// Snapshot the filter state for persistence in `.ryve/ui_state.json`.
+    pub fn to_persisted(&self) -> data::ryve_dir::SparksFilterState {
+        data::ryve_dir::SparksFilterState {
+            status: self.status.clone(),
+            spark_type: self.spark_types.clone(),
+            priority: self.priorities.clone(),
+            assignee: self.assignee.clone(),
+            search: self.search.clone(),
+            sort_mode: String::new(),
+            show_closed: self.show_closed,
+        }
+    }
+
+    /// Rehydrate from persisted state.
+    pub fn from_persisted(state: &data::ryve_dir::SparksFilterState) -> Self {
+        Self {
+            status: state.status.clone(),
+            show_closed: state.show_closed,
+            spark_types: state.spark_type.clone(),
+            priorities: state.priority.clone(),
+            assignee: state.assignee.clone(),
+            search: state.search.clone(),
+        }
+    }
 }
 
 // ── State ────────────────────────────────────────────
@@ -456,6 +481,8 @@ pub enum Message {
     /// Navigate to an agent session in the agents panel (and open its
     /// log tab if applicable). Spark ryve-dba4b8c4.
     FocusAgentSession(String),
+    /// The sparks filter changed — persist to `.ryve/ui_state.json`.
+    SparksFilterChanged,
 }
 
 // ── Refresh button glyph ─────────────────────────────

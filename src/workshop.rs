@@ -554,7 +554,9 @@ impl Workshop {
     /// fields. Used by the save side-effect helpers.
     pub fn ui_state_snapshot(&self) -> UiState {
         UiState {
+            version: 1,
             collapsed_epics: self.collapsed_epics.clone(),
+            sparks_filter: self.sparks_filter.to_persisted(),
         }
     }
 

@@ -311,30 +311,87 @@ pub async fn save_config(
 
 // ── UI State (spark ryve-926870a9) ─────────────────────
 
-/// Per-workshop UI state persisted across restarts. Currently just the set
-/// of collapsed epic IDs in the workgraph panel; other mostly-ephemeral UI
-/// knobs (filter, sort, selection) can ride on the same file later without
-/// a new persistence plumb.
+/// Per-workshop UI state persisted across restarts. Contains collapsed
+/// epic IDs and sparks filter/sort state. Each field carries
+/// `#[serde(default)]` so new additions deserialise cleanly from older
+/// files.
 ///
 /// Stored as JSON in `.ryve/ui_state.json` — deliberately separate from
 /// `config.toml` so high-frequency, UI-driven writes don't rewrite the
 /// canonical (user-editable) workshop config on every chevron click.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// The `version` field enables future migrations. Current version: `1`.
+/// Spark ryve-926870a9 (initial), ryve-27e33825 (filter persistence).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UiState {
+    /// Format version for forward-compatible migration. Defaults to 1.
+    #[serde(default = "ui_state_version_default")]
+    pub version: u32,
     /// IDs of epics the user has collapsed in the sparks panel. Default-
     /// expanded: only collapsed IDs are persisted, so a freshly-created
     /// epic appears open.
     #[serde(default)]
     pub collapsed_epics: std::collections::HashSet<String>,
+    /// Persisted sparks-panel filter + sort state. Scoped per workshop —
+    /// each workshop stores its own filter in its `.ryve/ui_state.json`.
+    /// Spark ryve-27e33825.
+    #[serde(default)]
+    pub sparks_filter: SparksFilterState,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            collapsed_epics: std::collections::HashSet::new(),
+            sparks_filter: SparksFilterState::default(),
+        }
+    }
+}
+
+fn ui_state_version_default() -> u32 {
+    1
+}
+
+/// Serializable sparks filter state for persistence in `UiState`.
+///
+/// Mirrors the fields of the UI-side `SparksFilter` struct but lives in
+/// the `data` crate so it stays decoupled from the rendering layer. The
+/// `#[serde(default)]` on every field means older files that lack filter
+/// state deserialise cleanly into the default (show all non-closed).
+/// Spark ryve-27e33825.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparksFilterState {
+    #[serde(default)]
+    pub status: std::collections::HashSet<String>,
+    #[serde(default)]
+    pub spark_type: std::collections::HashSet<String>,
+    #[serde(default)]
+    pub priority: std::collections::HashSet<i32>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub search: String,
+    #[serde(default)]
+    pub sort_mode: String,
+    #[serde(default)]
+    pub show_closed: bool,
 }
 
 /// Load per-workshop UI state from `.ryve/ui_state.json`. Returns the
 /// default (empty) state on any missing-file or parse error — UI state
-/// is cosmetic and must never block workshop open.
+/// is cosmetic and must never block workshop open. A corrupted file
+/// logs a warning and falls back to the default. Spark ryve-27e33825.
 pub async fn load_ui_state(ryve_dir: &RyveDir) -> UiState {
     let path = ryve_dir.ui_state_path();
     match tokio::fs::read_to_string(&path).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(state) => state,
+            Err(e) => {
+                log::warn!("corrupted .ryve/ui_state.json, falling back to defaults: {e}");
+                UiState::default()
+            }
+        },
         Err(_) => UiState::default(),
     }
 }
@@ -460,5 +517,58 @@ mod tests {
             .unwrap();
         let state = load_ui_state(&ryve_dir).await;
         assert!(state.collapsed_epics.is_empty());
+    }
+
+    // Spark ryve-27e33825: sparks filter persistence.
+
+    #[tokio::test]
+    async fn ui_state_roundtrip_preserves_sparks_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        let mut state = UiState::default();
+        state.sparks_filter = SparksFilterState {
+            status: ["open".to_string()].into_iter().collect(),
+            priority: [0, 1].into_iter().collect(),
+            show_closed: true,
+            sort_mode: "recently_updated".to_string(),
+            search: "auth".to_string(),
+            ..Default::default()
+        };
+        save_ui_state(&ryve_dir, &state).await.unwrap();
+
+        let reloaded = load_ui_state(&ryve_dir).await;
+        assert_eq!(reloaded.sparks_filter, state.sparks_filter);
+        assert_eq!(reloaded.version, 1);
+    }
+
+    #[tokio::test]
+    async fn ui_state_without_filter_field_deserialises_to_default() {
+        // Older ui_state.json files won't have sparks_filter — they must
+        // still load cleanly with the default filter (forward compat).
+        let tmp = tempfile::tempdir().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+        tokio::fs::write(ryve_dir.ui_state_path(), r#"{"collapsed_epics":["ep-1"]}"#)
+            .await
+            .unwrap();
+
+        let state = load_ui_state(&ryve_dir).await;
+        assert!(state.collapsed_epics.contains("ep-1"));
+        assert_eq!(state.sparks_filter, SparksFilterState::default());
+    }
+
+    #[tokio::test]
+    async fn ui_state_version_defaults_to_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+        tokio::fs::write(ryve_dir.ui_state_path(), r#"{}"#)
+            .await
+            .unwrap();
+
+        let state = load_ui_state(&ryve_dir).await;
+        assert_eq!(state.version, 1);
     }
 }
