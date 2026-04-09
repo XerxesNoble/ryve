@@ -234,7 +234,7 @@ fn view_progress_bar<'a>(ratio: f32, pal: &Palette) -> Element<'a, Message> {
 /// Renders a single epic row with status chip.
 fn view_epic_row<'a>(spark: &'a Spark, pal: &Palette) -> Element<'a, Message> {
     let pal = *pal;
-    let status_color = spark_status_color(&spark.status, &pal);
+    let status_color = style::status_color(&spark.status, &pal);
 
     row![
         text(status_symbol(&spark.status))
@@ -334,18 +334,6 @@ fn status_symbol(status: &str) -> &'static str {
         "deferred" => "\u{25CC}",    // ◌
         "closed" => "\u{25CF}",      // ●
         _ => "\u{25CB}",
-    }
-}
-
-/// Map spark status string to a palette color.
-fn spark_status_color(status: &str, pal: &Palette) -> iced::Color {
-    match status {
-        "open" => pal.text_secondary,
-        "in_progress" => pal.accent,
-        "blocked" => pal.danger,
-        "deferred" => pal.text_tertiary,
-        "closed" => pal.success,
-        _ => pal.text_secondary,
     }
 }
 

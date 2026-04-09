@@ -949,7 +949,7 @@ pub fn view<'a>(
 
     // Status / Priority / Type badges
     let status_indicator = status_symbol(&spark.status);
-    let status_color = status_color(&spark.status, &pal);
+    let status_color = style::status_color(&spark.status, &pal);
     let next = next_status_str(&spark.status);
 
     let status_pill = button(
@@ -1729,7 +1729,7 @@ fn bond_status_symbol(status: &str) -> &'static str {
 fn view_bond_row<'a>(s: &'a Spark, pal: &Palette) -> Element<'a, Message> {
     let pal = *pal;
     let icon = bond_status_symbol(&s.status);
-    let color = status_color(&s.status, &pal);
+    let color = style::status_color(&s.status, &pal);
     row![
         text(icon).size(FONT_SMALL).color(color),
         text(format!("P{}", s.priority))
@@ -1756,7 +1756,7 @@ fn view_bond_row_typed<'a>(
 ) -> Element<'a, Message> {
     let pal = *pal;
     let icon = bond_status_symbol(&s.status);
-    let color = status_color(&s.status, &pal);
+    let color = style::status_color(&s.status, &pal);
     let arrow = if outgoing { "\u{2192}" } else { "\u{2190}" };
     row![
         text(icon).size(FONT_SMALL).color(color),
@@ -2127,17 +2127,6 @@ fn status_symbol(status: &str) -> &'static str {
         "deferred" => "\u{25CC}",    // ◌
         "closed" => "\u{25CF}",      // ●
         _ => "\u{25CB}",
-    }
-}
-
-fn status_color(status: &str, pal: &Palette) -> iced::Color {
-    match status {
-        "open" => pal.text_secondary,
-        "in_progress" => pal.accent,
-        "blocked" => pal.danger,
-        "deferred" => pal.text_tertiary,
-        "closed" => pal.text_tertiary,
-        _ => pal.text_secondary,
     }
 }
 
