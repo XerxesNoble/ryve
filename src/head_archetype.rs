@@ -11,11 +11,13 @@
 //! write discipline its Crew operates under.
 //!
 //! Archetypes are declared once, here, in a data-driven registry. The CLI
-//! (`ryve head archetype list`) and, eventually, `ryve head spawn
-//! --archetype <name>` look archetypes up by name — neither the CLI parser
-//! nor the spawn path hardcodes archetype identifiers. Adding a new
-//! archetype is a matter of extending [`Registry::builtins`] (or dropping
-//! a future TOML overlay into `.ryve/`); no CLI-parser edit is required.
+//! (`ryve head archetype list`) lists them from this registry, while
+//! `ryve head spawn --archetype <name>` validates against
+//! `agent_prompts::HeadArchetype::from_str` (`build`, `research`,
+//! `review`). Adding a new archetype requires extending both
+//! [`Registry::builtins`] and the `HeadArchetype` enum in `agent_prompts`.
+//! In the future, archetypes may be looked up purely by registry name
+//! (or a TOML overlay in `.ryve/`), removing the CLI-parser edit.
 //!
 //! ## Invariants
 //!

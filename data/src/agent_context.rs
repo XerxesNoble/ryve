@@ -364,7 +364,7 @@ fn generate_workshop_md() -> String {
     md.push_str("### Lifecycle\n\n");
     md.push_str(
         "1. **Atlas spawns a Head** on an epic spark with a populated intent: \
-         `ryve head spawn <epic_id> --agent claude`. This creates a worktree, an agent \
+         `ryve head spawn <epic_id> --archetype <build|research|review> --agent claude`. This creates a worktree, an agent \
          session, and an assignment where the Head \"owns\" the epic.\n",
     );
     md.push_str(
@@ -438,7 +438,7 @@ fn generate_workshop_md() -> String {
     md.push_str("ryve head --help                                      # long-form Head docs\n");
     md.push_str("ryve head spawn --help                                # spawn-specific help\n");
     md.push_str(
-        "ryve head spawn <epic_id> [--agent <a>] [--crew <c>]  # launch a Head on an epic\n",
+        "ryve head spawn <epic_id> --archetype build [--agent <a>] [--crew <c>]  # launch a Head on an epic\n",
     );
     md.push_str(
         "ryve head list                                        # list active Head sessions\n",

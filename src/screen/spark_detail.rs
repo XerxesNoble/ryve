@@ -3,12 +3,452 @@
 
 //! Spark detail view — shown when a spark is selected in the workgraph panel.
 
+use std::collections::HashMap;
+
 use data::sparks::types::{Bond, Contract, ContractEnforcement, ContractKind, Spark};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::{Element, Length, Theme};
+use iced::widget::{
+    Id, Space, button, column, combo_box, container, mouse_area, pick_list, row, scrollable, stack,
+    text, text_editor, text_input, tooltip,
+};
+use iced::{Background, Border, Element, Length, Theme};
+
+/// Prefix used to build stable widget `Id`s for acceptance criterion rows.
+/// Building the id from the row index lets the update handler issue the
+/// focus operation to move focus to a freshly inserted row (used by the
+/// "+ Add criterion" button to drop the caret straight into the new row).
+const ACCEPTANCE_ROW_ID_PREFIX: &str = "ac-row-";
+
+/// Build a stable widget `Id` for the Nth acceptance criterion row.
+pub fn acceptance_row_id(index: usize) -> Id {
+    Id::from(format!("{ACCEPTANCE_ROW_ID_PREFIX}{index}"))
+}
+
+// ── Inline edit state ────────────────────────────────
+//
+// The detail view will gain per-field inline editing across the rest of
+// the epic (ryve-82e1102f). Every field needs the same basic state:
+//
+//   1. A draft value the user is currently typing.
+//   2. An "in flight" value that has been committed to the DB but whose
+//      write has not yet confirmed — used so the UI can render the
+//      optimistic value while the async task runs, and so a failure can
+//      roll the field back cleanly.
+//
+// Centralising that here (instead of letting every field invent its own)
+// is the entire point of this foundation spark. Non-goal: any actual
+// field-level UI — that lands in the follow-up sparks.
+
+/// Fields on a [`Spark`] that can be edited inline in the detail view.
+/// The indexed variants (`Acceptance`, `Invariant`, `NonGoal`) identify
+/// a specific list item by position so multiple items in the same list
+/// can be edited independently without colliding in the draft map.
+// Variants beyond `Title` are consumed by follow-up sparks in the
+// ryve-82e1102f epic — allow dead_code until those land.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum Field {
+    Title,
+    Description,
+    Priority,
+    Type,
+    Assignee,
+    Problem,
+    Acceptance(usize),
+    Invariant(usize),
+    NonGoal(usize),
+}
+
+/// A committed-but-not-yet-persisted field edit. The update loop turns
+/// one of these into the actual DB write task; holding it in a
+/// dedicated type (rather than a raw tuple) lets the follow-up sparks
+/// pattern-match on `field` to dispatch to the correct repo function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimisticWrite {
+    pub spark_id: String,
+    pub field: Field,
+    pub value: String,
+}
+
+/// Per-spark inline-edit state held on [`crate::workshop::Workshop`].
+///
+/// * `drafts` — fields the user has opened for editing but not yet
+///   committed. The value is whatever they've typed so far.
+/// * `in_flight` — fields whose commit has been dispatched to the DB
+///   but whose confirmation hasn't come back yet. The UI renders these
+///   optimistically; a rollback wipes them if the write fails.
+///
+/// Invariant (enforced by [`crate::workshop::Workshop`]): at most one
+/// `SparkEdit` exists per workshop at a time. Selecting a different
+/// spark clears it.
+#[derive(Debug, Clone)]
+pub struct SparkEdit {
+    pub spark_id: String,
+    pub drafts: HashMap<Field, String>,
+    pub in_flight: HashMap<Field, String>,
+}
+
+#[allow(dead_code)] // indexed-field helpers consumed by follow-up sparks
+impl SparkEdit {
+    pub fn new(spark_id: impl Into<String>) -> Self {
+        Self {
+            spark_id: spark_id.into(),
+            drafts: HashMap::new(),
+            in_flight: HashMap::new(),
+        }
+    }
+
+    /// True when there is any unsaved user input — either a draft the
+    /// user is still typing or a commit that hasn't confirmed yet. The
+    /// selection-change path uses this to decide whether to surface a
+    /// "discard unsaved changes?" prompt.
+    pub fn is_dirty(&self) -> bool {
+        !self.drafts.is_empty() || !self.in_flight.is_empty()
+    }
+
+    /// Open `field` for editing, seeding a draft entry if one doesn't
+    /// already exist. Calling this on a field with an existing draft is
+    /// a no-op so the user's in-progress text isn't clobbered if they
+    /// re-enter the field.
+    pub fn begin_edit(&mut self, field: Field) {
+        self.drafts.entry(field).or_default();
+    }
+
+    /// Replace the draft value for `field`. Called on every keystroke.
+    pub fn update_draft(&mut self, field: Field, value: String) {
+        self.drafts.insert(field, value);
+    }
+
+    /// Move a draft into `in_flight` and return the write the update
+    /// loop should dispatch. Returns `None` if `begin_edit` was never
+    /// called for this field (callers should treat that as a no-op).
+    pub fn commit(&mut self, field: Field) -> Option<OptimisticWrite> {
+        let value = self.drafts.remove(&field)?;
+        self.in_flight.insert(field.clone(), value.clone());
+        Some(OptimisticWrite {
+            spark_id: self.spark_id.clone(),
+            field,
+            value,
+        })
+    }
+
+    /// Discard any in-flight or draft value for `field`. Called when a
+    /// DB write fails (rollback) or when the user cancels an edit.
+    pub fn rollback(&mut self, field: Field) {
+        self.in_flight.remove(&field);
+        self.drafts.remove(&field);
+    }
+}
+
+/// Inline-edit state for the `problem_statement` multi-line field. Lives
+/// on [`crate::workshop::Workshop`] because iced's [`text_editor::Content`]
+/// is stateful (cursor, selection) and must outlive a single view frame.
+///
+/// `original` is the snapshot taken when editing began; Escape reverts to
+/// it. The spark_id binds this editor to a specific cached spark so a
+/// selection change immediately discards the editor. Spark ryve-a5997352.
+pub struct ProblemEditState {
+    pub spark_id: String,
+    pub content: text_editor::Content,
+    pub original: String,
+}
+
+impl ProblemEditState {
+    pub fn new(spark_id: impl Into<String>, initial: &str) -> Self {
+        Self {
+            spark_id: spark_id.into(),
+            content: text_editor::Content::with_text(initial),
+            original: initial.to_string(),
+        }
+    }
+}
 
 use crate::screen::delegation_trace::DelegationTrace;
+use crate::screen::intent_list_editor::{self, IntentListDrafts};
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_LABEL, FONT_SMALL, Palette};
+
+// ── Inline validation + closed-edit confirmation ─────
+//
+// See spark ryve-8ad372cf. This module-level machinery is deliberately
+// expressed as pure data + pure functions so it can be exercised in unit
+// tests and plugged into whichever field-edit plumbing lands from the
+// sibling "editable <field>" sparks. The view layer only asks:
+//
+//   1. `validate_title` — is the current draft legal to persist?
+//   2. `begin_edit` — may this field enter edit mode right now, or do we
+//      need to prompt because the spark is in a terminal state?
+//
+// INVARIANT: validation here must be a *strict subset* of the data-layer
+// rules. We reject empty titles (which the CLI also rejects at
+// `src/cli.rs:639`); we do not invent new rules the data layer wouldn't
+// enforce, because the data layer is the source of truth.
+
+/// Fields on a spark that participate in inline editing. This enum lives
+/// here so the confirmation machinery can be consulted for *any* field —
+/// the title spark, description spark, and acceptance-list spark all
+/// route their `begin_edit` through the same gate. Non-Title variants
+/// are declared ahead of their callsites so sibling sparks
+/// (ryve-4742d98b, ryve-9b98f949, and the rest of the ryve-82e1102f
+/// epic) can wire themselves in without re-touching this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum EditField {
+    Title,
+    Description,
+    Priority,
+    SparkType,
+    Assignee,
+    ProblemStatement,
+    Invariants,
+    NonGoals,
+    AcceptanceCriteria,
+}
+
+/// Reasons a draft value is not acceptable to persist. Kept as a small
+/// enum rather than a free-form String so the view layer can render each
+/// case (tooltip copy, aria-label, etc.) without string matching.
+/// Consumed by the sibling editable-title spark (ryve-f58d0492) which
+/// will call `validate_title` from its save path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ValidationError {
+    /// Title was empty (or whitespace-only) after trimming.
+    TitleEmpty,
+}
+
+impl ValidationError {
+    /// Tooltip/hover copy explaining the rejection. Short and user-facing.
+    #[allow(dead_code)]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::TitleEmpty => "Title cannot be empty",
+        }
+    }
+}
+
+/// Validate a draft title. Mirrors the CLI rule at `src/cli.rs:639` and
+/// the create-form rule at `src/screen/sparks.rs:51` — empty after
+/// trimming is rejected. This is the short-circuit the save path should
+/// consult *before* dispatching a `SparkUpdate` message.
+#[allow(dead_code)]
+pub fn validate_title(draft: &str) -> Result<(), ValidationError> {
+    if draft.trim().is_empty() {
+        Err(ValidationError::TitleEmpty)
+    } else {
+        Ok(())
+    }
+}
+
+/// Is this status one where editing should require an explicit
+/// confirmation from the user? "closed" is the project's terminal state;
+/// "completed" is accepted defensively because the spark description and
+/// other subsystems (delegation, contracts) use that label and a future
+/// SparkStatus::Completed would otherwise silently bypass the guard.
+pub fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "closed" | "completed")
+}
+
+/// Outcome of asking "can this field enter edit mode right now?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginEditOutcome {
+    /// Proceed — the caller may flip the field into edit mode.
+    Proceed,
+    /// The spark is in a terminal state and the user has not yet
+    /// acknowledged it for this edit session. The caller should render
+    /// the confirmation modal with the carried status string and stash
+    /// the pending field so `confirm_closed_edit` can release it.
+    NeedsConfirmation { status: String, field: EditField },
+}
+
+/// Per-edit-session state for the closed/completed confirmation gate.
+///
+/// "Session" here means: a single continuous selection of a single
+/// spark, bounded on one side by the user selecting that spark and on
+/// the other by either a selection change or the spark's status moving
+/// out of a terminal state. Within that window, one confirmation
+/// unlocks every subsequent `begin_edit` on that spark — we do not
+/// re-prompt per field.
+#[derive(Debug, Default, Clone)]
+pub struct SparkEditSession {
+    /// The spark this session is tracking. `None` when no spark is
+    /// selected (e.g. before the detail view has ever been shown).
+    selection_id: Option<String>,
+    /// Snapshot of the last status we saw for the tracked spark. Used
+    /// to detect a status transition *away from* terminal, which
+    /// invalidates a previously granted confirmation.
+    last_seen_status: Option<String>,
+    /// True once the user has clicked "Edit anyway" on the confirmation
+    /// modal for the current selection.
+    confirmed_closed_edit: bool,
+    /// Which field is pending a confirmation answer, if the modal is up.
+    /// `None` when the modal is not showing.
+    pending_field: Option<EditField>,
+}
+
+impl SparkEditSession {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True when the closed-edit modal should be rendered.
+    #[allow(dead_code)]
+    pub fn is_modal_open(&self) -> bool {
+        self.pending_field.is_some()
+    }
+
+    /// The status string to interpolate into the modal copy, if any.
+    pub fn modal_status(&self) -> Option<&str> {
+        if self.pending_field.is_some() {
+            self.last_seen_status.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Call whenever the detail view receives a (possibly new) spark to
+    /// display — either because the user selected a different spark or
+    /// because a refresh pulled down a new status. This is where the
+    /// "selection changed" and "status moved away from terminal"
+    /// invalidation rules fire.
+    pub fn observe_spark(&mut self, spark: &Spark) {
+        let new_id = &spark.id;
+        let selection_changed = self.selection_id.as_deref() != Some(new_id.as_str());
+
+        if selection_changed {
+            // Brand-new selection: wipe the slate.
+            self.selection_id = Some(new_id.clone());
+            self.last_seen_status = Some(spark.status.clone());
+            self.confirmed_closed_edit = false;
+            self.pending_field = None;
+            return;
+        }
+
+        // Same spark — check for a status transition. If the spark has
+        // moved *out* of terminal (e.g. reopened), revoke any prior
+        // confirmation so a future re-close prompts again. This is the
+        // rule from the spark's acceptance criteria.
+        let was_terminal = self
+            .last_seen_status
+            .as_deref()
+            .map(is_terminal_status)
+            .unwrap_or(false);
+        let is_terminal_now = is_terminal_status(&spark.status);
+        if was_terminal && !is_terminal_now {
+            self.confirmed_closed_edit = false;
+            self.pending_field = None;
+        }
+        self.last_seen_status = Some(spark.status.clone());
+    }
+
+    /// Ask whether `field` may enter edit mode right now. The caller
+    /// should treat `NeedsConfirmation` as "open the modal and stop" —
+    /// the pending field is already recorded on the session, so
+    /// `confirm_closed_edit` can finish the transition without the
+    /// caller having to remember what was clicked.
+    pub fn begin_edit(&mut self, spark: &Spark, field: EditField) -> BeginEditOutcome {
+        // Keep the session's view of the spark in sync. Callers may
+        // have just received a fresh copy from a refresh; we want to
+        // reason against the most recent status.
+        self.observe_spark(spark);
+
+        if !is_terminal_status(&spark.status) || self.confirmed_closed_edit {
+            self.pending_field = None;
+            return BeginEditOutcome::Proceed;
+        }
+
+        self.pending_field = Some(field);
+        BeginEditOutcome::NeedsConfirmation {
+            status: spark.status.clone(),
+            field,
+        }
+    }
+
+    /// User clicked "Edit anyway" on the modal. Returns the field that
+    /// was pending so the caller can flip it into edit mode without
+    /// having to re-derive which click started this.
+    pub fn confirm_closed_edit(&mut self) -> Option<EditField> {
+        let field = self.pending_field.take();
+        if field.is_some() {
+            self.confirmed_closed_edit = true;
+        }
+        field
+    }
+
+    /// User clicked "Cancel" on the modal. Leaves the view unchanged.
+    pub fn cancel_closed_edit(&mut self) {
+        self.pending_field = None;
+    }
+}
+
+/// Container style for a text_input that failed inline validation.
+/// Applied as an overlay border so the input widget itself retains its
+/// normal glass styling. The red border + tooltip on hover is the
+/// "rejected inline" signal the spark's acceptance criteria call for.
+/// Consumed by the sibling editable-title spark (ryve-f58d0492) which
+/// wraps its text_input in a container with this style when
+/// `validate_title` returns an error.
+#[allow(dead_code)]
+pub fn validation_error_border(pal: &Palette) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: None,
+        border: iced::Border {
+            color: pal.danger,
+            width: 1.5,
+            radius: 4.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Render the closed/completed edit confirmation modal body. This is a
+/// standalone helper so the detail view can overlay it without
+/// rebuilding the modal every frame. Callers are responsible for the
+/// backdrop/dimming layer.
+pub fn view_closed_edit_modal<'a>(status: &str, pal: &Palette) -> Element<'a, Message> {
+    let pal = *pal;
+
+    let title = text("Edit finished spark?")
+        .size(FONT_HEADER)
+        .color(pal.text_primary);
+
+    let body = text(format!("This spark is {status}. Edit anyway?"))
+        .size(FONT_BODY)
+        .color(pal.text_secondary);
+
+    let cancel_btn = button(text("Cancel").size(FONT_LABEL).color(pal.text_primary))
+        .style(button::text)
+        .padding([6, 14])
+        .on_press(Message::CancelClosedEdit);
+
+    let confirm_btn = button(text("Edit anyway").size(FONT_LABEL).color(pal.window_bg))
+        .style(move |_t: &Theme, _s| button::Style {
+            background: Some(iced::Background::Color(pal.danger)),
+            text_color: pal.window_bg,
+            border: iced::Border {
+                color: pal.danger,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        })
+        .padding([6, 14])
+        .on_press(Message::ConfirmClosedEdit);
+
+    let actions = row![Space::new().width(Length::Fill), cancel_btn, confirm_btn].spacing(8);
+
+    container(column![title, body, actions].spacing(12).padding(16))
+        .width(Length::Shrink)
+        .style(move |_t: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(pal.surface)),
+            border: iced::Border {
+                color: pal.border,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
 
 // ── Form state ───────────────────────────────────────
 
@@ -82,6 +522,218 @@ fn enforcement_label(e: ContractEnforcement) -> &'static str {
     }
 }
 
+// ── Acceptance criteria edit state ───────────────────
+
+/// In-memory draft of a spark's acceptance criteria while the user is
+/// editing them in the detail view. Held on the Workshop so edits and
+/// the one-level undo buffer survive cross-message updates.
+///
+/// Invariant for the caller: after a successful save, `items` must equal
+/// the `metadata.intent.acceptance_criteria` on the reloaded spark. The
+/// easiest way to honour that is to call [`AcceptanceCriteriaEdit::load`]
+/// whenever a fresh spark comes back from the DB.
+#[derive(Debug, Clone, Default)]
+pub struct AcceptanceCriteriaEdit {
+    /// Spark id this editor is bound to — used to guard against stale state
+    /// when the selection changes.
+    pub spark_id: String,
+    /// Current draft rows, one entry per criterion.
+    pub items: Vec<String>,
+    /// One-level undo buffer for the most recent deletion: `(index, text)`.
+    /// Populated by [`delete_criterion`] and consumed by [`undo_delete`].
+    pub last_deleted: Option<(usize, String)>,
+}
+
+impl AcceptanceCriteriaEdit {
+    /// Seed the editor from the spark's current intent. Call this whenever
+    /// the selection changes or a save reloads the spark — it keeps the
+    /// in-memory vec in sync with persisted state.
+    pub fn load(spark: &Spark) -> Self {
+        Self {
+            spark_id: spark.id.clone(),
+            items: spark.intent().acceptance_criteria,
+            last_deleted: None,
+        }
+    }
+
+    /// Returns true if this editor is bound to the given spark id.
+    pub fn is_for(&self, spark_id: &str) -> bool {
+        self.spark_id == spark_id
+    }
+}
+
+/// Merge a new acceptance-criteria vec into a spark's existing metadata
+/// JSON, preserving every other field under `intent` and every sibling of
+/// `intent`. Returns the serialized JSON string ready for
+/// `UpdateSpark { metadata: Some(..) }`.
+///
+/// If the existing metadata is missing or malformed we fall back to a
+/// freshly constructed `{ "intent": { "acceptance_criteria": [...] } }`.
+pub fn merge_acceptance_criteria_into_metadata(
+    existing_metadata: &str,
+    new_criteria: &[String],
+) -> String {
+    let mut root: serde_json::Value =
+        serde_json::from_str(existing_metadata).unwrap_or_else(|_| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let obj = root.as_object_mut().expect("root is object");
+    let intent_entry = obj
+        .entry("intent".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !intent_entry.is_object() {
+        *intent_entry = serde_json::json!({});
+    }
+    let intent_obj = intent_entry.as_object_mut().expect("intent is object");
+    intent_obj.insert(
+        "acceptance_criteria".to_string(),
+        serde_json::Value::Array(
+            new_criteria
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ),
+    );
+    serde_json::to_string(&root).unwrap_or_else(|_| existing_metadata.to_string())
+}
+
+/// Append a new empty row and return its index so the caller can focus it.
+pub fn add_criterion(edit: &mut AcceptanceCriteriaEdit) -> usize {
+    edit.items.push(String::new());
+    edit.last_deleted = None;
+    edit.items.len() - 1
+}
+
+/// Delete the row at `index`, stashing it in the undo buffer. Returns
+/// `true` if the row existed.
+pub fn delete_criterion(edit: &mut AcceptanceCriteriaEdit, index: usize) -> bool {
+    if index >= edit.items.len() {
+        return false;
+    }
+    let text = edit.items.remove(index);
+    edit.last_deleted = Some((index, text));
+    true
+}
+
+/// Restore the last deleted row if one is in the undo buffer. Returns
+/// `true` if anything was restored.
+pub fn undo_delete(edit: &mut AcceptanceCriteriaEdit) -> bool {
+    let Some((index, text)) = edit.last_deleted.take() else {
+        return false;
+    };
+    let clamped = index.min(edit.items.len());
+    edit.items.insert(clamped, text);
+    true
+}
+
+/// Move the row at `index` one slot up. No-op at position 0.
+pub fn move_up(edit: &mut AcceptanceCriteriaEdit, index: usize) -> bool {
+    if index == 0 || index >= edit.items.len() {
+        return false;
+    }
+    edit.items.swap(index, index - 1);
+    edit.last_deleted = None;
+    true
+}
+
+/// Move the row at `index` one slot down. No-op at the last position.
+pub fn move_down(edit: &mut AcceptanceCriteriaEdit, index: usize) -> bool {
+    if index + 1 >= edit.items.len() {
+        return false;
+    }
+    edit.items.swap(index, index + 1);
+    edit.last_deleted = None;
+    true
+}
+
+/// On-blur commit for the row at `index`. If the row is blank we drop it
+/// so stray empties never land on disk (matches the "empty row on blur is
+/// auto-deleted" acceptance criterion). Returns `true` if a row was
+/// removed, so the caller can skip focusing into a gone-away index.
+pub fn trim_blank_on_blur(edit: &mut AcceptanceCriteriaEdit, index: usize) -> bool {
+    if index >= edit.items.len() {
+        return false;
+    }
+    if edit.items[index].trim().is_empty() {
+        edit.items.remove(index);
+        // A blank row removal isn't undo-worthy — the user never typed anything.
+        return true;
+    }
+    false
+}
+
+// ── Assignee inline-edit state ────────────────────────
+//
+// Spark ryve-7e1cb491. The assignee cell becomes an editable combo_box
+// when the user clicks it. Suggestions are the union of active agent
+// session names and distinct past assignees from the workshop. Selecting
+// a suggestion persists; pressing Enter with any non-empty free-text
+// persists; blurring the widget (on_close) also persists the current
+// typed value. Escape cancels without writing.
+//
+// `combo_state` holds the iced `combo_box::State` that owns the option
+// list, filter cache, and focus. It's `Some` while editing and `None`
+// otherwise. `input` is kept in sync via `on_input` so the main-update
+// handler can read the live text at on_close time (the widget's internal
+// value accessor is private).
+#[derive(Debug, Default)]
+pub struct AssigneeEditState {
+    pub combo_state: Option<combo_box::State<String>>,
+    pub input: String,
+    /// Set by the Escape path in `Message::HotkeyEscape` so the
+    /// subsequent `AssigneeClosed` blur event does not persist.
+    pub cancelled: bool,
+}
+
+impl AssigneeEditState {
+    pub fn is_active(&self) -> bool {
+        self.combo_state.is_some()
+    }
+
+    /// Enter edit mode with the current assignee as seed text and the
+    /// given suggestion list. Callers are responsible for building the
+    /// suggestion union (active agents + past assignees) and passing it
+    /// in — this keeps the view free of any DB/session awareness.
+    pub fn begin(&mut self, current: Option<&str>, suggestions: Vec<String>) {
+        self.input = current.unwrap_or_default().to_string();
+        self.cancelled = false;
+        self.combo_state = Some(combo_box::State::new(suggestions));
+    }
+
+    pub fn end(&mut self) {
+        self.combo_state = None;
+        self.input.clear();
+        self.cancelled = false;
+    }
+}
+
+/// Build the assignee suggestion list from the inputs the workshop
+/// already has in memory. Union of agent session names and every
+/// distinct non-empty assignee across the cached sparks, sorted
+/// case-insensitively and deduplicated. Pure so it can be unit-tested.
+pub fn build_assignee_suggestions(agent_names: &[&str], sparks: &[Spark]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for n in agent_names {
+        let t = n.trim();
+        if !t.is_empty() {
+            set.insert(t.to_string());
+        }
+    }
+    for s in sparks {
+        if let Some(a) = s.assignee.as_deref() {
+            let t = a.trim();
+            if !t.is_empty() {
+                set.insert(t.to_string());
+            }
+        }
+    }
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort_by_key(|a| a.to_lowercase());
+    out
+}
+
 // ── Messages ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -111,6 +763,139 @@ pub enum Message {
         spark_id: String,
         contract_id: i64,
     },
+    /// Set priority via dropdown — writes immediately. Carries the
+    /// label string ("P0".."P4") so the view can stay String-typed.
+    SetPriority(String, String),
+    /// Set spark_type via dropdown — writes immediately.
+    SetType(String, String),
+
+    // ── Acceptance criteria editing ──────────────────
+    /// Text in the Nth row changed (keystroke). Draft-only — no DB write.
+    AcceptanceCriterionChanged(usize, String),
+    /// Nth row was submitted / blurred. If blank, auto-delete it.
+    /// Otherwise persist the full vec through `update_spark`.
+    AcceptanceCriterionSubmit(usize),
+    /// "+ Add criterion" pressed: append an empty row and focus it.
+    AcceptanceCriterionAdd,
+    /// Delete the Nth row, persist, and show an undo toast.
+    AcceptanceCriterionDelete(usize),
+    /// Restore the most recently deleted row and persist.
+    AcceptanceCriterionUndoDelete,
+    /// Reorder: move the Nth row up by one (persist on change).
+    AcceptanceCriterionMoveUp(usize),
+    /// Reorder: move the Nth row down by one (persist on change).
+    AcceptanceCriterionMoveDown(usize),
+
+    /// Row-list editor message for one of the three intent lists
+    /// (acceptance criteria, invariants, non-goals). See
+    /// `intent_list_editor` — all three lists are backed by one widget.
+    IntentList(intent_list_editor::Message),
+
+    /// Request to enter edit mode for a field. The workshop-level
+    /// handler must route this through `SparkEditSession::begin_edit`
+    /// so the closed-spark confirmation gate fires. See ryve-8ad372cf.
+    BeginEditField(EditField),
+    /// User clicked "Edit anyway" in the closed-edit confirmation
+    /// modal. The handler should call
+    /// `SparkEditSession::confirm_closed_edit` and then flip the
+    /// returned field into edit mode.
+    ConfirmClosedEdit,
+    /// User dismissed the closed-edit confirmation modal — the view
+    /// stays unchanged.
+    CancelClosedEdit,
+
+    // ── Title inline editing (spark ryve-f58d0492) ───────
+    /// Keystroke in the title text_input: replace the draft.
+    TitleChanged(String),
+    /// Enter pressed in the title text_input — commit.
+    TitleSubmit,
+    /// User clicked outside the title text_input (mouse_area blur) —
+    /// commit whatever's in the draft.
+    TitleBlur,
+
+    /// Enter assignee edit mode for the given spark. The main handler
+    /// computes the suggestion union and seeds AssigneeEditState.
+    BeginEditAssignee,
+    /// Live input change in the assignee combo_box.
+    AssigneeInputChanged(String),
+    /// A suggestion (or explicit value) was picked from the dropdown by
+    /// Enter or by clicking a row.
+    AssigneeSelected(String),
+    /// The combo_box lost focus. If `cancelled` is not set, the main
+    /// handler commits the current `input` value (empty → None).
+    /// Escape cancellation is routed through `Message::HotkeyEscape`
+    /// in main.rs, which flips `AssigneeEditState::cancelled` before
+    /// `AssigneeClosed` fires so the blur does not persist.
+    AssigneeClosed,
+
+    // -- Description editing (ryve-4742d98b) --
+    /// User clicked on the description area — open the inline editor.
+    /// Seeds the draft (and the `text_editor::Content` held on the
+    /// workshop) with the persisted value.
+    DescriptionClicked,
+    /// A `text_editor::Action` from the description editor. The handler
+    /// applies it to the live `Content` and mirrors the resulting text
+    /// into the `SparkEdit` draft so the dirty indicator stays accurate.
+    DescriptionAction(text_editor::Action),
+    /// The user clicked outside the editor (or another blur source
+    /// fired). Commit the draft: dispatch a `SparkUpdate` with the new
+    /// value and clear the edit state. A no-op if the draft equals the
+    /// persisted value.
+    DescriptionBlur,
+    /// User pressed Escape while the editor was focused. Throw away the
+    /// draft — the persisted value is untouched. The next view pass
+    /// will fall back to the static render.
+    DescriptionRevert,
+    /// User chose "Save" in the "unsaved changes" dialog raised when
+    /// navigating away from a spark with a dirty description draft.
+    NavPromptSave,
+    /// User chose "Discard" in the unsaved-changes dialog.
+    NavPromptDiscard,
+    /// User dismissed the unsaved-changes dialog with "Cancel" — stay
+    /// on the current spark, keep the draft intact.
+    NavPromptCancel,
+
+    /// Begin inline-editing the problem statement for `spark_id`.
+    /// Initializes a fresh `ProblemEditState` seeded from the spark's
+    /// current value. Spark ryve-a5997352.
+    BeginEditProblem(String),
+    /// Forwarded `text_editor::Action` from the active problem editor.
+    ProblemAction(text_editor::Action),
+    /// Save the current editor buffer via `SparkUpdate`. Fired by blur
+    /// (clicks outside the editor) and by the key binding on no-op
+    /// paths. Idempotent: does nothing when no editor is active.
+    CommitProblem,
+    /// Discard the editor and revert to the pre-edit snapshot. Fired by
+    /// Escape via the editor key binding.
+    CancelProblem,
+}
+
+// ── Dropdown option lists ────────────────────────────
+
+/// Priority labels rendered in the priority pick_list. Index in this
+/// slice equals the underlying integer priority (P0 → 0).
+pub const PRIORITY_OPTIONS: [&str; 5] = ["P0", "P1", "P2", "P3", "P4"];
+
+/// All spark_type values the dropdown surfaces. Order is intentional:
+/// most-frequently-used first.
+pub const TYPE_OPTIONS: [&str; 7] = [
+    "task",
+    "bug",
+    "feature",
+    "epic",
+    "spike",
+    "chore",
+    "milestone",
+];
+
+/// Parse a priority label like "P3" back into the integer the data
+/// layer stores. Returns `None` for anything outside P0..P4 so the
+/// caller can refuse to write a malformed value.
+pub fn parse_priority_label(label: &str) -> Option<i32> {
+    PRIORITY_OPTIONS
+        .iter()
+        .position(|p| *p == label)
+        .map(|i| i as i32)
 }
 
 // ── View ─────────────────────────────────────────────
@@ -123,9 +908,23 @@ pub fn view<'a>(
     all_sparks: &'a [Spark],
     delegation: &DelegationTrace,
     create_form: &'a ContractCreateForm,
+    acceptance_edit: &'a AcceptanceCriteriaEdit,
+    intent_drafts: &'a IntentListDrafts,
+    edit_session: &'a SparkEditSession,
+    spark_edit: Option<&'a SparkEdit>,
+    assignee_edit: &'a AssigneeEditState,
+    description_editor: Option<&'a text_editor::Content>,
+    description_draft: Option<&'a str>,
+    nav_prompt: Option<&'a crate::workshop::PendingNavPrompt>,
+    problem_edit: Option<&'a ProblemEditState>,
     pal: &Palette,
     has_bg: bool,
 ) -> Element<'a, Message> {
+    // Does an active problem editor apply to the currently displayed spark?
+    // Keeping this binding local means the view can ignore a stale editor
+    // (e.g. selection change mid-flight) without panicking on a mismatched
+    // spark_id.
+    let active_problem_edit = problem_edit.filter(|e| e.spark_id == spark.id);
     let pal = *pal;
 
     // Back button + header row
@@ -145,12 +944,8 @@ pub fn view<'a>(
         .spacing(4)
         .padding([8, 10]);
 
-    // Title
-    let title = text(&spark.title)
-        .size(FONT_HEADER + 4.0)
-        .color(pal.text_primary);
-
-    let title_row = container(title).padding([4, 10]);
+    // Title — click to inline-edit. Spark ryve-f58d0492.
+    let title_row = view_title(spark, spark_edit, &pal);
 
     // Status / Priority / Type badges
     let status_indicator = status_symbol(&spark.status);
@@ -171,22 +966,28 @@ pub fn view<'a>(
     .padding([3, 8])
     .on_press(Message::CycleStatus(spark.id.clone(), next.to_string()));
 
-    let priority_color = priority_color(spark.priority, &pal);
-    let priority_pill = container(
-        text(format!("P{}", spark.priority))
-            .size(FONT_LABEL)
-            .color(priority_color),
-    )
-    .padding([3, 8]);
+    // Priority dropdown — pick_list seeded with the persisted value so
+    // it renders correctly on first paint and after every reload.
+    let priority_spark_id = spark.id.clone();
+    let priority_options: Vec<String> = PRIORITY_OPTIONS.iter().map(|s| (*s).to_string()).collect();
+    let priority_selected = Some(format!("P{}", spark.priority));
+    let priority_dropdown = pick_list(priority_options, priority_selected, move |label: String| {
+        Message::SetPriority(priority_spark_id.clone(), label)
+    })
+    .text_size(FONT_LABEL)
+    .padding([2, 6]);
 
-    let type_pill = container(
-        text(&spark.spark_type)
-            .size(FONT_LABEL)
-            .color(pal.text_secondary),
-    )
-    .padding([3, 8]);
+    // Type dropdown — same shape, seeded with the persisted spark_type.
+    let type_spark_id = spark.id.clone();
+    let type_options: Vec<String> = TYPE_OPTIONS.iter().map(|s| (*s).to_string()).collect();
+    let type_selected = Some(spark.spark_type.clone());
+    let type_dropdown = pick_list(type_options, type_selected, move |label: String| {
+        Message::SetType(type_spark_id.clone(), label)
+    })
+    .text_size(FONT_LABEL)
+    .padding([2, 6]);
 
-    let badges = row![status_pill, priority_pill, type_pill]
+    let badges = row![status_pill, priority_dropdown, type_dropdown]
         .spacing(6)
         .padding([4, 10])
         .align_y(iced::Alignment::Center);
@@ -200,83 +1001,62 @@ pub fn view<'a>(
             ..Default::default()
         });
 
-    // Description
+    // Description — editable inline (spark ryve-4742d98b). Renders the
+    // persisted value as a clickable MouseArea when not editing, and
+    // swaps to a multi-line `text_editor` when editing. Blur saves,
+    // Escape reverts, Enter inserts a newline. Empty descriptions are
+    // allowed (unlike the title) so there is no static "no description"
+    // fallback — the click target shows a placeholder instead.
     let mut body = column![].spacing(12).padding([8, 10]);
-
-    if !spark.description.is_empty() {
-        body = body.push(
-            column![
-                text("Description")
-                    .size(FONT_LABEL)
-                    .color(pal.text_tertiary),
-                text(&spark.description)
-                    .size(FONT_BODY)
-                    .color(pal.text_primary),
-            ]
-            .spacing(4),
-        );
-    }
+    body = body.push(view_description_section(
+        spark,
+        description_editor,
+        description_draft,
+        &pal,
+    ));
 
     // Intent section — intent() returns an owned struct, so we extract
     // owned strings to avoid lifetime issues with the view tree.
     let intent = spark.intent();
 
-    if let Some(problem) = intent.problem_statement
-        && !problem.is_empty()
-    {
-        body = body.push(
-            column![
-                text("Problem Statement")
-                    .size(FONT_LABEL)
-                    .color(pal.text_tertiary),
-                text(problem).size(FONT_BODY).color(pal.text_primary),
-            ]
-            .spacing(4),
-        );
-    }
+    // Problem Statement section. Always rendered so the user has an
+    // affordance to *add* a problem statement when none exists — empty
+    // is allowed (ryve-a5997352). Clicking it begins inline edit; while
+    // editing, it renders as a multi-line text_editor with blur-to-save /
+    // Escape-revert.
+    body = body.push(view_problem_statement_section(
+        spark,
+        intent.problem_statement.clone().unwrap_or_default(),
+        active_problem_edit,
+        &pal,
+    ));
 
-    if !intent.invariants.is_empty() {
-        let mut items =
-            column![text("Invariants").size(FONT_LABEL).color(pal.text_tertiary),].spacing(2);
-        for inv in intent.invariants {
-            items = items.push(
-                text(format!("\u{2022} {inv}"))
-                    .size(FONT_BODY)
-                    .color(pal.text_primary),
-            );
-        }
-        body = body.push(items);
-    }
+    // Invariants + non-goals render through the shared row-list widget
+    // in `intent_list_editor`. The drafts are kept on the Workshop and
+    // seeded whenever `selected_spark` changes.
+    body = body.push(
+        intent_list_editor::view(
+            intent_list_editor::ListKind::Invariants,
+            intent_drafts.invariants.as_slice(),
+            &pal,
+        )
+        .map(Message::IntentList),
+    );
+    body = body.push(
+        intent_list_editor::view(
+            intent_list_editor::ListKind::NonGoals,
+            intent_drafts.non_goals.as_slice(),
+            &pal,
+        )
+        .map(Message::IntentList),
+    );
 
-    if !intent.non_goals.is_empty() {
-        let mut items =
-            column![text("Non-Goals").size(FONT_LABEL).color(pal.text_tertiary),].spacing(2);
-        for ng in intent.non_goals {
-            items = items.push(
-                text(format!("\u{2022} {ng}"))
-                    .size(FONT_BODY)
-                    .color(pal.text_primary),
-            );
-        }
-        body = body.push(items);
-    }
-
-    if !intent.acceptance_criteria.is_empty() {
-        let mut items = column![
-            text("Acceptance Criteria")
-                .size(FONT_LABEL)
-                .color(pal.text_tertiary),
-        ]
-        .spacing(2);
-        for ac in intent.acceptance_criteria {
-            items = items.push(
-                text(format!("\u{2022} {ac}"))
-                    .size(FONT_BODY)
-                    .color(pal.text_primary),
-            );
-        }
-        body = body.push(items);
-    }
+    // Acceptance criteria are always editable — even when empty, we
+    // render the header and the "+ Add criterion" button so users can
+    // seed a brand-new list. The editor reads from `acceptance_edit`
+    // (the draft vec) rather than `intent.acceptance_criteria` so
+    // in-flight keystrokes are visible before a save round-trips.
+    body = body.push(view_acceptance_criteria_section(acceptance_edit, &pal));
 
     // ── Delegation trace section ─────────────────────
     // Surface the Atlas → Head → Hand chain so users can see who is
@@ -302,15 +1082,11 @@ pub fn view<'a>(
     // Metadata row: assignee, owner, dates
     let mut meta = column![].spacing(4).padding([8, 0]);
 
-    if let Some(ref assignee) = spark.assignee {
-        meta = meta.push(
-            row![
-                text("Assignee").size(FONT_SMALL).color(pal.text_tertiary),
-                text(assignee).size(FONT_SMALL).color(pal.text_secondary),
-            ]
-            .spacing(8),
-        );
-    }
+    // Assignee: always editable. Clicking the value (or the "unassigned"
+    // placeholder) swaps the label for a combo_box populated with the
+    // union of active Hand session names and distinct past assignees.
+    // See AssigneeEditState / Message::BeginEditAssignee.
+    meta = meta.push(view_assignee_row(spark, assignee_edit, &pal));
 
     if let Some(ref owner) = spark.owner {
         meta = meta.push(
@@ -344,21 +1120,490 @@ pub fn view<'a>(
 
     body = body.push(meta);
 
-    let content = column![
-        header,
-        title_row,
-        badges,
-        sep,
-        scrollable(body).height(Length::Fill),
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill);
+    // When the problem editor is active, clicking anywhere on inert
+    // content (text, labels, whitespace) blurs the editor and commits
+    // the current buffer. Interactive children (the text_editor itself,
+    // buttons) capture events in their own update paths so mouse_area's
+    // on_press does not fire for them — see iced_widget mouse_area:
+    // `if shell.is_event_captured() { return; }`. This gives us the
+    // spark's required "blur-to-save" behavior without a modal overlay.
+    let scrollable_body: Element<'_, Message> = if active_problem_edit.is_some() {
+        mouse_area(scrollable(body).height(Length::Fill))
+            .on_press(Message::CommitProblem)
+            .into()
+    } else {
+        scrollable(body).height(Length::Fill).into()
+    };
+    let content = column![header, title_row, badges, sep, scrollable_body,]
+        .width(Length::Fill)
+        .height(Length::Fill);
 
-    container(content)
+    // Blur-wrapping: if a field is being edited inline, wrap the panel
+    // in a mouse_area so clicks outside the widget commit the draft.
+    // When a nav-away dialog is up, skip the outer mouse_area so clicks
+    // on the dialog buttons aren't shadowed by a spurious blur publish.
+    let editing_title = spark_edit
+        .map(|e| e.drafts.contains_key(&Field::Title) || e.in_flight.contains_key(&Field::Title))
+        .unwrap_or(false);
+
+    let detail_body = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg))
+        .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg));
+
+    let base: Element<'a, Message> = if nav_prompt.is_some() {
+        detail_body.into()
+    } else if editing_title {
+        mouse_area(detail_body).on_press(Message::TitleBlur).into()
+    } else if description_editor.is_some() {
+        mouse_area(detail_body)
+            .on_press(Message::DescriptionBlur)
+            .into()
+    } else {
+        detail_body.into()
+    };
+
+    // Overlay the closed/completed confirmation modal when the edit
+    // session has a pending field. A dimming backdrop sits between the
+    // base content and the modal so clicks outside don't accidentally
+    // land on the detail view's widgets.
+    if let Some(status) = edit_session.modal_status() {
+        let backdrop = container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_t: &Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.4,
+                })),
+                ..Default::default()
+            });
+
+        let modal = container(view_closed_edit_modal(status, &pal))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center);
+
+        stack![base, backdrop, modal].into()
+    } else if let Some(prompt) = nav_prompt {
+        let dialog: Element<'a, Message> = view_nav_prompt_dialog(prompt, &pal);
+        stack![base, dialog].into()
+    } else {
+        base
+    }
+}
+
+// ── Inline title edit ─────────────────────────────────
+
+/// Render the spark title row. When the title is not being edited, it
+/// shows a button-styled text that enters edit mode on click. When a
+/// draft exists in `spark_edit`, it renders a `text_input` with the
+/// draft value, save-on-submit, and keystroke-to-draft wiring. While a
+/// save is in flight, the input renders disabled with a subtle spinner
+/// glyph. Empty drafts get a red border + tooltip so the user sees why
+/// the save won't fire. Spark ryve-f58d0492.
+fn view_title<'a>(
+    spark: &'a Spark,
+    spark_edit: Option<&'a SparkEdit>,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    let draft = spark_edit.and_then(|e| e.drafts.get(&Field::Title));
+    let in_flight = spark_edit.and_then(|e| e.in_flight.get(&Field::Title));
+
+    if draft.is_none() && in_flight.is_none() {
+        // Read-only mode: clicking the title enters edit mode.
+        let title_text = text(&spark.title)
+            .size(FONT_HEADER + 4.0)
+            .color(pal.text_primary);
+        let btn = button(title_text)
+            .style(button::text)
+            .padding([4, 10])
+            .on_press(Message::BeginEditField(EditField::Title));
+        return container(btn).into();
+    }
+
+    // One of `draft` or `in_flight` is Some — prefer the in-flight
+    // value (the optimistic save) while a write is dispatched. An
+    // empty on-submit is rejected inline (see below) so an empty
+    // value only reaches `in_flight` through a draft rollback — in
+    // which case we still show it so the user can fix it.
+    let showing_in_flight = in_flight.is_some() && draft.is_none();
+    let value: &str = draft
+        .map(String::as_str)
+        .or(in_flight.map(String::as_str))
+        .unwrap_or("");
+    let is_empty = value.trim().is_empty();
+
+    let mut input = text_input("Title", value)
+        .size(FONT_HEADER + 4.0)
+        .padding([4, 8]);
+
+    if showing_in_flight {
+        // In-flight: leave `on_input`/`on_submit` unset so the widget
+        // renders disabled — the user can't type over an optimistic
+        // save mid-flight.
+        input =
+            input.style(move |_theme: &Theme, status| title_input_style(status, &pal, false, true));
+    } else {
+        input = input
+            .on_input(Message::TitleChanged)
+            .on_submit(Message::TitleSubmit)
+            .style(move |_theme: &Theme, status| title_input_style(status, &pal, is_empty, false));
+    }
+
+    // Right-side adornment: spinner while the save is in flight.
+    let input_row: Element<'a, Message> = if showing_in_flight {
+        // Subtle spinner glyph — iced 0.14 has no animated spinner,
+        // but a dim ⟳ is enough to signal "working".
+        row![
+            input,
+            text("\u{27F3}").size(FONT_LABEL).color(pal.text_tertiary),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
         .into()
+    } else {
+        row![input]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+    };
+
+    // Empty-title validation: show a tooltip on the row so the user
+    // sees why their save was rejected. Not persisted — see handler.
+    let framed: Element<'a, Message> = if is_empty && !showing_in_flight {
+        tooltip(
+            input_row,
+            text("Title cannot be empty")
+                .size(FONT_SMALL)
+                .color(pal.danger),
+            tooltip::Position::Bottom,
+        )
+        .into()
+    } else {
+        input_row
+    };
+
+    container(framed).padding([4, 10]).into()
+}
+
+/// Compute the text_input style for the title field. `invalid` draws a
+/// red border + danger tint for the empty-draft case; `disabled` draws
+/// a dimmer appearance for in-flight saves.
+fn title_input_style(
+    status: text_input::Status,
+    pal: &Palette,
+    invalid: bool,
+    disabled: bool,
+) -> text_input::Style {
+    let border_color = if invalid {
+        pal.danger
+    } else {
+        match status {
+            text_input::Status::Focused { .. } => pal.accent,
+            text_input::Status::Hovered => pal.text_secondary,
+            _ => pal.separator,
+        }
+    };
+    let value_color = if disabled {
+        pal.text_tertiary
+    } else {
+        pal.text_primary
+    };
+    text_input::Style {
+        background: Background::Color(iced::Color::TRANSPARENT),
+        border: Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        icon: pal.text_tertiary,
+        placeholder: pal.text_tertiary,
+        value: value_color,
+        selection: iced::Color {
+            a: 0.3,
+            ..pal.accent
+        },
+    }
+}
+
+// ── Assignee row ─────────────────────────────────────
+
+fn view_assignee_row<'a>(
+    spark: &'a Spark,
+    assignee_edit: &'a AssigneeEditState,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+    let label = text("Assignee").size(FONT_SMALL).color(pal.text_tertiary);
+
+    if let Some(state) = assignee_edit.combo_state.as_ref() {
+        // Editing mode: combo_box handles arrow-key nav, Enter selection,
+        // filter-as-you-type, and blur-to-close. The main-update handler
+        // treats an `AssigneeClosed` that's not preceded by
+        // `AssigneeCancelEdit` as a commit of the current input.
+        let selected = assignee_edit.input.clone();
+        let cb = combo_box(
+            state,
+            "Assignee (type to search)",
+            Some(&selected),
+            Message::AssigneeSelected,
+        )
+        .on_input(Message::AssigneeInputChanged)
+        .on_close(Message::AssigneeClosed)
+        .size(FONT_SMALL)
+        .padding([4, 6])
+        .width(Length::Fixed(240.0));
+
+        row![label, cb]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+    } else {
+        let display = spark
+            .assignee
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unassigned");
+        let value_color = if spark.assignee.is_some() {
+            pal.text_secondary
+        } else {
+            pal.text_tertiary
+        };
+        let value_btn = button(text(display).size(FONT_SMALL).color(value_color))
+            .style(button::text)
+            .padding([2, 6])
+            .on_press(Message::BeginEditAssignee);
+        row![label, value_btn]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+    }
+}
+
+// ── Description section (ryve-4742d98b) ──────────────
+
+fn view_description_section<'a>(
+    spark: &'a Spark,
+    editor: Option<&'a text_editor::Content>,
+    draft: Option<&'a str>,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    // Header row shows "Description" plus a dirty-state pill whenever
+    // the live draft differs from the persisted value. The pill is the
+    // user-visible "unsaved changes" indicator required by the spark's
+    // acceptance criteria.
+    let is_dirty = draft.is_some_and(|d| d != spark.description);
+    let mut header = row![
+        text("Description")
+            .size(FONT_LABEL)
+            .color(pal.text_tertiary),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+    if is_dirty {
+        header = header.push(
+            container(text("unsaved changes").size(FONT_SMALL).color(pal.accent))
+                .padding([1, 6])
+                .style(move |_t: &Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(iced::Color {
+                        a: 0.10,
+                        ..pal.accent
+                    })),
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        width: 0.0,
+                        color: iced::Color::TRANSPARENT,
+                    },
+                    ..Default::default()
+                }),
+        );
+    }
+
+    // Editing: render a multi-line `text_editor` with a key-binding
+    // override that turns Escape into a `DescriptionRevert` message
+    // rather than the default silent "Unfocus" (see iced 0.14
+    // `text_editor::Binding::from_key_press`). Enter falls through to
+    // the default `Binding::Enter`, which inserts a newline — that's
+    // what the spark wants ("Enter adds a newline").
+    if let Some(content) = editor {
+        let editor_widget = text_editor(content)
+            .placeholder("Add a description…")
+            .padding([8, 10])
+            .size(FONT_BODY)
+            .min_height(120.0)
+            .on_action(Message::DescriptionAction)
+            .key_binding(|kp| {
+                use iced::keyboard::Key;
+                use iced::keyboard::key::Named;
+                match kp.key.as_ref() {
+                    Key::Named(Named::Escape) => {
+                        Some(text_editor::Binding::Custom(Message::DescriptionRevert))
+                    }
+                    _ => text_editor::Binding::from_key_press(kp),
+                }
+            });
+
+        return column![header, editor_widget].spacing(6).into();
+    }
+
+    // Not editing: render the persisted value (or a placeholder when
+    // empty — empty descriptions are allowed, so we still need a
+    // click target). Wrap in a mouse_area so a click opens the editor.
+    let body_text: Element<'a, Message> = if spark.description.is_empty() {
+        text("Add a description…")
+            .size(FONT_BODY)
+            .color(pal.text_tertiary)
+            .into()
+    } else {
+        text(&spark.description)
+            .size(FONT_BODY)
+            .color(pal.text_primary)
+            .into()
+    };
+
+    let clickable = mouse_area(container(body_text).padding([4, 0]).width(Length::Fill))
+        .on_press(Message::DescriptionClicked);
+
+    column![header, clickable].spacing(4).into()
+}
+
+// ── Unsaved-changes nav-away dialog (ryve-4742d98b) ──
+
+fn view_nav_prompt_dialog<'a>(
+    prompt: &'a crate::workshop::PendingNavPrompt,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    let title = text("Unsaved changes")
+        .size(FONT_HEADER)
+        .color(pal.text_primary);
+    let body = text(format!(
+        "You have unsaved edits to the description of {}. What would you like to do?",
+        prompt.dirty_spark_id
+    ))
+    .size(FONT_BODY)
+    .color(pal.text_secondary);
+
+    let save_btn = button(text("Save").size(FONT_LABEL).color(pal.accent))
+        .padding([6, 14])
+        .style(button::text)
+        .on_press(Message::NavPromptSave);
+    let discard_btn = button(text("Discard").size(FONT_LABEL).color(pal.danger))
+        .padding([6, 14])
+        .style(button::text)
+        .on_press(Message::NavPromptDiscard);
+    let cancel_btn = button(text("Cancel").size(FONT_LABEL).color(pal.text_secondary))
+        .padding([6, 14])
+        .style(button::text)
+        .on_press(Message::NavPromptCancel);
+
+    let actions = row![
+        Space::new().width(Length::Fill),
+        cancel_btn,
+        discard_btn,
+        save_btn,
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+
+    let card = container(column![title, body, actions].spacing(12))
+        .padding(20)
+        .max_width(420)
+        .style(move |_t: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(pal.window_bg)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: pal.separator,
+            },
+            ..Default::default()
+        });
+
+    // Full-screen scrim that also catches stray clicks and maps them
+    // to "Cancel" — clicking outside the card is the standard dismiss
+    // gesture for modals.
+    mouse_area(
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(move |_t: &Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    a: 0.55,
+                    ..iced::Color::BLACK
+                })),
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::NavPromptCancel)
+    .into()
+}
+
+// ── Problem Statement section (ryve-a5997352) ────────
+
+fn view_problem_statement_section<'a>(
+    spark: &'a Spark,
+    current: String,
+    edit: Option<&'a ProblemEditState>,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+    let label = text("Problem Statement")
+        .size(FONT_LABEL)
+        .color(pal.text_tertiary);
+
+    if let Some(state) = edit {
+        // Multi-line editable view. Enter inserts a newline (default
+        // text_editor binding); Escape triggers Message::CancelProblem
+        // to revert. Blur-to-save is driven by the mouse_area wrapper
+        // around the scrollable body in `view()`.
+        let editor = text_editor(&state.content)
+            .placeholder("Why does this spark exist?")
+            .on_action(Message::ProblemAction)
+            .padding(8)
+            .key_binding(problem_editor_key_binding);
+        let hint = text("Click outside to save  ·  Esc to revert")
+            .size(FONT_SMALL)
+            .color(pal.text_tertiary);
+        return column![label, editor, hint].spacing(4).into();
+    }
+
+    // Read-only, click-to-edit affordance. An empty problem statement
+    // still renders a clickable placeholder so the user can add one.
+    let display_text = current;
+    let display = if display_text.is_empty() {
+        text("(click to add a problem statement)")
+            .size(FONT_BODY)
+            .color(pal.text_tertiary)
+    } else {
+        text(display_text).size(FONT_BODY).color(pal.text_primary)
+    };
+    let clickable = button(column![label, display].spacing(4))
+        .style(button::text)
+        .padding(0)
+        .on_press(Message::BeginEditProblem(spark.id.clone()));
+    clickable.into()
+}
+
+/// Escape → cancel (revert); everything else falls through to the
+/// default iced text_editor bindings (Enter inserts newline, etc.).
+fn problem_editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    use iced::keyboard::Key;
+    use iced::keyboard::key::Named;
+    if matches!(kp.key, Key::Named(Named::Escape)) {
+        return Some(text_editor::Binding::Custom(Message::CancelProblem));
+    }
+    text_editor::Binding::from_key_press(kp)
 }
 
 // ── Bonds section ────────────────────────────────────
@@ -528,6 +1773,115 @@ fn view_bond_row_typed<'a>(
     .padding([2, 8])
     .align_y(iced::Alignment::Center)
     .into()
+}
+
+// ── Acceptance criteria section ──────────────────────
+
+fn view_acceptance_criteria_section<'a>(
+    edit: &'a AcceptanceCriteriaEdit,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    let header = text("Acceptance Criteria")
+        .size(FONT_LABEL)
+        .color(pal.text_tertiary);
+
+    let mut col = column![header].spacing(4);
+
+    if edit.items.is_empty() {
+        col = col.push(
+            text("No acceptance criteria yet")
+                .size(FONT_SMALL)
+                .color(pal.text_tertiary),
+        );
+    } else {
+        let last = edit.items.len() - 1;
+        for (i, item) in edit.items.iter().enumerate() {
+            col = col.push(view_acceptance_row(i, item, last, &pal));
+        }
+    }
+
+    // "+ Add criterion" + optional inline undo for the most recent delete.
+    let add_btn = button(
+        row![
+            text("+").size(FONT_ICON).color(pal.accent),
+            text("Add criterion").size(FONT_LABEL).color(pal.accent),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center),
+    )
+    .style(button::text)
+    .padding([2, 6])
+    .on_press(Message::AcceptanceCriterionAdd);
+
+    let mut footer = row![add_btn].spacing(8).align_y(iced::Alignment::Center);
+    if edit.last_deleted.is_some() {
+        footer = footer.push(
+            button(
+                text("\u{21B6} Undo delete")
+                    .size(FONT_LABEL)
+                    .color(pal.text_secondary),
+            )
+            .style(button::text)
+            .padding([2, 6])
+            .on_press(Message::AcceptanceCriterionUndoDelete),
+        );
+    }
+    col = col.push(footer);
+
+    col.into()
+}
+
+fn view_acceptance_row<'a>(
+    index: usize,
+    value: &'a str,
+    last_index: usize,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+
+    // Reorder handle: two stacked arrows. Iced 0.14 doesn't give us a
+    // first-class drag affordance so we expose the reorder operation as
+    // an up/down pair. Functionally this is the "drag handle" — it
+    // updates the vec order and persists on click. Using the unicode
+    // vertical double arrow glyph keeps it visually compact.
+    let up_btn = {
+        let mut b = button(text("\u{25B4}").size(FONT_SMALL).color(pal.text_tertiary))
+            .style(button::text)
+            .padding([0, 4]);
+        if index > 0 {
+            b = b.on_press(Message::AcceptanceCriterionMoveUp(index));
+        }
+        b
+    };
+    let down_btn = {
+        let mut b = button(text("\u{25BE}").size(FONT_SMALL).color(pal.text_tertiary))
+            .style(button::text)
+            .padding([0, 4]);
+        if index < last_index {
+            b = b.on_press(Message::AcceptanceCriterionMoveDown(index));
+        }
+        b
+    };
+    let handle = column![up_btn, down_btn].spacing(0).width(Length::Shrink);
+
+    let input = text_input("New criterion…", value)
+        .id(acceptance_row_id(index))
+        .size(FONT_BODY)
+        .padding([4, 6])
+        .on_input(move |s| Message::AcceptanceCriterionChanged(index, s))
+        .on_submit(Message::AcceptanceCriterionSubmit(index));
+
+    let delete_btn = button(text("\u{00D7}").size(FONT_ICON).color(pal.text_tertiary))
+        .style(button::text)
+        .padding([2, 6])
+        .on_press(Message::AcceptanceCriterionDelete(index));
+
+    row![handle, input, delete_btn]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+        .into()
 }
 
 // ── Contracts section ────────────────────────────────
@@ -798,22 +2152,6 @@ fn format_status(status: &str) -> &'static str {
     }
 }
 
-fn priority_color(priority: i32, pal: &Palette) -> iced::Color {
-    match priority {
-        0 => pal.danger, // P0 — critical
-        1 => iced::Color {
-            // P1 — orange-ish
-            r: 1.0,
-            g: 0.6,
-            b: 0.0,
-            a: 1.0,
-        },
-        2 => pal.accent,         // P2 — normal
-        3 => pal.text_secondary, // P3 — low
-        _ => pal.text_tertiary,  // P4+ — minimal
-    }
-}
-
 /// Cycle: open -> in_progress -> closed -> open
 fn next_status_str(current: &str) -> &'static str {
     match current {
@@ -847,6 +2185,113 @@ mod tests {
             toggle_enforcement(toggle_enforcement(e)),
             ContractEnforcement::Required
         );
+    }
+
+    #[test]
+    fn parse_priority_label_round_trips_p0_through_p4() {
+        // Every label rendered by the dropdown must round-trip back to
+        // the integer the data layer stores. If this regresses, the
+        // dropdown will silently write the wrong priority.
+        for (i, label) in PRIORITY_OPTIONS.iter().enumerate() {
+            assert_eq!(parse_priority_label(label), Some(i as i32));
+        }
+    }
+
+    #[test]
+    fn parse_priority_label_rejects_garbage() {
+        assert_eq!(parse_priority_label("P5"), None);
+        assert_eq!(parse_priority_label("p0"), None);
+        assert_eq!(parse_priority_label(""), None);
+        assert_eq!(parse_priority_label("normal"), None);
+    }
+
+    #[test]
+    fn type_options_cover_every_spark_type() {
+        // The dropdown must offer every value the data layer accepts.
+        // Drift here would let users edit a spark and lose access to a
+        // valid type.
+        for expected in [
+            "task",
+            "bug",
+            "feature",
+            "epic",
+            "spike",
+            "chore",
+            "milestone",
+        ] {
+            assert!(
+                TYPE_OPTIONS.contains(&expected),
+                "TYPE_OPTIONS missing {expected}"
+            );
+        }
+        assert_eq!(TYPE_OPTIONS.len(), 7);
+    }
+
+    /// Mirror of the no-orphan check in main.rs::SparkDetail::SetType.
+    /// Kept here as pure data so the rule can be unit-tested without
+    /// pulling in the whole iced runtime.
+    fn would_orphan_on_demote(
+        spark: &Spark,
+        new_type: &str,
+        all_sparks: &[Spark],
+    ) -> Option<&'static str> {
+        if spark.spark_type != "epic" || new_type == "epic" {
+            return None;
+        }
+        let has_children = all_sparks
+            .iter()
+            .any(|s| s.parent_id.as_deref() == Some(spark.id.as_str()));
+        if has_children {
+            return Some("would orphan children");
+        }
+        if spark.parent_id.is_none() {
+            return Some("would orphan self");
+        }
+        None
+    }
+
+    #[test]
+    fn demote_epic_with_children_is_rejected() {
+        let mut epic = make_spark("sp-epic", "open");
+        epic.spark_type = "epic".to_string();
+        epic.parent_id = Some("sp-root".to_string());
+        let mut child = make_spark("sp-child", "open");
+        child.parent_id = Some("sp-epic".to_string());
+        let all = vec![epic.clone(), child];
+        assert_eq!(
+            would_orphan_on_demote(&epic, "task", &all),
+            Some("would orphan children")
+        );
+    }
+
+    #[test]
+    fn demote_childless_rooted_epic_is_allowed() {
+        let mut epic = make_spark("sp-epic", "open");
+        epic.spark_type = "epic".to_string();
+        epic.parent_id = Some("sp-root".to_string());
+        let all = vec![epic.clone()];
+        assert_eq!(would_orphan_on_demote(&epic, "task", &all), None);
+    }
+
+    #[test]
+    fn demote_childless_unparented_epic_is_rejected() {
+        let mut epic = make_spark("sp-epic", "open");
+        epic.spark_type = "epic".to_string();
+        epic.parent_id = None;
+        let all = vec![epic.clone()];
+        assert_eq!(
+            would_orphan_on_demote(&epic, "task", &all),
+            Some("would orphan self")
+        );
+    }
+
+    #[test]
+    fn promote_to_epic_is_always_allowed_by_orphan_check() {
+        let mut task = make_spark("sp-t", "open");
+        task.spark_type = "task".to_string();
+        task.parent_id = None;
+        let all = vec![task.clone()];
+        assert_eq!(would_orphan_on_demote(&task, "epic", &all), None);
     }
 
     #[test]
@@ -950,6 +2395,489 @@ mod tests {
         assert_eq!(blocked_by.len(), 1);
     }
 
+    // ── Acceptance criteria editor tests ─────────────
+
+    fn edit_with(items: Vec<&str>) -> AcceptanceCriteriaEdit {
+        AcceptanceCriteriaEdit {
+            spark_id: "sp-me".to_string(),
+            items: items.into_iter().map(String::from).collect(),
+            last_deleted: None,
+        }
+    }
+
+    #[test]
+    fn add_criterion_appends_empty_row_and_returns_index() {
+        let mut e = edit_with(vec!["a", "b"]);
+        let idx = add_criterion(&mut e);
+        assert_eq!(idx, 2);
+        assert_eq!(e.items, vec!["a", "b", ""]);
+    }
+
+    #[test]
+    fn delete_criterion_removes_and_stashes_for_undo() {
+        let mut e = edit_with(vec!["a", "b", "c"]);
+        assert!(delete_criterion(&mut e, 1));
+        assert_eq!(e.items, vec!["a", "c"]);
+        assert_eq!(e.last_deleted, Some((1, "b".to_string())));
+    }
+
+    #[test]
+    fn delete_criterion_out_of_range_is_noop() {
+        let mut e = edit_with(vec!["a"]);
+        assert!(!delete_criterion(&mut e, 5));
+        assert_eq!(e.items, vec!["a"]);
+        assert!(e.last_deleted.is_none());
+    }
+
+    #[test]
+    fn undo_delete_restores_at_original_index() {
+        let mut e = edit_with(vec!["a", "b", "c"]);
+        delete_criterion(&mut e, 1);
+        assert!(undo_delete(&mut e));
+        assert_eq!(e.items, vec!["a", "b", "c"]);
+        assert!(e.last_deleted.is_none());
+    }
+
+    #[test]
+    fn undo_delete_without_buffer_is_noop() {
+        let mut e = edit_with(vec!["a"]);
+        assert!(!undo_delete(&mut e));
+        assert_eq!(e.items, vec!["a"]);
+    }
+
+    #[test]
+    fn move_up_and_down_reorder_vec() {
+        let mut e = edit_with(vec!["a", "b", "c"]);
+        assert!(move_up(&mut e, 2));
+        assert_eq!(e.items, vec!["a", "c", "b"]);
+        assert!(move_down(&mut e, 0));
+        assert_eq!(e.items, vec!["c", "a", "b"]);
+        // edges
+        assert!(!move_up(&mut e, 0));
+        assert!(!move_down(&mut e, 2));
+    }
+
+    #[test]
+    fn trim_blank_on_blur_removes_whitespace_only_row() {
+        let mut e = edit_with(vec!["a", "   ", "c"]);
+        assert!(trim_blank_on_blur(&mut e, 1));
+        assert_eq!(e.items, vec!["a", "c"]);
+        // Blank trim should NOT populate the undo buffer — there's
+        // nothing to undo since the user never typed anything real.
+        assert!(e.last_deleted.is_none());
+    }
+
+    #[test]
+    fn trim_blank_on_blur_keeps_nonempty_row() {
+        let mut e = edit_with(vec!["real"]);
+        assert!(!trim_blank_on_blur(&mut e, 0));
+        assert_eq!(e.items, vec!["real"]);
+    }
+
+    #[test]
+    fn merge_into_existing_metadata_preserves_other_intent_fields() {
+        let existing = serde_json::json!({
+            "intent": {
+                "problem_statement": "keep me",
+                "invariants": ["x"],
+                "acceptance_criteria": ["old"],
+            },
+            "unrelated": 42,
+        })
+        .to_string();
+        let merged = merge_acceptance_criteria_into_metadata(
+            &existing,
+            &["new1".to_string(), "new2".to_string()],
+        );
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["intent"]["problem_statement"], "keep me");
+        assert_eq!(v["intent"]["invariants"][0], "x");
+        assert_eq!(v["intent"]["acceptance_criteria"][0], "new1");
+        assert_eq!(v["intent"]["acceptance_criteria"][1], "new2");
+        assert_eq!(v["unrelated"], 42);
+    }
+
+    #[test]
+    fn merge_into_empty_metadata_creates_intent_shell() {
+        let merged = merge_acceptance_criteria_into_metadata("{}", &["only".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["intent"]["acceptance_criteria"][0], "only");
+    }
+
+    #[test]
+    fn merge_into_malformed_metadata_falls_back_to_fresh_object() {
+        // Malformed input shouldn't panic or lose the new criteria.
+        let merged =
+            merge_acceptance_criteria_into_metadata("not json at all", &["rescued".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["intent"]["acceptance_criteria"][0], "rescued");
+    }
+
+    #[test]
+    fn load_reads_acceptance_criteria_from_spark_metadata() {
+        let mut s = make_spark("sp-me", "open");
+        s.metadata = serde_json::json!({
+            "intent": { "acceptance_criteria": ["one", "two"] }
+        })
+        .to_string();
+        let e = AcceptanceCriteriaEdit::load(&s);
+        assert_eq!(e.spark_id, "sp-me");
+        assert_eq!(e.items, vec!["one", "two"]);
+        assert!(e.is_for("sp-me"));
+        assert!(!e.is_for("sp-other"));
+    }
+
+    #[test]
+    fn spark_edit_begin_edit_records_empty_draft() {
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Title);
+        assert!(edit.drafts.contains_key(&Field::Title));
+        assert_eq!(edit.drafts[&Field::Title], "");
+        assert!(edit.is_dirty());
+    }
+
+    #[test]
+    fn spark_edit_begin_edit_preserves_existing_draft() {
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Title);
+        edit.update_draft(Field::Title, "hello".into());
+        // Re-entering the field must not wipe in-progress text.
+        edit.begin_edit(Field::Title);
+        assert_eq!(edit.drafts[&Field::Title], "hello");
+    }
+
+    #[test]
+    fn spark_edit_commit_moves_draft_to_in_flight() {
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Description);
+        edit.update_draft(Field::Description, "new body".into());
+        let write = edit.commit(Field::Description).expect("commit");
+        assert_eq!(write.spark_id, "sp-1");
+        assert_eq!(write.field, Field::Description);
+        assert_eq!(write.value, "new body");
+        assert!(!edit.drafts.contains_key(&Field::Description));
+        assert_eq!(edit.in_flight[&Field::Description], "new body");
+        assert!(edit.is_dirty(), "in-flight counts as dirty");
+    }
+
+    #[test]
+    fn spark_edit_commit_without_draft_returns_none() {
+        let mut edit = SparkEdit::new("sp-1");
+        assert!(edit.commit(Field::Title).is_none());
+        assert!(!edit.is_dirty());
+    }
+
+    #[test]
+    fn spark_edit_rollback_discards_in_flight() {
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Priority);
+        edit.update_draft(Field::Priority, "0".into());
+        let _ = edit.commit(Field::Priority);
+        assert!(edit.in_flight.contains_key(&Field::Priority));
+        edit.rollback(Field::Priority);
+        assert!(!edit.in_flight.contains_key(&Field::Priority));
+        assert!(!edit.drafts.contains_key(&Field::Priority));
+        assert!(!edit.is_dirty());
+    }
+
+    #[test]
+    fn spark_edit_rollback_discards_draft_too() {
+        // Rollback from an uncommitted draft (user cancelled) should
+        // also clear the draft, not just the in-flight slot.
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Assignee);
+        edit.update_draft(Field::Assignee, "alice".into());
+        edit.rollback(Field::Assignee);
+        assert!(!edit.drafts.contains_key(&Field::Assignee));
+    }
+
+    #[test]
+    fn spark_edit_indexed_fields_are_independent() {
+        // Acceptance(0) and Acceptance(1) must hash differently so two
+        // list items can be edited at once without colliding.
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Acceptance(0));
+        edit.update_draft(Field::Acceptance(0), "first".into());
+        edit.begin_edit(Field::Acceptance(1));
+        edit.update_draft(Field::Acceptance(1), "second".into());
+        assert_eq!(edit.drafts.len(), 2);
+        assert_eq!(edit.drafts[&Field::Acceptance(0)], "first");
+        assert_eq!(edit.drafts[&Field::Acceptance(1)], "second");
+    }
+
+    // ── Validation + closed-edit confirmation tests (ryve-8ad372cf) ──
+
+    #[test]
+    fn validate_title_rejects_empty_and_whitespace() {
+        assert_eq!(validate_title(""), Err(ValidationError::TitleEmpty));
+        assert_eq!(validate_title("   "), Err(ValidationError::TitleEmpty));
+        assert_eq!(validate_title("\t\n  "), Err(ValidationError::TitleEmpty));
+    }
+
+    #[test]
+    fn validate_title_accepts_non_empty() {
+        assert_eq!(validate_title("fix auth"), Ok(()));
+        assert_eq!(validate_title("  leading space is fine  "), Ok(()));
+    }
+
+    #[test]
+    fn is_terminal_status_matches_closed_and_completed() {
+        assert!(is_terminal_status("closed"));
+        assert!(is_terminal_status("completed"));
+        assert!(!is_terminal_status("open"));
+        assert!(!is_terminal_status("in_progress"));
+        assert!(!is_terminal_status("blocked"));
+        assert!(!is_terminal_status("deferred"));
+    }
+
+    #[test]
+    fn begin_edit_proceeds_for_open_spark() {
+        let mut session = SparkEditSession::new();
+        let spark = make_spark("sp-x", "open");
+        assert_eq!(
+            session.begin_edit(&spark, EditField::Title),
+            BeginEditOutcome::Proceed
+        );
+        assert!(!session.is_modal_open());
+    }
+
+    #[test]
+    fn begin_edit_prompts_for_closed_spark() {
+        let mut session = SparkEditSession::new();
+        let spark = make_spark("sp-x", "closed");
+        let outcome = session.begin_edit(&spark, EditField::Title);
+        assert_eq!(
+            outcome,
+            BeginEditOutcome::NeedsConfirmation {
+                status: "closed".to_string(),
+                field: EditField::Title,
+            }
+        );
+        assert!(session.is_modal_open());
+        assert_eq!(session.modal_status(), Some("closed"));
+    }
+
+    #[test]
+    fn begin_edit_prompts_for_completed_spark() {
+        let mut session = SparkEditSession::new();
+        let spark = make_spark("sp-x", "completed");
+        let outcome = session.begin_edit(&spark, EditField::Description);
+        assert!(matches!(
+            outcome,
+            BeginEditOutcome::NeedsConfirmation { .. }
+        ));
+    }
+
+    #[test]
+    fn confirmation_is_session_scoped_once_granted() {
+        let mut session = SparkEditSession::new();
+        let spark = make_spark("sp-x", "closed");
+
+        // First edit prompts.
+        assert!(matches!(
+            session.begin_edit(&spark, EditField::Title),
+            BeginEditOutcome::NeedsConfirmation { .. }
+        ));
+
+        // User confirms. The pending field comes back so the caller
+        // knows what to flip into edit mode.
+        assert_eq!(session.confirm_closed_edit(), Some(EditField::Title));
+        assert!(!session.is_modal_open());
+
+        // Subsequent edits on *any* field proceed without re-prompting.
+        assert_eq!(
+            session.begin_edit(&spark, EditField::Title),
+            BeginEditOutcome::Proceed
+        );
+        assert_eq!(
+            session.begin_edit(&spark, EditField::Description),
+            BeginEditOutcome::Proceed
+        );
+        assert_eq!(
+            session.begin_edit(&spark, EditField::AcceptanceCriteria),
+            BeginEditOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn cancel_leaves_view_unchanged_and_re_prompts_next_time() {
+        let mut session = SparkEditSession::new();
+        let spark = make_spark("sp-x", "closed");
+        assert!(matches!(
+            session.begin_edit(&spark, EditField::Title),
+            BeginEditOutcome::NeedsConfirmation { .. }
+        ));
+        session.cancel_closed_edit();
+        assert!(!session.is_modal_open());
+
+        // Next begin_edit should still prompt — the user did not grant
+        // consent.
+        assert!(matches!(
+            session.begin_edit(&spark, EditField::Title),
+            BeginEditOutcome::NeedsConfirmation { .. }
+        ));
+    }
+
+    #[test]
+    fn reopening_spark_clears_confirmation() {
+        let mut session = SparkEditSession::new();
+        let closed = make_spark("sp-x", "closed");
+        session.begin_edit(&closed, EditField::Title);
+        session.confirm_closed_edit();
+
+        // Status transitions away from terminal — e.g. the user flips
+        // it back to open in another window, and a refresh pulls it in.
+        let reopened = make_spark("sp-x", "open");
+        session.observe_spark(&reopened);
+
+        // Now close it again. A future edit must re-prompt, because
+        // the original consent was for the *previous* closed state.
+        let closed_again = make_spark("sp-x", "closed");
+        assert!(matches!(
+            session.begin_edit(&closed_again, EditField::Title),
+            BeginEditOutcome::NeedsConfirmation { .. }
+        ));
+    }
+
+    #[test]
+    fn switching_selected_spark_resets_confirmation() {
+        let mut session = SparkEditSession::new();
+        let a = make_spark("sp-a", "closed");
+        session.begin_edit(&a, EditField::Title);
+        session.confirm_closed_edit();
+
+        // User selects a different closed spark. We must not carry
+        // consent across selections — the per-session guarantee is
+        // scoped to a single spark.
+        let b = make_spark("sp-b", "closed");
+        assert!(matches!(
+            session.begin_edit(&b, EditField::Title),
+            BeginEditOutcome::NeedsConfirmation { .. }
+        ));
+    }
+
+    #[test]
+    fn confirm_without_pending_field_is_noop() {
+        let mut session = SparkEditSession::new();
+        assert_eq!(session.confirm_closed_edit(), None);
+    }
+
+    #[test]
+    fn modal_status_reflects_current_terminal_state() {
+        let mut session = SparkEditSession::new();
+        let completed = make_spark("sp-x", "completed");
+        session.begin_edit(&completed, EditField::Title);
+        assert_eq!(session.modal_status(), Some("completed"));
+    }
+
+    #[test]
+    fn validation_error_border_uses_danger_color() {
+        let pal = Palette::dark();
+        let style_ = validation_error_border(&pal);
+        assert_eq!(style_.border.color, pal.danger);
+        assert!(style_.border.width > 0.0);
+    }
+
+    // ── Title inline edit (spark ryve-f58d0492) ─────────
+
+    #[test]
+    fn title_edit_draft_roundtrip_through_commit() {
+        // Begin-edit → draft present; commit → draft moved to in_flight;
+        // the resulting OptimisticWrite carries the trimmed draft value.
+        let mut edit = SparkEdit::new("sp-1");
+        edit.begin_edit(Field::Title);
+        edit.update_draft(Field::Title, "New title".into());
+        let write = edit.commit(Field::Title).expect("draft exists");
+        assert_eq!(write.spark_id, "sp-1");
+        assert_eq!(write.field, Field::Title);
+        assert_eq!(write.value, "New title");
+        assert!(edit.in_flight.contains_key(&Field::Title));
+        assert!(!edit.drafts.contains_key(&Field::Title));
+    }
+
+    #[test]
+    fn title_invalid_border_uses_danger_color() {
+        // Empty drafts get a red border so the user sees why save was
+        // rejected. The helper returns danger regardless of focus state.
+        let pal = Palette::dark();
+        let style = title_input_style(text_input::Status::Active, &pal, true, false);
+        assert_eq!(style.border.color, pal.danger);
+    }
+
+    #[test]
+    fn title_disabled_style_dims_the_value_color() {
+        // In-flight saves render the value with text_tertiary so the
+        // input reads as disabled while the async write is pending.
+        let pal = Palette::dark();
+        let style = title_input_style(text_input::Status::Active, &pal, false, true);
+        assert_eq!(style.value, pal.text_tertiary);
+    }
+
+    #[test]
+    fn title_valid_focused_style_uses_accent_border() {
+        // Non-empty, non-disabled, focused input gets the accent border
+        // so it reads as the active edit target.
+        let pal = Palette::dark();
+        let style = title_input_style(
+            text_input::Status::Focused { is_hovered: false },
+            &pal,
+            false,
+            false,
+        );
+        assert_eq!(style.border.color, pal.accent);
+    }
+
+    #[test]
+    fn assignee_edit_begins_and_ends() {
+        let mut st = AssigneeEditState::default();
+        assert!(!st.is_active());
+        st.begin(Some("alice"), vec!["alice".to_string(), "bob".to_string()]);
+        assert!(st.is_active());
+        assert_eq!(st.input, "alice");
+        assert!(!st.cancelled);
+        st.end();
+        assert!(!st.is_active());
+        assert!(st.input.is_empty());
+    }
+
+    #[test]
+    fn build_assignee_suggestions_unions_and_dedupes() {
+        let s1 = make_spark("sp-1", "open");
+        let mut s2 = make_spark("sp-2", "open");
+        s2.assignee = Some("Bob".to_string());
+        let mut s3 = make_spark("sp-3", "closed");
+        s3.assignee = Some("alice".to_string());
+        let mut s4 = make_spark("sp-4", "open");
+        s4.assignee = Some("".to_string()); // skipped — empty
+        let sparks = vec![s1, s2, s3, s4];
+
+        // Agents: "alice" overlaps with a past assignee; "Carol" is new;
+        // whitespace-only is skipped.
+        let agents = ["alice", "Carol", "   "];
+        let out = build_assignee_suggestions(&agents, &sparks);
+        assert_eq!(
+            out,
+            vec!["alice".to_string(), "Bob".to_string(), "Carol".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_assignee_suggestions_handles_empty_inputs() {
+        let out = build_assignee_suggestions(&[], &[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn assignee_cancel_flag_survives_until_end() {
+        let mut st = AssigneeEditState::default();
+        st.begin(None, vec!["alice".into()]);
+        st.cancelled = true;
+        assert!(st.cancelled);
+        st.end();
+        // end() resets cancelled so a future edit starts clean.
+        assert!(!st.cancelled);
+    }
+
     #[test]
     fn contract_status_visuals_distinguishes_states() {
         let pal = Palette::dark();
@@ -959,5 +2887,82 @@ mod tests {
         assert_eq!(pass_icon, "\u{25CF}");
         assert_eq!(fail_icon, "\u{25CF}");
         assert_eq!(pending_icon, "\u{25CB}");
+    }
+
+    // ── Problem statement editor (ryve-a5997352) ─────────
+
+    #[test]
+    fn problem_edit_state_seeds_content_and_original() {
+        let state = ProblemEditState::new("sp-1", "existing problem");
+        assert_eq!(state.spark_id, "sp-1");
+        assert_eq!(state.original, "existing problem");
+        // text_editor::Content::text() appends a trailing newline for
+        // non-empty content; strip it for comparison.
+        let content = state.content.text();
+        let normalized = content.strip_suffix('\n').unwrap_or(&content);
+        assert_eq!(normalized, "existing problem");
+    }
+
+    #[test]
+    fn problem_edit_state_handles_empty_initial() {
+        // Empty problem_statement is allowed (acceptance criterion).
+        let state = ProblemEditState::new("sp-1", "");
+        assert!(state.original.is_empty());
+        assert!(state.content.text().is_empty() || state.content.text() == "\n");
+    }
+
+    #[test]
+    fn problem_edit_state_preserves_newlines_in_buffer() {
+        // Newlines in the seed must round-trip so multi-line editing
+        // doesn't lose data on first render.
+        let state = ProblemEditState::new("sp-1", "line1\nline2\nline3");
+        let text = state.content.text();
+        let normalized = text.strip_suffix('\n').unwrap_or(&text);
+        assert_eq!(normalized, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn problem_editor_key_binding_escape_cancels() {
+        use iced::keyboard;
+        use iced::keyboard::key::{Named, Physical};
+        use iced::widget::text_editor::{KeyPress, Status};
+        let kp = KeyPress {
+            key: keyboard::Key::Named(Named::Escape),
+            modified_key: keyboard::Key::Named(Named::Escape),
+            physical_key: Physical::Code(keyboard::key::Code::Escape),
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        };
+        let binding = problem_editor_key_binding(kp);
+        match binding {
+            Some(text_editor::Binding::Custom(Message::CancelProblem)) => {}
+            other => panic!("expected CancelProblem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn problem_editor_key_binding_other_keys_pass_through() {
+        // Pressing a normal key (e.g. 'a') should fall through to the
+        // default binding so typing still works.
+        use iced::keyboard;
+        use iced::keyboard::key::{Code, Physical};
+        use iced::widget::text_editor::{KeyPress, Status};
+        let kp = KeyPress {
+            key: keyboard::Key::Character("a".into()),
+            modified_key: keyboard::Key::Character("a".into()),
+            physical_key: Physical::Code(Code::KeyA),
+            modifiers: keyboard::Modifiers::default(),
+            text: Some("a".into()),
+            status: Status::Focused { is_hovered: false },
+        };
+        let binding = problem_editor_key_binding(kp);
+        // Should NOT be CancelProblem; anything else (including None) is fine.
+        match binding {
+            Some(text_editor::Binding::Custom(Message::CancelProblem)) => {
+                panic!("escape binding should not fire for 'a'")
+            }
+            _ => {}
+        }
     }
 }
