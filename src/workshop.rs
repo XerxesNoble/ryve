@@ -1195,8 +1195,9 @@ impl Workshop {
     /// Tear down the running terminal for an Atlas tab and queue a fresh
     /// `PendingTerminalSpawn` so the next `HandWorktreeReady` rebuilds it
     /// in-place. The tab itself (id, position, title, `is_atlas` flag) is
-    /// left untouched. Returns the `CodingAgent` that was running so the
-    /// caller can persist the new session and dispatch the worktree task.
+    /// left untouched. Returns the `CodingAgent` that was running and the
+    /// IDs of sessions that were ended so the caller can persist the new
+    /// session and end only those specific sessions in the DB.
     ///
     /// Spark ryve-71c3ec9f.
     pub fn prepare_atlas_refresh(
@@ -1204,7 +1205,7 @@ impl Workshop {
         tab_id: u64,
         new_session_id: String,
         full_auto: bool,
-    ) -> Option<CodingAgent> {
+    ) -> Option<(CodingAgent, Vec<String>)> {
         // Find the agent from the session attached to this tab.
         let agent = self
             .agent_sessions
@@ -1216,9 +1217,12 @@ impl Workshop {
         // the PTY, killing the subprocess.
         self.terminals.remove(&tab_id);
 
-        // End the old session(s) on this tab.
+        // End the old session(s) on this tab, collecting their IDs so the
+        // caller can persist the change in the DB.
+        let mut ended_ids = Vec::new();
         for session in self.agent_sessions.iter_mut() {
             if session.tab_id == Some(tab_id) {
+                ended_ids.push(session.id.clone());
                 session.tab_id = None;
                 session.active = false;
                 session.stale = false;
@@ -1251,7 +1255,7 @@ impl Workshop {
             },
         );
 
-        Some(agent)
+        Some((agent, ended_ids))
     }
 
     pub fn end_agent_sessions_for_tab(&mut self, id: u64) -> Vec<String> {

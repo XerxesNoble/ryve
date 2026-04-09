@@ -1607,7 +1607,7 @@ impl App {
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
                             let next_id = &mut self.next_terminal_id;
-                            let is_atlas = session.name.starts_with("Atlas");
+                            let is_atlas = session.session_label.as_deref() == Some("atlas");
                             let tab_id = if is_atlas {
                                 ws.begin_atlas_terminal(
                                     session.name.clone(),
@@ -2171,7 +2171,7 @@ impl App {
                                 .agent_settings
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
-                            let is_atlas = session.name.starts_with("Atlas");
+                            let is_atlas = session.session_label.as_deref() == Some("atlas");
                             let tab_id = if is_atlas {
                                 ws.begin_atlas_terminal(
                                     session.name.clone(),
@@ -4791,7 +4791,7 @@ impl App {
                     .unwrap_or(false);
 
                 let new_session_id = Uuid::new_v4().to_string();
-                let Some(agent) =
+                let Some((agent, ended_session_ids)) =
                     ws.prepare_atlas_refresh(tab_id, new_session_id.clone(), full_auto)
                 else {
                     return Task::none();
@@ -4830,13 +4830,7 @@ impl App {
                     let ws_id = self.workshops[idx].workshop_id();
 
                     // End old sessions for this tab in DB.
-                    let ended: Vec<String> = self.workshops[idx]
-                        .agent_sessions
-                        .iter()
-                        .filter(|s| !s.active && s.tab_id.is_none())
-                        .map(|s| s.id.clone())
-                        .collect();
-                    for sid in ended {
+                    for sid in ended_session_ids {
                         let p = pool_end.clone();
                         tasks.push(Task::perform(
                             async move {
