@@ -3513,6 +3513,16 @@ impl App {
                             }
                         }
                     }
+                    screen::sparks::Message::ToggleStatusFilter(status) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.toggle_status(&status);
+                        }
+                    }
+                    screen::sparks::Message::ToggleShowClosed => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.sparks_filter.show_closed = !ws.sparks_filter.show_closed;
+                        }
+                    }
                     screen::sparks::Message::ToggleEpicCollapse(epic_id) => {
                         // Flip the collapse flag in memory and persist the
                         // new snapshot to `.ryve/ui_state.json` so the
@@ -5959,6 +5969,7 @@ impl App {
                     status_menu: &ws.spark_status_menu,
                     collapsed: &ws.collapsed_epics,
                     refreshing: ws.sparks_refreshing,
+                    filter: &ws.sparks_filter,
                 })
                 .map(Message::Sparks)
             }
@@ -5972,6 +5983,7 @@ impl App {
                 status_menu: &ws.spark_status_menu,
                 collapsed: &ws.collapsed_epics,
                 refreshing: ws.sparks_refreshing,
+                filter: &ws.sparks_filter,
             })
             .map(Message::Sparks)
         };
