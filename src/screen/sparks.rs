@@ -301,6 +301,11 @@ pub enum Message {
     /// `.ryve/ui_state.json` so the decision survives restart.
     /// Sparks ryve-8be256a8 / ryve-926870a9.
     ToggleEpicCollapse(String),
+    /// The sparks filter changed. The workshop persists the new filter
+    /// state to `.ryve/ui_state.json` (fire-and-forget). Filter UI
+    /// widgets emit this after mutating `Workshop::sparks_filter`.
+    /// Spark ryve-27e33825. Not yet emitted — awaiting filter UI widgets.
+    SparksFilterChanged,
 }
 
 // ── Refresh button glyph ─────────────────────────────

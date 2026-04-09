@@ -23,6 +23,7 @@ use crate::screen::bench::{BenchState, TabKind};
 use crate::screen::file_explorer::FileExplorerState;
 use crate::screen::file_viewer::FileViewerState;
 use crate::screen::log_tail::LogTailState;
+use crate::sparks_filter::SparksFilter;
 use crate::style::{Appearance, Palette};
 
 const BOTTOM_PIN_NEWLINES: usize = 20;
@@ -360,6 +361,10 @@ pub struct Workshop {
     /// the panel survives restart; stale IDs (epics deleted between runs)
     /// are pruned on load. Spark ryve-926870a9.
     pub collapsed_epics: HashSet<String>,
+    /// Filter + sort state for the sparks panel. Initialised from
+    /// `.ryve/ui_state.json` on workshop open; persisted on every change.
+    /// Spark ryve-d6916c7e (struct), ryve-27e33825 (persistence).
+    pub sparks_filter: SparksFilter,
 }
 
 impl Workshop {
@@ -425,6 +430,7 @@ impl Workshop {
             terminal_font_family: None,
             agent_context_sync_cache: Arc::new(Mutex::new(AgentContextSyncCache::new())),
             collapsed_epics: HashSet::new(),
+            sparks_filter: SparksFilter::default(),
         }
     }
 
@@ -487,7 +493,9 @@ impl Workshop {
     /// fields. Used by the save side-effect helpers.
     pub fn ui_state_snapshot(&self) -> UiState {
         UiState {
+            version: 1,
             collapsed_epics: self.collapsed_epics.clone(),
+            sparks_filter: self.sparks_filter.to_persisted(),
         }
     }
 
