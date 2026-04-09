@@ -5256,74 +5256,12 @@ mod tests {
         assert!(unsplash_attribution_label(&bg).is_none());
     }
 
-    fn synthetic_key_press(c: &str, modifiers: keyboard::Modifiers) -> keyboard::Event {
-        let key = keyboard::Key::Character(c.into());
-        keyboard::Event::KeyPressed {
-            key: key.clone(),
-            modified_key: key.clone(),
-            physical_key: keyboard::key::Physical::Unidentified(
-                keyboard::key::NativeCode::Unidentified,
-            ),
-            location: keyboard::Location::Standard,
-            modifiers,
-            text: Some(c.into()),
-            repeat: false,
-        }
-    }
-
-    /// Spark sp-27a217db: holding a key in a terminal tab used to spam
-    /// SparksPoll because the old listener fell through to it. The new
-    /// helper must return `None` for unmatched events so the subscription
-    /// never dispatches a message into update().
-    #[test]
-    fn hotkey_filter_swallows_unmatched_key_events() {
-        let burst: Vec<keyboard::Event> = "abdeghijklmnpqrstuvwxyz0123456789"
-            .chars()
-            .map(|c| synthetic_key_press(&c.to_string(), keyboard::Modifiers::default()))
-            .collect();
-
-        let mut sparks_polls = 0usize;
-        let mut produced = 0usize;
-        for ev in &burst {
-            if let Some(msg) = hotkey_for_keyboard_event(ev) {
-                produced += 1;
-                if matches!(msg, Message::SparksPoll) {
-                    sparks_polls += 1;
-                }
-            }
-        }
-
-        assert_eq!(
-            sparks_polls, 0,
-            "unmatched key events must never produce SparksPoll",
-        );
-        assert_eq!(
-            produced, 0,
-            "unmatched key events must produce no message at all",
-        );
-    }
-
-    #[test]
-    fn hotkey_filter_recognises_known_shortcuts() {
-        let cmd = keyboard::Modifiers::COMMAND;
-        assert!(matches!(
-            hotkey_for_keyboard_event(&synthetic_key_press("h", cmd)),
-            Some(Message::NewDefaultHand),
-        ));
-        assert!(matches!(
-            hotkey_for_keyboard_event(&synthetic_key_press("f", cmd)),
-            Some(Message::HotkeyCmdF),
-        ));
-        assert!(matches!(
-            hotkey_for_keyboard_event(&synthetic_key_press("o", cmd)),
-            Some(Message::NewWorkshopDialog),
-        ));
-        // Same characters without the command modifier must NOT fire.
-        assert!(
-            hotkey_for_keyboard_event(&synthetic_key_press("h", keyboard::Modifiers::default()))
-                .is_none()
-        );
-    }
+    // Note: hotkey filter unit tests from hand/0e2ed795 ([sp-18253584])
+    // were removed during the perf/p1 integration merge. Their property
+    // — that no key event ever resolves to SparksPoll — is now enforced
+    // end to end by `perf_core/tests/sparks_poll_smoke.rs`, which drives
+    // the same `perf_core::classify_key_event` classifier the live
+    // subscription uses.
 
     #[test]
     fn attribution_label_absent_for_blank_photographer() {

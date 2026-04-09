@@ -58,15 +58,18 @@ mod tests {
 
     #[test]
     fn many_calls_with_same_name_do_not_grow_cache() {
-        // Use a name unlikely to collide with other tests in this module.
+        // The real invariant: 1000 intern calls for the same name return
+        // exactly the same `&'static str` pointer (i.e. zero new leaks).
+        // We can't compare `cache().len()` before/after because sibling
+        // tests in this module run in parallel and mutate the same global
+        // cache; that comparison is racy. The pointer-identity loop below
+        // is sufficient — if the cache leaked on every call, the pointer
+        // would change.
         let unique = "font-intern-stress-test-family";
         let first = intern(unique);
-        let before = cache().lock().unwrap().len();
         for _ in 0..1000 {
             let p = intern(unique);
             assert_eq!(p.as_ptr(), first.as_ptr());
         }
-        let after = cache().lock().unwrap().len();
-        assert_eq!(before, after);
     }
 }

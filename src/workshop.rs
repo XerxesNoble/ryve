@@ -1153,8 +1153,8 @@ mod tests {
     fn bottom_pin_newlines_is_modest() {
         // Spark sp-ux0027: 200 newlines polluted scrollback. Keep this small
         // (<= 30) so scroll-up history isn't drowned in blank lines.
-        assert!(BOTTOM_PIN_NEWLINES <= 30);
-        assert!(BOTTOM_PIN_NEWLINES >= 10);
+        const _: () = assert!(BOTTOM_PIN_NEWLINES <= 30);
+        const _: () = assert!(BOTTOM_PIN_NEWLINES >= 10);
     }
 
     #[test]
