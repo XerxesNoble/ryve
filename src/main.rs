@@ -363,6 +363,11 @@ enum Message {
     /// reload — all reading liveness from this single snapshot. Spark
     /// `ryve-a5b9e4a1`.
     ProcessSnapshotReady(Arc<ProcessSnapshot>),
+    /// Inert no-op. Used by the global keyboard subscription for any key
+    /// event that does not map to a real hotkey, so unmatched keystrokes
+    /// can never accidentally re-trigger an expensive `SparksPoll`.
+    /// Spark ryve-5b9c5d93 (perf regression harness).
+    Noop,
     /// Spawn a new Hand with the default agent (Cmd+H)
     NewDefaultHand,
     HandAssignmentSaved,
@@ -510,6 +515,7 @@ impl std::fmt::Debug for Message {
             Self::AgentContextSynced => write!(f, "AgentContextSynced"),
             Self::SparksPoll => write!(f, "SparksPoll"),
             Self::ProcessSnapshotReady(_) => write!(f, "ProcessSnapshotReady"),
+            Self::Noop => write!(f, "Noop"),
             Self::NewDefaultHand => write!(f, "NewDefaultHand"),
             Self::HandAssignmentSaved => write!(f, "HandAssignmentSaved"),
             Self::ShiftStateChanged(held) => write!(f, "ShiftStateChanged({held})"),
@@ -2610,6 +2616,7 @@ impl App {
             }
             Message::BackgroundConfigSaved => Task::none(),
             Message::AgentContextSynced => Task::none(),
+            Message::Noop => Task::none(),
             Message::SparksPoll => {
                 // Opportunistically surface any worktree warnings that the
                 // synchronous spawn paths accumulated since the last tick.
@@ -4050,14 +4057,66 @@ impl App {
         let poll =
             iced::time::every(std::time::Duration::from_secs(3)).map(|_| Message::SparksPoll);
 
-        // Hotkey filter — return None for unmatched events so we don't
-        // dispatch a no-op Message into update() on every keystroke. The
-        // previous version fell through to SparksPoll, which rebuilt
-        // sysinfo::System and ran DB queries on every keypress. See
-        // sp-27a217db / ryve-a13f9d3a.
-        let hotkeys = event::listen_with(|event, _status, _id| match event {
-            iced::Event::Keyboard(kb_event) => hotkey_for_keyboard_event(&kb_event),
-            _ => None,
+        // Translate Iced keyboard events into the framework-agnostic
+        // [`perf_core::KeyKind`] / [`perf_core::KeyModifiers`] pair so the
+        // routing decision lives in [`perf_core::classify_key_event`]. The
+        // smoke test in `perf_core/tests/sparks_poll_smoke.rs` drives the
+        // *same* classifier with synthetic events to assert no key path
+        // ever resolves to `SparksPoll`. This subsumes the lean
+        // event::listen_with fix from hand/0e2ed795 ([sp-18253584]) by
+        // making the same correctness property automatically tested.
+        // Sparks ryve-5b9c5d93 + ryve-a13f9d3a.
+        let hotkeys = keyboard::listen().map(|event| {
+            let (kind, mods) = match &event {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(c),
+                    modifiers,
+                    ..
+                } => {
+                    let ch = c.chars().next().unwrap_or('\0');
+                    (
+                        perf_core::KeyKind::Character(ch),
+                        perf_core::KeyModifiers {
+                            command: modifiers.command(),
+                        },
+                    )
+                }
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                } => (
+                    perf_core::KeyKind::Escape,
+                    perf_core::KeyModifiers::default(),
+                ),
+                keyboard::Event::ModifiersChanged(modifiers) => (
+                    perf_core::KeyKind::ModifiersChanged {
+                        shift: modifiers.shift(),
+                    },
+                    perf_core::KeyModifiers::default(),
+                ),
+                _ => (
+                    perf_core::KeyKind::Other,
+                    perf_core::KeyModifiers::default(),
+                ),
+            };
+
+            match perf_core::classify_key_event(kind, mods) {
+                perf_core::KeyDispatch::NewDefaultHand => Message::NewDefaultHand,
+                perf_core::KeyDispatch::CopySelection => {
+                    Message::FileViewer(file_viewer::Message::CopySelection)
+                }
+                perf_core::KeyDispatch::HotkeyCmdF => Message::HotkeyCmdF,
+                perf_core::KeyDispatch::NewWorkshopDialog => Message::NewWorkshopDialog,
+                perf_core::KeyDispatch::HotkeyEscape => Message::HotkeyEscape,
+                perf_core::KeyDispatch::ShiftStateChanged(shift) => {
+                    Message::ShiftStateChanged(shift)
+                }
+                // SparksPoll is a sentinel that classify_key_event must
+                // never return. The regression test asserts this; if it
+                // ever did escape, we still want a no-op rather than a
+                // workgraph reload — so map it to Noop here too.
+                perf_core::KeyDispatch::Noop | perf_core::KeyDispatch::SparksPoll => Message::Noop,
+            }
         });
 
         // Track window resizes so the splitter can convert vertical
@@ -4858,45 +4917,12 @@ impl App {
 /// drag is in progress. `listen_with` requires a `fn` (no closures),
 /// so we always emit messages and let the `update` function decide
 /// what to do based on `splitter_drag` state.
-/// Map a raw keyboard event to one of our hotkey messages, or `None` if
-/// nothing wants it. Pulled out of the subscription closure so it can be
-/// unit-tested without standing up an iced runtime. Spark sp-27a217db.
-fn hotkey_for_keyboard_event(event: &keyboard::Event) -> Option<Message> {
-    match event {
-        keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(c),
-            modifiers,
-            ..
-        } => {
-            if modifiers.command() && c.as_str() == "h" {
-                return Some(Message::NewDefaultHand);
-            }
-            if modifiers.command() && c.as_str() == "c" {
-                return Some(Message::FileViewer(file_viewer::Message::CopySelection));
-            }
-            if modifiers.command() && c.as_str() == "f" {
-                return Some(Message::HotkeyCmdF);
-            }
-            // Cmd+O — open workshop directory picker. Advertised on
-            // the welcome screen so first-time users have a way in
-            // beyond clicking the button. Active everywhere so the
-            // shortcut works once a workshop is already loaded too.
-            if modifiers.command() && c.as_str() == "o" {
-                return Some(Message::NewWorkshopDialog);
-            }
-            None
-        }
-        keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(keyboard::key::Named::Escape),
-            ..
-        } => Some(Message::HotkeyEscape),
-        keyboard::Event::ModifiersChanged(modifiers) => {
-            Some(Message::ShiftStateChanged(modifiers.shift()))
-        }
-        _ => None,
-    }
-}
-
+//
+// Note: the previous `hotkey_for_keyboard_event` helper from
+// hand/0e2ed795 ([sp-18253584]) was removed during the perf/p1
+// integration merge — the regression-harness branch ([sp-961b4d5e])
+// replaced it with `perf_core::classify_key_event`, which is exercised
+// by the headless smoke test in `perf_core/tests/sparks_poll_smoke.rs`.
 fn splitter_event_filter(
     event: iced::Event,
     _status: event::Status,
