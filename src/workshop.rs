@@ -154,6 +154,10 @@ pub struct Workshop {
     pub blocked_spark_ids: HashSet<String>,
     /// Inline contract-create form for the spark detail view.
     pub contract_create_form: crate::screen::spark_detail::ContractCreateForm,
+    /// Assignee field inline-edit state for the spark detail view.
+    /// Only one spark's assignee can be edited at a time since the detail
+    /// view shows one spark. See spark ryve-7e1cb491.
+    pub assignee_edit: crate::screen::spark_detail::AssigneeEditState,
     /// Whether the background image is dark (for adaptive font color).
     /// `None` means no background or not yet computed.
     pub bg_is_dark: Option<bool>,
@@ -231,6 +235,7 @@ impl Workshop {
             selected_spark_bonds: Vec::new(),
             blocked_spark_ids: HashSet::new(),
             contract_create_form: Default::default(),
+            assignee_edit: Default::default(),
             bg_is_dark: None,
             pending_agent_spawn: None,
             pending_head_spawn: None,

@@ -4,7 +4,7 @@
 //! Spark detail view — shown when a spark is selected in the workgraph panel.
 
 use data::sparks::types::{Bond, Contract, ContractEnforcement, ContractKind, Spark};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, combo_box, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Theme};
 
 use crate::screen::delegation_trace::DelegationTrace;
@@ -82,6 +82,77 @@ fn enforcement_label(e: ContractEnforcement) -> &'static str {
     }
 }
 
+// ── Assignee inline-edit state ────────────────────────
+//
+// Spark ryve-7e1cb491. The assignee cell becomes an editable combo_box
+// when the user clicks it. Suggestions are the union of active agent
+// session names and distinct past assignees from the workshop. Selecting
+// a suggestion persists; pressing Enter with any non-empty free-text
+// persists; blurring the widget (on_close) also persists the current
+// typed value. Escape cancels without writing.
+//
+// `combo_state` holds the iced `combo_box::State` that owns the option
+// list, filter cache, and focus. It's `Some` while editing and `None`
+// otherwise. `input` is kept in sync via `on_input` so the main-update
+// handler can read the live text at on_close time (the widget's internal
+// value accessor is private).
+#[derive(Debug, Default)]
+pub struct AssigneeEditState {
+    pub combo_state: Option<combo_box::State<String>>,
+    pub input: String,
+    /// Set by the Escape path in `Message::HotkeyEscape` so the
+    /// subsequent `AssigneeClosed` blur event does not persist.
+    pub cancelled: bool,
+}
+
+impl AssigneeEditState {
+    pub fn is_active(&self) -> bool {
+        self.combo_state.is_some()
+    }
+
+    /// Enter edit mode with the current assignee as seed text and the
+    /// given suggestion list. Callers are responsible for building the
+    /// suggestion union (active agents + past assignees) and passing it
+    /// in — this keeps the view free of any DB/session awareness.
+    pub fn begin(&mut self, current: Option<&str>, suggestions: Vec<String>) {
+        self.input = current.unwrap_or_default().to_string();
+        self.cancelled = false;
+        self.combo_state = Some(combo_box::State::new(suggestions));
+    }
+
+    pub fn end(&mut self) {
+        self.combo_state = None;
+        self.input.clear();
+        self.cancelled = false;
+    }
+}
+
+/// Build the assignee suggestion list from the inputs the workshop
+/// already has in memory. Union of agent session names and every
+/// distinct non-empty assignee across the cached sparks, sorted
+/// case-insensitively and deduplicated. Pure so it can be unit-tested.
+pub fn build_assignee_suggestions(agent_names: &[&str], sparks: &[Spark]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for n in agent_names {
+        let t = n.trim();
+        if !t.is_empty() {
+            set.insert(t.to_string());
+        }
+    }
+    for s in sparks {
+        if let Some(a) = s.assignee.as_deref() {
+            let t = a.trim();
+            if !t.is_empty() {
+                set.insert(t.to_string());
+            }
+        }
+    }
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort_by_key(|a| a.to_lowercase());
+    out
+}
+
 // ── Messages ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -111,6 +182,20 @@ pub enum Message {
         spark_id: String,
         contract_id: i64,
     },
+    /// Enter assignee edit mode for the given spark. The main handler
+    /// computes the suggestion union and seeds AssigneeEditState.
+    BeginEditAssignee,
+    /// Live input change in the assignee combo_box.
+    AssigneeInputChanged(String),
+    /// A suggestion (or explicit value) was picked from the dropdown by
+    /// Enter or by clicking a row.
+    AssigneeSelected(String),
+    /// The combo_box lost focus. If `cancelled` is not set, the main
+    /// handler commits the current `input` value (empty → None).
+    /// Escape cancellation is routed through `Message::HotkeyEscape`
+    /// in main.rs, which flips `AssigneeEditState::cancelled` before
+    /// `AssigneeClosed` fires so the blur does not persist.
+    AssigneeClosed,
 }
 
 // ── View ─────────────────────────────────────────────
@@ -123,6 +208,7 @@ pub fn view<'a>(
     all_sparks: &'a [Spark],
     delegation: &DelegationTrace,
     create_form: &'a ContractCreateForm,
+    assignee_edit: &'a AssigneeEditState,
     pal: &Palette,
     has_bg: bool,
 ) -> Element<'a, Message> {
@@ -302,15 +388,11 @@ pub fn view<'a>(
     // Metadata row: assignee, owner, dates
     let mut meta = column![].spacing(4).padding([8, 0]);
 
-    if let Some(ref assignee) = spark.assignee {
-        meta = meta.push(
-            row![
-                text("Assignee").size(FONT_SMALL).color(pal.text_tertiary),
-                text(assignee).size(FONT_SMALL).color(pal.text_secondary),
-            ]
-            .spacing(8),
-        );
-    }
+    // Assignee: always editable. Clicking the value (or the "unassigned"
+    // placeholder) swaps the label for a combo_box populated with the
+    // union of active Hand session names and distinct past assignees.
+    // See AssigneeEditState / Message::BeginEditAssignee.
+    meta = meta.push(view_assignee_row(spark, assignee_edit, &pal));
 
     if let Some(ref owner) = spark.owner {
         meta = meta.push(
@@ -359,6 +441,60 @@ pub fn view<'a>(
         .height(Length::Fill)
         .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg))
         .into()
+}
+
+// ── Assignee row ─────────────────────────────────────
+
+fn view_assignee_row<'a>(
+    spark: &'a Spark,
+    assignee_edit: &'a AssigneeEditState,
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let pal = *pal;
+    let label = text("Assignee").size(FONT_SMALL).color(pal.text_tertiary);
+
+    if let Some(state) = assignee_edit.combo_state.as_ref() {
+        // Editing mode: combo_box handles arrow-key nav, Enter selection,
+        // filter-as-you-type, and blur-to-close. The main-update handler
+        // treats an `AssigneeClosed` that's not preceded by
+        // `AssigneeCancelEdit` as a commit of the current input.
+        let selected = assignee_edit.input.clone();
+        let cb = combo_box(
+            state,
+            "Assignee (type to search)",
+            Some(&selected),
+            Message::AssigneeSelected,
+        )
+        .on_input(Message::AssigneeInputChanged)
+        .on_close(Message::AssigneeClosed)
+        .size(FONT_SMALL)
+        .padding([4, 6])
+        .width(Length::Fixed(240.0));
+
+        row![label, cb]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+    } else {
+        let display = spark
+            .assignee
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unassigned");
+        let value_color = if spark.assignee.is_some() {
+            pal.text_secondary
+        } else {
+            pal.text_tertiary
+        };
+        let value_btn = button(text(display).size(FONT_SMALL).color(value_color))
+            .style(button::text)
+            .padding([2, 6])
+            .on_press(Message::BeginEditAssignee);
+        row![label, value_btn]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+    }
 }
 
 // ── Bonds section ────────────────────────────────────
@@ -948,6 +1084,57 @@ mod tests {
         let bonds = vec![make_bond(1, "sp-b", "sp-me", "conditional_blocks")];
         let (_, blocked_by, _) = classify_bonds(&me, &bonds, &all);
         assert_eq!(blocked_by.len(), 1);
+    }
+
+    #[test]
+    fn assignee_edit_begins_and_ends() {
+        let mut st = AssigneeEditState::default();
+        assert!(!st.is_active());
+        st.begin(
+            Some("alice"),
+            vec!["alice".to_string(), "bob".to_string()],
+        );
+        assert!(st.is_active());
+        assert_eq!(st.input, "alice");
+        assert!(!st.cancelled);
+        st.end();
+        assert!(!st.is_active());
+        assert!(st.input.is_empty());
+    }
+
+    #[test]
+    fn build_assignee_suggestions_unions_and_dedupes() {
+        let s1 = make_spark("sp-1", "open");
+        let mut s2 = make_spark("sp-2", "open");
+        s2.assignee = Some("Bob".to_string());
+        let mut s3 = make_spark("sp-3", "closed");
+        s3.assignee = Some("alice".to_string());
+        let mut s4 = make_spark("sp-4", "open");
+        s4.assignee = Some("".to_string()); // skipped — empty
+        let sparks = vec![s1, s2, s3, s4];
+
+        // Agents: "alice" overlaps with a past assignee; "Carol" is new;
+        // whitespace-only is skipped.
+        let agents = ["alice", "Carol", "   "];
+        let out = build_assignee_suggestions(&agents, &sparks);
+        assert_eq!(out, vec!["alice".to_string(), "Bob".to_string(), "Carol".to_string()]);
+    }
+
+    #[test]
+    fn build_assignee_suggestions_handles_empty_inputs() {
+        let out = build_assignee_suggestions(&[], &[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn assignee_cancel_flag_survives_until_end() {
+        let mut st = AssigneeEditState::default();
+        st.begin(None, vec!["alice".into()]);
+        st.cancelled = true;
+        assert!(st.cancelled);
+        st.end();
+        // end() resets cancelled so a future edit starts clean.
+        assert!(!st.cancelled);
     }
 
     #[test]
