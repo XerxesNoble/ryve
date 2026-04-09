@@ -21,6 +21,10 @@ pub struct Tab {
     pub id: u64,
     pub title: String,
     pub kind: TabKind,
+    /// Pinned tabs are locked to the front of the tab bar. The Atlas
+    /// tab uses this to guarantee it stays at index 0 — no other tab
+    /// can be inserted or dragged to its left.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -140,11 +144,45 @@ impl BenchState {
         self.active_tab.and_then(|id| self.terminal_search.get(&id))
     }
 
-    /// Create a tab with an externally-assigned ID.
+    /// Create a tab with an externally-assigned ID. Appended after all
+    /// existing tabs — pinned tabs stay at the front undisturbed.
     pub fn create_tab(&mut self, id: u64, title: String, kind: TabKind) {
-        self.tabs.push(Tab { id, title, kind });
+        self.tabs.push(Tab {
+            id,
+            title,
+            kind,
+            pinned: false,
+        });
         self.active_tab = Some(id);
         self.dropdown_open = false;
+    }
+
+    /// Create a pinned tab locked to index 0. Only one pinned tab
+    /// (Atlas) is expected; if another already exists it is inserted
+    /// immediately after the existing pinned tabs.
+    pub fn create_pinned_tab(&mut self, id: u64, title: String, kind: TabKind) {
+        let tab = Tab {
+            id,
+            title,
+            kind,
+            pinned: true,
+        };
+        // Insert at the end of the current pinned range (i.e. at
+        // `first_unpinned_index`) so multiple pinned tabs stay
+        // contiguous and the newest one is rightmost among them.
+        let insert_at = self.first_unpinned_index();
+        self.tabs.insert(insert_at, tab);
+        self.active_tab = Some(id);
+        self.dropdown_open = false;
+    }
+
+    /// Index of the first non-pinned tab, or `tabs.len()` if every
+    /// tab is pinned (or the list is empty).
+    fn first_unpinned_index(&self) -> usize {
+        self.tabs
+            .iter()
+            .position(|t| !t.pinned)
+            .unwrap_or(self.tabs.len())
     }
 
     pub fn close_tab(&mut self, id: u64) {
@@ -528,6 +566,48 @@ mod tests {
         assert!(bench.terminal_search.contains_key(&7));
         bench.close_tab(7);
         assert!(!bench.terminal_search.contains_key(&7));
+    }
+
+    /// Spark ryve-5ebb111e — pinned Atlas tab stays at index 0 even
+    /// when other tabs are added before or after it.
+    #[test]
+    fn pinned_tab_stays_at_index_zero() {
+        let mut bench = BenchState::new();
+        // Add some regular tabs first.
+        bench.create_tab(1, "term-1".into(), TabKind::Terminal);
+        bench.create_tab(2, "term-2".into(), TabKind::Terminal);
+        // Now pin Atlas.
+        bench.create_pinned_tab(10, "Atlas".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs[0].id, 10, "pinned tab must be at index 0");
+        assert!(bench.tabs[0].pinned);
+        // Add another regular tab — it must land after the pinned one.
+        bench.create_tab(3, "term-3".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs[0].id, 10, "pinned tab still at index 0");
+        assert!(!bench.tabs.last().unwrap().pinned);
+    }
+
+    /// Spark ryve-5ebb111e — creating a pinned tab into an empty bench
+    /// puts it at index 0 and subsequent regular tabs follow.
+    #[test]
+    fn pinned_tab_first_in_empty_bench() {
+        let mut bench = BenchState::new();
+        bench.create_pinned_tab(99, "Atlas".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs.len(), 1);
+        assert_eq!(bench.tabs[0].id, 99);
+        assert!(bench.tabs[0].pinned);
+        bench.create_tab(1, "term".into(), TabKind::Terminal);
+        assert_eq!(bench.tabs[0].id, 99, "pinned tab unchanged");
+        assert_eq!(bench.tabs[1].id, 1);
+    }
+
+    /// Spark ryve-5ebb111e — regular `create_tab` never produces a
+    /// pinned tab, preserving the invariant that only explicit
+    /// `create_pinned_tab` pins.
+    #[test]
+    fn create_tab_never_pins() {
+        let mut bench = BenchState::new();
+        bench.create_tab(1, "x".into(), TabKind::Terminal);
+        assert!(!bench.tabs[0].pinned);
     }
 
     /// Spark ryve-acdb248a — confirm `Message::NewAtlas` exists as a

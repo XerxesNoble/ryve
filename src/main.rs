@@ -1589,13 +1589,24 @@ impl App {
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
                             let next_id = &mut self.next_terminal_id;
-                            let tab_id = ws.begin_hand_terminal(
-                                session.name.clone(),
-                                workshop::PendingTerminalKind::Agent(resume_agent.clone()),
-                                next_id,
-                                session_id.clone(),
-                                full_auto,
-                            );
+                            let is_atlas = session.name.starts_with("Atlas");
+                            let tab_id = if is_atlas {
+                                ws.begin_pinned_hand_terminal(
+                                    session.name.clone(),
+                                    workshop::PendingTerminalKind::Agent(resume_agent.clone()),
+                                    next_id,
+                                    session_id.clone(),
+                                    full_auto,
+                                )
+                            } else {
+                                ws.begin_hand_terminal(
+                                    session.name.clone(),
+                                    workshop::PendingTerminalKind::Agent(resume_agent.clone()),
+                                    next_id,
+                                    session_id.clone(),
+                                    full_auto,
+                                )
+                            };
                             follow_up.push(Self::dispatch_worktree_task(
                                 ws,
                                 tab_id,
@@ -2124,13 +2135,24 @@ impl App {
                                 .agent_settings
                                 .get(&resume_agent.command)
                                 .is_some_and(|s| s.full_auto);
-                            let tab_id = ws.begin_hand_terminal(
-                                session.name.clone(),
-                                workshop::PendingTerminalKind::Agent(resume_agent.clone()),
-                                next_id,
-                                session_id.clone(),
-                                full_auto,
-                            );
+                            let is_atlas = session.name.starts_with("Atlas");
+                            let tab_id = if is_atlas {
+                                ws.begin_pinned_hand_terminal(
+                                    session.name.clone(),
+                                    workshop::PendingTerminalKind::Agent(resume_agent.clone()),
+                                    next_id,
+                                    session_id.clone(),
+                                    full_auto,
+                                )
+                            } else {
+                                ws.begin_hand_terminal(
+                                    session.name.clone(),
+                                    workshop::PendingTerminalKind::Agent(resume_agent.clone()),
+                                    next_id,
+                                    session_id.clone(),
+                                    full_auto,
+                                )
+                            };
                             let worktree_task =
                                 Self::dispatch_worktree_task(ws, tab_id, session_id.clone());
 
@@ -5073,7 +5095,7 @@ impl App {
             .get(&agent.command)
             .is_some_and(|s| s.full_auto);
 
-        let tab_id = ws.begin_hand_terminal(
+        let tab_id = ws.begin_pinned_hand_terminal(
             title.clone(),
             workshop::PendingTerminalKind::Agent(agent.clone()),
             &mut self.next_terminal_id,
