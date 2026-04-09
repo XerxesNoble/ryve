@@ -154,6 +154,12 @@ pub struct Workshop {
     pub blocked_spark_ids: HashSet<String>,
     /// Inline contract-create form for the spark detail view.
     pub contract_create_form: crate::screen::spark_detail::ContractCreateForm,
+    /// Per-spark inline-edit state. `None` when no spark is currently
+    /// being edited; replaced (not merged) when the selected spark
+    /// changes. Invariant: at most one `SparkEdit` per workshop at a
+    /// time — see [`Workshop::change_selected_spark`]. Spark
+    /// ryve-1d8c2847.
+    pub spark_edit: Option<crate::screen::spark_detail::SparkEdit>,
     /// Whether the background image is dark (for adaptive font color).
     /// `None` means no background or not yet computed.
     pub bg_is_dark: Option<bool>,
@@ -231,6 +237,7 @@ impl Workshop {
             selected_spark_bonds: Vec::new(),
             blocked_spark_ids: HashSet::new(),
             contract_create_form: Default::default(),
+            spark_edit: None,
             bg_is_dark: None,
             pending_agent_spawn: None,
             pending_head_spawn: None,
@@ -266,6 +273,27 @@ impl Workshop {
     /// appearance changes (and on workshop creation).
     pub fn set_appearance(&mut self, appearance: Appearance) {
         self.appearance = appearance;
+    }
+
+    /// Change the currently selected spark, clearing the inline-edit
+    /// state as required by the spark-detail edit epic (ryve-1d8c2847).
+    ///
+    /// Returns the previous [`SparkEdit`] **if it was dirty** so the
+    /// caller can surface a "discard unsaved changes?" prompt to the
+    /// user. A non-dirty edit (or no edit at all) returns `None` and is
+    /// dropped silently. The selected spark is always updated before
+    /// this method returns — rollback of the selection change is the
+    /// UI layer's problem once the prompt lands.
+    pub fn change_selected_spark(
+        &mut self,
+        new: Option<String>,
+    ) -> Option<crate::screen::spark_detail::SparkEdit> {
+        let discarded = self
+            .spark_edit
+            .take()
+            .filter(crate::screen::spark_detail::SparkEdit::is_dirty);
+        self.selected_spark = new;
+        discarded
     }
 
     /// Effective palette for this workshop, honoring an adaptive

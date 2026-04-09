@@ -1969,7 +1969,7 @@ impl App {
                         // Mirror screen::sparks::Message::SelectSpark — set the
                         // selected spark and load its contracts + bonds so the
                         // right panel hydrates immediately.
-                        ws.selected_spark = Some(spark_id.clone());
+                        let _discarded = ws.change_selected_spark(Some(spark_id.clone()));
                         ws.selected_spark_contracts.clear();
                         ws.selected_spark_bonds.clear();
                         ws.contract_create_form.reset();
@@ -2023,7 +2023,7 @@ impl App {
                 match msg {
                     screen::spark_detail::Message::Back => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
-                            ws.selected_spark = None;
+                            let _discarded = ws.change_selected_spark(None);
                             ws.selected_spark_contracts.clear();
                             ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
@@ -2351,7 +2351,7 @@ impl App {
                     }
                     screen::sparks::Message::SelectSpark(spark_id) => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
-                            ws.selected_spark = Some(spark_id.clone());
+                            let _discarded = ws.change_selected_spark(Some(spark_id.clone()));
                             ws.selected_spark_contracts.clear();
                             ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
@@ -3045,7 +3045,7 @@ impl App {
         let ws = &mut self.workshops[idx];
         match msg {
             screen::home::Message::SelectSpark(id) => {
-                ws.selected_spark = Some(id.clone());
+                let _discarded = ws.change_selected_spark(Some(id.clone()));
                 if let Some(ref pool) = ws.sparks_db {
                     let pool = pool.clone();
                     let ws_id = ws.id;
