@@ -676,15 +676,12 @@ fn view_epic_header<'a>(
         .on_press(Message::ToggleEpicCollapse(epic.id.clone()));
 
     let status_indicator = status_symbol(&epic.status);
+    let badge_color = style::status_color(&epic.status, &pal);
     let id = epic.id.clone();
-    let status_btn = button(
-        text(status_indicator)
-            .size(FONT_ICON_SM)
-            .color(pal.text_secondary),
-    )
-    .style(button::text)
-    .padding([2, 4])
-    .on_press(Message::OpenStatusMenu(id.clone()));
+    let status_btn = button(text(status_indicator).size(FONT_ICON_SM).color(badge_color))
+        .style(button::text)
+        .padding([2, 4])
+        .on_press(Message::OpenStatusMenu(id.clone()));
 
     let title_color = if is_blocked {
         pal.text_tertiary
@@ -750,14 +747,11 @@ fn view_spark_row<'a>(
     let priority_label = format!("P{}", spark.priority);
     let id = spark.id.clone();
 
-    let status_btn = button(
-        text(status_indicator)
-            .size(FONT_ICON_SM)
-            .color(pal.text_secondary),
-    )
-    .style(button::text)
-    .padding([2, 4])
-    .on_press(Message::OpenStatusMenu(id.clone()));
+    let badge_color = style::status_color(&spark.status, &pal);
+    let status_btn = button(text(status_indicator).size(FONT_ICON_SM).color(badge_color))
+        .style(button::text)
+        .padding([2, 4])
+        .on_press(Message::OpenStatusMenu(id.clone()));
 
     // When a spark has open blockers, dim the title and surface a 🔒-style
     // padlock so agents glance-read "don't claim this" without opening detail.

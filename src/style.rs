@@ -709,4 +709,22 @@ mod tests {
             "hovered row must reuse hovered_item's background"
         );
     }
+
+    /// `status_color` must map each known spark status to the correct palette
+    /// color in both dark and light modes, ensuring scanability [sp-ryve-a54c61dc].
+    #[test]
+    fn status_color_maps_all_states() {
+        for pal in [Palette::dark(), Palette::light()] {
+            assert_eq!(status_color("open", &pal), pal.text_secondary);
+            assert_eq!(status_color("in_progress", &pal), pal.accent);
+            assert_eq!(status_color("blocked", &pal), pal.danger);
+            assert_eq!(status_color("deferred", &pal), pal.text_tertiary);
+            assert_eq!(status_color("closed", &pal), pal.success);
+            assert_eq!(
+                status_color("unknown_status", &pal),
+                pal.text_secondary,
+                "unknown status should fall back to text_secondary"
+            );
+        }
+    }
 }
