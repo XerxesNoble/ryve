@@ -53,6 +53,8 @@ pub const CLI_COMMANDS: &[&str] = &[
     "crews",
     "hand",
     "hands",
+    "head",
+    "heads",
     "worktree",
     "worktrees",
     "wt",
@@ -162,6 +164,7 @@ pub async fn run(args: Vec<String>) {
         "commit" | "commits" => handle_commit(&pool, &args_clean[2..], &ws_id, json_mode).await,
         "crew" | "crews" => handle_crew(&pool, &args_clean[2..], &ws_id, json_mode).await,
         "hand" | "hands" => handle_hand(&pool, &workshop_root, &args_clean[2..], json_mode).await,
+        "head" | "heads" => handle_head(&args_clean[2..], json_mode),
         "worktree" | "worktrees" | "wt" => {
             handle_worktree(&pool, &workshop_root, &args_clean[2..], json_mode).await
         }
@@ -268,6 +271,8 @@ fn print_usage() {
     eprintln!("  hand spawn <spark_id> [--agent <name>] [--role owner|merger] [--crew <id>]");
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
+    eprintln!();
+    eprintln!("  head archetype list                  List registered Head archetypes");
     eprintln!();
     eprintln!(
         "  worktree prune [--yes]               Prune stale hand worktrees (dry-run by default)"
@@ -1742,6 +1747,57 @@ async fn handle_hand(
             Err(e) => die(&format!("{e}")),
         },
         other => die(&format!("unknown hand subcommand '{other}'")),
+    }
+}
+
+// ── Head (archetype registry) ────────────────────────
+
+/// `ryve head <subcommand>` — inspect the Head archetype registry.
+///
+/// Currently exposes `head archetype list`, which prints every
+/// archetype registered in [`head_archetype::Registry::builtins`]. The
+/// spawn half (`ryve head spawn --archetype <name>`) is not wired yet;
+/// that's a follow-up spark. This handler deliberately does nothing
+/// fancier than iterate `Registry::all()` so adding a new archetype
+/// never requires touching the CLI parser — the listing picks it up
+/// automatically.
+fn handle_head(args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("head subcommand required (archetype list)");
+    }
+    match args[0].as_str() {
+        "archetype" | "archetypes" => {
+            let sub = args.get(1).map(|s| s.as_str()).unwrap_or("list");
+            match sub {
+                "list" | "ls" => {
+                    let registry = crate::head_archetype::Registry::builtins();
+                    if json_mode {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(registry.all()).unwrap_or_default()
+                        );
+                    } else if registry.all().is_empty() {
+                        println!("No Head archetypes registered.");
+                    } else {
+                        println!(
+                            "{:<12} {:<18} {:<22} DESCRIPTION",
+                            "NAME", "DEFAULT AGENT", "WRITE DISCIPLINE"
+                        );
+                        let sep = "-".repeat(96);
+                        println!("{sep}");
+                        for a in registry.all() {
+                            let discipline = format!("{:?}", a.write_discipline);
+                            println!(
+                                "{:<12} {:<18} {:<22} {}",
+                                a.name, a.default_agent, discipline, a.description
+                            );
+                        }
+                    }
+                }
+                other => die(&format!("unknown head archetype subcommand '{other}'")),
+            }
+        }
+        other => die(&format!("unknown head subcommand '{other}'")),
     }
 }
 
