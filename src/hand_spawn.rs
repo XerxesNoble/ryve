@@ -383,25 +383,35 @@ pub async fn spawn_head(
     let mut env_vars = workshop::hand_env_vars(workshop_dir);
     env_vars.push(("RYVE_HAND_SESSION_ID".to_string(), session_id.clone()));
 
-    // 7. Spawn detached. On failure, end the session so the row does not
-    //    linger as a phantom Head that never actually ran. The crew row
-    //    we created is kept — the caller can retry with `--crew <id>`.
-    let child_pid = match launch_detached(
-        &agent.command,
-        &cmd_args,
+    // 7. Launch inside a tmux session on the Ryve-private socket so the
+    //    Head survives Ryve restarts and is recallable via `tmux attach`.
+    //    The session name uses `head-<session_id>` so Heads and Hands are
+    //    trivially distinguishable at the tmux level (invariant).
+    let tmux_session_name = format!("head-{session_id}");
+
+    // Build the full argv: [command, args...]
+    let mut full_argv = vec![agent.command.clone()];
+    full_argv.extend(cmd_args);
+
+    // Ensure log file exists before pipe-pane tries to write to it.
+    tokio::fs::write(&log_path, b"").await?;
+
+    if let Err(err) = crate::tmux::new_session_detached(
+        workshop_dir,
+        &tmux_session_name,
         &worktree_path,
         &env_vars,
-        &log_path,
+        &full_argv,
     ) {
-        Ok(pid) => pid,
-        Err(err) => {
-            let _ = agent_session_repo::end_session(pool, &session_id).await;
-            return Err(err);
-        }
-    };
+        let _ = agent_session_repo::end_session(pool, &session_id).await;
+        return Err(HandSpawnError::Worktree(format!("tmux: {err}")));
+    }
 
-    if let Some(pid) = child_pid {
-        let _ = agent_session_repo::set_child_pid(pool, &session_id, pid).await;
+    // Pipe all pane output to the log file so existing log-tail consumers
+    // (the UI spy view, `tail -f`) continue to work unchanged.
+    if let Err(err) = crate::tmux::pipe_pane(workshop_dir, &tmux_session_name, &log_path) {
+        log::warn!("tmux pipe-pane failed for {tmux_session_name}: {err}");
+        // Non-fatal: the agent is already running, just without log capture.
     }
 
     Ok(SpawnedHead {
@@ -411,7 +421,10 @@ pub async fn spawn_head(
         archetype,
         worktree_path,
         log_path,
-        child_pid,
+        // tmux owns the child process — we don't get a PID back from
+        // `new-session -d`. Liveness is determined by `has_session`
+        // instead of PID tracking.
+        child_pid: None,
     })
 }
 
@@ -641,17 +654,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&workshop_dir);
     }
 
-    /// Acceptance criteria for spark ryve-e4cadc03:
+    /// Acceptance criteria for spark ryve-e4cadc03 + ryve-7e1854c7:
     ///   - spawning a Head creates an `agent_sessions` row with
     ///     `session_label = "head"`;
     ///   - it links to a new Crew whose `head_session_id` points at that
-    ///     session (via `head_session_id`, the schema column named on the
-    ///     `crews` table);
-    ///   - the archetype prompt template is handed to the spawned
-    ///     subprocess verbatim (detected by the archetype name + epic id
-    ///     appearing in the stub agent's recorded argv).
+    ///     session;
+    ///   - the Head runs inside a tmux session named `head-<session_id>`
+    ///     on the Ryve-private socket;
+    ///   - logs land under `.ryve/logs/head-<session_id>.log` via pipe-pane;
+    ///   - the archetype prompt is delivered to the spawned subprocess.
     #[tokio::test]
-    async fn spawn_head_creates_session_and_crew_and_delivers_prompt() {
+    async fn spawn_head_creates_tmux_session_and_crew_and_delivers_prompt() {
         let (workshop_dir, pool, out_path) = setup_workshop().await;
         let stub_path = workshop_dir.join("stub-agent.sh");
 
@@ -697,7 +710,11 @@ mod tests {
         .await
         .expect("spawn_head should succeed against the stub agent");
 
-        assert!(spawned.child_pid.is_some(), "child pid should be reported");
+        // tmux owns the child process — child_pid is None.
+        assert!(
+            spawned.child_pid.is_none(),
+            "tmux-managed heads have no direct child_pid"
+        );
         assert_eq!(spawned.epic_id, epic.id);
 
         // 1. Session row exists with label "head".
@@ -720,9 +737,10 @@ mod tests {
         );
         assert_eq!(crew.parent_spark_id.as_deref(), Some(epic.id.as_str()));
 
-        // 3. Subprocess received the archetype prompt. Poll for the stub's
-        //    recorded argv and assert it includes both the archetype name
-        //    (identity-at-boot invariant) and the epic id it was given.
+        // 3. Tmux session `head-<session_id>` exists on the Ryve-private socket.
+        //    The stub script exits immediately, so the session may already be
+        //    gone by the time we check. Instead, verify via the stub's output
+        //    file that the agent actually ran inside the tmux session.
         let deadline = Instant::now() + Duration::from_secs(5);
         let recorded = loop {
             if out_path.exists()
@@ -733,7 +751,7 @@ mod tests {
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "stub agent never wrote {} — Head failed to launch.\nlog: {}",
+                    "stub agent never wrote {} — Head failed to launch inside tmux.\nlog: {}",
                     out_path.display(),
                     std::fs::read_to_string(&spawned.log_path).unwrap_or_default()
                 );
@@ -749,6 +767,20 @@ mod tests {
             "epic id missing from prompt:\n{recorded}"
         );
 
+        // 4. Log file was created at the expected path.
+        let expected_log = workshop_dir
+            .join(".ryve")
+            .join("logs")
+            .join(format!("head-{}.log", spawned.session_id));
+        assert!(
+            expected_log.exists(),
+            "log file should exist at {}",
+            expected_log.display()
+        );
+
+        // Cleanup: kill the tmux session (if still alive) and remove temp dir.
+        let tmux_name = format!("head-{}", spawned.session_id);
+        let _ = crate::tmux::kill_session(&workshop_dir, &tmux_name);
         let _ = std::fs::remove_dir_all(&workshop_dir);
     }
 

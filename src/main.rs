@@ -15,6 +15,7 @@ mod process_snapshot;
 mod release_artifact;
 mod screen;
 mod style;
+mod tmux;
 mod widget;
 mod workshop;
 mod worktree_cleanup;
