@@ -11,6 +11,7 @@ pub mod file_explorer;
 pub mod file_viewer;
 pub mod head_picker;
 pub mod home;
+pub mod intent_list_editor;
 pub mod log_tail;
 pub mod spark_detail;
 pub mod spark_picker;

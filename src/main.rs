@@ -1079,6 +1079,11 @@ impl App {
                     ws.prev_blocked_spark_ids = current_blocked;
                     ws.sparks_baseline_seen = true;
                     ws.sparks = sparks;
+                    // Only reseed the intent-list drafts if the selected
+                    // spark *changed*; otherwise a mid-type keystroke
+                    // would get clobbered on every 3-second poll. Spark
+                    // ryve-212c63aa.
+                    ws.reseed_intent_drafts_if_selection_changed();
 
                     // Reseed the acceptance-criteria editor from the freshly
                     // loaded spark so the invariant "in-memory vec == persisted
@@ -2096,6 +2101,7 @@ impl App {
                         ws.selected_spark_contracts.clear();
                         ws.selected_spark_bonds.clear();
                         ws.contract_create_form.reset();
+                        ws.reseed_intent_drafts();
                         if let Some(ref pool) = ws.sparks_db {
                             let pool_c = pool.clone();
                             let pool_b = pool.clone();
@@ -2151,7 +2157,99 @@ impl App {
                             ws.selected_spark_bonds.clear();
                             ws.contract_create_form.reset();
                             ws.acceptance_criteria_edit = Default::default();
+                            ws.intent_list_drafts.clear();
                         }
+                    }
+                    screen::spark_detail::Message::IntentList(list_msg) => {
+                        use crate::screen::intent_list_editor as ile;
+                        let ws = &mut self.workshops[idx];
+                        // Mutate drafts first, then decide whether the
+                        // change warrants a persist. `Edit` is purely
+                        // local (keystroke-level) and must not write.
+                        let mut persist = false;
+                        match list_msg {
+                            ile::Message::Edit { kind, index, value } => {
+                                let list = ws.intent_list_drafts.list_mut(kind);
+                                if let Some(slot) = list.get_mut(index) {
+                                    *slot = value;
+                                }
+                            }
+                            ile::Message::Add { kind } => {
+                                ile::add_blank(ws.intent_list_drafts.list_mut(kind));
+                                // Adding a blank row doesn't persist yet
+                                // — we'd strip it on save. The first
+                                // keystroke or Submit will persist.
+                            }
+                            ile::Message::Delete { kind, index } => {
+                                if ile::delete_at(
+                                    ws.intent_list_drafts.list_mut(kind),
+                                    index,
+                                ) {
+                                    persist = true;
+                                }
+                            }
+                            ile::Message::MoveUp { kind, index } => {
+                                if ile::move_up(
+                                    ws.intent_list_drafts.list_mut(kind),
+                                    index,
+                                ) {
+                                    persist = true;
+                                }
+                            }
+                            ile::Message::MoveDown { kind, index } => {
+                                if ile::move_down(
+                                    ws.intent_list_drafts.list_mut(kind),
+                                    index,
+                                ) {
+                                    persist = true;
+                                }
+                            }
+                            ile::Message::Submit { kind } => {
+                                // "Empty row on blur is auto-deleted" —
+                                // fire on Enter. Prune blanks for the
+                                // submitted kind so stray empties never
+                                // leak into persisted state.
+                                ile::prune_blanks(ws.intent_list_drafts.list_mut(kind));
+                                persist = true;
+                            }
+                        }
+                        if !persist {
+                            return Task::none();
+                        }
+                        let Some(ref spark_id) = ws.intent_list_drafts.spark_id.clone() else {
+                            return Task::none();
+                        };
+                        let Some(spark) = ws.sparks.iter().find(|s| &s.id == spark_id).cloned()
+                        else {
+                            return Task::none();
+                        };
+                        let new_metadata = ile::rebuild_metadata(
+                            &spark.metadata,
+                            &ws.intent_list_drafts.acceptance,
+                            &ws.intent_list_drafts.invariants,
+                            &ws.intent_list_drafts.non_goals,
+                        );
+                        let Some(ref pool) = ws.sparks_db else {
+                            return Task::none();
+                        };
+                        let pool = pool.clone();
+                        let ws_id = ws.workshop_id();
+                        let id = ws.id;
+                        let sid = spark_id.clone();
+                        return Task::perform(
+                            async move {
+                                let upd = data::sparks::types::UpdateSpark {
+                                    metadata: Some(new_metadata),
+                                    ..Default::default()
+                                };
+                                let _ = data::sparks::spark_repo::update(
+                                    &pool, &sid, upd, "ui",
+                                )
+                                .await;
+                                load_sparks(pool, ws_id).await
+                            },
+                            move |sparks| Message::SparksLoaded(id, sparks),
+                        );
                     }
                     screen::spark_detail::Message::ShowCreateContract => {
                         if let Some(ws) = self.workshops.get_mut(idx) {
@@ -2751,6 +2849,7 @@ impl App {
                                 .find(|s| s.id == spark_id)
                                 .map(screen::spark_detail::AcceptanceCriteriaEdit::load)
                                 .unwrap_or_default();
+                            ws.reseed_intent_drafts();
                             if let Some(ref pool) = ws.sparks_db {
                                 let pool_c = pool.clone();
                                 let pool_b = pool.clone();
@@ -3532,6 +3631,7 @@ impl App {
         match msg {
             screen::home::Message::SelectSpark(id) => {
                 let _discarded = ws.change_selected_spark(Some(id.clone()));
+                ws.reseed_intent_drafts();
                 if let Some(ref pool) = ws.sparks_db {
                     let pool = pool.clone();
                     let ws_id = ws.id;
@@ -5161,6 +5261,7 @@ impl App {
                     &delegation,
                     &ws.contract_create_form,
                     &ws.acceptance_criteria_edit,
+                    &ws.intent_list_drafts,
                     &pal,
                     has_bg,
                 )

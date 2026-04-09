@@ -142,6 +142,7 @@ impl SparkEdit {
 }
 
 use crate::screen::delegation_trace::DelegationTrace;
+use crate::screen::intent_list_editor::{self, IntentListDrafts};
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_ICON, FONT_LABEL, FONT_SMALL, Palette};
 
 // ── Form state ───────────────────────────────────────
@@ -408,6 +409,11 @@ pub enum Message {
     AcceptanceCriterionMoveUp(usize),
     /// Reorder: move the Nth row down by one (persist on change).
     AcceptanceCriterionMoveDown(usize),
+
+    /// Row-list editor message for one of the three intent lists
+    /// (acceptance criteria, invariants, non-goals). See
+    /// `intent_list_editor` — all three lists are backed by one widget.
+    IntentList(intent_list_editor::Message),
 }
 
 // ── Dropdown option lists ────────────────────────────
@@ -449,6 +455,7 @@ pub fn view<'a>(
     delegation: &DelegationTrace,
     create_form: &'a ContractCreateForm,
     acceptance_edit: &'a AcceptanceCriteriaEdit,
+    intent_drafts: &'a IntentListDrafts,
     pal: &Palette,
     has_bg: bool,
 ) -> Element<'a, Message> {
@@ -571,31 +578,25 @@ pub fn view<'a>(
         );
     }
 
-    if !intent.invariants.is_empty() {
-        let mut items =
-            column![text("Invariants").size(FONT_LABEL).color(pal.text_tertiary),].spacing(2);
-        for inv in intent.invariants {
-            items = items.push(
-                text(format!("\u{2022} {inv}"))
-                    .size(FONT_BODY)
-                    .color(pal.text_primary),
-            );
-        }
-        body = body.push(items);
-    }
-
-    if !intent.non_goals.is_empty() {
-        let mut items =
-            column![text("Non-Goals").size(FONT_LABEL).color(pal.text_tertiary),].spacing(2);
-        for ng in intent.non_goals {
-            items = items.push(
-                text(format!("\u{2022} {ng}"))
-                    .size(FONT_BODY)
-                    .color(pal.text_primary),
-            );
-        }
-        body = body.push(items);
-    }
+    // Invariants + non-goals render through the shared row-list widget
+    // in `intent_list_editor`. The drafts are kept on the Workshop and
+    // seeded whenever `selected_spark` changes.
+    body = body.push(
+        intent_list_editor::view(
+            intent_list_editor::ListKind::Invariants,
+            intent_drafts.invariants.as_slice(),
+            &pal,
+        )
+        .map(Message::IntentList),
+    );
+    body = body.push(
+        intent_list_editor::view(
+            intent_list_editor::ListKind::NonGoals,
+            intent_drafts.non_goals.as_slice(),
+            &pal,
+        )
+        .map(Message::IntentList),
+    );
 
     // Acceptance criteria are always editable — even when empty, we
     // render the header and the "+ Add criterion" button so users can
