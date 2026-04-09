@@ -103,6 +103,57 @@ Workgraph syncs bidirectionally with GitHub Issues via `octocrab`:
 | **Watch** | Cyclic monitoring pattern | Parallel |
 | **Chain** | Sequential pipeline | Sequential |
 
+## Sidecars must never be tracked
+
+`.ryve/sparks.db` is a SQLite database running in WAL mode. At any moment
+a live workshop has **three** files on disk that SQLite treats as one
+atomic unit:
+
+| File | Role |
+|------|------|
+| `.ryve/sparks.db` | main database |
+| `.ryve/sparks.db-wal` | write-ahead log — uncheckpointed commits live here |
+| `.ryve/sparks.db-shm` | shared memory index over the WAL |
+
+If any of these files — or any subset — gets committed to git, a
+subsequent `git stash`, `git checkout`, `git reset`, or branch switch will
+move the versioned files out from under the running Ryve process. The
+live writers keep appending to the remaining on-disk copy, the main DB
+and the WAL drift apart, and the workgraph corrupts beyond `.recover`
+salvage. This is exactly what happened in the 2026-04-08 incident
+(spark `sp-b862594d`): only the two sidecars were tracked, a routine
+stash tore them away, and the entire workgraph was lost.
+
+### Invariant
+
+**No `sparks.db*` file may ever be staged, committed, or tracked.**
+
+This is enforced in three places:
+
+1. **`.gitignore`** — explicitly ignores `.ryve/sparks.db` and
+   `.ryve/sparks.db-*`.
+2. **Pre-commit hook** — `.githooks/pre-commit` rejects any staged
+   `sparks.db*` path. Enable once per clone:
+   ```sh
+   git config core.hooksPath .githooks
+   ```
+3. **CI + `cargo test`** — `scripts/check-sparks-db-not-tracked.sh` runs
+   in the `workgraph-hygiene` CI job, and
+   `tests/no_tracked_sparks_db.rs` runs the same check under
+   `cargo test`, so a sidecar sneaking in via a new worktree or a
+   `git add -f` fails the build.
+
+### If you find a tracked sidecar
+
+```sh
+git rm --cached .ryve/sparks.db .ryve/sparks.db-wal .ryve/sparks.db-shm
+git commit -m "chore: untrack sparks.db sidecars"
+```
+
+Do **not** delete the files from the working tree — the running Ryve
+process still needs them. `git rm --cached` removes only the index
+entry.
+
 ## Ember Types
 
 | Type | Purpose | Typical TTL |
