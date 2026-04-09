@@ -267,6 +267,10 @@ pub struct Workshop {
     /// modal and short-circuits the save path on failed validation.
     /// See ryve-8ad372cf.
     pub spark_edit_session: crate::screen::spark_detail::SparkEditSession,
+    /// Assignee field inline-edit state for the spark detail view.
+    /// Only one spark's assignee can be edited at a time since the detail
+    /// view shows one spark. See spark ryve-7e1cb491.
+    pub assignee_edit: crate::screen::spark_detail::AssigneeEditState,
     /// Whether the background image is dark (for adaptive font color).
     /// `None` means no background or not yet computed.
     pub bg_is_dark: Option<bool>,
@@ -348,6 +352,7 @@ impl Workshop {
             acceptance_criteria_edit: Default::default(),
             intent_list_drafts: Default::default(),
             spark_edit_session: Default::default(),
+            assignee_edit: Default::default(),
             bg_is_dark: None,
             pending_agent_spawn: None,
             pending_head_spawn: None,

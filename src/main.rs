@@ -2158,6 +2158,7 @@ impl App {
                             ws.contract_create_form.reset();
                             ws.acceptance_criteria_edit = Default::default();
                             ws.intent_list_drafts.clear();
+                            ws.assignee_edit.end();
                         }
                     }
                     screen::spark_detail::Message::IntentList(list_msg) => {
@@ -2695,6 +2696,64 @@ impl App {
                             ws.spark_edit_session.cancel_closed_edit();
                         }
                     }
+                    screen::spark_detail::Message::BeginEditAssignee => {
+                        // Spark ryve-7e1cb491: enter inline edit mode for the
+                        // assignee field. Compute the suggestion union
+                        // (active agent session names ∪ distinct past
+                        // assignees across sparks) from in-memory caches.
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            let current = ws
+                                .selected_spark
+                                .as_deref()
+                                .and_then(|id| ws.sparks.iter().find(|s| s.id == id))
+                                .and_then(|s| s.assignee.clone());
+                            let agent_names: Vec<&str> = ws
+                                .agent_sessions
+                                .iter()
+                                .filter(|a| a.active)
+                                .map(|a| a.name.as_str())
+                                .collect();
+                            let suggestions =
+                                screen::spark_detail::build_assignee_suggestions(
+                                    &agent_names,
+                                    &ws.sparks,
+                                );
+                            ws.assignee_edit.begin(current.as_deref(), suggestions);
+                        }
+                    }
+                    screen::spark_detail::Message::AssigneeInputChanged(val) => {
+                        if let Some(ws) = self.workshops.get_mut(idx) {
+                            ws.assignee_edit.input = val;
+                        }
+                    }
+                    screen::spark_detail::Message::AssigneeSelected(val) => {
+                        // A suggestion was picked (Enter on a highlighted
+                        // option or mouse click). Persist as-is and end
+                        // the edit.
+                        if let Some(task) = self.commit_assignee_edit(idx, Some(val)) {
+                            return task;
+                        }
+                    }
+                    screen::spark_detail::Message::AssigneeClosed => {
+                        // combo_box blurred. If Escape set the cancelled
+                        // flag, drop the edit silently. Otherwise commit
+                        // the current input (empty → clear).
+                        let Some(ws) = self.workshops.get_mut(idx) else {
+                            return Task::none();
+                        };
+                        if !ws.assignee_edit.is_active() {
+                            return Task::none();
+                        }
+                        if ws.assignee_edit.cancelled {
+                            ws.assignee_edit.end();
+                            return Task::none();
+                        }
+                        let value = ws.assignee_edit.input.trim().to_string();
+                        let new_value = if value.is_empty() { None } else { Some(value) };
+                        if let Some(task) = self.commit_assignee_edit(idx, new_value) {
+                            return task;
+                        }
+                    }
                     screen::spark_detail::Message::CycleStatus(spark_id, new_status) => {
                         if let Some(ws) = self.workshops.get(idx)
                             && let Some(ref pool) = ws.sparks_db
@@ -2948,6 +3007,15 @@ impl App {
                         ws.spark_edit = None;
                     }
                 }
+                // Spark ryve-7e1cb491: if the assignee inline editor is
+                // active, Escape cancels the edit (no persistence) and
+                // the remaining Escape side-effects still run.
+                if let Some(ws) = self.workshops.get_mut(idx)
+                    && ws.assignee_edit.is_active()
+                {
+                    ws.assignee_edit.cancelled = true;
+                    ws.assignee_edit.end();
+                }
                 let ws = &self.workshops[idx];
                 let mut tasks: Vec<Task<Message>> = Vec::new();
                 if let Some(active_id) = ws.bench.active_tab
@@ -2994,6 +3062,7 @@ impl App {
                                 .map(screen::spark_detail::AcceptanceCriteriaEdit::load)
                                 .unwrap_or_default();
                             ws.reseed_intent_drafts();
+                            ws.assignee_edit.end();
                             if let Some(ref pool) = ws.sparks_db {
                                 let pool_c = pool.clone();
                                 let pool_b = pool.clone();
@@ -3783,6 +3852,47 @@ impl App {
     fn active_workshop_mut(&mut self) -> Option<&mut Workshop> {
         let idx = self.active_workshop?;
         self.workshops.get_mut(idx)
+    }
+
+    /// Persist an assignee edit for the currently-selected spark and end
+    /// the inline edit state. `new_value == None` clears the assignee
+    /// (writes `assignee: Some(None)` so the repo updates the column to
+    /// NULL); `Some(v)` sets it to `v` as-is. Returns the follow-up
+    /// reload task, or `None` if there is no selected spark or no DB
+    /// available (in which case the edit state is still torn down so
+    /// the UI snaps back to display mode).
+    ///
+    /// Spark ryve-7e1cb491.
+    fn commit_assignee_edit(
+        &mut self,
+        idx: usize,
+        new_value: Option<String>,
+    ) -> Option<Task<Message>> {
+        let ws = self.workshops.get_mut(idx)?;
+        let spark_id = ws.selected_spark.clone();
+        ws.assignee_edit.end();
+        let spark_id = spark_id?;
+        // Optimistic update of the cached spark so the row flips back
+        // to display mode showing the new value immediately, before
+        // the async write completes.
+        if let Some(s) = ws.sparks.iter_mut().find(|s| s.id == spark_id) {
+            s.assignee = new_value.clone();
+        }
+        let pool = ws.sparks_db.as_ref()?.clone();
+        let ws_id_str = ws.workshop_id();
+        let id = ws.id;
+        Some(Task::perform(
+            async move {
+                let upd = data::sparks::types::UpdateSpark {
+                    assignee: Some(new_value),
+                    ..Default::default()
+                };
+                let _ =
+                    data::sparks::spark_repo::update(&pool, &spark_id, upd, "user").await;
+                load_sparks(pool, ws_id_str).await
+            },
+            move |sparks| Message::SparksLoaded(id, sparks),
+        ))
     }
 
     /// Route Home dashboard interactions: clicking a spark surfaces it in
@@ -4966,6 +5076,20 @@ impl App {
             }
         });
 
+        // Spark ryve-7e1cb491: Tab pressed while the assignee inline
+        // editor is active commits the current value as a selection.
+        // The SparkDetail handler no-ops if no workshop is editing, so
+        // emitting unconditionally is safe.
+        let assignee_tab = event::listen_with(|event, _status, _id| match event {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                ..
+            }) => Some(Message::SparkDetail(
+                screen::spark_detail::Message::AssigneeClosed,
+            )),
+            _ => None,
+        });
+
         // Track window resizes so the splitter can convert vertical
         // drag deltas into a sensible sidebar split ratio.
         let resizes = window::resize_events().map(|(_, size)| Message::WindowResized(size));
@@ -4986,6 +5110,7 @@ impl App {
             .chain(std::iter::once(poll))
             .chain(std::iter::once(backup_tick))
             .chain(std::iter::once(hotkeys))
+            .chain(std::iter::once(assignee_tab))
             .chain(std::iter::once(resizes))
             .chain(std::iter::once(file_drops))
             .collect();
@@ -5429,6 +5554,7 @@ impl App {
                     &ws.intent_list_drafts,
                     &ws.spark_edit_session,
                     ws.spark_edit.as_ref(),
+                    &ws.assignee_edit,
                     &pal,
                     has_bg,
                 )
