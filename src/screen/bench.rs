@@ -21,6 +21,10 @@ pub struct Tab {
     pub id: u64,
     pub title: String,
     pub kind: TabKind,
+    /// When true the tab cannot be closed by the user — the close button is
+    /// hidden and [`Message::CloseTab`] is a no-op. Used for the Atlas
+    /// Director tab (spark ryve-59983890).
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -142,17 +146,30 @@ impl BenchState {
 
     /// Create a tab with an externally-assigned ID.
     pub fn create_tab(&mut self, id: u64, title: String, kind: TabKind) {
-        self.tabs.push(Tab { id, title, kind });
+        self.tabs.push(Tab {
+            id,
+            title,
+            kind,
+            pinned: false,
+        });
         self.active_tab = Some(id);
         self.dropdown_open = false;
     }
 
     pub fn close_tab(&mut self, id: u64) {
+        if self.tabs.iter().any(|t| t.id == id && t.pinned) {
+            return;
+        }
         self.tabs.retain(|t| t.id != id);
         self.terminal_search.remove(&id);
         if self.active_tab == Some(id) {
             self.active_tab = self.tabs.last().map(|t| t.id);
         }
+    }
+
+    /// Returns true if the tab with the given id is pinned (cannot be closed).
+    pub fn is_pinned(&self, id: u64) -> bool {
+        self.tabs.iter().any(|t| t.id == id && t.pinned)
     }
 
     /// Render the tab bar row with liquid glass pill tabs.
@@ -178,19 +195,24 @@ impl BenchState {
                 }
             };
 
-            let tab_content = row![
+            let mut tab_content = row![
                 text(kind_icon).size(FONT_ICON_SM).color(text_color),
                 button(text(&tab.title).size(FONT_BODY).color(text_color))
                     .style(button::text)
                     .padding(0)
                     .on_press(Message::SelectTab(tab.id)),
-                button(text("\u{00D7}").size(FONT_ICON).color(pal.text_tertiary))
-                    .style(button::text)
-                    .padding(0)
-                    .on_press(Message::CloseTab(tab.id)),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
+
+            if !tab.pinned {
+                tab_content = tab_content.push(
+                    button(text("\u{00D7}").size(FONT_ICON).color(pal.text_tertiary))
+                        .style(button::text)
+                        .padding(0)
+                        .on_press(Message::CloseTab(tab.id)),
+                );
+            }
 
             let pill = container(tab_content)
                 .padding([4, 10])
@@ -565,5 +587,28 @@ mod tests {
         // Switch to tab 1 — now the overlay appears.
         bench.active_tab = Some(1);
         assert!(bench.view_terminal_search(&pal).is_some());
+    }
+
+    /// Spark ryve-59983890 — pinned tabs cannot be closed.
+    #[test]
+    fn pinned_tab_is_not_closeable() {
+        let mut bench = BenchState::new();
+        bench.create_tab(1, "Atlas".into(), TabKind::Terminal);
+        // Pin the tab
+        bench.tabs[0].pinned = true;
+        bench.create_tab(2, "other".into(), TabKind::Terminal);
+
+        assert!(bench.is_pinned(1));
+        assert!(!bench.is_pinned(2));
+
+        // Attempting to close a pinned tab is a no-op
+        bench.close_tab(1);
+        assert_eq!(bench.tabs.len(), 2);
+        assert!(bench.tabs.iter().any(|t| t.id == 1));
+
+        // Non-pinned tab can still be closed
+        bench.close_tab(2);
+        assert_eq!(bench.tabs.len(), 1);
+        assert!(!bench.tabs.iter().any(|t| t.id == 2));
     }
 }
