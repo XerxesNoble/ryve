@@ -779,6 +779,22 @@ impl App {
             .and_then(|ws| ws.sparks_db.clone().map(|p| (p, ws.directory.clone())))
             .map(|(pool, dir)| Self::snapshot_task(pool, dir))
             .unwrap_or(Task::none());
+        // Kill all Ryve-managed tmux sessions for this workshop so no
+        // agent processes survive after the workshop is closed.
+        // Spark ryve-c1517114.
+        let kill_agents = self
+            .workshops
+            .get(idx)
+            .map(|ws| {
+                let ws_dir = ws.directory.clone();
+                Task::perform(
+                    async move {
+                        crate::tmux::kill_all_sessions(&ws_dir).await;
+                    },
+                    |_| Message::AgentSessionSaved,
+                )
+            })
+            .unwrap_or(Task::none());
         self.workshops.remove(idx);
         if self.workshops.is_empty() {
             self.active_workshop = None;
@@ -789,7 +805,7 @@ impl App {
                 self.active_workshop = Some(idx.min(self.workshops.len() - 1));
             }
         }
-        snapshot
+        Task::batch([snapshot, kill_agents])
     }
 
     /// Push a new toast onto the stack and return a `Task` that will
@@ -1623,8 +1639,9 @@ impl App {
                     {
                         let pool = pool.clone();
                         let ids = dead_session_ids;
+                        let ws_dir = ws.directory.clone();
                         chain_tasks.push(Task::perform(
-                            reconcile_dead_sessions(pool, ids),
+                            reconcile_dead_sessions(pool, ws_dir, ids),
                             Message::DeadSessionsReconciled,
                         ));
                     }
@@ -2377,8 +2394,11 @@ impl App {
                         if let Some(ref pool) = ws.sparks_db {
                             let pool = pool.clone();
                             let sid = session_id.clone();
+                            let ws_dir = ws.directory.clone();
                             return Task::perform(
                                 async move {
+                                    // Kill tmux session first, then delete DB row.
+                                    crate::tmux::terminate_session(&pool, &ws_dir, &sid).await;
                                     let _ =
                                         data::sparks::agent_session_repo::delete(&pool, &sid).await;
                                 },
@@ -4895,16 +4915,15 @@ impl App {
                         && let Some(ref pool) = ws.sparks_db
                     {
                         let pool = pool.clone();
+                        let ws_dir = ws.directory.clone();
                         let mut tasks: Vec<Task<Message>> = ended_sessions
                             .into_iter()
                             .map(|sid| {
                                 let pool = pool.clone();
+                                let ws_dir = ws_dir.clone();
                                 Task::perform(
                                     async move {
-                                        let _ = data::sparks::agent_session_repo::end_session(
-                                            &pool, &sid,
-                                        )
-                                        .await;
+                                        crate::tmux::terminate_session(&pool, &ws_dir, &sid).await;
                                     },
                                     |_| Message::AgentSessionSaved,
                                 )
@@ -4976,8 +4995,9 @@ impl App {
                 ws.terminals.remove(&id);
                 ws.file_viewers.remove(&id);
 
-                // Mark agent sessions as ended (keep in history) rather than removing
+                // Mark agent sessions as ended AND kill their tmux sessions
                 let mut end_tasks: Vec<Task<Message>> = Vec::new();
+                let ws_dir = ws.directory.clone();
                 for session in ws.agent_sessions.iter_mut() {
                     if session.tab_id == Some(id) {
                         session.tab_id = None;
@@ -4986,11 +5006,10 @@ impl App {
                         if let Some(ref pool) = ws.sparks_db {
                             let pool = pool.clone();
                             let sid = session.id.clone();
+                            let ws_dir = ws_dir.clone();
                             end_tasks.push(Task::perform(
                                 async move {
-                                    let _ =
-                                        data::sparks::agent_session_repo::end_session(&pool, &sid)
-                                            .await;
+                                    crate::tmux::terminate_session(&pool, &ws_dir, &sid).await;
                                 },
                                 |_| Message::AgentSessionSaved,
                             ));
@@ -5246,19 +5265,20 @@ impl App {
 
                 let mut tasks: Vec<Task<Message>> = vec![worktree_task];
 
-                // Persist the new session + end the old one(s) in DB.
+                // Persist the new session + end the old one(s) in DB + kill tmux.
                 if let Some(ref pool) = self.workshops[idx].sparks_db {
                     let pool_end = pool.clone();
                     let pool_create = pool.clone();
                     let ws_id = self.workshops[idx].workshop_id();
+                    let ws_dir = self.workshops[idx].directory.clone();
 
-                    // End old sessions for this tab in DB.
+                    // End old sessions for this tab in DB and kill tmux.
                     for sid in ended_session_ids {
                         let p = pool_end.clone();
+                        let wd = ws_dir.clone();
                         tasks.push(Task::perform(
                             async move {
-                                let _ =
-                                    data::sparks::agent_session_repo::end_session(&p, &sid).await;
+                                crate::tmux::terminate_session(&p, &wd, &sid).await;
                             },
                             |_| Message::AgentSessionSaved,
                         ));
@@ -7165,14 +7185,15 @@ async fn load_embers(pool: sqlx::SqlitePool, workshop_id: String) -> Vec<Ember> 
 /// individual sessions are logged but do not abort the rest of the batch.
 ///
 /// Spark `ryve-a677498c`.
-async fn reconcile_dead_sessions(pool: sqlx::SqlitePool, session_ids: Vec<String>) -> Vec<String> {
+async fn reconcile_dead_sessions(
+    pool: sqlx::SqlitePool,
+    workshop_dir: PathBuf,
+    session_ids: Vec<String>,
+) -> Vec<String> {
     let mut reconciled = Vec::new();
     for session_id in &session_ids {
-        // 1. End the agent_sessions row.
-        if let Err(e) = data::sparks::agent_session_repo::end_session(&pool, session_id).await {
-            log::warn!("Failed to end dead session {session_id}: {e}");
-            continue;
-        }
+        // 1. End the agent_sessions row AND kill its tmux session.
+        crate::tmux::terminate_session(&pool, &workshop_dir, session_id).await;
         // 2. Abandon all active assignments for this session.
         let assignments = data::sparks::assignment_repo::list_for_session(&pool, session_id)
             .await
@@ -7441,7 +7462,8 @@ mod tests {
         );
 
         // 3. Run the reconciliation.
-        let reconciled = reconcile_dead_sessions(pool.clone(), dead).await;
+        let reconciled =
+            reconcile_dead_sessions(pool.clone(), PathBuf::from("/tmp/ryve-test-fake"), dead).await;
         assert_eq!(reconciled, vec![session_id.clone()]);
 
         // 4. Verify: session ended, assignment abandoned.

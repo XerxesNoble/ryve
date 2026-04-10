@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "collapsed_epics": [],
+  "sparks_filter": {
+    "status": [
+      "open"
+    ],
+    "spark_type": [
+      "epic"
+    ],
+    "priority": [],
+    "assignee": null,
+    "search": "",
+    "sort_mode": "default",
+    "show_closed": false
+  }
+}

@@ -101,6 +101,20 @@ pub async fn set_child_pid(
     Ok(())
 }
 
+/// Fetch a single session by ID, or `None` if not found.
+pub async fn get(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<PersistedAgentSession>, SparksError> {
+    let session =
+        sqlx::query_as::<_, PersistedAgentSession>("SELECT * FROM agent_sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(session)
+}
+
 /// Delete a session record.
 pub async fn delete(pool: &SqlitePool, session_id: &str) -> Result<(), SparksError> {
     sqlx::query("DELETE FROM agent_sessions WHERE id = ?")

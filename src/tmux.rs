@@ -269,10 +269,31 @@ impl<R: CommandRunner> TmuxClient<R> {
         self.run_tmux_ok(&["pipe-pane", "-t", name, &pipe_cmd])?;
         Ok(())
     }
+
+    /// Kill (destroy) a tmux session by name.
+    ///
+    /// Returns `Ok(())` if the session was killed or did not exist.
+    /// Only returns `Err` on I/O or tmux binary failures.
+    #[allow(dead_code)] // sync API; async callers use kill_tmux_session()
+    pub fn kill_session(&self, name: &str) -> Result<(), TmuxError> {
+        match self.has_session(name) {
+            Ok(false) => return Ok(()), // already gone — success
+            Err(TmuxError::BinaryMissing(_)) => return Ok(()), // no tmux — nothing to kill
+            Err(e) => return Err(e),
+            Ok(true) => {}
+        }
+        self.run_tmux_ok(&["kill-session", "-t", name])?;
+        Ok(())
+    }
+
+    /// Return the path to the socket this client uses.
+    #[allow(dead_code)] // part of TmuxClient public API
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
 }
 
-/// Methods used only in tests. Part of the TmuxClient API surface defined
-/// by spark ryve-4bae4ff6 but not yet wired into production code paths.
+/// Additional methods only used in tests.
 #[cfg(test)]
 impl<R: CommandRunner> TmuxClient<R> {
     /// List all sessions on the private socket.
@@ -306,20 +327,6 @@ impl<R: CommandRunner> TmuxClient<R> {
             .collect();
 
         Ok(sessions)
-    }
-
-    /// Kill (destroy) a session by name.
-    pub fn kill_session(&self, name: &str) -> Result<(), TmuxError> {
-        if !self.has_session(name)? {
-            return Err(TmuxError::SessionNotFound(name.to_string()));
-        }
-        self.run_tmux_ok(&["kill-session", "-t", name])?;
-        Ok(())
-    }
-
-    /// Return the path to the socket this client uses.
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
     }
 }
 
@@ -428,6 +435,66 @@ pub async fn list_sessions_async(workshop_dir: &Path) -> Vec<TmuxSession> {
                 .collect()
         }
         _ => Vec::new(),
+    }
+}
+
+/// Kill a tmux session by name on the workshop's private socket (async).
+///
+/// Best-effort: returns `Ok(())` if the session was killed, was already gone,
+/// or if no tmux binary is available. Only returns `Err` on unexpected I/O
+/// failures.
+pub async fn kill_tmux_session(workshop_dir: &Path, session_name: &str) -> Result<(), TmuxError> {
+    let state_dir = workshop_dir.join(".ryve");
+    let sock = short_socket_path(&state_dir);
+    if !sock.exists() {
+        return Ok(());
+    }
+    let tmux_bin = match resolve_tmux_bin() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    let output = tokio::process::Command::new(&tmux_bin)
+        .args([
+            "-S",
+            &sock.to_string_lossy(),
+            "kill-session",
+            "-t",
+            session_name,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            log::info!("tmux: killed session '{session_name}'");
+            Ok(())
+        }
+        Ok(_) => {
+            // Session probably doesn't exist — that's fine
+            log::debug!("tmux: session '{session_name}' not found (already dead)");
+            Ok(())
+        }
+        Err(e) => Err(TmuxError::Io(e)),
+    }
+}
+
+/// Kill all Ryve-managed tmux sessions on the workshop's private socket (async).
+///
+/// Called on workshop close / app shutdown to prevent zombie agent processes.
+pub async fn kill_all_sessions(workshop_dir: &Path) {
+    let live = list_sessions_async(workshop_dir).await;
+    for s in &live {
+        if is_ryve_session(&s.name) {
+            let _ = kill_tmux_session(workshop_dir, &s.name).await;
+        }
+    }
+    if !live.is_empty() {
+        log::info!(
+            "tmux: killed {} Ryve-managed session(s) on workshop close",
+            live.len()
+        );
     }
 }
 
@@ -574,6 +641,29 @@ pub fn attach_command(
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     Ok((program, args))
+}
+
+/// End an agent session in the DB **and** kill its tmux session (if any).
+///
+/// This is the single correct way to terminate a session. Every callsite
+/// that previously called `agent_session_repo::end_session` alone should
+/// use this instead to prevent zombie tmux processes.
+///
+/// Best-effort on the tmux side: if the session is already gone or no
+/// tmux binary is available, the DB update still succeeds.
+pub async fn terminate_session(pool: &SqlitePool, workshop_dir: &Path, session_id: &str) {
+    // 1. Look up the session label so we can derive the tmux name.
+    let label = match data::sparks::agent_session_repo::get(pool, session_id).await {
+        Ok(Some(s)) => s.session_label.unwrap_or_else(|| "hand".to_string()),
+        _ => "hand".to_string(),
+    };
+    let tmux_name = session_name(Some(&label), session_id);
+
+    // 2. Kill the tmux session (best-effort).
+    let _ = kill_tmux_session(workshop_dir, &tmux_name).await;
+
+    // 3. Mark ended in the DB.
+    let _ = data::sparks::agent_session_repo::end_session(pool, session_id).await;
 }
 
 // ── PID-based liveness detection ─────────────────────────
@@ -728,10 +818,14 @@ mod tests {
     }
 
     #[test]
-    fn kill_session_not_found() {
+    fn kill_session_not_found_is_ok() {
+        // Killing a session that doesn't exist is a success (idempotent).
         let client = make_client(|_, _| Ok(err_output(1, "")));
         let result = client.kill_session("ghost");
-        assert!(matches!(result, Err(TmuxError::SessionNotFound(_))));
+        assert!(
+            result.is_ok(),
+            "kill of non-existent session should succeed"
+        );
     }
 
     #[test]
