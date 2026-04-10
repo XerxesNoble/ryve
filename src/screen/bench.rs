@@ -265,7 +265,7 @@ impl BenchState {
             // Atlas tabs use logo.svg icon and "Atlas" label; others use the
             // text glyph determined above.
             let mut tab_content = if is_atlas {
-                let logo = svg(svg::Handle::from_path("assets/logo.svg"))
+                let logo = svg(crate::icons::logo_icon())
                     .width(14)
                     .height(14)
                     .style(crate::icons::ui_icon_color(text_color));

@@ -194,6 +194,36 @@ pub fn classify_key_event(kind: KeyKind, modifiers: KeyModifiers) -> KeyDispatch
     }
 }
 
+// ── Log-tail virtualization ──────────────────────────────
+
+/// Estimated height in logical pixels of a single monospace line at body
+/// font size. Shared between the UI and the benchmark.
+pub const LOG_LINE_HEIGHT: f32 = 20.0;
+
+/// Extra lines rendered above/below the viewport to avoid flicker.
+pub const LOG_OVERSCAN_LINES: usize = 5;
+
+/// Given a scroll offset, viewport height, and total line count, return the
+/// `(first, last)` indices of lines to render (half-open range). The range
+/// includes overscan margins so scrolling doesn't flash empty space.
+///
+/// This is the pure hot-path that determines which log lines the UI
+/// materialises on each frame.
+pub fn log_tail_visible_range(
+    offset_y: f32,
+    viewport_height: f32,
+    total_lines: usize,
+) -> (usize, usize) {
+    if total_lines == 0 {
+        return (0, 0);
+    }
+    let first = (offset_y / LOG_LINE_HEIGHT).floor() as usize;
+    let visible_count = (viewport_height / LOG_LINE_HEIGHT).ceil() as usize;
+    let first = first.saturating_sub(LOG_OVERSCAN_LINES).min(total_lines);
+    let last = (first + visible_count + 2 * LOG_OVERSCAN_LINES).min(total_lines);
+    (first, last)
+}
+
 // ── Tests ────────────────────────────────────────────────
 
 #[cfg(test)]

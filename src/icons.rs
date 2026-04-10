@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use iced::widget::svg;
 
@@ -143,9 +143,28 @@ pub fn agent_icon_for_command(command: &str) -> UiIcon {
 }
 
 /// Resolve an SVG handle for a named UI icon. Loads from `assets/icons/ui/`.
+/// The handle is cached so repeated calls (e.g. every frame) return a clone
+/// of the same `Arc`-backed handle instead of re-allocating.
 pub fn ui_icon(icon: UiIcon) -> svg::Handle {
-    let path = ui_icon_base_path().join(format!("{}.svg", icon.file_stem()));
-    svg::Handle::from_path(path)
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, svg::Handle>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    let stem = icon.file_stem();
+    if let Some(handle) = map.get(stem) {
+        return handle.clone();
+    }
+    let path = ui_icon_base_path().join(format!("{stem}.svg"));
+    let handle = svg::Handle::from_path(path);
+    map.insert(stem, handle.clone());
+    handle
+}
+
+/// Return the cached SVG handle for `assets/logo.svg`.
+pub fn logo_icon() -> svg::Handle {
+    static HANDLE: OnceLock<svg::Handle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| svg::Handle::from_path("assets/logo.svg"))
+        .clone()
 }
 
 /// Build a tinted SVG style function for the Iced `svg` widget. Use like:
@@ -180,13 +199,20 @@ fn ui_icon_base_path() -> &'static Path {
 // ── Internals ────────────────────────────────────────
 
 fn load_icon(name: &str) -> svg::Handle {
+    static CACHE: OnceLock<Mutex<HashMap<String, svg::Handle>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Some(handle) = map.get(name) {
+        return handle.clone();
+    }
     let path = icon_base_path().join(format!("{name}.svg"));
-    if path.exists() {
+    let handle = if path.exists() {
         svg::Handle::from_path(path)
     } else {
-        // Fallback to default file icon
         svg::Handle::from_path(icon_base_path().join(format!("{DEFAULT_FILE_ICON}.svg")))
-    }
+    };
+    map.insert(name.to_owned(), handle.clone());
+    handle
 }
 
 fn icon_base_path() -> &'static Path {

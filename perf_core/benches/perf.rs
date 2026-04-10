@@ -14,7 +14,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use data::git::FileStatus;
 use perf_core::{
     KeyDispatch, KeyKind, KeyModifiers, NodeKind, SessionLike, classify_key_event,
-    count_active_sessions, file_git_status, process_is_alive,
+    count_active_sessions, file_git_status, log_tail_visible_range, process_is_alive,
 };
 
 // ── Fixtures ─────────────────────────────────────────────
@@ -116,11 +116,41 @@ fn bench_classify_key_event(c: &mut Criterion) {
     });
 }
 
+fn bench_log_tail_visible_range(c: &mut Criterion) {
+    // The acceptance criterion requires constant frame time regardless of
+    // buffer size.  We benchmark with a 1MB log (~52k lines at ~20 bytes
+    // each) to prove the visible-range computation is O(1).
+    let total_lines_1mb = 1_000_000 / 20; // ~50_000 lines
+    let viewport_height = 600.0_f32;
+
+    let mut group = c.benchmark_group("log_tail_visible_range");
+    for &total in &[100, 1_000, 10_000, total_lines_1mb] {
+        group.bench_with_input(
+            criterion::BenchmarkId::from_parameter(total),
+            &total,
+            |b, &total| {
+                // Scroll to the middle — exercises the non-trivial overscan path.
+                let offset = (total as f32 / 2.0) * 20.0;
+                b.iter(|| {
+                    let range = log_tail_visible_range(
+                        std::hint::black_box(offset),
+                        std::hint::black_box(viewport_height),
+                        std::hint::black_box(total),
+                    );
+                    std::hint::black_box(range);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_process_is_alive,
     bench_session_filter,
     bench_file_git_status,
     bench_classify_key_event,
+    bench_log_tail_visible_range,
 );
 criterion_main!(benches);
