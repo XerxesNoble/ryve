@@ -431,35 +431,52 @@ pub fn owner_spark_for_session<'a>(
         .map(|a| a.spark_id.as_str())
 }
 
+/// Case-insensitive ASCII substring check without allocating. Returns `true`
+/// when `haystack` contains `needle` ignoring ASCII case.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let needle_bytes = needle.as_bytes();
+    let haystack_bytes = haystack.as_bytes();
+    if needle_bytes.len() > haystack_bytes.len() {
+        return false;
+    }
+    haystack_bytes
+        .windows(needle_bytes.len())
+        .any(|window| window.eq_ignore_ascii_case(needle_bytes))
+}
+
 /// Decide whether a session row matches the search query. The query is
 /// matched (case-insensitively) against:
 /// - the session's display name (e.g. "Claude Code")
 /// - the agent command (e.g. "claude")
 /// - the linked spark id and (if found) spark title
 ///
-/// Empty queries match everything.
+/// Empty queries match everything. This function allocates zero `String`s
+/// per call — it uses byte-level ASCII-case-insensitive comparison.
 pub fn session_matches_query(
     session: &AgentSession,
     assignments: &[HandAssignment],
     sparks: &[Spark],
     query: &str,
 ) -> bool {
-    let q = query.trim().to_ascii_lowercase();
+    let q = query.trim();
     if q.is_empty() {
         return true;
     }
-    if session.name.to_ascii_lowercase().contains(&q) {
+    if contains_ignore_ascii_case(&session.name, q) {
         return true;
     }
-    if session.agent.command.to_ascii_lowercase().contains(&q) {
+    if contains_ignore_ascii_case(&session.agent.command, q) {
         return true;
     }
     if let Some(spark_id) = owner_spark_for_session(&session.id, assignments) {
-        if spark_id.to_ascii_lowercase().contains(&q) {
+        if contains_ignore_ascii_case(spark_id, q) {
             return true;
         }
         if let Some(spark) = sparks.iter().find(|s| s.id == spark_id)
-            && spark.title.to_ascii_lowercase().contains(&q)
+            && contains_ignore_ascii_case(&spark.title, q)
         {
             return true;
         }
@@ -1584,6 +1601,17 @@ mod tests {
         assert!(session_matches_query(&s, &[], &[], "claude"));
         assert!(session_matches_query(&s, &[], &[], "CLA"));
         assert!(!session_matches_query(&s, &[], &[], "codex"));
+    }
+
+    #[test]
+    fn contains_ignore_ascii_case_basics() {
+        assert!(super::contains_ignore_ascii_case("Claude Code", "claude"));
+        assert!(super::contains_ignore_ascii_case("Claude Code", "CODE"));
+        assert!(super::contains_ignore_ascii_case("Claude Code", "de Co"));
+        assert!(!super::contains_ignore_ascii_case("Claude Code", "codex"));
+        assert!(super::contains_ignore_ascii_case("anything", ""));
+        assert!(!super::contains_ignore_ascii_case("", "x"));
+        assert!(!super::contains_ignore_ascii_case("ab", "abc"));
     }
 
     // ── Tmux attach (spark ryve-8ba40d83) ──────────

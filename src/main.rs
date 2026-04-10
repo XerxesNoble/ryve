@@ -1046,7 +1046,7 @@ impl App {
                 custom_agents,
                 agent_context,
                 agent_context_sync_cache,
-                ui_state,
+                mut ui_state,
             } => {
                 let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
                 let Some(idx) = ws_idx else {
@@ -1061,7 +1061,7 @@ impl App {
                     // the sparks panel honours the user's last collapse
                     // choices. Stale IDs are pruned once sparks finish
                     // loading (see SparksLoaded below). Spark ryve-926870a9.
-                    ws.collapsed_epics = ui_state.collapsed_epics.clone();
+                    ws.collapsed_epics = std::mem::take(&mut ui_state.collapsed_epics);
                     // Rehydrate the persisted sparks-panel filter so the
                     // user returns to the same view. Spark ryve-27e33825.
                     ws.sparks_filter = crate::screen::sparks::SparksFilter::from_persisted(
@@ -1588,7 +1588,7 @@ impl App {
                             log_path: p.log_path.map(PathBuf::from),
                             last_output_at: None,
                             parent_session_id: p.parent_session_id,
-                            session_label: p.session_label.clone(),
+                            session_label: p.session_label,
                             tmux_session_live: tmux_live,
                         });
                     }
@@ -5840,11 +5840,13 @@ impl App {
             }
             screen::background_picker::Message::SearchResults(photos) => {
                 ws.background_picker.loading = false;
-                ws.background_picker.results = photos.clone();
+                ws.background_picker.results = photos;
 
                 // Kick off thumbnail downloads
-                let tasks: Vec<_> = photos
-                    .into_iter()
+                let tasks: Vec<_> = ws
+                    .background_picker
+                    .results
+                    .iter()
                     .map(|photo| {
                         let id = photo.id.clone();
                         let url = photo.thumb_url.clone();
