@@ -4,10 +4,11 @@
 //! File explorer panel — displays project tree with git/worktree awareness.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use data::git::{DiffStat, FileStatus};
-use iced::widget::{Space, button, column, container, row, scrollable, svg, text};
+use iced::widget::{Space, button, column, container, lazy, row, scrollable, svg, text};
 use iced::{Color, Element, Length, Theme};
 
 use crate::icons;
@@ -184,6 +185,41 @@ fn build_tree(
     })
 }
 
+// ── Lazy key computation ─────────────────────────────
+
+/// Compute a hash key for the file explorer so `lazy()` can skip widget-tree
+/// rebuilds when the tree is unchanged (sp-78d34de4).
+fn file_explorer_hash(state: &FileExplorerState) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    fn hash_nodes(nodes: &[FileNode], h: &mut impl Hasher) {
+        nodes.len().hash(h);
+        for n in nodes {
+            n.path.hash(h);
+            n.name.hash(h);
+            hash_nodes(&n.children, h);
+        }
+    }
+    hash_nodes(&state.tree, &mut h);
+    state.expanded.len().hash(&mut h);
+    let mut exp_sorted: Vec<&PathBuf> = state.expanded.iter().collect();
+    exp_sorted.sort();
+    for p in exp_sorted {
+        p.hash(&mut h);
+    }
+    state.selected.hash(&mut h);
+    state.branch.hash(&mut h);
+    state.git_statuses.len().hash(&mut h);
+    state.diff_stats.len().hash(&mut h);
+    // Hash individual git status entries for change detection.
+    let mut gs_sorted: Vec<(&PathBuf, &FileStatus)> = state.git_statuses.iter().collect();
+    gs_sorted.sort_by_key(|(p, _)| *p);
+    for (p, s) in gs_sorted {
+        p.hash(&mut h);
+        std::mem::discriminant(s).hash(&mut h);
+    }
+    h.finish()
+}
+
 // ── View ──────────────────────────────────────────────
 
 /// Render the file explorer panel.
@@ -193,7 +229,7 @@ pub fn view<'a>(
     pal: &Palette,
 ) -> Element<'a, Message> {
     let pal = *pal;
-    let branch_label = state.branch.as_deref().unwrap_or("no branch");
+    let branch_label = state.branch.as_deref().unwrap_or("no branch").to_string();
 
     let root_icon = svg(icons::root_folder_icon(true)).width(16).height(16);
 
@@ -213,27 +249,35 @@ pub fn view<'a>(
     .align_y(iced::Alignment::Center)
     .padding([8, 10]);
 
-    let mut items: Vec<Element<'a, Message>> = Vec::new();
+    // Wrap the file tree list in `lazy()` so iced reuses the cached widget
+    // tree when the file explorer state is unchanged (sp-78d34de4).
+    let key = file_explorer_hash(state);
+    let st = state.clone();
+    let root_owned = root.to_path_buf();
 
-    if state.tree.is_empty() {
-        items.push(
-            container(text("Scanning...").size(FONT_BODY))
-                .padding([8, 10])
-                .into(),
-        );
-    } else {
-        for node in &state.tree {
-            collect_nodes(node, root, state, 0, &pal, &mut items);
+    let tree_el = lazy(key, move |_| {
+        let mut items: Vec<Element<'static, Message>> = Vec::new();
+
+        if st.tree.is_empty() {
+            items.push(
+                container(text("Scanning...").size(FONT_BODY))
+                    .padding([8, 10])
+                    .into(),
+            );
+        } else {
+            for node in &st.tree {
+                collect_nodes(node, &root_owned, &st, 0, &pal, &mut items);
+            }
         }
-    }
 
-    let list = iced::widget::Column::with_children(items)
-        .spacing(0)
-        .padding([0, 10]);
+        iced::widget::Column::with_children(items)
+            .spacing(0)
+            .padding([0, 10])
+    });
 
     let content = column![
         header,
-        scrollable(list)
+        scrollable(tree_el)
             .height(Length::Fill)
             .style(scrollable::default)
     ]
@@ -243,13 +287,13 @@ pub fn view<'a>(
     content.into()
 }
 
-fn collect_nodes<'a>(
-    node: &'a FileNode,
-    root: &'a Path,
-    state: &'a FileExplorerState,
+fn collect_nodes(
+    node: &FileNode,
+    root: &Path,
+    state: &FileExplorerState,
     depth: u16,
     pal: &Palette,
-    items: &mut Vec<Element<'a, Message>>,
+    items: &mut Vec<Element<'static, Message>>,
 ) {
     let indent = (depth as f32) * 16.0;
     let is_expanded = state.expanded.contains(&node.path);
@@ -278,7 +322,7 @@ fn collect_nodes<'a>(
     let mut label = row![
         Space::new().width(indent),
         icon_widget,
-        text(&node.name).size(FONT_BODY).color(git_color),
+        text(node.name.clone()).size(FONT_BODY).color(git_color),
         Space::new().width(Length::Fill),
     ]
     .spacing(4)

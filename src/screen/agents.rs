@@ -3,12 +3,13 @@
 
 //! Hands panel — lists active and past Hand sessions.
 
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use data::sparks::types::{Crew, CrewMember, HandAssignment, Spark};
 use iced::widget::{
-    Space, button, column, container, mouse_area, row, scrollable, svg, text, text_input,
+    Space, button, column, container, lazy, mouse_area, row, scrollable, svg, text, text_input,
 };
 use iced::{Element, Length, Theme};
 
@@ -467,6 +468,75 @@ pub fn session_matches_query(
     false
 }
 
+// ── Lazy key computation ─────────────────────────────
+
+/// Compute a hash key for the agents panel so `lazy()` can skip widget-tree
+/// rebuilds when inputs are unchanged. Includes a 5-second time bucket so
+/// idle/working status colors refresh at the same cadence as `IDLE_THRESHOLD`.
+fn agents_panel_hash(
+    sessions: &[AgentSession],
+    assignments: &[HandAssignment],
+    crews: &[Crew],
+    crew_members: &[CrewMember],
+    sparks: &[Spark],
+    state: &AgentsPanelState,
+) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // 5-second time bucket for status color refresh.
+    let time_bucket = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 5)
+        .unwrap_or(0);
+    time_bucket.hash(&mut h);
+    sessions.len().hash(&mut h);
+    for s in sessions {
+        s.id.hash(&mut h);
+        s.name.hash(&mut h);
+        s.active.hash(&mut h);
+        s.stale.hash(&mut h);
+        s.tmux_session_live.hash(&mut h);
+        s.parent_session_id.hash(&mut h);
+        s.session_label.hash(&mut h);
+    }
+    assignments.len().hash(&mut h);
+    for a in assignments {
+        a.session_id.hash(&mut h);
+        a.spark_id.hash(&mut h);
+    }
+    crews.len().hash(&mut h);
+    for c in crews {
+        c.id.hash(&mut h);
+        c.name.hash(&mut h);
+    }
+    crew_members.len().hash(&mut h);
+    for m in crew_members {
+        m.crew_id.hash(&mut h);
+        m.session_id.hash(&mut h);
+    }
+    // Only hash spark fields relevant to rendering.
+    sparks.len().hash(&mut h);
+    for s in sparks {
+        s.id.hash(&mut h);
+        s.title.hash(&mut h);
+        s.spark_type.hash(&mut h);
+        s.priority.hash(&mut h);
+    }
+    state.search.hash(&mut h);
+    state.history_limit.hash(&mut h);
+    state.stale_collapsed.hash(&mut h);
+    let mut ch: Vec<&String> = state.collapsed_heads.iter().collect();
+    ch.sort();
+    for id in ch {
+        id.hash(&mut h);
+    }
+    let mut cc: Vec<&String> = state.collapsed_crews.iter().collect();
+    cc.sort();
+    for id in cc {
+        id.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Render the Hands panel.
 ///
 /// Layout (top → bottom):
@@ -486,7 +556,6 @@ pub fn view<'a>(
     state: &'a AgentsPanelState,
     pal: Palette,
 ) -> Element<'a, Message> {
-    let now = Instant::now();
     // Panel title is "Activity" (not "Hands") because the panel actually
     // shows the entire orchestration tree — Heads, Crews, leaf Hands,
     // and history — not just Hands. The inner section labels ("Active",
@@ -508,115 +577,120 @@ pub fn view<'a>(
         .align_y(iced::Alignment::Center)
         .padding([2, 4]);
 
-    let mut content = column![header, search_row].spacing(6).padding(10);
+    // Wrap the content sections (active, history, stale) in `lazy()` so
+    // iced reuses the cached widget tree when inputs are unchanged (sp-78d34de4).
+    let key = agents_panel_hash(sessions, assignments, crews, crew_members, sparks, state);
+    let sess = sessions.to_vec();
+    let asgn = assignments.to_vec();
+    let cr = crews.to_vec();
+    let cm = crew_members.to_vec();
+    let sp = sparks.to_vec();
+    let st = state.clone();
 
-    // Pre-filter sessions by the search query so the tree only contains
-    // matching rows. Stale section is filtered separately below.
-    let q = state.search.as_str();
-    let active_filtered: Vec<AgentSession> = sessions
-        .iter()
-        .filter(|s| s.active && session_matches_query(s, assignments, sparks, q))
-        .cloned()
-        .collect();
+    let body = lazy(key, move |_| {
+        let now = Instant::now();
+        let q = st.search.as_str();
+        let mut content = column![].spacing(6);
 
-    // Build the hierarchical tree from filtered Active rows.
-    let tree = build_active_tree(&active_filtered, crews, crew_members);
+        let active_filtered: Vec<AgentSession> = sess
+            .iter()
+            .filter(|s| s.active && session_matches_query(s, &asgn, &sp, q))
+            .cloned()
+            .collect();
 
-    if tree.is_empty()
-        && sessions.iter().filter(|s| !s.active && !s.stale).count() == 0
-        && sessions.iter().filter(|s| s.stale).count() == 0
-    {
-        content = content.push(
-            text("No hands yet")
-                .size(FONT_BODY)
-                .color(pal.text_tertiary),
-        );
-    }
+        let tree = build_active_tree(&active_filtered, &cr, &cm);
 
-    // ── Active section ─────────────────────
-    if !tree.is_empty() {
-        content = content.push(text("Active").size(FONT_LABEL).color(pal.text_secondary));
-        for node in tree {
-            content = content.push(render_active_node(
-                node,
-                sessions,
-                assignments,
-                sparks,
-                state,
-                &pal,
-                now,
-            ));
-        }
-    }
-
-    // ── History section ────────────────────
-    let history_filtered: Vec<&AgentSession> = sessions
-        .iter()
-        .filter(|s| !s.active && !s.stale && session_matches_query(s, assignments, sparks, q))
-        .collect();
-    if !history_filtered.is_empty() {
-        content = content.push(Space::new().height(4));
-        content = content.push(text("History").size(FONT_LABEL).color(pal.text_secondary));
-
-        let total = history_filtered.len();
-        let limit = state.history_limit.min(total);
-        for session in history_filtered.iter().take(limit) {
-            content = content.push(render_history_row(session, assignments, sparks, &pal));
+        if tree.is_empty()
+            && sess.iter().filter(|s| !s.active && !s.stale).count() == 0
+            && sess.iter().filter(|s| s.stale).count() == 0
+        {
+            content = content.push(
+                text("No hands yet")
+                    .size(FONT_BODY)
+                    .color(pal.text_tertiary),
+            );
         }
 
-        if total > limit {
-            let remaining = total - limit;
-            let more_btn = button(
-                text(format!("Load more… ({remaining})"))
-                    .size(FONT_SMALL)
-                    .color(pal.accent),
-            )
-            .style(button::text)
-            .padding([4, 8])
-            .on_press(Message::LoadMoreHistory);
-            content = content.push(more_btn);
-        }
-    }
-
-    // ── Stale section (collapsed by default, at the bottom) ─────
-    let stale: Vec<&AgentSession> = sessions
-        .iter()
-        .filter(|s| s.stale && session_matches_query(s, assignments, sparks, q))
-        .collect();
-    if !stale.is_empty() {
-        content = content.push(Space::new().height(8));
-
-        let chev_icon = if state.stale_collapsed {
-            UiIcon::ChevronRight
-        } else {
-            UiIcon::ChevronDown
-        };
-        let chev = svg(icons::ui_icon(chev_icon))
-            .width(12)
-            .height(12)
-            .style(icons::ui_icon_color(pal.text_secondary));
-        let header_row = row![
-            chev,
-            text(format!("Stale ({})", stale.len()))
-                .size(FONT_LABEL)
-                .color(pal.text_secondary),
-        ]
-        .spacing(4)
-        .align_y(iced::Alignment::Center);
-        let header_btn = button(header_row)
-            .style(button::text)
-            .padding([2, 4])
-            .on_press(Message::ToggleStaleCollapsed);
-        content = content.push(header_btn);
-
-        if !state.stale_collapsed {
-            for session in &stale {
-                content = content.push(render_stale_row(session, &pal));
+        // ── Active section ─────────────────────
+        if !tree.is_empty() {
+            content = content.push(text("Active").size(FONT_LABEL).color(pal.text_secondary));
+            for node in tree {
+                content = content.push(render_active_node(node, &sess, &asgn, &sp, &st, &pal, now));
             }
         }
-    }
 
-    scrollable(content)
+        // ── History section ────────────────────
+        let history_filtered: Vec<&AgentSession> = sess
+            .iter()
+            .filter(|s| !s.active && !s.stale && session_matches_query(s, &asgn, &sp, q))
+            .collect();
+        if !history_filtered.is_empty() {
+            content = content.push(Space::new().height(4));
+            content = content.push(text("History").size(FONT_LABEL).color(pal.text_secondary));
+
+            let total = history_filtered.len();
+            let limit = st.history_limit.min(total);
+            for session in history_filtered.iter().take(limit) {
+                content = content.push(render_history_row(session, &asgn, &sp, &pal));
+            }
+
+            if total > limit {
+                let remaining = total - limit;
+                let more_btn = button(
+                    text(format!("Load more… ({remaining})"))
+                        .size(FONT_SMALL)
+                        .color(pal.accent),
+                )
+                .style(button::text)
+                .padding([4, 8])
+                .on_press(Message::LoadMoreHistory);
+                content = content.push(more_btn);
+            }
+        }
+
+        // ── Stale section (collapsed by default, at the bottom) ─────
+        let stale: Vec<&AgentSession> = sess
+            .iter()
+            .filter(|s| s.stale && session_matches_query(s, &asgn, &sp, q))
+            .collect();
+        if !stale.is_empty() {
+            content = content.push(Space::new().height(8));
+
+            let chev_icon = if st.stale_collapsed {
+                UiIcon::ChevronRight
+            } else {
+                UiIcon::ChevronDown
+            };
+            let chev = svg(icons::ui_icon(chev_icon))
+                .width(12)
+                .height(12)
+                .style(icons::ui_icon_color(pal.text_secondary));
+            let header_row = row![
+                chev,
+                text(format!("Stale ({})", stale.len()))
+                    .size(FONT_LABEL)
+                    .color(pal.text_secondary),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
+            let header_btn = button(header_row)
+                .style(button::text)
+                .padding([2, 4])
+                .on_press(Message::ToggleStaleCollapsed);
+            content = content.push(header_btn);
+
+            if !st.stale_collapsed {
+                for session in &stale {
+                    content = content.push(render_stale_row(session, &pal));
+                }
+            }
+        }
+
+        content
+    });
+
+    let outer = column![header, search_row, body].spacing(6).padding(10);
+    scrollable(outer)
         .height(Length::Fill)
         .width(Length::Fill)
         .into()
@@ -627,15 +701,15 @@ pub fn view<'a>(
 /// Render a single node in the Active hierarchy. Recurses one level for
 /// crew children. Heads always render a chevron toggle (even with no
 /// children) so the affordance stays consistent.
-fn render_active_node<'a>(
+fn render_active_node(
     node: ActiveNode,
-    sessions: &'a [AgentSession],
-    assignments: &'a [HandAssignment],
-    sparks: &'a [Spark],
-    state: &'a AgentsPanelState,
+    sessions: &[AgentSession],
+    assignments: &[HandAssignment],
+    sparks: &[Spark],
+    state: &AgentsPanelState,
     pal: &Palette,
     now: Instant,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     match node {
         ActiveNode::Standalone { session_id } => sessions
             .iter()
@@ -691,16 +765,16 @@ fn render_active_node<'a>(
 // now) parameters into a shared `RenderCtx<'a>` borrow struct so the
 // row renderers don't keep growing. Tracked separately from this PR.
 #[allow(clippy::too_many_arguments)]
-fn render_head_row<'a>(
-    session: Option<&'a AgentSession>,
+fn render_head_row(
+    session: Option<&AgentSession>,
     session_id: String,
     epic_spark_id: Option<String>,
     expanded: bool,
     pal: &Palette,
-    assignments: &'a [HandAssignment],
-    sparks: &'a [Spark],
+    assignments: &[HandAssignment],
+    sparks: &[Spark],
     now: Instant,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let chev_icon = if expanded {
         UiIcon::ChevronDown
     } else {
@@ -805,15 +879,15 @@ fn render_head_row<'a>(
         .into()
 }
 
-fn render_crew_node<'a>(
+fn render_crew_node(
     crew: CrewNode,
-    sessions: &'a [AgentSession],
-    assignments: &'a [HandAssignment],
-    sparks: &'a [Spark],
-    state: &'a AgentsPanelState,
+    sessions: &[AgentSession],
+    assignments: &[HandAssignment],
+    sparks: &[Spark],
+    state: &AgentsPanelState,
     pal: &Palette,
     now: Instant,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let expanded = !state.collapsed_crews.contains(&crew.crew_id);
     let chev_icon = if expanded {
         UiIcon::ChevronDown
@@ -860,14 +934,14 @@ fn render_crew_node<'a>(
     col.into()
 }
 
-fn render_hand_row<'a>(
-    session: &'a AgentSession,
-    assignments: &'a [HandAssignment],
-    sparks: &'a [Spark],
+fn render_hand_row(
+    session: &AgentSession,
+    assignments: &[HandAssignment],
+    sparks: &[Spark],
     pal: &Palette,
     now: Instant,
     depth: u16,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let status = hand_status(
         &session.id,
         assignments,
@@ -952,12 +1026,12 @@ fn render_hand_row<'a>(
     btn.into()
 }
 
-fn render_history_row<'a>(
-    session: &'a AgentSession,
-    assignments: &'a [HandAssignment],
-    sparks: &'a [Spark],
+fn render_history_row(
+    session: &AgentSession,
+    assignments: &[HandAssignment],
+    sparks: &[Spark],
     pal: &Palette,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     // Per product decision: history rows are read-only. Click does
     // nothing (no resume, no spy view) — the spark captures the outcome.
     // We still render the spark chip so the user can jump to context.
@@ -1024,7 +1098,7 @@ fn render_history_row<'a>(
         .into()
 }
 
-fn render_stale_row<'a>(session: &'a AgentSession, pal: &Palette) -> Element<'a, Message> {
+fn render_stale_row(session: &AgentSession, pal: &Palette) -> Element<'static, Message> {
     let warn = text("\u{26A0}").size(FONT_ICON_SM).color(pal.danger);
     let agent_icon = svg(icons::ui_icon(icons::agent_icon_for_command(
         &session.agent.command,
@@ -1032,7 +1106,7 @@ fn render_stale_row<'a>(session: &'a AgentSession, pal: &Palette) -> Element<'a,
     .width(14)
     .height(14)
     .style(icons::ui_icon_color(pal.text_secondary));
-    let label = text(&session.name)
+    let label = text(session.name.clone())
         .size(FONT_BODY)
         .color(pal.text_secondary);
     let time_label = text(format_relative_time(&session.started_at))
@@ -1078,7 +1152,7 @@ fn render_stale_row<'a>(session: &'a AgentSession, pal: &Palette) -> Element<'a,
 /// Small clickable spark id chip — emits `Message::OpenSpark` so the
 /// parent can route to the spark detail panel via the existing
 /// `SelectSpark` flow.
-fn spark_chip<'a>(spark_id: &str, pal: &Palette) -> Element<'a, Message> {
+fn spark_chip(spark_id: &str, pal: &Palette) -> Element<'static, Message> {
     let label = text(spark_id.to_string())
         .size(FONT_SMALL)
         .color(pal.accent);

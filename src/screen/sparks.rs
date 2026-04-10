@@ -4,9 +4,10 @@
 //! Workgraph panel — displays and manages sparks for the active workshop.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use data::sparks::types::Spark;
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, lazy, row, scrollable, text, text_input};
 use iced::{Element, Length, Theme};
 
 use crate::screen::agents::AgentSession;
@@ -511,6 +512,39 @@ pub(crate) fn refresh_button_glyph(refreshing: bool) -> &'static str {
     }
 }
 
+// ── Lazy key computation ─────────────────────────────
+
+/// Compute a lightweight hash key for the sparks list so `lazy()` can
+/// skip widget-tree rebuilds when inputs are unchanged. Only hashes the
+/// fields that affect rendering — id and updated_at per spark (updated_at
+/// changes on every DB write), plus the UI state fields.
+fn sparks_list_hash(
+    sparks: &[Spark],
+    blocked_ids: &HashSet<String>,
+    collapsed: &HashSet<String>,
+    status_menu: &StatusMenu,
+    agent_sessions: &[AgentSession],
+) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    sparks.len().hash(&mut h);
+    for s in sparks {
+        s.id.hash(&mut h);
+        s.updated_at.hash(&mut h);
+    }
+    blocked_ids.len().hash(&mut h);
+    collapsed.len().hash(&mut h);
+    // Deterministic: hash sorted collapsed IDs.
+    let mut collapsed_sorted: Vec<&String> = collapsed.iter().collect();
+    collapsed_sorted.sort_unstable();
+    for id in collapsed_sorted {
+        id.hash(&mut h);
+    }
+    status_menu.open_for.hash(&mut h);
+    status_menu.close_stage.hash(&mut h);
+    agent_sessions.len().hash(&mut h);
+    h.finish()
+}
+
 // ── View ─────────────────────────────────────────────
 
 /// Bundles the view parameters to stay within the clippy argument limit.
@@ -630,39 +664,53 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
         list = list.push(view_create_form(sparks, create_form, &pal));
     }
 
-    if filtered_sparks.is_empty() && !create_form.visible {
-        let msg = if filter.is_empty() {
-            "No sparks yet"
-        } else {
-            "No sparks match the current filters"
-        };
-        list = list.push(text(msg).size(FONT_BODY).color(pal.text_tertiary));
-    } else {
-        let groups = group_by_epic(filtered_sparks);
-        let epic_ids: HashSet<&str> = groups.iter().map(|g| g.epic.id.as_str()).collect();
-        // Top-level groups are those whose epic has no epic-group parent;
-        // nested epics are rendered inline under their parent group instead.
-        for g in &groups {
-            let is_nested = g
-                .epic
-                .parent_id
-                .as_deref()
-                .map(|pid| epic_ids.contains(pid))
-                .unwrap_or(false);
-            if is_nested {
-                continue;
+    // Wrap the expensive epic-group rendering in `lazy()` so iced reuses
+    // the cached widget tree when inputs are unchanged (sp-78d34de4).
+    {
+        let key = sparks_list_hash(
+            filtered_sparks,
+            blocked_ids,
+            collapsed,
+            status_menu,
+            agent_sessions,
+        );
+        let cf_vis = create_form.visible;
+        let f_empty = filter.is_empty();
+        let fs = filtered_sparks.to_vec();
+        let bi = blocked_ids.clone();
+        let asess = agent_sessions.to_vec();
+        let smenu = status_menu.clone();
+        let coll = collapsed.clone();
+
+        list = list.push(lazy(key, move |_| {
+            let mut inner = column![].spacing(2);
+            if fs.is_empty() && !cf_vis {
+                let msg = if f_empty {
+                    "No sparks yet"
+                } else {
+                    "No sparks match the current filters"
+                };
+                inner = inner.push(text(msg).size(FONT_BODY).color(pal.text_tertiary));
+            } else if !fs.is_empty() {
+                let groups = group_by_epic(&fs);
+                let epic_ids: HashSet<&str> = groups.iter().map(|g| g.epic.id.as_str()).collect();
+                for g in &groups {
+                    let is_nested = g
+                        .epic
+                        .parent_id
+                        .as_deref()
+                        .map(|pid| epic_ids.contains(pid))
+                        .unwrap_or(false);
+                    if is_nested {
+                        continue;
+                    }
+                    inner = inner.push(view_epic_group(
+                        g, &groups, 0, &bi, &asess, &pal, &smenu, &coll,
+                    ));
+                }
             }
-            list = list.push(view_epic_group(
-                g,
-                &groups,
-                0,
-                blocked_ids,
-                agent_sessions,
-                &pal,
-                status_menu,
-                collapsed,
-            ));
-        }
+            inner
+        }));
     }
 
     let content = column![
@@ -1085,16 +1133,16 @@ fn status_symbol(status: &str) -> &'static str {
 /// its own collapsible group; beyond two levels deep we flatten the
 /// remaining rows (per the spark non-goal).
 #[allow(clippy::too_many_arguments)]
-fn view_epic_group<'a>(
-    group: &EpicGroup<'a>,
-    all_groups: &[EpicGroup<'a>],
+fn view_epic_group(
+    group: &EpicGroup<'_>,
+    all_groups: &[EpicGroup<'_>],
     depth: usize,
     blocked_ids: &HashSet<String>,
-    agent_sessions: &'a [AgentSession],
+    agent_sessions: &[AgentSession],
     pal: &Palette,
-    status_menu: &'a StatusMenu,
-    collapsed: &'a HashSet<String>,
-) -> Element<'a, Message> {
+    status_menu: &StatusMenu,
+    collapsed: &HashSet<String>,
+) -> Element<'static, Message> {
     let pal = *pal;
     let epic = group.epic;
     let is_collapsed = collapsed.contains(&epic.id);
@@ -1145,13 +1193,13 @@ fn view_epic_group<'a>(
 /// Header row for an `EpicGroup`: a clickable chevron that toggles the
 /// collapse state, followed by the same status button + title the task
 /// rows use. Indent by `depth` so nested epics sit under their parent.
-fn view_epic_header<'a>(
-    epic: &'a Spark,
+fn view_epic_header(
+    epic: &Spark,
     is_collapsed: bool,
     is_blocked: bool,
     depth: usize,
     pal: &Palette,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let pal = *pal;
     let chevron = if is_collapsed { "\u{25B8}" } else { "\u{25BE}" };
     let chevron_btn = button(text(chevron).size(FONT_ICON_SM).color(pal.text_secondary))
@@ -1177,7 +1225,7 @@ fn view_epic_header<'a>(
         text(format!("P{}", epic.priority))
             .size(FONT_LABEL)
             .color(pal.text_tertiary),
-        text(&epic.title).size(FONT_BODY).color(title_color),
+        text(epic.title.clone()).size(FONT_BODY).color(title_color),
     ]
     .spacing(6)
     .align_y(iced::Alignment::Center);
@@ -1205,14 +1253,14 @@ fn view_epic_header<'a>(
 
 /// Indented variant of `view_spark_row` for children nested under an
 /// epic header. `depth` is a row-level indent in steps of 16 px.
-fn view_spark_row_indented<'a>(
-    spark: &'a Spark,
+fn view_spark_row_indented(
+    spark: &Spark,
     is_blocked: bool,
     depth: usize,
-    agent_sessions: &'a [AgentSession],
+    agent_sessions: &[AgentSession],
     pal: &Palette,
-    status_menu: &'a StatusMenu,
-) -> Element<'a, Message> {
+    status_menu: &StatusMenu,
+) -> Element<'static, Message> {
     let indent = Space::new().width(Length::Fixed(16.0 * depth as f32));
     row![
         indent,
@@ -1224,13 +1272,13 @@ fn view_spark_row_indented<'a>(
     .into()
 }
 
-fn view_spark_row<'a>(
-    spark: &'a Spark,
+fn view_spark_row(
+    spark: &Spark,
     is_blocked: bool,
-    agent_sessions: &'a [AgentSession],
+    agent_sessions: &[AgentSession],
     pal: &Palette,
-    status_menu: &'a StatusMenu,
-) -> Element<'a, Message> {
+    status_menu: &StatusMenu,
+) -> Element<'static, Message> {
     let pal = *pal;
     let status_indicator = status_symbol(&spark.status);
     let priority_label = format!("P{}", spark.priority);
@@ -1254,7 +1302,7 @@ fn view_spark_row<'a>(
         text(priority_label)
             .size(FONT_LABEL)
             .color(pal.text_tertiary),
-        text(&spark.title).size(FONT_BODY).color(title_color),
+        text(spark.title.clone()).size(FONT_BODY).color(title_color),
     ]
     .spacing(6)
     .align_y(iced::Alignment::Center);
@@ -1266,16 +1314,20 @@ fn view_spark_row<'a>(
     // Assignee chip: clickable link when matching an agent session,
     // dimmed plain text otherwise. Spark ryve-dba4b8c4.
     if let Some(assignee) = spark.assignee.as_deref().filter(|s| !s.is_empty()) {
-        let assignee_el: Element<'a, Message> =
+        let assignee_el: Element<'static, Message> =
             if let Some(session) = resolve_agent_session(assignee, agent_sessions) {
                 let session_id = session.id.clone();
-                button(text(assignee).size(FONT_LABEL).color(pal.accent))
-                    .style(button::text)
-                    .padding([0, 4])
-                    .on_press(Message::FocusAgentSession(session_id))
-                    .into()
+                button(
+                    text(assignee.to_string())
+                        .size(FONT_LABEL)
+                        .color(pal.accent),
+                )
+                .style(button::text)
+                .padding([0, 4])
+                .on_press(Message::FocusAgentSession(session_id))
+                .into()
             } else {
-                text(assignee)
+                text(assignee.to_string())
                     .size(FONT_LABEL)
                     .color(pal.text_tertiary)
                     .into()
@@ -1306,12 +1358,12 @@ fn view_spark_row<'a>(
     }
 }
 
-fn view_status_menu<'a>(
-    spark_id: &'a str,
+fn view_status_menu(
+    spark_id: &str,
     current_status: &str,
     close_stage: bool,
     pal: &Palette,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let pal = *pal;
 
     let menu_body: Element<Message> = if close_stage {
@@ -1371,9 +1423,14 @@ fn view_status_menu<'a>(
         .into()
 }
 
-fn menu_chip<'a, F>(label: &str, selected: bool, pal: &Palette, on_press: F) -> Element<'a, Message>
+fn menu_chip<F>(
+    label: &str,
+    selected: bool,
+    pal: &Palette,
+    on_press: F,
+) -> Element<'static, Message>
 where
-    F: 'a + Fn() -> Message,
+    F: 'static + Fn() -> Message,
 {
     let pal = *pal;
     let text_color = if selected {
@@ -2281,5 +2338,104 @@ mod tests {
     fn resolve_agent_session_returns_none_for_empty() {
         let sessions: Vec<AgentSession> = vec![];
         assert!(resolve_agent_session("anything", &sessions).is_none());
+    }
+
+    /// Benchmark the sparks panel lazy key: with 150 sparks the hash
+    /// computation (run every frame) is cheap, while group_by_epic +
+    /// widget tree construction (only on cache miss) is relatively
+    /// expensive. This validates that `lazy()` saves work. Spark sp-78d34de4.
+    #[test]
+    fn lazy_hash_is_cheaper_than_full_rebuild_150_sparks() {
+        // Build 15 epics with 10 children each = 150 sparks total.
+        let mut sparks: Vec<Spark> = Vec::with_capacity(165);
+        for e in 0..15 {
+            let eid = format!("epic-{e:03}");
+            sparks.push(Spark {
+                id: eid.clone(),
+                title: format!("Epic {e}"),
+                spark_type: "epic".to_string(),
+                status: "open".to_string(),
+                priority: (e % 5) as i32,
+                parent_id: None,
+                ..mk_sort_spark(&eid, 0, "epic", "open")
+            });
+            for c in 0..10 {
+                let cid = format!("task-{e:03}-{c:03}");
+                sparks.push(Spark {
+                    id: cid.clone(),
+                    title: format!("Task {e}-{c}"),
+                    spark_type: "task".to_string(),
+                    status: "open".to_string(),
+                    priority: (c % 5) as i32,
+                    parent_id: Some(eid.clone()),
+                    assignee: if c % 3 == 0 {
+                        Some(format!("agent-{c}"))
+                    } else {
+                        None
+                    },
+                    ..mk_sort_spark(&cid, 0, "task", "open")
+                });
+            }
+        }
+        assert!(sparks.len() >= 150);
+
+        let blocked_ids: HashSet<String> = (0..5).map(|i| format!("task-{i:03}-000")).collect();
+        let collapsed: HashSet<String> = HashSet::new();
+        let status_menu = StatusMenu::default();
+        let sessions: Vec<AgentSession> = Vec::new();
+
+        // Measure hash computation (per-frame cost with lazy).
+        let iters = 500;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let h = sparks_list_hash(&sparks, &blocked_ids, &collapsed, &status_menu, &sessions);
+            std::hint::black_box(h);
+        }
+        let hash_elapsed = start.elapsed();
+        let hash_per_iter = hash_elapsed / iters;
+
+        // Measure group_by_epic (part of the rebuild cost skipped by lazy).
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let groups = group_by_epic(&sparks);
+            std::hint::black_box(&groups);
+        }
+        let group_elapsed = start.elapsed();
+        let group_per_iter = group_elapsed / iters;
+
+        // The hash should be significantly cheaper than the grouping +
+        // widget tree build. We only assert the hash is faster than
+        // grouping alone (the full tree build is much more expensive).
+        eprintln!(
+            "lazy_hash_benchmark: {iters} iters, {} sparks",
+            sparks.len()
+        );
+        eprintln!("  hash/frame:     {hash_per_iter:?}");
+        eprintln!("  group_by_epic:  {group_per_iter:?}");
+        eprintln!(
+            "  speedup:        {:.1}x",
+            group_per_iter.as_nanos() as f64 / hash_per_iter.as_nanos().max(1) as f64
+        );
+
+        // On a cache hit, lazy only pays the hash cost. On a miss it pays
+        // hash + full rebuild. The hash must be cheaper than group_by_epic
+        // alone to show measurable improvement.
+        assert!(
+            hash_per_iter < group_per_iter,
+            "hash ({hash_per_iter:?}) should be cheaper than group_by_epic ({group_per_iter:?})"
+        );
+
+        // Verify hash stability: same input → same output.
+        let h1 = sparks_list_hash(&sparks, &blocked_ids, &collapsed, &status_menu, &sessions);
+        let h2 = sparks_list_hash(&sparks, &blocked_ids, &collapsed, &status_menu, &sessions);
+        assert_eq!(h1, h2, "hash must be deterministic for same input");
+
+        // Verify hash sensitivity: mutating a spark changes the hash.
+        // The hash keys on `updated_at` (which the DB bumps on every write),
+        // so we simulate a data change by touching that field.
+        let mut sparks2 = sparks.clone();
+        sparks2[50].updated_at = "2026-04-09T12:00:00Z".to_string();
+        let h3 = sparks_list_hash(&sparks2, &blocked_ids, &collapsed, &status_menu, &sessions);
+        assert_ne!(h1, h3, "hash must change when spark data changes");
     }
 }
