@@ -1054,7 +1054,7 @@ impl App {
                 };
                 if let Some(ws) = self.workshops.get_mut(idx) {
                     ws.sparks_db = Some(pool.clone());
-                    ws.config = *config;
+                    ws.config = Arc::new(*config);
                     ws.custom_agents = custom_agents;
                     ws.agent_context = agent_context;
                     // Apply persisted UI state before the first render so
@@ -1190,7 +1190,7 @@ impl App {
                     // Spark ryve-926870a9.
                     let live_epic_ids = Workshop::live_epic_ids(&ws.sparks);
                     if ws.prune_collapsed_epics(&live_epic_ids) {
-                        let ryve_dir = ws.ryve_dir.clone();
+                        let ryve_dir = Arc::clone(&ws.ryve_dir);
                         let snapshot = ws.ui_state_snapshot();
                         tokio::spawn(async move {
                             if let Err(e) =
@@ -1271,8 +1271,8 @@ impl App {
                     // Spark ryve-86b0b326.
                     if !ws.config.agents.disable_sync {
                         let dir = ws.directory.clone();
-                        let ryve_dir = ws.ryve_dir.clone();
-                        let config = ws.config.clone();
+                        let ryve_dir = Arc::clone(&ws.ryve_dir);
+                        let config = Arc::clone(&ws.config);
                         let cache = ws.agent_context_sync_cache.clone();
                         tasks.push(Task::perform(
                             async move {
@@ -3831,7 +3831,7 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.sparks_filter.toggle_status(&status);
                             ws.recompute_filtered_sparks();
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3846,7 +3846,7 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.sparks_filter.show_closed = !ws.sparks_filter.show_closed;
                             ws.recompute_filtered_sparks();
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3865,7 +3865,7 @@ impl App {
                         // Spark ryve-926870a9.
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.toggle_epic_collapse(&epic_id);
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3881,7 +3881,7 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.sparks_filter.toggle_type(ty);
                             ws.recompute_filtered_sparks();
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3896,7 +3896,7 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.sparks_filter.toggle_priority(p);
                             ws.recompute_filtered_sparks();
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3911,7 +3911,7 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.sparks_filter.set_assignee(a);
                             ws.recompute_filtered_sparks();
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3928,7 +3928,7 @@ impl App {
                             ws.sort_dropdown_open = false;
                             ws.sort_sparks();
                             ws.recompute_filtered_sparks();
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3948,7 +3948,7 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.sparks_filter.search = query;
                             ws.recompute_filtered_sparks();
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3963,7 +3963,7 @@ impl App {
                         if let Some(ws) = self.workshops.get_mut(idx) {
                             ws.sparks_filter.search.clear();
                             ws.recompute_filtered_sparks();
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -3980,7 +3980,7 @@ impl App {
                         // failed write is logged but never blocks the UI.
                         // Spark ryve-27e33825.
                         if let Some(ws) = self.workshops.get_mut(idx) {
-                            let ryve_dir = ws.ryve_dir.clone();
+                            let ryve_dir = Arc::clone(&ws.ryve_dir);
                             let snapshot = ws.ui_state_snapshot();
                             tokio::spawn(async move {
                                 if let Err(e) =
@@ -4115,17 +4115,18 @@ impl App {
                 };
                 let ws = &mut self.workshops[idx];
                 let ws_uuid = ws.id;
-                ws.config.background.image = Some(filename.clone());
-                ws.config.background.unsplash_photographer = Some(photographer);
-                ws.config.background.unsplash_photographer_url = Some(photographer_url);
+                let cfg = Arc::make_mut(&mut ws.config);
+                cfg.background.image = Some(filename.clone());
+                cfg.background.unsplash_photographer = Some(photographer);
+                cfg.background.unsplash_photographer_url = Some(photographer_url);
                 ws.background_picker.open = false;
                 ws.background_picker.loading = false;
 
                 // Load the image + save config
                 let bg_dir = ws.ryve_dir.backgrounds_dir();
                 let path = bg_dir.join(&filename);
-                let ryve_dir = ws.ryve_dir.clone();
-                let config = ws.config.clone();
+                let ryve_dir = Arc::clone(&ws.ryve_dir);
+                let config = Arc::clone(&ws.config);
                 Task::batch([
                     Task::perform(
                         async move { tokio::fs::read(&path).await.ok() },
@@ -4173,15 +4174,16 @@ impl App {
                 };
                 let ws = &mut self.workshops[idx];
                 let ws_uuid = ws.id;
-                ws.config.background.image = Some(filename.clone());
-                ws.config.background.unsplash_photographer = None;
-                ws.config.background.unsplash_photographer_url = None;
+                let cfg = Arc::make_mut(&mut ws.config);
+                cfg.background.image = Some(filename.clone());
+                cfg.background.unsplash_photographer = None;
+                cfg.background.unsplash_photographer_url = None;
                 ws.background_picker.open = false;
 
                 let bg_dir = ws.ryve_dir.backgrounds_dir();
                 let path = bg_dir.join(&filename);
-                let ryve_dir = ws.ryve_dir.clone();
-                let config = ws.config.clone();
+                let ryve_dir = Arc::clone(&ws.ryve_dir);
+                let config = Arc::clone(&ws.config);
                 Task::batch([
                     Task::perform(
                         async move { tokio::fs::read(&path).await.ok() },
@@ -4460,10 +4462,11 @@ impl App {
                 let new_value = splitter::compute_new_value(drag, cursor, sidebar_height);
                 let kind = drag.kind;
                 let ws = &mut self.workshops[idx];
+                let cfg = Arc::make_mut(&mut ws.config);
                 match kind {
-                    SplitterKind::SidebarRight => ws.config.layout.sidebar_width = new_value,
-                    SplitterKind::SparksLeft => ws.config.layout.sparks_width = new_value,
-                    SplitterKind::SidebarFilesHands => ws.config.layout.sidebar_split = new_value,
+                    SplitterKind::SidebarRight => cfg.layout.sidebar_width = new_value,
+                    SplitterKind::SparksLeft => cfg.layout.sparks_width = new_value,
+                    SplitterKind::SidebarFilesHands => cfg.layout.sidebar_split = new_value,
                 }
                 Task::none()
             }
@@ -4475,8 +4478,8 @@ impl App {
                     return Task::none();
                 };
                 let ws = &self.workshops[idx];
-                let ryve_dir = ws.ryve_dir.clone();
-                let config = ws.config.clone();
+                let ryve_dir = Arc::clone(&ws.ryve_dir);
+                let config = Arc::clone(&ws.config);
                 Task::perform(
                     async move {
                         if let Err(e) = data::ryve_dir::save_config(&ryve_dir, &config).await {
@@ -5400,7 +5403,7 @@ impl App {
     /// blocking the UI thread on `git worktree add`.
     fn dispatch_worktree_task(ws: &Workshop, tab_id: u64, session_id: String) -> Task<Message> {
         let workshop_dir = ws.directory.clone();
-        let ryve_dir = ws.ryve_dir.clone();
+        let ryve_dir = Arc::clone(&ws.ryve_dir);
         let workshop_id = ws.id;
         Task::perform(
             async move { workshop::create_hand_worktree(&workshop_dir, &ryve_dir, &session_id).await },
@@ -5895,15 +5898,16 @@ impl App {
                 )
             }
             screen::background_picker::Message::RemoveBackground => {
-                ws.config.background.image = None;
-                ws.config.background.unsplash_photographer = None;
-                ws.config.background.unsplash_photographer_url = None;
+                let cfg = Arc::make_mut(&mut ws.config);
+                cfg.background.image = None;
+                cfg.background.unsplash_photographer = None;
+                cfg.background.unsplash_photographer_url = None;
                 ws.background_handle = None;
                 ws.bg_is_dark = None;
                 ws.background_picker.open = false;
 
-                let ryve_dir = ws.ryve_dir.clone();
-                let config = ws.config.clone();
+                let ryve_dir = Arc::clone(&ws.ryve_dir);
+                let config = Arc::clone(&ws.config);
                 Task::perform(
                     async move {
                         data::ryve_dir::save_config(&ryve_dir, &config).await.ok();
@@ -5914,12 +5918,12 @@ impl App {
 
             // ── Dim opacity ──────────────────────────────────
             screen::background_picker::Message::DimOpacityChanged(value) => {
-                ws.config.background.dim_opacity = value.clamp(0.0, 1.0);
+                Arc::make_mut(&mut ws.config).background.dim_opacity = value.clamp(0.0, 1.0);
                 Task::none()
             }
             screen::background_picker::Message::DimOpacityCommitted => {
-                let ryve_dir = ws.ryve_dir.clone();
-                let config = ws.config.clone();
+                let ryve_dir = Arc::clone(&ws.ryve_dir);
+                let config = Arc::clone(&ws.config);
                 Task::perform(
                     async move {
                         data::ryve_dir::save_config(&ryve_dir, &config).await.ok();

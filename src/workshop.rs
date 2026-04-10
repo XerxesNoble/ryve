@@ -207,8 +207,8 @@ pub struct PendingNavPrompt {
 pub struct Workshop {
     pub id: Uuid,
     pub directory: PathBuf,
-    pub ryve_dir: RyveDir,
-    pub config: WorkshopConfig,
+    pub ryve_dir: Arc<RyveDir>,
+    pub config: Arc<WorkshopConfig>,
     pub bench: BenchState,
     pub terminals: HashMap<u64, iced_term::Terminal>,
     /// Hand terminals whose worktree is being created asynchronously. Keyed
@@ -376,12 +376,12 @@ pub struct Workshop {
 
 impl Workshop {
     pub fn new(directory: PathBuf) -> Self {
-        let ryve_dir = RyveDir::new(&directory);
+        let ryve_dir = Arc::new(RyveDir::new(&directory));
         Self {
             id: Uuid::new_v4(),
             directory,
             ryve_dir,
-            config: WorkshopConfig::default(),
+            config: Arc::new(WorkshopConfig::default()),
             bench: BenchState::new(),
             terminals: HashMap::new(),
             pending_terminal_spawns: HashMap::new(),
@@ -2517,5 +2517,34 @@ mod tests {
             "wrapped command should embed BOTTOM_PIN_NEWLINES loop bound: {}",
             args[1]
         );
+    }
+
+    // ── Arc-wrapped config & ryve_dir (spark ryve-7fc6006f) ──
+
+    #[test]
+    fn config_and_ryve_dir_are_arc_wrapped() {
+        let ws = Workshop::new(PathBuf::from("/tmp/ryve-arc-test"));
+        // Clone is a cheap Arc pointer bump, not a deep copy.
+        let config_clone = Arc::clone(&ws.config);
+        let ryve_dir_clone = Arc::clone(&ws.ryve_dir);
+        assert!(Arc::ptr_eq(&ws.config, &config_clone));
+        assert!(Arc::ptr_eq(&ws.ryve_dir, &ryve_dir_clone));
+    }
+
+    #[test]
+    fn arc_make_mut_allows_config_mutation() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve-arc-mut"));
+        // Shared clone first — refcount > 1.
+        let shared = Arc::clone(&ws.config);
+        assert_eq!(
+            shared.background.dim_opacity,
+            ws.config.background.dim_opacity
+        );
+
+        // make_mut triggers copy-on-write: ws.config gets a new allocation.
+        Arc::make_mut(&mut ws.config).background.dim_opacity = 0.42;
+        assert!((ws.config.background.dim_opacity - 0.42).abs() < f32::EPSILON);
+        // The previously-shared Arc still holds the old value.
+        assert!(!Arc::ptr_eq(&ws.config, &shared));
     }
 }
