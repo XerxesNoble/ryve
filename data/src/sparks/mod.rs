@@ -25,7 +25,8 @@ pub mod open_tab_repo;
 pub mod release_repo;
 pub mod spark_repo;
 pub mod stamp_repo;
+pub mod transition;
 pub mod types;
 
-pub use error::SparksError;
+pub use error::{SparksError, TransitionError};
 pub use types::*;

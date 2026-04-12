@@ -50,4 +50,46 @@ pub enum SparksError {
 
     #[error("spark {spark_id} already belongs to another open release")]
     EpicAlreadyInOpenRelease { spark_id: String },
+
+    #[error("{0}")]
+    Transition(#[from] TransitionError),
+}
+
+/// Errors specific to `assignment_phase` transition validation.
+#[derive(Debug, thiserror::Error)]
+pub enum TransitionError {
+    #[error(
+        "illegal transition from {from} to {to}: \
+         not in the legal transition map"
+    )]
+    IllegalTransition {
+        from: &'static str,
+        to: &'static str,
+    },
+
+    #[error(
+        "phase mismatch: expected {expected} but assignment is currently {actual} \
+         (out-of-order replay)"
+    )]
+    PhaseMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+
+    #[error(
+        "role {role} is not authorized for transition {from} → {to}; \
+         authorized roles: {authorized}"
+    )]
+    Unauthorized {
+        role: &'static str,
+        from: &'static str,
+        to: &'static str,
+        authorized: String,
+    },
+
+    #[error("assignment {assignment_id} not found")]
+    AssignmentNotFound { assignment_id: i64 },
+
+    #[error("database error during transition: {0}")]
+    Database(#[from] sqlx::Error),
 }

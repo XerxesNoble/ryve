@@ -811,12 +811,120 @@ pub struct HandAssignment {
     pub completed_at: Option<String>,
     pub handoff_to: Option<String>,
     pub handoff_reason: Option<String>,
+    /// Current workflow phase, governed by the transition validator.
+    /// `None` for rows created before the migration adds this column.
+    pub assignment_phase: Option<String>,
+    /// When the phase was last changed (RFC 3339).
+    pub phase_changed_at: Option<String>,
+    /// actor_id that performed the last phase transition.
+    pub phase_changed_by: Option<String>,
+    /// Role of the actor that performed the last phase transition.
+    pub phase_actor_role: Option<String>,
+    /// Event ID that triggered the last phase transition.
+    pub phase_event_id: Option<i64>,
 }
 
 pub struct NewHandAssignment {
     pub session_id: String,
     pub spark_id: String,
     pub role: AssignmentRole,
+}
+
+// ── Assignment Phase (transition state machine) ─────
+
+/// The workflow phase of an assignment, governed by a strict transition
+/// validator. Only the `transition::transition_assignment_phase` function
+/// may advance this value — direct UPDATEs are forbidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentPhase {
+    Assigned,
+    InProgress,
+    AwaitingReview,
+    Approved,
+    Rejected,
+    InRepair,
+    ReadyForMerge,
+    Merged,
+}
+
+impl AssignmentPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Assigned => "assigned",
+            Self::InProgress => "in_progress",
+            Self::AwaitingReview => "awaiting_review",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::InRepair => "in_repair",
+            Self::ReadyForMerge => "ready_for_merge",
+            Self::Merged => "merged",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "assigned" => Some(Self::Assigned),
+            "in_progress" => Some(Self::InProgress),
+            "awaiting_review" => Some(Self::AwaitingReview),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "in_repair" => Some(Self::InRepair),
+            "ready_for_merge" => Some(Self::ReadyForMerge),
+            "merged" => Some(Self::Merged),
+            _ => None,
+        }
+    }
+}
+
+/// Role of the actor performing a phase transition. This is distinct from
+/// `AgentRole` (Director/Head/Hand hierarchy) and `AssignmentRole`
+/// (Owner/Assistant/Observer/Merger relationship to a spark). Transition
+/// actor roles encode *who is allowed to advance the state machine*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionActorRole {
+    /// A Hand doing implementation work on the spark.
+    Hand,
+    /// A Hand performing code review.
+    ReviewerHand,
+    /// A Hand performing merge/integration.
+    MergeHand,
+    /// A Head orchestrating the crew — may override any transition.
+    Head,
+    /// The top-level Director — may override any transition.
+    Director,
+}
+
+impl TransitionActorRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hand => "hand",
+            Self::ReviewerHand => "reviewer_hand",
+            Self::MergeHand => "merge_hand",
+            Self::Head => "head",
+            Self::Director => "director",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "hand" => Some(Self::Hand),
+            "reviewer_hand" => Some(Self::ReviewerHand),
+            "merge_hand" => Some(Self::MergeHand),
+            "head" => Some(Self::Head),
+            "director" => Some(Self::Director),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this role can override any transition regardless
+    /// of the normal role-ownership rules.
+    pub fn can_override(&self) -> bool {
+        matches!(self, Self::Head | Self::Director)
+    }
 }
 
 // ── Crew ──────────────────────────────────────────────
