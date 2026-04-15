@@ -1007,7 +1007,8 @@ impl App {
                     ws.file_explorer.git_statuses = statuses;
                     ws.file_explorer.diff_stats = diff_stats;
                     ws.file_explorer.branch = branch;
-                    // Start collapsed — user expands directories on demand
+                    ws.file_explorer.rebuild_precomputed_maps();
+                    ws.recompute_git_stats();
                 }
                 Task::none()
             }
@@ -1446,6 +1447,7 @@ impl App {
             // Spark ryve-6f24ef2a.
             ws.sort_sparks();
             ws.recompute_filtered_sparks();
+            ws.recompute_spark_summary();
             // Clear the Refresh-button indicator now that the
             // refetch has landed. Both the explicit Refresh and
             // the 3s poll route through this handler; clearing
@@ -1701,6 +1703,7 @@ impl App {
             // Refresh cached agent session names for the filter bar
             // (spark ryve-baca34b0).
             ws.agent_session_names = ws.agent_sessions.iter().map(|s| s.name.clone()).collect();
+            ws.recompute_hand_counts();
 
             // First time we see agent_sessions for this workshop:
             // chain into load_open_tabs so the persisted snapshot
@@ -7042,21 +7045,21 @@ mod tests {
         assert!(!agents.iter().any(|a| !a.compatibility.is_unsupported()));
 
         // All unsupported → no compatible agent.
-        let agents = vec![make(CompatStatus::Unsupported {
+        let agents = [make(CompatStatus::Unsupported {
             version: "0.1".into(),
             reason: "old".into(),
         })];
         assert!(!agents.iter().any(|a| !a.compatibility.is_unsupported()));
 
         // One compatible → has compatible agent.
-        let agents = vec![make(CompatStatus::Compatible {
+        let agents = [make(CompatStatus::Compatible {
             version: "1.0".into(),
         })];
         assert!(agents.iter().any(|a| !a.compatibility.is_unsupported()));
 
         // Unknown counts as "not unsupported" — we give the benefit of
         // the doubt when the version probe couldn't run.
-        let agents = vec![make(CompatStatus::Unknown)];
+        let agents = [make(CompatStatus::Unknown)];
         assert!(agents.iter().any(|a| !a.compatibility.is_unsupported()));
     }
 
@@ -7149,8 +7152,6 @@ mod tests {
                 session_id: session_id.clone(),
                 spark_id: spark.id.clone(),
                 role: AssignmentRole::Owner,
-                source_branch: None,
-                target_branch: None,
             },
         )
         .await

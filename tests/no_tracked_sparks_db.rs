@@ -71,10 +71,12 @@ fn sparks_db_and_sidecars_are_not_tracked() {
 fn is_backup_db_path(path: &str) -> bool {
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
-        if *part == "backups" && i > 0 && parts[i - 1] == ".ryve" {
-            if let Some(filename) = parts.get(i + 1) {
-                return filename.ends_with(".db");
-            }
+        if *part == "backups"
+            && i > 0
+            && parts[i - 1] == ".ryve"
+            && let Some(filename) = parts.get(i + 1)
+        {
+            return filename.ends_with(".db");
         }
     }
     false

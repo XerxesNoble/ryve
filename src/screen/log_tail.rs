@@ -127,12 +127,12 @@ pub fn update(
             viewport_height,
         } => {
             for ws in workshops.iter_mut() {
-                if let Some(active_id) = ws.bench.active_tab {
-                    if let Some(tail) = ws.log_tails.get_mut(&active_id) {
-                        tail.scroll_offset_y = offset_y;
-                        tail.viewport_height = viewport_height;
-                        break;
-                    }
+                if let Some(active_id) = ws.bench.active_tab
+                    && let Some(tail) = ws.log_tails.get_mut(&active_id)
+                {
+                    tail.scroll_offset_y = offset_y;
+                    tail.viewport_height = viewport_height;
+                    break;
                 }
             }
         }

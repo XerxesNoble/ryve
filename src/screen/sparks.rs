@@ -2457,7 +2457,7 @@ mod tests {
                 title: format!("Epic {e}"),
                 spark_type: "epic".to_string(),
                 status: "open".to_string(),
-                priority: (e % 5) as i32,
+                priority: e % 5,
                 parent_id: None,
                 ..mk_sort_spark(&eid, 0, "epic", "open")
             });
@@ -2468,7 +2468,7 @@ mod tests {
                     title: format!("Task {e}-{c}"),
                     spark_type: "task".to_string(),
                     status: "open".to_string(),
-                    priority: (c % 5) as i32,
+                    priority: c % 5,
                     parent_id: Some(eid.clone()),
                     assignee: if c % 3 == 0 {
                         Some(format!("agent-{c}"))
