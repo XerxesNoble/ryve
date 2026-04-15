@@ -299,6 +299,7 @@ fn print_usage() {
     eprintln!("  release create <major|minor|patch>   Create a new release");
     eprintln!("  release list                         List releases");
     eprintln!("  release show <id>                    Show release details + member epics");
+    eprintln!("  release edit <id> --version <semver>  Update release version");
     eprintln!("  release add-epic <id> <epic_id>      Add an epic to a release");
     eprintln!("  release remove-epic <id> <epic_id>   Remove an epic from a release");
     eprintln!("  release status <id> <status>         Transition release status");
@@ -2822,7 +2823,7 @@ async fn handle_release(
 ) {
     if args.is_empty() {
         die(
-            "release subcommand required (create, list, show, add-epic, remove-epic, status, close)",
+            "release subcommand required (create, list, show, edit, add-epic, remove-epic, status, close)",
         );
     }
     match args[0].as_str() {
@@ -3056,8 +3057,87 @@ async fn handle_release(
             }
             release_close(pool, workshop_root, &args[1], json_mode).await;
         }
+        "edit" => {
+            if args.len() < 2 {
+                die("release edit requires <id>");
+            }
+            let id = &args[1];
+            let mut version: Option<String> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--version" => {
+                        i += 1;
+                        if i < args.len() {
+                            version = Some(args[i].clone());
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let Some(ver) = version else {
+                die("release edit requires --version <semver>");
+            };
+            match release_repo::update(pool, id, &ver).await {
+                Ok(release) => {
+                    let epics = release_repo::list_member_epics(pool, &release.id)
+                        .await
+                        .unwrap_or_default();
+                    if json_mode {
+                        let payload = serde_json::json!({
+                            "release": release,
+                            "epics": epics,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    } else {
+                        println!("ID:       {}", release.id);
+                        println!("Version:  {}", release.version);
+                        println!("Status:   {}", release.status);
+                        if let Some(ref b) = release.branch_name {
+                            println!("Branch:   {b}");
+                        }
+                        println!("Created:  {}", release.created_at);
+                        if let Some(ref t) = release.cut_at {
+                            println!("Cut at:   {t}");
+                        }
+                        if let Some(ref t) = release.tag {
+                            println!("Tag:      {t}");
+                        }
+                        if let Some(ref p) = release.artifact_path {
+                            println!("Artifact: {p}");
+                        }
+                        if let Some(ref p) = release.problem {
+                            println!("Problem:  {p}");
+                        }
+                        let acc = release.acceptance();
+                        if !acc.is_empty() {
+                            println!("Acceptance:");
+                            for a in &acc {
+                                println!("  - {a}");
+                            }
+                        }
+                        if let Some(ref n) = release.notes {
+                            println!("Notes:    {n}");
+                        }
+                        if epics.is_empty() {
+                            println!("\nNo member epics.");
+                        } else {
+                            println!("\nMember epics ({}):", epics.len());
+                            for eid in &epics {
+                                println!("  {eid}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => die(&format!("{e}")),
+            }
+        }
         other => die(&format!(
-            "unknown release subcommand '{other}': expected create, list, show, add-epic, remove-epic, status, or close"
+            "unknown release subcommand '{other}': expected create, list, show, edit, add-epic, remove-epic, status, or close"
         )),
     }
 }

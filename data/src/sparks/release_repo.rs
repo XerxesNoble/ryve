@@ -194,6 +194,24 @@ pub async fn list_member_epics(
     Ok(rows.into_iter().map(|(s,)| s).collect())
 }
 
+/// Update the version of an existing release.
+pub async fn update(
+    pool: &SqlitePool,
+    release_id: &str,
+    new_version: &str,
+) -> Result<Release, SparksError> {
+    validate_semver(new_version)?;
+    let _ = get(pool, release_id).await?;
+
+    sqlx::query("UPDATE releases SET version = ? WHERE id = ?")
+        .bind(new_version)
+        .bind(release_id)
+        .execute(pool)
+        .await?;
+
+    get(pool, release_id).await
+}
+
 /// Record the tag name and artifact path on a release. Used by the close flow
 /// after tagging + building so the release row carries pointers to both.
 pub async fn record_close_metadata(
