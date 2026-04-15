@@ -231,7 +231,7 @@ pub(crate) enum Message {
         spark_id: String,
     },
     /// Agent sessions loaded from DB
-    AgentSessionsLoaded(Uuid, Vec<PersistedAgentSession>),
+    AgentSessionsLoaded(Uuid, Vec<PersistedAgentSession>, Vec<tmux::TmuxSession>),
     /// Agent session saved to DB
     AgentSessionSaved,
     /// Dead-session reconciliation completed. Carries the session IDs whose
@@ -325,6 +325,12 @@ pub(crate) enum Message {
         workshop_id: Uuid,
         tab_id: u64,
         result: Result<PathBuf, String>,
+        system_prompt: Option<(String, String)>,
+    },
+    TmuxAttachReady {
+        workshop_id: Uuid,
+        tab_id: u64,
+        result: Result<(String, Vec<String>), String>,
     },
     /// Send initial spark prompt to a Hand's terminal after agent boots.
     SendSparkPrompt {
@@ -460,8 +466,13 @@ impl std::fmt::Debug for Message {
             Self::ContractCheckFinished { ws_id, spark_id } => {
                 write!(f, "ContractCheckFinished({ws_id}, {spark_id})")
             }
-            Self::AgentSessionsLoaded(id, s) => {
-                write!(f, "AgentSessionsLoaded({id}, {} sessions)", s.len())
+            Self::AgentSessionsLoaded(id, s, tmux) => {
+                write!(
+                    f,
+                    "AgentSessionsLoaded({id}, {} sessions, {} tmux)",
+                    s.len(),
+                    tmux.len()
+                )
             }
             Self::AgentSessionSaved => write!(f, "AgentSessionSaved"),
             Self::DeadSessionsReconciled(ids) => {
@@ -525,11 +536,15 @@ impl std::fmt::Debug for Message {
                 workshop_id,
                 tab_id,
                 result,
+                ..
             } => write!(
                 f,
                 "HandWorktreeReady({workshop_id}, {tab_id}, ok={})",
                 result.is_ok()
             ),
+            Self::TmuxAttachReady { tab_id, result, .. } => {
+                write!(f, "TmuxAttachReady({tab_id}, ok={})", result.is_ok())
+            }
             Self::SendSparkPrompt { tab_id, .. } => write!(f, "SendSparkPrompt({tab_id})"),
             Self::SubmitSparkPrompt { tab_id } => write!(f, "SubmitSparkPrompt({tab_id})"),
             Self::SplitterPressed(k) => write!(f, "SplitterPressed({k:?})"),
@@ -649,7 +664,7 @@ impl App {
                 data::backup::snapshot_and_retain(
                     &pool,
                     &ryve_dir,
-                    data::backup::DEFAULT_BACKUP_RETENTION,
+                    &data::backup::RetentionPolicy::default(),
                 )
                 .await
                 .map_err(|e| e.to_string())
@@ -948,8 +963,8 @@ impl App {
                 self.handle_contract_check_finished(ws_id, spark_id)
             }
 
-            Message::AgentSessionsLoaded(id, persisted) => {
-                self.handle_agent_sessions_loaded(id, persisted)
+            Message::AgentSessionsLoaded(id, persisted, tmux_live) => {
+                self.handle_agent_sessions_loaded(id, persisted, tmux_live)
             }
 
             Message::CrewsLoaded(id, crews, members) => {
@@ -1010,12 +1025,13 @@ impl App {
                 workshop_id,
                 tab_id,
                 result,
+                system_prompt,
             } => {
                 let Some(idx) = self.workshops.iter().position(|ws| ws.id == workshop_id) else {
                     return Task::none();
                 };
                 let ws = &mut self.workshops[idx];
-                let created = ws.finalize_hand_terminal(tab_id, result);
+                let created = ws.finalize_hand_terminal(tab_id, result, system_prompt);
                 let mut tasks: Vec<Task<Message>> = Vec::new();
                 if created && let Some(term) = ws.terminals.get(&tab_id) {
                     tasks.push(iced_term::TerminalView::focus(term.widget_id().clone()));
@@ -1028,6 +1044,40 @@ impl App {
                 } else {
                     Task::batch(tasks)
                 }
+            }
+            Message::TmuxAttachReady {
+                workshop_id,
+                tab_id,
+                result,
+            } => {
+                let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == workshop_id) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok((program, args)) => {
+                        let (shell, shell_args) =
+                            workshop::wrap_command_with_bottom_pin(&program, &args);
+                        let mut settings = iced_term::settings::Settings {
+                            font: ws.terminal_font_settings(),
+                            ..iced_term::settings::Settings::default()
+                        };
+                        settings.theme.color_pallete.background = ws.terminal_bg_hex();
+                        settings.backend.working_directory = Some(ws.directory.clone());
+                        settings.backend.program = shell;
+                        settings.backend.args = shell_args;
+
+                        if let Ok(term) = iced_term::Terminal::new(tab_id, settings) {
+                            let focus = iced_term::TerminalView::focus(term.widget_id().clone());
+                            ws.terminals.insert(tab_id, term);
+                            return focus;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Cannot attach to tmux session: {e}");
+                        ws.bench.close_tab(tab_id);
+                    }
+                }
+                Task::none()
             }
             Message::SendSparkPrompt { tab_id, prompt } => {
                 for ws in &mut self.workshops {
@@ -1509,6 +1559,7 @@ impl App {
         &mut self,
         id: Uuid,
         persisted: Vec<PersistedAgentSession>,
+        tmux_live: Vec<tmux::TmuxSession>,
     ) -> Task<Message> {
         // Merge persisted sessions into the in-memory vec.
         //
@@ -1545,13 +1596,8 @@ impl App {
             let known_ids: std::collections::HashSet<String> =
                 ws.agent_sessions.iter().map(|s| s.id.clone()).collect();
 
-            // Cache the set of live tmux session names once per
-            // poll so we avoid shelling out per-session.
-            // Spark: copilot review comment #10.
-            let live_tmux_names: std::collections::HashSet<String> = {
-                let live = tmux::list_sessions_sync(&ws.directory);
-                live.into_iter().map(|s| s.name).collect()
-            };
+            let live_tmux_names: std::collections::HashSet<String> =
+                tmux_live.into_iter().map(|s| s.name).collect();
 
             // Use the tmux wrapper to diff tracked sessions against
             // the process snapshot, collecting session IDs to feed
@@ -2953,9 +2999,13 @@ impl App {
                 Task::perform(
                     async move {
                         tmux::reconcile_sessions(&dir, &pool2, &ws_id2).await;
-                        load_agent_sessions(pool, ws_id).await
+                        let sessions = load_agent_sessions(pool, ws_id).await;
+                        let tmux_live = tmux::list_sessions_async(&dir).await;
+                        (sessions, tmux_live)
                     },
-                    move |sessions| Message::AgentSessionsLoaded(id, sessions),
+                    move |(sessions, tmux_live)| {
+                        Message::AgentSessionsLoaded(id, sessions, tmux_live)
+                    },
                 )
             })
             .collect();
@@ -3042,7 +3092,7 @@ impl App {
         };
         if let Some(ws) = self.workshops.get_mut(idx) {
             ws.sparks_db = Some(pool.clone());
-            ws.config = config;
+            ws.config = Arc::new(config);
             ws.custom_agents = custom_agents;
             ws.agent_context = agent_context;
             // Apply persisted UI state before the first render so
@@ -3075,9 +3125,11 @@ impl App {
             let reconcile_then_sessions = Task::perform(
                 async move {
                     tmux::reconcile_sessions(&dir_rec, &pool_rec, &ws_id_rec).await;
-                    load_agent_sessions(pool2, ws_id2).await
+                    let sessions = load_agent_sessions(pool2, ws_id2).await;
+                    let tmux_live = tmux::list_sessions_async(&dir_rec).await;
+                    (sessions, tmux_live)
                 },
-                move |sessions| Message::AgentSessionsLoaded(id, sessions),
+                move |(sessions, tmux_live)| Message::AgentSessionsLoaded(id, sessions, tmux_live),
             );
 
             // Load sparks + (reconcile → agent sessions) + scan file tree in parallel
@@ -3363,9 +3415,10 @@ impl App {
         };
         let ws = &mut self.workshops[idx];
         let ws_uuid = ws.id;
-        ws.config.background.image = Some(filename.clone());
-        ws.config.background.unsplash_photographer = Some(photographer);
-        ws.config.background.unsplash_photographer_url = Some(photographer_url);
+        let cfg = Arc::make_mut(&mut ws.config);
+        cfg.background.image = Some(filename.clone());
+        cfg.background.unsplash_photographer = Some(photographer);
+        cfg.background.unsplash_photographer_url = Some(photographer_url);
         ws.background_picker.open = false;
         ws.background_picker.loading = false;
 
@@ -3418,9 +3471,10 @@ impl App {
         };
         let ws = &mut self.workshops[idx];
         let ws_uuid = ws.id;
-        ws.config.background.image = Some(filename.clone());
-        ws.config.background.unsplash_photographer = None;
-        ws.config.background.unsplash_photographer_url = None;
+        let cfg = Arc::make_mut(&mut ws.config);
+        cfg.background.image = Some(filename.clone());
+        cfg.background.unsplash_photographer = None;
+        cfg.background.unsplash_photographer_url = None;
         ws.background_picker.open = false;
 
         let bg_dir = ws.ryve_dir.backgrounds_dir();
@@ -3520,10 +3574,11 @@ impl App {
         let new_value = splitter::compute_new_value(drag, cursor, sidebar_height);
         let kind = drag.kind;
         let ws = &mut self.workshops[idx];
+        let cfg = Arc::make_mut(&mut ws.config);
         match kind {
-            SplitterKind::SidebarRight => ws.config.layout.sidebar_width = new_value,
-            SplitterKind::SparksLeft => ws.config.layout.sparks_width = new_value,
-            SplitterKind::SidebarFilesHands => ws.config.layout.sidebar_split = new_value,
+            SplitterKind::SidebarRight => cfg.layout.sidebar_width = new_value,
+            SplitterKind::SparksLeft => cfg.layout.sparks_width = new_value,
+            SplitterKind::SidebarFilesHands => cfg.layout.sidebar_split = new_value,
         }
         Task::none()
     }
@@ -3818,7 +3873,8 @@ impl App {
                         started_at,
                         can_resume,
                     } => {
-                        let when = screen::agents::format_relative_time(&started_at);
+                        let when =
+                            screen::agents::format_relative_time(&started_at, chrono::Utc::now());
                         let body = if can_resume {
                             format!("Past session started {when}. Click \u{25B6} to resume.")
                         } else {
@@ -3989,30 +4045,20 @@ impl App {
 
                     // Create the iced_term::Terminal with the tmux
                     // attach command as the backend program.
-                    let (program, args) = match tmux::attach_command(&ws.directory, &tmux_name) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            log::error!("Cannot attach to tmux session '{tmux_name}': {e}");
-                            return Task::none();
-                        }
-                    };
-                    let (shell, shell_args) =
-                        workshop::wrap_command_with_bottom_pin(&program, &args);
-
-                    let mut settings = iced_term::settings::Settings {
-                        font: ws.terminal_font_settings(),
-                        ..iced_term::settings::Settings::default()
-                    };
-                    settings.theme.color_pallete.background = ws.terminal_bg_hex();
-                    settings.backend.working_directory = Some(ws.directory.clone());
-                    settings.backend.program = shell;
-                    settings.backend.args = shell_args;
-
-                    if let Ok(term) = iced_term::Terminal::new(tab_id, settings) {
-                        let focus = iced_term::TerminalView::focus(term.widget_id().clone());
-                        ws.terminals.insert(tab_id, term);
-                        return focus;
-                    }
+                    let workshop_dir = ws.directory.clone();
+                    let workshop_id = ws.id;
+                    return Task::perform(
+                        async move {
+                            tmux::attach_command_async(&workshop_dir, &tmux_name)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        move |result| Message::TmuxAttachReady {
+                            workshop_id,
+                            tab_id,
+                            result,
+                        },
+                    );
                 }
             }
             screen::agents::Message::ViewLog(session_id) => {
@@ -5050,14 +5096,40 @@ impl App {
     /// blocking the UI thread on `git worktree add`.
     fn dispatch_worktree_task(ws: &Workshop, tab_id: u64, session_id: String) -> Task<Message> {
         let workshop_dir = ws.directory.clone();
-        let ryve_dir = ws.ryve_dir.clone();
+        let ryve_dir = Arc::clone(&ws.ryve_dir);
         let workshop_id = ws.id;
+
+        let prompt_flag = ws
+            .pending_terminal_spawns
+            .get(&tab_id)
+            .and_then(|p| match &p.kind {
+                workshop::PendingTerminalKind::Agent(agent) => agent
+                    .system_prompt_flag()
+                    .map(|(f, is_file)| (f.to_string(), is_file)),
+                workshop::PendingTerminalKind::CustomAgent(_) => None,
+            });
+
         Task::perform(
-            async move { workshop::create_hand_worktree(&workshop_dir, &ryve_dir, &session_id).await },
-            move |result| Message::HandWorktreeReady {
+            async move {
+                let result =
+                    workshop::create_hand_worktree(&workshop_dir, &ryve_dir, &session_id).await;
+                let system_prompt = match &prompt_flag {
+                    Some((flag, is_file)) => {
+                        workshop::resolve_system_prompt_async(
+                            &ryve_dir,
+                            Some((flag.as_str(), *is_file)),
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+                (result, system_prompt)
+            },
+            move |(result, system_prompt)| Message::HandWorktreeReady {
                 workshop_id,
                 tab_id,
                 result,
+                system_prompt,
             },
         )
     }
@@ -5157,16 +5229,10 @@ impl App {
             let spark_id_clone = spark_id.clone();
             tasks.push(Task::perform(
                 async move {
-                    let source_branch = {
-                        let short_id = &sid_for_assign[..8.min(sid_for_assign.len())];
-                        format!("hand/{short_id}")
-                    };
                     let assignment = data::sparks::types::NewHandAssignment {
                         session_id: sid_for_assign,
                         spark_id: spark_id_clone,
                         role: data::sparks::types::AssignmentRole::Owner,
-                        source_branch: Some(source_branch),
-                        target_branch: Some("main".to_string()),
                     };
                     let _ = data::sparks::assignment_repo::assign(&pool2, assignment).await;
                 },
@@ -5551,9 +5617,10 @@ impl App {
                 )
             }
             screen::background_picker::Message::RemoveBackground => {
-                ws.config.background.image = None;
-                ws.config.background.unsplash_photographer = None;
-                ws.config.background.unsplash_photographer_url = None;
+                let cfg = Arc::make_mut(&mut ws.config);
+                cfg.background.image = None;
+                cfg.background.unsplash_photographer = None;
+                cfg.background.unsplash_photographer_url = None;
                 ws.background_handle = None;
                 ws.bg_is_dark = None;
                 ws.background_picker.open = false;
@@ -5570,7 +5637,7 @@ impl App {
 
             // ── Dim opacity ──────────────────────────────────
             screen::background_picker::Message::DimOpacityChanged(value) => {
-                ws.config.background.dim_opacity = value.clamp(0.0, 1.0);
+                Arc::make_mut(&mut ws.config).background.dim_opacity = value.clamp(0.0, 1.0);
                 Task::none()
             }
             screen::background_picker::Message::DimOpacityCommitted => {
@@ -6489,6 +6556,7 @@ impl App {
                         assignments: &ws.hand_assignments,
                         failing_contracts: &ws.failing_contracts_list,
                         embers: &ws.embers,
+                        utc_now: chrono::Utc::now(),
                     },
                     pal,
                     has_bg,
