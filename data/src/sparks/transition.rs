@@ -222,11 +222,12 @@ async fn transition_assignment_phase_inner(
         assignment_id: assignment_id.to_string(),
     })?;
 
-    let current_phase = AssignmentPhase::from_str(Some(&assignment.assignment_phase).unwrap())
-        .ok_or(TransitionError::IllegalTransition {
+    let current_phase = AssignmentPhase::from_str(&assignment.assignment_phase).ok_or(
+        TransitionError::IllegalTransition {
             from: "unknown",
             to: target_phase.as_str(),
-        })?;
+        },
+    )?;
 
     validate_transition(
         current_phase,
