@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Pure, benchmarkable hot-path helpers for Ryve. Owned by the perf regression harness."
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 data = { path = "../data" }
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 

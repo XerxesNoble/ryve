@@ -1115,23 +1115,10 @@ fn spark_chip<'a>(spark_id: &str, pal: &Palette) -> Element<'a, Message> {
 
 /// Format an RFC 3339 timestamp as a short relative time string (e.g. "2h ago", "3d ago").
 ///
-/// Accepts the current UTC time as a parameter so callers can compute
-/// `Utc::now()` once per frame instead of per row. Spark ryve-252c5b6e.
-pub fn format_relative_time(rfc3339: &str, utc_now: chrono::DateTime<chrono::Utc>) -> String {
-    let Ok(then) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
-        return String::new();
-    };
-    let duration = utc_now.signed_duration_since(then);
-
-    if duration.num_minutes() < 1 {
-        "now".to_string()
-    } else if duration.num_minutes() < 60 {
-        format!("{}m ago", duration.num_minutes())
-    } else if duration.num_hours() < 24 {
-        format!("{}h ago", duration.num_hours())
-    } else {
-        format!("{}d ago", duration.num_days())
-    }
+/// Delegates to [`perf_core::format_relative_time`] so the hot path is
+/// benchmarkable without pulling in the UI crate.
+pub fn format_relative_time(rfc3339: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    perf_core::format_relative_time(rfc3339, now)
 }
 
 #[cfg(test)]
@@ -1227,15 +1214,13 @@ mod tests {
 
     #[test]
     fn format_relative_time_handles_invalid_input() {
-        let utc_now = chrono::Utc::now();
-        assert_eq!(format_relative_time("not a date", utc_now), "");
+        assert_eq!(format_relative_time("not a date", chrono::Utc::now()), "");
     }
 
     #[test]
     fn format_relative_time_returns_now_for_recent() {
-        let utc_now = chrono::Utc::now();
-        let now = utc_now.to_rfc3339();
-        assert_eq!(format_relative_time(&now, utc_now), "now");
+        let now = chrono::Utc::now();
+        assert_eq!(format_relative_time(&now.to_rfc3339(), now), "now");
     }
 
     #[test]

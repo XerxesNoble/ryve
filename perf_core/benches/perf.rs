@@ -14,8 +14,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use data::git::{DiffStat, FileStatus};
 use perf_core::{
     KeyDispatch, KeyKind, KeyModifiers, NodeKind, SessionLike, classify_key_event,
-    count_active_sessions, file_git_status, precompute_diff_stat_map, precompute_git_status_map,
-    process_is_alive,
+    count_active_sessions, file_git_status, format_relative_time, precompute_diff_stat_map,
+    precompute_git_status_map, process_is_alive,
 };
 
 // ── Fixtures ─────────────────────────────────────────────
@@ -188,6 +188,28 @@ fn bench_view_workshop_status_lookups(c: &mut Criterion) {
     });
 }
 
+fn bench_format_relative_time_100_sessions(c: &mut Criterion) {
+    let base = chrono::Utc::now();
+    let timestamps: Vec<String> = (0..100)
+        .map(|i| {
+            let offset = chrono::Duration::minutes(i as i64 * 29);
+            (base - offset).to_rfc3339()
+        })
+        .collect();
+
+    c.bench_function("format_relative_time_100_sessions", |b| {
+        b.iter(|| {
+            let now = chrono::Utc::now();
+            for ts in &timestamps {
+                std::hint::black_box(format_relative_time(
+                    std::hint::black_box(ts),
+                    std::hint::black_box(now),
+                ));
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_process_is_alive,
@@ -197,5 +219,6 @@ criterion_group!(
     bench_precompute_git_status_map,
     bench_precompute_diff_stat_map,
     bench_view_workshop_status_lookups,
+    bench_format_relative_time_100_sessions,
 );
 criterion_main!(benches);

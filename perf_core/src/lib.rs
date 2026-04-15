@@ -250,6 +250,28 @@ pub fn classify_key_event(kind: KeyKind, modifiers: KeyModifiers) -> KeyDispatch
     }
 }
 
+// ── Relative-time formatting ────────────────────────────
+
+/// Format an RFC 3339 timestamp as a short relative time string
+/// (e.g. "2h ago", "3d ago"). Accepts a pre-computed `now` so callers
+/// can share a single clock read across many rows in a frame.
+pub fn format_relative_time(rfc3339: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return String::new();
+    };
+    let duration = now.signed_duration_since(then);
+
+    if duration.num_minutes() < 1 {
+        "now".to_string()
+    } else if duration.num_minutes() < 60 {
+        format!("{}m ago", duration.num_minutes())
+    } else if duration.num_hours() < 24 {
+        format!("{}h ago", duration.num_hours())
+    } else {
+        format!("{}d ago", duration.num_days())
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -375,6 +397,38 @@ mod tests {
         let src = map.get(Path::new("src")).unwrap();
         assert_eq!(src.additions, 8);
         assert_eq!(src.deletions, 3);
+    }
+
+    #[test]
+    fn format_relative_time_invalid_returns_empty() {
+        assert_eq!(format_relative_time("not a date", chrono::Utc::now()), "");
+    }
+
+    #[test]
+    fn format_relative_time_recent_returns_now() {
+        let now = chrono::Utc::now();
+        assert_eq!(format_relative_time(&now.to_rfc3339(), now), "now");
+    }
+
+    #[test]
+    fn format_relative_time_minutes_ago() {
+        let now = chrono::Utc::now();
+        let then = now - chrono::Duration::minutes(5);
+        assert_eq!(format_relative_time(&then.to_rfc3339(), now), "5m ago");
+    }
+
+    #[test]
+    fn format_relative_time_hours_ago() {
+        let now = chrono::Utc::now();
+        let then = now - chrono::Duration::hours(3);
+        assert_eq!(format_relative_time(&then.to_rfc3339(), now), "3h ago");
+    }
+
+    #[test]
+    fn format_relative_time_days_ago() {
+        let now = chrono::Utc::now();
+        let then = now - chrono::Duration::days(2);
+        assert_eq!(format_relative_time(&then.to_rfc3339(), now), "2d ago");
     }
 
     #[test]

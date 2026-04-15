@@ -59,6 +59,7 @@ pub struct HomeData<'a> {
 
 pub fn view<'a>(data: HomeData<'a>, pal: &Palette, has_bg: bool) -> Element<'a, Message> {
     let pal = *pal;
+    let utc_now = chrono::Utc::now();
 
     let header = row![
         text("Home").size(FONT_HEADER).color(pal.text_primary),
@@ -80,11 +81,11 @@ pub fn view<'a>(data: HomeData<'a>, pal: &Palette, has_bg: bool) -> Element<'a, 
 
     let body = column![
         identity,
-        section_active_hands(&data, &pal),
+        section_active_hands(&data, &pal, utc_now),
         section_assigned_sparks(&data, &pal),
         section_blocked_sparks(&data, &pal),
         section_failing_contracts(data.failing_contracts, &pal),
-        section_active_embers(data.embers, &pal, data.utc_now),
+        section_active_embers(data.embers, &pal, utc_now),
     ]
     .spacing(14)
     .padding(iced::Padding {
@@ -107,7 +108,11 @@ pub fn view<'a>(data: HomeData<'a>, pal: &Palette, has_bg: bool) -> Element<'a, 
 
 // ── Sections ─────────────────────────────────────────
 
-fn section_active_hands<'a>(data: &HomeData<'a>, pal: &Palette) -> Element<'a, Message> {
+fn section_active_hands<'a>(
+    data: &HomeData<'a>,
+    pal: &Palette,
+    utc_now: chrono::DateTime<chrono::Utc>,
+) -> Element<'a, Message> {
     let pal = *pal;
     let active: Vec<&AgentSession> = data.agent_sessions.iter().filter(|s| s.active).collect();
 
@@ -147,7 +152,7 @@ fn section_active_hands<'a>(data: &HomeData<'a>, pal: &Palette) -> Element<'a, M
                 .color(claim_color)
                 .width(Length::FillPortion(3)),
             Space::new().width(Length::Fill),
-            text(format_relative_time(&session.started_at, data.utc_now))
+            text(format_relative_time(&session.started_at, utc_now))
                 .size(FONT_SMALL)
                 .color(pal.text_tertiary),
         ]
