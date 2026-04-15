@@ -127,21 +127,21 @@ pub fn validate_transition(
         })?;
 
     // 3. Role authorization (Head/Director may override).
-    if !override_role_check || !actor_role.can_override() {
-        if !rule.authorized_roles.contains(&actor_role) {
-            let authorized = rule
-                .authorized_roles
-                .iter()
-                .map(|r| r.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(TransitionError::Unauthorized {
-                role: actor_role.as_str(),
-                from: current_phase.as_str(),
-                to: target_phase.as_str(),
-                authorized,
-            });
-        }
+    if (!override_role_check || !actor_role.can_override())
+        && !rule.authorized_roles.contains(&actor_role)
+    {
+        let authorized = rule
+            .authorized_roles
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(TransitionError::Unauthorized {
+            role: actor_role.as_str(),
+            from: current_phase.as_str(),
+            to: target_phase.as_str(),
+            authorized,
+        });
     }
 
     Ok(())
@@ -175,7 +175,7 @@ pub async fn transition_assignment_phase(
     expected_previous_phase: AssignmentPhase,
     event_id: i64,
 ) -> Result<HandAssignment, TransitionError> {
-    transition_assignment_phase_inner(
+    transition_assignment_phase_inner(TransitionRequest {
         pool,
         assignment_id,
         actor_id,
@@ -183,8 +183,8 @@ pub async fn transition_assignment_phase(
         target_phase,
         expected_previous_phase,
         event_id,
-        false,
-    )
+        override_role_check: false,
+    })
     .await
 }
 
@@ -199,7 +199,7 @@ pub async fn transition_assignment_phase_override(
     expected_previous_phase: AssignmentPhase,
     event_id: i64,
 ) -> Result<HandAssignment, TransitionError> {
-    transition_assignment_phase_inner(
+    transition_assignment_phase_inner(TransitionRequest {
         pool,
         assignment_id,
         actor_id,
@@ -207,21 +207,35 @@ pub async fn transition_assignment_phase_override(
         target_phase,
         expected_previous_phase,
         event_id,
-        true,
-    )
+        override_role_check: true,
+    })
     .await
 }
 
-async fn transition_assignment_phase_inner(
-    pool: &SqlitePool,
+struct TransitionRequest<'a> {
+    pool: &'a SqlitePool,
     assignment_id: i64,
-    actor_id: &str,
+    actor_id: &'a str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
     event_id: i64,
     override_role_check: bool,
+}
+
+async fn transition_assignment_phase_inner(
+    req: TransitionRequest<'_>,
 ) -> Result<HandAssignment, TransitionError> {
+    let TransitionRequest {
+        pool,
+        assignment_id,
+        actor_id,
+        actor_role,
+        target_phase,
+        expected_previous_phase,
+        event_id,
+        override_role_check,
+    } = req;
     let mut tx = pool.begin().await?;
 
     // Read current assignment inside the transaction for consistency.
