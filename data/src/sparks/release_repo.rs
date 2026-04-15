@@ -194,6 +194,42 @@ pub async fn list_member_epics(
     Ok(rows.into_iter().map(|(s,)| s).collect())
 }
 
+/// Update mutable fields on a release. Only fields set to `Some` are changed;
+/// `None` fields are left untouched. Version is re-validated if provided.
+pub async fn update(
+    pool: &SqlitePool,
+    release_id: &str,
+    patch: UpdateRelease,
+) -> Result<Release, SparksError> {
+    let existing = get(pool, release_id).await?;
+
+    let version = match patch.version {
+        Some(ref v) => {
+            validate_semver(v)?;
+            v.clone()
+        }
+        None => existing.version.clone(),
+    };
+    let problem = match patch.problem {
+        Some(p) => p,
+        None => existing.problem.clone(),
+    };
+    let notes = match patch.notes {
+        Some(n) => n,
+        None => existing.notes.clone(),
+    };
+
+    sqlx::query("UPDATE releases SET version = ?, problem = ?, notes = ? WHERE id = ?")
+        .bind(&version)
+        .bind(&problem)
+        .bind(&notes)
+        .bind(release_id)
+        .execute(pool)
+        .await?;
+
+    get(pool, release_id).await
+}
+
 /// Record the tag name and artifact path on a release. Used by the close flow
 /// after tagging + building so the release row carries pointers to both.
 pub async fn record_close_metadata(

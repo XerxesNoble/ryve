@@ -147,6 +147,74 @@ async fn set_status_reopen_conflict_is_typed(pool: sqlx::SqlitePool) {
 }
 
 #[sqlx::test(fixtures("seed_sparks"))]
+async fn update_with_valid_version_succeeds(pool: sqlx::SqlitePool) {
+    let rel = release_repo::create(&pool, new_release("1.0.0"))
+        .await
+        .unwrap();
+
+    let updated = release_repo::update(
+        &pool,
+        &rel.id,
+        UpdateRelease {
+            version: Some("2.0.0".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(updated.version, "2.0.0");
+    assert_eq!(updated.id, rel.id);
+    assert_eq!(updated.status, "planning");
+
+    let fetched = release_repo::get(&pool, &rel.id).await.unwrap();
+    assert_eq!(fetched.version, "2.0.0");
+}
+
+#[sqlx::test(fixtures("seed_sparks"))]
+async fn update_with_invalid_semver_returns_error_and_does_not_mutate(pool: sqlx::SqlitePool) {
+    let rel = release_repo::create(&pool, new_release("1.0.0"))
+        .await
+        .unwrap();
+
+    let err = release_repo::update(
+        &pool,
+        &rel.id,
+        UpdateRelease {
+            version: Some("bad-version".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, SparksError::InvalidSemver(_)), "got {err:?}");
+
+    let fetched = release_repo::get(&pool, &rel.id).await.unwrap();
+    assert_eq!(fetched.version, "1.0.0");
+}
+
+#[sqlx::test(fixtures("seed_sparks"))]
+async fn update_with_none_version_leaves_version_unchanged(pool: sqlx::SqlitePool) {
+    let rel = release_repo::create(&pool, new_release("1.0.0"))
+        .await
+        .unwrap();
+
+    let updated = release_repo::update(
+        &pool,
+        &rel.id,
+        UpdateRelease {
+            notes: Some(Some("new notes".to_string())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(updated.version, "1.0.0");
+    assert_eq!(updated.notes.as_deref(), Some("new notes"));
+}
+
+#[sqlx::test(fixtures("seed_sparks"))]
 async fn list_filters_by_status(pool: sqlx::SqlitePool) {
     let a = release_repo::create(&pool, new_release("4.0.0"))
         .await
