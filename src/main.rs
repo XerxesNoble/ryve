@@ -5527,16 +5527,10 @@ impl App {
             let spark_id_clone = spark_id.clone();
             tasks.push(Task::perform(
                 async move {
-                    let source_branch = {
-                        let short_id = &sid_for_assign[..8.min(sid_for_assign.len())];
-                        format!("hand/{short_id}")
-                    };
                     let assignment = data::sparks::types::NewHandAssignment {
                         session_id: sid_for_assign,
                         spark_id: spark_id_clone,
                         role: data::sparks::types::AssignmentRole::Owner,
-                        source_branch: Some(source_branch),
-                        target_branch: Some("main".to_string()),
                     };
                     let _ = data::sparks::assignment_repo::assign(&pool2, assignment).await;
                 },
@@ -7451,8 +7445,6 @@ mod tests {
                 session_id: session_id.clone(),
                 spark_id: spark.id.clone(),
                 role: AssignmentRole::Owner,
-                source_branch: None,
-                target_branch: None,
             },
         )
         .await

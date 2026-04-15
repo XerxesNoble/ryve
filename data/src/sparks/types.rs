@@ -739,35 +739,18 @@ pub struct HandAssignment {
     pub spark_id: String,
     pub status: String,
     pub role: String,
-    pub phase: String,
-    pub event_version: i64,
-    pub source_branch: Option<String>,
-    pub target_branch: Option<String>,
     pub assigned_at: String,
     pub last_heartbeat_at: Option<String>,
     pub lease_expires_at: Option<String>,
     pub completed_at: Option<String>,
     pub handoff_to: Option<String>,
     pub handoff_reason: Option<String>,
-    /// Current workflow phase, governed by the transition validator.
-    /// `None` for rows created before the migration adds this column.
-    pub assignment_phase: Option<String>,
-    /// When the phase was last changed (RFC 3339).
-    pub phase_changed_at: Option<String>,
-    /// actor_id that performed the last phase transition.
-    pub phase_changed_by: Option<String>,
-    /// Role of the actor that performed the last phase transition.
-    pub phase_actor_role: Option<String>,
-    /// Event ID that triggered the last phase transition.
-    pub phase_event_id: Option<i64>,
 }
 
 pub struct NewHandAssignment {
     pub session_id: String,
     pub spark_id: String,
     pub role: AssignmentRole,
-    pub source_branch: Option<String>,
-    pub target_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

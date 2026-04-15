@@ -39,7 +39,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use super::error::TransitionError;
-use super::types::{AssignmentPhase, HandAssignment, TransitionActorRole};
+use super::types::{Assignment, AssignmentPhase, TransitionActorRole};
 
 /// A transition rule: (from_phase, to_phase) → list of authorized roles.
 struct TransitionRule {
@@ -147,69 +147,44 @@ pub fn validate_transition(
     Ok(())
 }
 
-/// Transition an assignment's phase in the database. This is the **only**
-/// function that may write to `hand_assignments.assignment_phase`.
-///
-/// # Arguments
-///
-/// * `pool` — database connection pool
-/// * `assignment_id` — PK of the `hand_assignments` row
-/// * `actor_id` — identifier of the actor performing the transition
-///   (typically a session_id)
-/// * `actor_role` — the role under which the actor is operating
-/// * `target_phase` — the desired new phase
-/// * `expected_previous_phase` — the phase the caller believes the
-///   assignment is currently in; if it doesn't match, the transition is
-///   rejected (out-of-order replay safety)
-/// * `event_id` — the event that triggered this transition (for audit)
-///
-/// # Returns
-///
-/// The updated `HandAssignment` on success, or a `TransitionError`.
 pub async fn transition_assignment_phase(
     pool: &SqlitePool,
-    assignment_id: i64,
-    actor_id: &str,
+    assignment_id: &str,
+    _actor_id: &str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
-    event_id: i64,
-) -> Result<HandAssignment, TransitionError> {
+    _event_id: i64,
+) -> Result<Assignment, TransitionError> {
     transition_assignment_phase_inner(
         pool,
         TransitionPhaseRequest {
             assignment_id,
-            actor_id,
             actor_role,
             target_phase,
             expected_previous_phase,
-            event_id,
             override_role_check: false,
         },
     )
     .await
 }
 
-/// Like [`transition_assignment_phase`] but with an explicit override flag
-/// that allows Head/Director to bypass role-ownership checks.
 pub async fn transition_assignment_phase_override(
     pool: &SqlitePool,
-    assignment_id: i64,
-    actor_id: &str,
+    assignment_id: &str,
+    _actor_id: &str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
-    event_id: i64,
-) -> Result<HandAssignment, TransitionError> {
+    _event_id: i64,
+) -> Result<Assignment, TransitionError> {
     transition_assignment_phase_inner(
         pool,
         TransitionPhaseRequest {
             assignment_id,
-            actor_id,
             actor_role,
             target_phase,
             expected_previous_phase,
-            event_id,
             override_role_check: true,
         },
     )
@@ -217,48 +192,42 @@ pub async fn transition_assignment_phase_override(
 }
 
 struct TransitionPhaseRequest<'a> {
-    assignment_id: i64,
-    actor_id: &'a str,
+    assignment_id: &'a str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
-    event_id: i64,
     override_role_check: bool,
 }
 
 async fn transition_assignment_phase_inner(
     pool: &SqlitePool,
     request: TransitionPhaseRequest<'_>,
-) -> Result<HandAssignment, TransitionError> {
+) -> Result<Assignment, TransitionError> {
     let mut tx = pool.begin().await?;
 
     let TransitionPhaseRequest {
         assignment_id,
-        actor_id,
         actor_role,
         target_phase,
         expected_previous_phase,
-        event_id,
         override_role_check,
     } = request;
 
-    // Read current assignment inside the transaction for consistency.
-    let row = sqlx::query_as::<_, HandAssignment>("SELECT * FROM hand_assignments WHERE id = ?")
+    let row = sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE assignment_id = ?")
         .bind(assignment_id)
         .fetch_optional(&mut *tx)
         .await?;
 
-    let assignment = row.ok_or(TransitionError::AssignmentNotFound { assignment_id })?;
+    let assignment = row.ok_or_else(|| TransitionError::AssignmentNotFound {
+        assignment_id: assignment_id.to_string(),
+    })?;
 
-    // Parse the current phase from the DB column.
-    let current_phase =
-        AssignmentPhase::from_str(assignment.assignment_phase.as_deref().unwrap_or("assigned"))
-            .ok_or(TransitionError::IllegalTransition {
-                from: "unknown",
-                to: target_phase.as_str(),
-            })?;
+    let current_phase = AssignmentPhase::from_str(Some(&assignment.assignment_phase).unwrap())
+        .ok_or(TransitionError::IllegalTransition {
+            from: "unknown",
+            to: target_phase.as_str(),
+        })?;
 
-    // Pure validation (no side effects).
     validate_transition(
         current_phase,
         target_phase,
@@ -267,29 +236,18 @@ async fn transition_assignment_phase_inner(
         override_role_check,
     )?;
 
-    // Perform the phase UPDATE — this is the single sanctioned write path.
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE hand_assignments \
-         SET assignment_phase = ?, \
-             phase_changed_at = ?, \
-             phase_changed_by = ?, \
-             phase_actor_role = ?, \
-             phase_event_id = ? \
-         WHERE id = ?",
+        "UPDATE assignments SET assignment_phase = ?, updated_at = ? WHERE assignment_id = ?",
     )
     .bind(target_phase.as_str())
     .bind(&now)
-    .bind(actor_id)
-    .bind(actor_role.as_str())
-    .bind(event_id)
     .bind(assignment_id)
     .execute(&mut *tx)
     .await?;
 
-    // Re-read the updated row to return.
     let updated =
-        sqlx::query_as::<_, HandAssignment>("SELECT * FROM hand_assignments WHERE id = ?")
+        sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE assignment_id = ?")
             .bind(assignment_id)
             .fetch_one(&mut *tx)
             .await?;

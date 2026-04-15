@@ -88,7 +88,7 @@ pub enum TransitionError {
     },
 
     #[error("assignment {assignment_id} not found")]
-    AssignmentNotFound { assignment_id: i64 },
+    AssignmentNotFound { assignment_id: String },
 
     #[error("database error during transition: {0}")]
     Database(#[from] sqlx::Error),

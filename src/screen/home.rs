@@ -428,21 +428,12 @@ mod tests {
             spark_id: spark.to_string(),
             status: "active".to_string(),
             role: "owner".to_string(),
-            phase: "assigned".to_string(),
-            event_version: 0,
-            source_branch: None,
-            target_branch: None,
             assigned_at: "2026-04-07T11:00:00+00:00".to_string(),
             last_heartbeat_at: None,
             lease_expires_at: None,
             completed_at: None,
             handoff_to: None,
             handoff_reason: None,
-            assignment_phase: None,
-            phase_changed_at: None,
-            phase_changed_by: None,
-            phase_actor_role: None,
-            phase_event_id: None,
         }
     }
 

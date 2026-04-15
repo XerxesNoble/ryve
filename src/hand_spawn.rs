@@ -173,13 +173,10 @@ pub async fn spawn_hand(
     agent_session_repo::create(pool, &new_session).await?;
 
     // 3. Claim the spark.
-    let short_id = &session_id[..8.min(session_id.len())];
     let assignment = NewHandAssignment {
         session_id: session_id.clone(),
         spark_id: spark_id.to_string(),
         role: kind.role(),
-        source_branch: Some(format!("hand/{short_id}")),
-        target_branch: Some("main".to_string()),
     };
     assignment_repo::assign(pool, assignment).await?;
 
