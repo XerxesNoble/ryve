@@ -68,6 +68,55 @@ fn sparks_db_and_sidecars_are_not_tracked() {
     );
 }
 
+fn is_backup_db_path(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "backups" && i > 0 && parts[i - 1] == ".ryve" {
+            if let Some(filename) = parts.get(i + 1) {
+                return filename.ends_with(".db");
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn backup_db_files_are_not_tracked() {
+    let root = repo_root();
+    let output = Command::new("git")
+        .arg("ls-files")
+        .current_dir(&root)
+        .output()
+        .expect("git ls-files");
+    assert!(output.status.success(), "git ls-files failed");
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+
+    let offenders: Vec<&str> = stdout
+        .lines()
+        .filter(|line| is_backup_db_path(line))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Backup .db file(s) are tracked in git — .ryve/backups/*.db must be \
+         ignored. Offending paths: {offenders:?}. \
+         Run `git rm --cached <path>` and ensure .gitignore covers \
+         `.ryve/backups/`. See docs/WORKGRAPH.md."
+    );
+}
+
+#[test]
+fn backup_path_matcher_recognizes_variants() {
+    assert!(is_backup_db_path(".ryve/backups/sparks-20260414.db"));
+    assert!(is_backup_db_path(".ryve/backups/sparks-1713052800.db"));
+    assert!(is_backup_db_path(".ryve/backups/other.db"));
+
+    assert!(!is_backup_db_path(".ryve/sparks.db"));
+    assert!(!is_backup_db_path(".ryve/backups/readme.md"));
+    assert!(!is_backup_db_path("backups/sparks-20260414.db"));
+    assert!(!is_backup_db_path("other/backups/sparks.db"));
+}
+
 #[test]
 fn path_matcher_recognizes_sidecar_variants() {
     assert!(is_sparks_db_path("sparks.db"));
