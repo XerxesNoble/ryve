@@ -299,7 +299,10 @@ fn print_usage() {
     eprintln!("  release create <major|minor|patch>   Create a new release");
     eprintln!("  release list                         List releases");
     eprintln!("  release show <id>                    Show release details + member epics");
-    eprintln!("  release edit <id> --version <semver>  Update release version");
+    eprintln!(
+        "  release edit <id> [--version <semver>] [--notes <text>] [--clear-notes] [--problem <text>] [--clear-problem]"
+    );
+    eprintln!("      Update release fields in place (pass --clear-* to null a field)");
     eprintln!("  release add-epic <id> <epic_id>      Add an epic to a release");
     eprintln!("  release remove-epic <id> <epic_id>   Remove an epic from a release");
     eprintln!("  release status <id> <status>         Transition release status");
@@ -3054,7 +3057,7 @@ async fn handle_release(
         "edit" => {
             if args.len() < 2 {
                 die(
-                    "release edit requires <id> [--version <ver>] [--notes <text>] [--problem <text>]",
+                    "release edit requires <id> [--version <ver>] [--notes <text>] [--clear-notes] [--problem <text>] [--clear-problem]",
                 );
             }
             let release_id = &args[1];
@@ -3074,14 +3077,20 @@ async fn handle_release(
                         if i >= args.len() {
                             die("--notes requires a value");
                         }
-                        patch.notes = Some(args[i].clone());
+                        patch.notes = Some(Some(args[i].clone()));
+                    }
+                    "--clear-notes" => {
+                        patch.notes = Some(None);
                     }
                     "--problem" => {
                         i += 1;
                         if i >= args.len() {
                             die("--problem requires a value");
                         }
-                        patch.problem = Some(args[i].clone());
+                        patch.problem = Some(Some(args[i].clone()));
+                    }
+                    "--clear-problem" => {
+                        patch.problem = Some(None);
                     }
                     other => die(&format!("unknown flag '{other}' for release edit")),
                 }

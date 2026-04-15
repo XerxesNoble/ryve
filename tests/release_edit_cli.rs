@@ -16,20 +16,33 @@ fn fresh_workshop() -> PathBuf {
     root.push(format!("ryve-cli-test-{nanos}-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("create tempdir");
 
-    Command::new("git")
+    let git_init = Command::new("git")
         .args(["init", "--initial-branch", "main"])
         .current_dir(&root)
-        .status()
-        .expect("git init");
-    Command::new("git")
+        .output()
+        .expect("spawn git init");
+    assert!(
+        git_init.status.success(),
+        "git init failed in {root:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&git_init.stdout),
+        String::from_utf8_lossy(&git_init.stderr)
+    );
+
+    let git_commit = Command::new("git")
         .args(["commit", "--allow-empty", "-m", "init"])
         .current_dir(&root)
         .env("GIT_AUTHOR_NAME", "test")
         .env("GIT_AUTHOR_EMAIL", "test@test")
         .env("GIT_COMMITTER_NAME", "test")
         .env("GIT_COMMITTER_EMAIL", "test@test")
-        .status()
-        .expect("git commit");
+        .output()
+        .expect("spawn git commit");
+    assert!(
+        git_commit.status.success(),
+        "git commit failed in {root:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&git_commit.stdout),
+        String::from_utf8_lossy(&git_commit.stderr)
+    );
 
     let status = Command::new(ryve_bin())
         .arg("init")

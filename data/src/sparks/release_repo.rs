@@ -112,18 +112,29 @@ pub async fn update(
     id: &str,
     patch: UpdateRelease,
 ) -> Result<Release, SparksError> {
-    let existing = get(pool, id).await?;
+    let Release {
+        version: existing_version,
+        problem: existing_problem,
+        notes: existing_notes,
+        ..
+    } = get(pool, id).await?;
 
     let version = match patch.version {
         Some(v) => {
             release_version::parse(&v).map_err(|_| SparksError::InvalidSemver(v.clone()))?;
             v
         }
-        None => existing.version,
+        None => existing_version,
     };
 
-    let problem = patch.problem.or(existing.problem);
-    let notes = patch.notes.or(existing.notes);
+    let problem = match patch.problem {
+        Some(opt) => opt,
+        None => existing_problem,
+    };
+    let notes = match patch.notes {
+        Some(opt) => opt,
+        None => existing_notes,
+    };
 
     sqlx::query("UPDATE releases SET version = ?, problem = ?, notes = ? WHERE id = ?")
         .bind(&version)

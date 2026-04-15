@@ -203,7 +203,7 @@ async fn update_with_none_version_leaves_version_unchanged(pool: sqlx::SqlitePoo
         &pool,
         &rel.id,
         UpdateRelease {
-            notes: Some("new notes".to_string()),
+            notes: Some(Some("new notes".to_string())),
             ..Default::default()
         },
     )
@@ -296,7 +296,7 @@ async fn update_none_fields_are_preserved(pool: sqlx::SqlitePool) {
         &pool,
         &rel.id,
         UpdateRelease {
-            notes: Some("new notes".to_string()),
+            notes: Some(Some("new notes".to_string())),
             ..Default::default()
         },
     )
