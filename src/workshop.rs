@@ -1181,34 +1181,13 @@ impl Workshop {
             self.bench.create_tab(tab_id, title, tab_kind);
         }
 
-        // Pre-resolve the system-prompt file (for built-in agents that
-        // support `--system-prompt`). Reading it now lets stage 2 stay
-        // trivially synchronous and keeps the behavior identical to the
-        // previous blocking implementation.
-        let system_prompt = if let PendingTerminalKind::Agent(agent) = &kind {
-            agent.system_prompt_flag().and_then(|(flag, is_file)| {
-                let prompt_path = self.ryve_dir.workshop_md_path();
-                if !prompt_path.exists() {
-                    return None;
-                }
-                let value = if is_file {
-                    prompt_path.to_string_lossy().into_owned()
-                } else {
-                    std::fs::read_to_string(&prompt_path).unwrap_or_default()
-                };
-                Some((flag.to_string(), value))
-            })
-        } else {
-            None
-        };
-
         self.pending_terminal_spawns.insert(
             tab_id,
             PendingTerminalSpawn {
                 session_id,
                 kind,
                 full_auto,
-                system_prompt,
+                system_prompt: None,
             },
         );
 
@@ -1227,10 +1206,19 @@ impl Workshop {
         &mut self,
         tab_id: u64,
         worktree_result: Result<PathBuf, String>,
+        system_prompt: Option<(String, String)>,
     ) -> bool {
-        let Some(pending) = self.pending_terminal_spawns.remove(&tab_id) else {
+        let Some(mut pending) = self.pending_terminal_spawns.remove(&tab_id) else {
             return false;
         };
+
+        // Prefer the asynchronously-resolved system prompt passed in from
+        // the worktree task (spark ryve-2c7d348b). Fall back to whatever
+        // was stored in the pending spawn (always None after the async
+        // migration, but kept for safety).
+        if system_prompt.is_some() {
+            pending.system_prompt = system_prompt;
+        }
 
         let working_dir = match worktree_result {
             Ok(path) => path,
@@ -1359,29 +1347,16 @@ impl Workshop {
             }
         }
 
-        // Resolve system-prompt for the agent.
-        let system_prompt = agent.system_prompt_flag().and_then(|(flag, is_file)| {
-            let prompt_path = self.ryve_dir.workshop_md_path();
-            if !prompt_path.exists() {
-                return None;
-            }
-            let value = if is_file {
-                prompt_path.to_string_lossy().into_owned()
-            } else {
-                std::fs::read_to_string(&prompt_path).unwrap_or_default()
-            };
-            Some((flag.to_string(), value))
-        });
-
         // Queue the pending spawn so `finalize_hand_terminal` picks it up
-        // when `HandWorktreeReady` arrives.
+        // when `HandWorktreeReady` arrives. System prompt is resolved
+        // asynchronously in dispatch_worktree_task (spark ryve-2c7d348b).
         self.pending_terminal_spawns.insert(
             tab_id,
             PendingTerminalSpawn {
                 session_id: new_session_id,
                 kind: PendingTerminalKind::Agent(agent.clone()),
                 full_auto,
-                system_prompt,
+                system_prompt: None,
             },
         );
 
@@ -1642,6 +1617,30 @@ pub(crate) async fn create_hand_worktree(
     }
 
     Ok(wt_dir)
+}
+
+/// Asynchronously resolve the system-prompt flag + value for a coding agent.
+///
+/// Spark ryve-2c7d348b: moved out of `begin_hand_terminal_inner` /
+/// `prepare_atlas_refresh` (which ran on the UI thread) into the async
+/// worktree task so no `std::fs` calls block `update()`.
+pub(crate) async fn resolve_system_prompt_async(
+    ryve_dir: &RyveDir,
+    prompt_flag: Option<(&str, bool)>,
+) -> Option<(String, String)> {
+    let (flag, is_file) = prompt_flag?;
+    let prompt_path = ryve_dir.workshop_md_path();
+    if !tokio::fs::try_exists(&prompt_path).await.unwrap_or(false) {
+        return None;
+    }
+    let value = if is_file {
+        prompt_path.to_string_lossy().into_owned()
+    } else {
+        tokio::fs::read_to_string(&prompt_path)
+            .await
+            .unwrap_or_default()
+    };
+    Some((flag.to_string(), value))
 }
 
 /// Env vars to inject into every Hand's terminal so the `ryve` CLI works

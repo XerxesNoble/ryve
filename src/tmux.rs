@@ -406,10 +406,12 @@ pub struct TmuxSession {
 pub async fn list_sessions_async(workshop_dir: &Path) -> Vec<TmuxSession> {
     let state_dir = workshop_dir.join(".ryve");
     let sock = short_socket_path(&state_dir);
-    if !sock.exists() {
+    if !tokio::fs::try_exists(&sock).await.unwrap_or(false) {
         return Vec::new();
     }
-    let tmux_bin = resolve_tmux_bin().unwrap_or_else(|| PathBuf::from("tmux"));
+    let tmux_bin = resolve_tmux_bin_async()
+        .await
+        .unwrap_or_else(|| PathBuf::from("tmux"));
     let output = tokio::process::Command::new(&tmux_bin)
         .args([
             "-S",
@@ -586,53 +588,16 @@ pub fn session_name_for(label: &str, session_id: &str) -> String {
     format!("{label}-{session_id}")
 }
 
-/// List all tmux sessions on the workshop's private socket (sync).
-///
-/// Returns the same `TmuxSession` vec as the async variant but blocks.
-/// Used by the poll loop to cache the full session list once per tick
-/// instead of shelling out per-session.
-pub fn list_sessions_sync(workshop_dir: &Path) -> Vec<TmuxSession> {
-    let state_dir = workshop_dir.join(".ryve");
-    let sock = short_socket_path(&state_dir);
-    if !sock.exists() {
-        return Vec::new();
-    }
-    let tmux_bin = resolve_tmux_bin().unwrap_or_else(|| PathBuf::from("tmux"));
-    let output = std::process::Command::new(&tmux_bin)
-        .args([
-            "-S",
-            &sock.to_string_lossy(),
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| TmuxSession {
-                    name: l.trim().to_string(),
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Build a command that attaches to the named tmux session.
-/// Returns `Ok((program, args))` suitable for spawning, or `Err` if no
-/// tmux binary could be resolved.
-pub fn attach_command(
+/// Build a command that attaches to the named tmux session, resolving the
+/// tmux binary asynchronously to avoid blocking the UI thread.
+/// Spark ryve-2c7d348b.
+pub async fn attach_command_async(
     workshop_dir: &Path,
     session_name: &str,
 ) -> Result<(String, Vec<String>), TmuxError> {
-    let bin = resolve_tmux_bin().ok_or_else(|| TmuxError::BinaryMissing(PathBuf::from("tmux")))?;
+    let bin = resolve_tmux_bin_async()
+        .await
+        .ok_or_else(|| TmuxError::BinaryMissing(PathBuf::from("tmux")))?;
     let client = TmuxClient::new(bin, &workshop_dir.join(".ryve"));
     let cmd = client.attach_command(session_name);
     let program = cmd.get_program().to_string_lossy().into_owned();
@@ -664,6 +629,44 @@ pub async fn terminate_session(pool: &SqlitePool, workshop_dir: &Path, session_i
 
     // 3. Mark ended in the DB.
     let _ = data::sparks::agent_session_repo::end_session(pool, session_id).await;
+}
+
+/// Async variant of [`resolve_tmux_bin`] — uses `tokio::fs` and
+/// `tokio::process::Command` instead of their blocking counterparts.
+async fn resolve_tmux_bin_async() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("RYVE_TMUX_PATH") {
+        let p = PathBuf::from(val);
+        if tokio::fs::try_exists(&p).await.unwrap_or(false) {
+            return Some(p);
+        }
+    }
+    if let Ok(val) = std::env::var("RYVE_TMUX_BIN") {
+        let p = PathBuf::from(val);
+        if tokio::fs::try_exists(&p).await.unwrap_or(false) {
+            return Some(p);
+        }
+    }
+    if let Some(p) = bundled_tmux::bundled_tmux_path() {
+        return Some(p);
+    }
+    which_tmux_async().await
+}
+
+async fn which_tmux_async() -> Option<PathBuf> {
+    tokio::process::Command::new("which")
+        .arg("tmux")
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(s))
+            }
+        })
 }
 
 // ── PID-based liveness detection ─────────────────────────
