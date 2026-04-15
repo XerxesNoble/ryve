@@ -971,10 +971,10 @@ mod tests {
         //    script's output should appear in the log file via pipe-pane.
         let deadline = Instant::now() + Duration::from_secs(5);
         let log_has_content = loop {
-            if let Ok(content) = std::fs::read_to_string(&expected_log) {
-                if !content.is_empty() {
-                    break true;
-                }
+            if let Ok(content) = std::fs::read_to_string(&expected_log)
+                && !content.is_empty()
+            {
+                break true;
             }
             if Instant::now() >= deadline {
                 break false;

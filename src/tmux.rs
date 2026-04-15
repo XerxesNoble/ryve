@@ -716,9 +716,11 @@ mod tests {
         }
     }
 
+    type MockHandler = dyn Fn(&str, &[&str]) -> std::io::Result<Output> + Send + Sync;
+
     /// A simple mock command runner that delegates to a closure.
     struct MockRunner {
-        handler: Box<dyn Fn(&str, &[&str]) -> std::io::Result<Output> + Send + Sync>,
+        handler: Box<MockHandler>,
     }
 
     impl CommandRunner for MockRunner {
@@ -770,7 +772,7 @@ mod tests {
     #[test]
     fn list_sessions_parses_output() {
         let client = make_client(|_, args: &[&str]| {
-            if args.iter().any(|a| *a == "list-sessions") {
+            if args.contains(&"list-sessions") {
                 Ok(ok_output("sess1\t1700000000\t0\nsess2\t1700000001\t1\n"))
             } else {
                 Ok(ok_output(""))
@@ -807,8 +809,8 @@ mod tests {
             if n == 0 {
                 Ok(err_output(1, "")) // has_session → not found
             } else {
-                assert!(args.iter().any(|a| *a == "new-session"));
-                assert!(args.iter().any(|a| *a == "-d"));
+                assert!(args.contains(&"new-session"));
+                assert!(args.contains(&"-d"));
                 Ok(ok_output(""))
             }
         });
@@ -837,7 +839,7 @@ mod tests {
             if n == 0 {
                 Ok(ok_output("")) // has_session → exists
             } else {
-                assert!(args.iter().any(|a| *a == "kill-session"));
+                assert!(args.contains(&"kill-session"));
                 Ok(ok_output(""))
             }
         });
@@ -860,7 +862,7 @@ mod tests {
             if n == 0 {
                 Ok(ok_output("")) // has_session
             } else {
-                assert!(args.iter().any(|a| *a == "pipe-pane"));
+                assert!(args.contains(&"pipe-pane"));
                 Ok(ok_output(""))
             }
         });
@@ -900,10 +902,7 @@ mod tests {
             if n == 0 {
                 Ok(err_output(1, "")) // has_session → not found
             } else {
-                assert!(
-                    args.iter().any(|a| *a == "-e"),
-                    "expected -e flags for env vars"
-                );
+                assert!(args.contains(&"-e"), "expected -e flags for env vars");
                 Ok(ok_output(""))
             }
         });

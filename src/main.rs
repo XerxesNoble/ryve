@@ -7344,21 +7344,21 @@ mod tests {
         assert!(!agents.iter().any(|a| !a.compatibility.is_unsupported()));
 
         // All unsupported → no compatible agent.
-        let agents = vec![make(CompatStatus::Unsupported {
+        let agents = [make(CompatStatus::Unsupported {
             version: "0.1".into(),
             reason: "old".into(),
         })];
         assert!(!agents.iter().any(|a| !a.compatibility.is_unsupported()));
 
         // One compatible → has compatible agent.
-        let agents = vec![make(CompatStatus::Compatible {
+        let agents = [make(CompatStatus::Compatible {
             version: "1.0".into(),
         })];
         assert!(agents.iter().any(|a| !a.compatibility.is_unsupported()));
 
         // Unknown counts as "not unsupported" — we give the benefit of
         // the doubt when the version probe couldn't run.
-        let agents = vec![make(CompatStatus::Unknown)];
+        let agents = [make(CompatStatus::Unknown)];
         assert!(agents.iter().any(|a| !a.compatibility.is_unsupported()));
     }
 

@@ -1747,8 +1747,10 @@ mod tests {
 
     #[test]
     fn validate_requires_title() {
-        let mut f = CreateForm::default();
-        f.spark_type = "epic".into();
+        let mut f = CreateForm {
+            spark_type: "epic".into(),
+            ..Default::default()
+        };
         assert!(f.validate().is_err());
         f.title = "hello".into();
         assert!(f.validate().is_ok());

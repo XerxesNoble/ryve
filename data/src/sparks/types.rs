@@ -766,6 +766,8 @@ pub struct NewHandAssignment {
     pub session_id: String,
     pub spark_id: String,
     pub role: AssignmentRole,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

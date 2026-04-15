@@ -2993,11 +2993,8 @@ mod tests {
         };
         let binding = problem_editor_key_binding(kp);
         // Should NOT be CancelProblem; anything else (including None) is fine.
-        match binding {
-            Some(text_editor::Binding::Custom(Message::CancelProblem)) => {
-                panic!("escape binding should not fire for 'a'")
-            }
-            _ => {}
+        if let Some(text_editor::Binding::Custom(Message::CancelProblem)) = binding {
+            panic!("escape binding should not fire for 'a'")
         }
     }
 }

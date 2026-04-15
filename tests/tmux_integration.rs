@@ -33,12 +33,12 @@ fn tmux_binary() -> Option<PathBuf> {
     }
     // Try PATH via `which`.
     let output = Command::new("which").arg("tmux").output().ok();
-    if let Some(out) = output {
-        if out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
+    if let Some(out) = output
+        && out.status.success()
+    {
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
         }
     }
     None

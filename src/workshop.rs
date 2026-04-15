@@ -2454,7 +2454,7 @@ mod tests {
         ws.revert_description_edit();
         assert!(ws.description_editor.is_none());
         let edit = ws.spark_edit.as_ref().expect("spark_edit still present");
-        assert!(edit.drafts.get(&Field::Description).is_none());
+        assert!(!edit.drafts.contains_key(&Field::Description));
         // Reverting a draft with no persisted change should leave the
         // edit wrapper clean (not dirty) so subsequent nav is free.
         assert!(ws.dirty_description_spark_id().is_none());
@@ -2476,12 +2476,11 @@ mod tests {
         assert_eq!(taken.1, "committed");
         assert!(ws.description_editor.is_none());
         assert!(
-            ws.spark_edit
+            !ws.spark_edit
                 .as_ref()
                 .unwrap()
                 .drafts
-                .get(&Field::Description)
-                .is_none()
+                .contains_key(&Field::Description)
         );
         assert!(ws.take_description_draft().is_none());
     }
