@@ -16,13 +16,13 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::coding_agents::CodingAgent;
+use crate::panel_state::agents::AgentSession;
+use crate::panel_state::background_picker::PickerState;
+use crate::panel_state::bench::{BenchState, TabKind};
+use crate::panel_state::file_explorer::FileExplorerState;
+use crate::panel_state::file_viewer::FileViewerState;
+use crate::panel_state::log_tail::LogTailState;
 use crate::process_snapshot::ProcessSnapshot;
-use crate::screen::agents::AgentSession;
-use crate::screen::background_picker::PickerState;
-use crate::screen::bench::{BenchState, TabKind};
-use crate::screen::file_explorer::FileExplorerState;
-use crate::screen::file_viewer::FileViewerState;
-use crate::screen::log_tail::LogTailState;
 use crate::style::{Appearance, Palette};
 
 const BOTTOM_PIN_NEWLINES: usize = 20;
@@ -111,12 +111,12 @@ impl SparkPatch {
             && self.problem_statement.is_none()
     }
 
-    /// Return the set of [`Field`](crate::screen::spark_detail::Field)s
+    /// Return the set of [`Field`](crate::panel_state::spark_detail::Field)s
     /// affected by this patch. Used by `SparkUpdateApplied` /
     /// `SparkUpdateFailed` to scope in-flight bookkeeping to just the
     /// fields that were part of a specific write.
-    pub fn affected_fields(&self) -> Vec<crate::screen::spark_detail::Field> {
-        use crate::screen::spark_detail::Field;
+    pub fn affected_fields(&self) -> Vec<crate::panel_state::spark_detail::Field> {
+        use crate::panel_state::spark_detail::Field;
         let mut out = Vec::new();
         if self.title.is_some() {
             out.push(Field::Title);
@@ -250,7 +250,7 @@ pub struct Workshop {
     /// UI state for the Hands panel (search query, history pagination,
     /// collapse flags). Held here so it survives panel re-renders without
     /// agents.rs needing to manage its own state.
-    pub agents_panel: crate::screen::agents::AgentsPanelState,
+    pub agents_panel: crate::panel_state::agents::AgentsPanelState,
     /// Active embers (Hand → Hand notifications) for this workshop. Refreshed
     /// on every sparks poll so the Home overview reflects current activity.
     pub embers: Vec<Ember>,
@@ -283,11 +283,11 @@ pub struct Workshop {
     /// Background picker modal state.
     pub background_picker: PickerState,
     /// Status filter for the sparks panel. Pill state mirrors this directly.
-    pub sparks_filter: crate::screen::sparks::SparksFilter,
+    pub sparks_filter: crate::panel_state::sparks::SparksFilter,
     /// Inline spark create form state.
-    pub spark_create_form: crate::screen::sparks::CreateForm,
+    pub spark_create_form: crate::panel_state::sparks::CreateForm,
     /// Inline status popover state for the workgraph panel.
-    pub spark_status_menu: crate::screen::sparks::StatusMenu,
+    pub spark_status_menu: crate::panel_state::sparks::StatusMenu,
     /// Cached agent session names for the filter bar assignee dropdown.
     /// Refreshed alongside `agent_sessions`. Spark ryve-baca34b0.
     pub agent_session_names: Vec<String>,
@@ -295,7 +295,7 @@ pub struct Workshop {
     /// `sparks` or `sparks_filter` changes. Spark ryve-baca34b0.
     pub filtered_sparks: Vec<Spark>,
     /// Active sort mode for the sparks panel. Spark ryve-6f24ef2a.
-    pub sort_mode: crate::screen::sparks::SortMode,
+    pub sort_mode: crate::panel_state::sparks::SortMode,
     /// Whether the sort mode dropdown is currently open. Spark ryve-6f24ef2a.
     pub sort_dropdown_open: bool,
     /// Currently selected spark ID (for detail view).
@@ -311,34 +311,34 @@ pub struct Workshop {
     /// blocked indicator without re-querying per row.
     pub blocked_spark_ids: HashSet<String>,
     /// Inline contract-create form for the spark detail view.
-    pub contract_create_form: crate::screen::spark_detail::ContractCreateForm,
+    pub contract_create_form: crate::panel_state::spark_detail::ContractCreateForm,
     /// Per-spark inline-edit state. `None` when no spark is currently
     /// being edited; replaced (not merged) when the selected spark
     /// changes. Invariant: at most one `SparkEdit` per workshop at a
     /// time — see [`Workshop::change_selected_spark`]. Spark
     /// ryve-1d8c2847.
-    pub spark_edit: Option<crate::screen::spark_detail::SparkEdit>,
-    pub acceptance_criteria_edit: crate::screen::spark_detail::AcceptanceCriteriaEdit,
-    pub intent_list_drafts: crate::screen::intent_list_editor::IntentListDrafts,
-    pub spark_edit_session: crate::screen::spark_detail::SparkEditSession,
-    pub assignee_edit: crate::screen::spark_detail::AssigneeEditState,
+    pub spark_edit: Option<crate::panel_state::spark_detail::SparkEdit>,
+    pub acceptance_criteria_edit: crate::panel_state::spark_detail::AcceptanceCriteriaEdit,
+    pub intent_list_drafts: crate::panel_state::intent_list_editor::IntentListDrafts,
+    pub spark_edit_session: crate::panel_state::spark_detail::SparkEditSession,
+    pub assignee_edit: crate::panel_state::spark_detail::AssigneeEditState,
     pub description_editor: Option<iced::widget::text_editor::Content>,
     pub pending_nav_prompt: Option<PendingNavPrompt>,
     /// Active multi-line problem-statement editor, if any. Spark ryve-a5997352.
-    pub problem_edit: Option<crate::screen::spark_detail::ProblemEditState>,
+    pub problem_edit: Option<crate::panel_state::spark_detail::ProblemEditState>,
     /// Whether the releases panel is shown instead of the sparks panel.
     pub show_releases: bool,
     /// Cached release view data for display. Refreshed alongside sparks.
-    pub release_view_data: Vec<crate::screen::releases::ReleaseViewData>,
+    pub release_view_data: Vec<crate::panel_state::releases::ReleaseViewData>,
     /// UI state for the releases panel.
-    pub releases_state: crate::screen::releases::ReleasesState,
+    pub releases_state: crate::panel_state::releases::ReleasesState,
     /// Whether the background image is dark (for adaptive font color).
     /// `None` means no background or not yet computed.
     pub bg_is_dark: Option<bool>,
     /// Pending agent spawn -- shows spark picker before creating terminal.
     pub pending_agent_spawn: Option<PendingAgentSpawn>,
     /// Pending Head spawn -- shows the Head picker overlay (agent + goal).
-    pub pending_head_spawn: Option<crate::screen::head_picker::PickerState>,
+    pub pending_head_spawn: Option<crate::panel_state::head_picker::PickerState>,
     /// One-shot warning set when the last worktree creation fell back to
     /// the main workshop directory. The UI drains this to surface a toast.
     pub last_worktree_warning: Option<String>,
@@ -397,7 +397,7 @@ impl Workshop {
             hand_assignments: Vec::new(),
             crews: Vec::new(),
             crew_members: Vec::new(),
-            agents_panel: crate::screen::agents::AgentsPanelState::default(),
+            agents_panel: crate::panel_state::agents::AgentsPanelState::default(),
             embers: Vec::new(),
             prev_blocked_spark_ids: HashSet::new(),
             prev_failing_contract_ids: HashSet::new(),
@@ -450,7 +450,7 @@ impl Workshop {
     /// Re-sort `self.sparks` in place according to the active `sort_mode`.
     /// Called after loading sparks from DB and after changing the sort mode.
     pub fn sort_sparks(&mut self) {
-        use crate::screen::sparks::{SortMode, spark_type_rank, status_rank};
+        use crate::panel_state::sparks::{SortMode, spark_type_rank, status_rank};
         match self.sort_mode {
             SortMode::Default => self.sparks.sort_by(|a, b| {
                 a.priority
@@ -629,11 +629,11 @@ impl Workshop {
     pub fn change_selected_spark(
         &mut self,
         new: Option<String>,
-    ) -> Option<crate::screen::spark_detail::SparkEdit> {
+    ) -> Option<crate::panel_state::spark_detail::SparkEdit> {
         let discarded = self
             .spark_edit
             .take()
-            .filter(crate::screen::spark_detail::SparkEdit::is_dirty);
+            .filter(crate::panel_state::spark_detail::SparkEdit::is_dirty);
         self.description_editor = None;
         // Problem editor is bound to a specific spark; clear it unless
         // the caller re-selected the same spark.
@@ -673,8 +673,8 @@ impl Workshop {
     /// differ from the persisted spark. A draft whose value matches
     /// the persisted field is not considered unsaved — the user
     /// merely opened the editor without typing.
-    fn has_unsaved_edits(&self, edit: &crate::screen::spark_detail::SparkEdit) -> bool {
-        use crate::screen::spark_detail::Field;
+    fn has_unsaved_edits(&self, edit: &crate::panel_state::spark_detail::SparkEdit) -> bool {
+        use crate::panel_state::spark_detail::Field;
 
         if !edit.in_flight.is_empty() {
             return true;
@@ -711,7 +711,7 @@ impl Workshop {
         let edit = self.spark_edit.as_ref()?;
         let draft = edit
             .drafts
-            .get(&crate::screen::spark_detail::Field::Description)?;
+            .get(&crate::panel_state::spark_detail::Field::Description)?;
         let spark = self.sparks.iter().find(|s| s.id == edit.spark_id)?;
         if draft != &spark.description {
             Some(edit.spark_id.clone())
@@ -741,7 +741,7 @@ impl Workshop {
             .as_ref()
             .is_none_or(|e| e.spark_id != selected);
         if need_new {
-            self.spark_edit = Some(crate::screen::spark_detail::SparkEdit::new(
+            self.spark_edit = Some(crate::panel_state::spark_detail::SparkEdit::new(
                 selected.clone(),
             ));
         }
@@ -753,7 +753,7 @@ impl Workshop {
         // ryve-1d8c2847 tests.
         let seeded = edit
             .drafts
-            .entry(crate::screen::spark_detail::Field::Description)
+            .entry(crate::panel_state::spark_detail::Field::Description)
             .or_insert_with(|| current.clone())
             .clone();
 
@@ -772,9 +772,9 @@ impl Workshop {
         self.description_editor = None;
         if let Some(edit) = self.spark_edit.as_mut() {
             edit.drafts
-                .remove(&crate::screen::spark_detail::Field::Description);
+                .remove(&crate::panel_state::spark_detail::Field::Description);
             edit.in_flight
-                .remove(&crate::screen::spark_detail::Field::Description);
+                .remove(&crate::panel_state::spark_detail::Field::Description);
         }
     }
 
@@ -785,7 +785,7 @@ impl Workshop {
         let edit = self.spark_edit.as_mut()?;
         let draft = edit
             .drafts
-            .remove(&crate::screen::spark_detail::Field::Description)?;
+            .remove(&crate::panel_state::spark_detail::Field::Description)?;
         let spark_id = edit.spark_id.clone();
         self.description_editor = None;
         Some((spark_id, draft))
@@ -1707,7 +1707,7 @@ pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::spa
 mod tests {
     use super::*;
     use crate::coding_agents::{CodingAgent, ResumeStrategy};
-    use crate::screen::agents::AgentSession;
+    use crate::panel_state::agents::AgentSession;
 
     #[test]
     fn terminal_font_settings_uses_workshop_size() {
@@ -2341,7 +2341,7 @@ mod tests {
     // through when not, and revert must leave `spark_edit` in a clean
     // state so the next open is a fresh seed.
 
-    use crate::screen::spark_detail::Field;
+    use crate::panel_state::spark_detail::Field;
 
     #[test]
     fn begin_description_edit_seeds_draft_from_persisted() {
