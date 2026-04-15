@@ -7,7 +7,11 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use super::error::SparksError;
+use super::id::generate_id;
 use super::types::*;
+
+const HA_SELECT_COLS: &str = "id, session_id, spark_id, status, role, assigned_at, last_heartbeat_at, \
+     lease_expires_at, completed_at, handoff_to, handoff_reason";
 
 /// Assign a Hand to a Spark. Fails if an active owner already exists.
 /// The check and INSERT are wrapped in a transaction to prevent TOCTOU races.
@@ -18,12 +22,14 @@ pub async fn assign(
     let mut tx = pool.begin().await?;
 
     if new.role == AssignmentRole::Owner {
-        let existing = sqlx::query_as::<_, HandAssignment>(
-            "SELECT * FROM hand_assignments WHERE spark_id = ? AND status = 'active' AND role = 'owner' LIMIT 1",
-        )
-        .bind(&new.spark_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let q = format!(
+            "SELECT {HA_SELECT_COLS} FROM assignments \
+             WHERE spark_id = ? AND status = 'active' AND role = 'owner' LIMIT 1"
+        );
+        let existing = sqlx::query_as::<_, HandAssignment>(&q)
+            .bind(&new.spark_id)
+            .fetch_optional(&mut *tx)
+            .await?;
 
         if let Some(existing) = existing {
             return Err(SparksError::AlreadyClaimed {
@@ -34,25 +40,32 @@ pub async fn assign(
     }
 
     let now = Utc::now().to_rfc3339();
+    let asgn_id = generate_id("asgn");
 
     let id = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO hand_assignments (session_id, spark_id, status, role, assigned_at, last_heartbeat_at)
-         VALUES (?, ?, 'active', ?, ?, ?)
+        "INSERT INTO assignments \
+         (assignment_id, spark_id, actor_id, session_id, status, role, assigned_at, \
+          last_heartbeat_at, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) \
          RETURNING id",
     )
-    .bind(&new.session_id)
+    .bind(&asgn_id)
     .bind(&new.spark_id)
+    .bind(&new.session_id)
+    .bind(&new.session_id)
     .bind(new.role.as_str())
+    .bind(&now)
+    .bind(&now)
     .bind(&now)
     .bind(&now)
     .fetch_one(&mut *tx)
     .await?;
 
-    let assignment =
-        sqlx::query_as::<_, HandAssignment>("SELECT * FROM hand_assignments WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let q = format!("SELECT {HA_SELECT_COLS} FROM assignments WHERE id = ?");
+    let assignment = sqlx::query_as::<_, HandAssignment>(&q)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     tx.commit().await?;
 
@@ -68,7 +81,8 @@ pub async fn complete(
     let now = Utc::now().to_rfc3339();
 
     let result = sqlx::query(
-        "UPDATE hand_assignments SET status = 'completed', completed_at = ? WHERE session_id = ? AND spark_id = ? AND status = 'active'",
+        "UPDATE assignments SET status = 'completed', completed_at = ? \
+         WHERE session_id = ? AND spark_id = ? AND status = 'active'",
     )
     .bind(&now)
     .bind(session_id)
@@ -95,7 +109,9 @@ pub async fn handoff(
     let now = Utc::now().to_rfc3339();
 
     let result = sqlx::query(
-        "UPDATE hand_assignments SET status = 'handed_off', completed_at = ?, handoff_to = ?, handoff_reason = ? WHERE session_id = ? AND spark_id = ? AND status = 'active'",
+        "UPDATE assignments SET status = 'handed_off', completed_at = ?, \
+         handoff_to = ?, handoff_reason = ? \
+         WHERE session_id = ? AND spark_id = ? AND status = 'active'",
     )
     .bind(&now)
     .bind(to_session_id)
@@ -122,7 +138,8 @@ pub async fn abandon(
     let now = Utc::now().to_rfc3339();
 
     sqlx::query(
-        "UPDATE hand_assignments SET status = 'abandoned', completed_at = ? WHERE session_id = ? AND spark_id = ? AND status = 'active'",
+        "UPDATE assignments SET status = 'abandoned', completed_at = ? \
+         WHERE session_id = ? AND spark_id = ? AND status = 'active'",
     )
     .bind(&now)
     .bind(session_id)
@@ -142,7 +159,8 @@ pub async fn heartbeat(
     let now = Utc::now().to_rfc3339();
 
     sqlx::query(
-        "UPDATE hand_assignments SET last_heartbeat_at = ? WHERE session_id = ? AND spark_id = ? AND status = 'active'",
+        "UPDATE assignments SET last_heartbeat_at = ? \
+         WHERE session_id = ? AND spark_id = ? AND status = 'active'",
     )
     .bind(&now)
     .bind(session_id)
@@ -161,17 +179,22 @@ pub async fn expire_stale_claims(
 ) -> Result<Vec<HandAssignment>, SparksError> {
     let now = Utc::now().to_rfc3339();
 
-    let stale = sqlx::query_as::<_, HandAssignment>(
-        "SELECT * FROM hand_assignments WHERE status = 'active' AND last_heartbeat_at IS NOT NULL AND datetime(last_heartbeat_at, '+' || ? || ' seconds') < datetime(?)",
-    )
-    .bind(max_age_seconds)
-    .bind(&now)
-    .fetch_all(pool)
-    .await?;
+    let q = format!(
+        "SELECT {HA_SELECT_COLS} FROM assignments \
+         WHERE status = 'active' AND last_heartbeat_at IS NOT NULL \
+         AND datetime(last_heartbeat_at, '+' || ? || ' seconds') < datetime(?)"
+    );
+    let stale = sqlx::query_as::<_, HandAssignment>(&q)
+        .bind(max_age_seconds)
+        .bind(&now)
+        .fetch_all(pool)
+        .await?;
 
     if !stale.is_empty() {
         sqlx::query(
-            "UPDATE hand_assignments SET status = 'expired', completed_at = ? WHERE status = 'active' AND last_heartbeat_at IS NOT NULL AND datetime(last_heartbeat_at, '+' || ? || ' seconds') < datetime(?)",
+            "UPDATE assignments SET status = 'expired', completed_at = ? \
+             WHERE status = 'active' AND last_heartbeat_at IS NOT NULL \
+             AND datetime(last_heartbeat_at, '+' || ? || ' seconds') < datetime(?)",
         )
         .bind(&now)
         .bind(max_age_seconds)
@@ -185,23 +208,23 @@ pub async fn expire_stale_claims(
 
 /// List all active hand assignments across all sparks.
 pub async fn list_active(pool: &SqlitePool) -> Result<Vec<HandAssignment>, SparksError> {
-    Ok(sqlx::query_as::<_, HandAssignment>(
-        "SELECT * FROM hand_assignments WHERE status = 'active'",
-    )
-    .fetch_all(pool)
-    .await?)
+    let q = format!("SELECT {HA_SELECT_COLS} FROM assignments WHERE status = 'active'");
+    Ok(sqlx::query_as::<_, HandAssignment>(&q)
+        .fetch_all(pool)
+        .await?)
 }
 
 /// List active hand assignments for sparks belonging to a specific workshop.
-/// Uses a single JOIN instead of fetching all assignments + all sparks separately.
 pub async fn list_active_for_workshop(
     pool: &SqlitePool,
     workshop_id: &str,
 ) -> Result<Vec<HandAssignment>, SparksError> {
     Ok(sqlx::query_as::<_, HandAssignment>(
-        "SELECT ha.* FROM hand_assignments ha
-         INNER JOIN sparks s ON s.id = ha.spark_id
-         WHERE ha.status = 'active' AND s.workshop_id = ?",
+        "SELECT a.id, a.session_id, a.spark_id, a.status, a.role, a.assigned_at, \
+         a.last_heartbeat_at, a.lease_expires_at, a.completed_at, a.handoff_to, a.handoff_reason \
+         FROM assignments a \
+         INNER JOIN sparks s ON s.id = a.spark_id \
+         WHERE a.status = 'active' AND s.workshop_id = ?",
     )
     .bind(workshop_id)
     .fetch_all(pool)
@@ -213,12 +236,14 @@ pub async fn active_for_spark(
     pool: &SqlitePool,
     spark_id: &str,
 ) -> Result<Option<HandAssignment>, SparksError> {
-    Ok(sqlx::query_as::<_, HandAssignment>(
-        "SELECT * FROM hand_assignments WHERE spark_id = ? AND status = 'active' AND role = 'owner' LIMIT 1",
-    )
-    .bind(spark_id)
-    .fetch_optional(pool)
-    .await?)
+    let q = format!(
+        "SELECT {HA_SELECT_COLS} FROM assignments \
+         WHERE spark_id = ? AND status = 'active' AND role = 'owner' LIMIT 1"
+    );
+    Ok(sqlx::query_as::<_, HandAssignment>(&q)
+        .bind(spark_id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// List all assignments for a session.
@@ -226,12 +251,14 @@ pub async fn list_for_session(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Vec<HandAssignment>, SparksError> {
-    Ok(sqlx::query_as::<_, HandAssignment>(
-        "SELECT * FROM hand_assignments WHERE session_id = ? ORDER BY assigned_at DESC",
-    )
-    .bind(session_id)
-    .fetch_all(pool)
-    .await?)
+    let q = format!(
+        "SELECT {HA_SELECT_COLS} FROM assignments \
+         WHERE session_id = ? ORDER BY assigned_at DESC"
+    );
+    Ok(sqlx::query_as::<_, HandAssignment>(&q)
+        .bind(session_id)
+        .fetch_all(pool)
+        .await?)
 }
 
 /// Check if a Spark is currently claimed by any active owner.
