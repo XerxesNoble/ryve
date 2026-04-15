@@ -1216,6 +1216,22 @@ pub struct NewRelease {
     pub notes: Option<String>,
 }
 
+/// Patch struct for [`release_repo::update`].
+///
+/// Each nullable field uses `Option<Option<T>>` to express three states:
+/// - `None` — field is unchanged
+/// - `Some(None)` — field is cleared to `NULL`
+/// - `Some(Some(v))` — field is set to `v`
+///
+/// `version` is non-nullable in the schema, so it stays `Option<String>`
+/// (unchanged vs. set).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateRelease {
+    pub version: Option<String>,
+    pub problem: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseStatus {

@@ -13,6 +13,7 @@ use sqlx::SqlitePool;
 use super::error::SparksError;
 use super::id::generate_id;
 use super::types::*;
+use crate::release_version;
 
 /// Validate that `s` is a strict `MAJOR.MINOR.PATCH` semver string.
 ///
@@ -102,6 +103,48 @@ pub async fn list(
         q = q.bind(b);
     }
     Ok(q.fetch_all(pool).await?)
+}
+
+/// Update mutable fields on an existing release. Only fields that are `Some`
+/// in `patch` are written; `None` fields are left unchanged.
+pub async fn update(
+    pool: &SqlitePool,
+    id: &str,
+    patch: UpdateRelease,
+) -> Result<Release, SparksError> {
+    let Release {
+        version: existing_version,
+        problem: existing_problem,
+        notes: existing_notes,
+        ..
+    } = get(pool, id).await?;
+
+    let version = match patch.version {
+        Some(v) => {
+            release_version::parse(&v).map_err(|_| SparksError::InvalidSemver(v.clone()))?;
+            v
+        }
+        None => existing_version,
+    };
+
+    let problem = match patch.problem {
+        Some(opt) => opt,
+        None => existing_problem,
+    };
+    let notes = match patch.notes {
+        Some(opt) => opt,
+        None => existing_notes,
+    };
+
+    sqlx::query("UPDATE releases SET version = ?, problem = ?, notes = ? WHERE id = ?")
+        .bind(&version)
+        .bind(&problem)
+        .bind(&notes)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    get(pool, id).await
 }
 
 /// Add an epic spark to a release.

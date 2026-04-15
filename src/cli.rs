@@ -299,6 +299,10 @@ fn print_usage() {
     eprintln!("  release create <major|minor|patch>   Create a new release");
     eprintln!("  release list                         List releases");
     eprintln!("  release show <id>                    Show release details + member epics");
+    eprintln!(
+        "  release edit <id> [--version <semver>] [--notes <text>] [--clear-notes] [--problem <text>] [--clear-problem]"
+    );
+    eprintln!("      Update release fields in place (pass --clear-* to null a field)");
     eprintln!("  release add-epic <id> <epic_id>      Add an epic to a release");
     eprintln!("  release remove-epic <id> <epic_id>   Remove an epic from a release");
     eprintln!("  release status <id> <status>         Transition release status");
@@ -2822,7 +2826,7 @@ async fn handle_release(
 ) {
     if args.is_empty() {
         die(
-            "release subcommand required (create, list, show, add-epic, remove-epic, status, close)",
+            "release subcommand required (create, list, show, edit, add-epic, remove-epic, status, close)",
         );
     }
     match args[0].as_str() {
@@ -3050,6 +3054,59 @@ async fn handle_release(
                 Err(e) => die(&format!("{e}")),
             }
         }
+        "edit" => {
+            if args.len() < 2 {
+                die(
+                    "release edit requires <id> [--version <ver>] [--notes <text>] [--clear-notes] [--problem <text>] [--clear-problem]",
+                );
+            }
+            let release_id = &args[1];
+            let mut patch = UpdateRelease::default();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--version" => {
+                        i += 1;
+                        if i >= args.len() {
+                            die("--version requires a value");
+                        }
+                        patch.version = Some(args[i].clone());
+                    }
+                    "--notes" => {
+                        i += 1;
+                        if i >= args.len() {
+                            die("--notes requires a value");
+                        }
+                        patch.notes = Some(Some(args[i].clone()));
+                    }
+                    "--clear-notes" => {
+                        patch.notes = Some(None);
+                    }
+                    "--problem" => {
+                        i += 1;
+                        if i >= args.len() {
+                            die("--problem requires a value");
+                        }
+                        patch.problem = Some(Some(args[i].clone()));
+                    }
+                    "--clear-problem" => {
+                        patch.problem = Some(None);
+                    }
+                    other => die(&format!("unknown flag '{other}' for release edit")),
+                }
+                i += 1;
+            }
+            match release_repo::update(pool, release_id, patch).await {
+                Ok(r) => {
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+                    } else {
+                        println!("{} updated — v{} ({})", r.id, r.version, r.status);
+                    }
+                }
+                Err(e) => die(&format!("{e}")),
+            }
+        }
         "close" => {
             if args.len() < 2 {
                 die("release close requires <id>");
@@ -3057,7 +3114,7 @@ async fn handle_release(
             release_close(pool, workshop_root, &args[1], json_mode).await;
         }
         other => die(&format!(
-            "unknown release subcommand '{other}': expected create, list, show, add-epic, remove-epic, status, or close"
+            "unknown release subcommand '{other}': expected create, list, show, edit, add-epic, remove-epic, status, or close"
         )),
     }
 }
