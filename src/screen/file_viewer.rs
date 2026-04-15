@@ -105,6 +105,144 @@ pub enum Message {
     SearchPrev,
 }
 
+/// Outcome of [`update`]: either the message was fully handled
+/// or it requires App-level state the screen module cannot access.
+pub enum UpdateResult {
+    /// The message was handled; carry the resulting task.
+    Handled(iced::Task<crate::Message>),
+    /// The message needs App-level handling; pass it back.
+    Unhandled(Message),
+}
+
+/// Process a file-viewer message, updating workshop state in place.
+///
+/// Handles variants that only mutate per-workshop screen state
+/// (scroll, search, selection, content loading, breadcrumb navigation).
+/// Variants that need App-level methods (`FileLoadFailed` needs
+/// `push_toast`, `ClickLine` needs `shift_held`) are returned as
+/// `UpdateResult::Unhandled`.
+pub fn update(ws: &mut crate::workshop::Workshop, msg: Message) -> UpdateResult {
+    match msg {
+        Message::GoToSpark(_spark_id) => {
+            // TODO: navigate to spark detail / select spark in panel
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::Scrolled {
+            offset_y,
+            viewport_height,
+        } => {
+            if let Some(active_id) = ws.bench.active_tab
+                && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
+            {
+                viewer.scroll_offset = offset_y;
+                viewer.viewport_height = viewport_height;
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CopySelection => {
+            if let Some(active_id) = ws.bench.active_tab
+                && let Some(viewer) = ws.file_viewers.get(&active_id)
+                && let Some(selected) = viewer.selected_text()
+                && let Ok(mut clip) = arboard::Clipboard::new()
+            {
+                let _ = clip.set_text(selected);
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ClearSelection => {
+            if let Some(active_id) = ws.bench.active_tab
+                && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
+            {
+                if viewer.search_open {
+                    viewer.close_search();
+                } else {
+                    viewer.clear_selection();
+                }
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::OpenSearch => {
+            if let Some(active_id) = ws.bench.active_tab
+                && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
+            {
+                viewer.open_search();
+                return UpdateResult::Handled(iced::widget::operation::focus(
+                    iced::widget::Id::new(SEARCH_INPUT_ID),
+                ));
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CloseSearch => {
+            if let Some(active_id) = ws.bench.active_tab
+                && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
+            {
+                viewer.close_search();
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::SearchQueryChanged(q) => {
+            if let Some(active_id) = ws.bench.active_tab
+                && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
+            {
+                viewer.set_search_query(q);
+                if let Some(target) = viewer.scroll_offset_for_current_match() {
+                    return UpdateResult::Handled(iced::widget::operation::scroll_to(
+                        iced::widget::Id::new(SCROLLABLE_ID),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
+                    ));
+                }
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::SearchNext => {
+            if let Some(active_id) = ws.bench.active_tab
+                && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
+            {
+                viewer.next_match();
+                if let Some(target) = viewer.scroll_offset_for_current_match() {
+                    return UpdateResult::Handled(iced::widget::operation::scroll_to(
+                        iced::widget::Id::new(SCROLLABLE_ID),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
+                    ));
+                }
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::SearchPrev => {
+            if let Some(active_id) = ws.bench.active_tab
+                && let Some(viewer) = ws.file_viewers.get_mut(&active_id)
+            {
+                viewer.prev_match();
+                if let Some(target) = viewer.scroll_offset_for_current_match() {
+                    return UpdateResult::Handled(iced::widget::operation::scroll_to(
+                        iced::widget::Id::new(SCROLLABLE_ID),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
+                    ));
+                }
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::NavigateToDir(ref target) => {
+            if *target == ws.directory {
+                ws.file_explorer.selected = None;
+            } else if target.starts_with(&ws.directory) {
+                let mut cur: Option<&std::path::Path> = Some(target.as_path());
+                while let Some(p) = cur {
+                    if p == ws.directory.as_path() {
+                        break;
+                    }
+                    ws.file_explorer.expanded.insert(p.to_path_buf());
+                    cur = p.parent();
+                }
+                ws.file_explorer.selected = Some(target.clone());
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        // ClickLine needs shift_held from App; FileLoadFailed needs push_toast
+        other => UpdateResult::Unhandled(other),
+    }
+}
+
 // ── State ─────────────────────────────────────────────
 
 #[derive(Debug)]

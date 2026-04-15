@@ -392,6 +392,11 @@ mod tests {
             completed_at: None,
             handoff_to: None,
             handoff_reason: None,
+            assignment_phase: None,
+            phase_changed_at: None,
+            phase_changed_by: None,
+            phase_actor_role: None,
+            phase_event_id: None,
         }
     }
 

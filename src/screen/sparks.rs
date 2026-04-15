@@ -495,6 +495,88 @@ pub enum Message {
     SparksFilterChanged,
 }
 
+/// Outcome of [`update`]: either the message was fully handled
+/// or it requires App-level state the screen module cannot access.
+pub enum UpdateResult {
+    /// The message was handled; carry the resulting task.
+    Handled(iced::Task<crate::Message>),
+    /// The message needs App-level handling; pass it back.
+    Unhandled(Message),
+}
+
+/// Process a sparks-panel message, updating workshop state in place.
+///
+/// Handles simple UI-state-only variants (form fields, status menu,
+/// sort dropdown, create form). Complex variants that need
+/// App-level methods or cross-workshop data are returned as
+/// `UpdateResult::Unhandled`.
+pub fn update(ws: &mut crate::workshop::Workshop, msg: Message) -> UpdateResult {
+    match msg {
+        Message::ShowCreateForm => {
+            let default_parent =
+                resolve_default_parent_epic(&ws.sparks, ws.selected_spark.as_deref());
+            ws.spark_create_form
+                .open_with_default_parent(default_parent);
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CreateFormTitleChanged(val) => {
+            ws.spark_create_form.title = val;
+            ws.spark_create_form.error = None;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CreateFormTypeChanged(val) => {
+            if val == "epic" {
+                ws.spark_create_form.parent_epic_id = None;
+            }
+            ws.spark_create_form.spark_type = val;
+            ws.spark_create_form.error = None;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CreateFormPriorityChanged(p) => {
+            ws.spark_create_form.priority = p;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CreateFormParentEpicChanged(val) => {
+            ws.spark_create_form.parent_epic_id = val;
+            ws.spark_create_form.error = None;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CancelCreate => {
+            ws.spark_create_form.visible = false;
+            ws.spark_create_form.reset();
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::OpenStatusMenu(spark_id) => {
+            ws.spark_status_menu.open(spark_id);
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CloseStatusMenu => {
+            ws.spark_status_menu.dismiss();
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::BeginCloseFlow(_spark_id) => {
+            ws.spark_status_menu.enter_close_stage();
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ToggleSortDropdown => {
+            ws.sort_dropdown_open = !ws.sort_dropdown_open;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ToggleEpicCollapse(ref epic_id) => {
+            ws.toggle_epic_collapse(epic_id);
+            let ryve_dir = ws.ryve_dir.clone();
+            let snapshot = ws.ui_state_snapshot();
+            tokio::spawn(async move {
+                if let Err(e) = data::ryve_dir::save_ui_state(&ryve_dir, &snapshot).await {
+                    log::warn!("failed to save .ryve/ui_state.json: {e}");
+                }
+            });
+            UpdateResult::Handled(iced::Task::none())
+        }
+        other => UpdateResult::Unhandled(other),
+    }
+}
+
 // ── Refresh button glyph ─────────────────────────────
 
 /// Pick the Workgraph panel's refresh-button glyph based on whether an

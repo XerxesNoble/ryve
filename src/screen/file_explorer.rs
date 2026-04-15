@@ -45,6 +45,38 @@ pub enum NodeKind {
     Directory,
 }
 
+/// Outcome of [`update`]: either the message was fully handled
+/// or it requires App-level state the screen module cannot access.
+pub enum UpdateResult {
+    /// The message was handled; carry the resulting task.
+    Handled(iced::Task<crate::Message>),
+    /// The message needs App-level handling; pass it back.
+    Unhandled(Message),
+}
+
+/// Process a file-explorer message, updating workshop state in place.
+///
+/// Messages that require App-level state (e.g. `SelectFile` needing
+/// `next_terminal_id` and `appearance`, or `Refresh` / `LinkSpark`
+/// needing cross-workshop data) are returned as `Unhandled`.
+pub fn update(ws: &mut crate::workshop::Workshop, msg: Message) -> UpdateResult {
+    match msg {
+        Message::ToggleDirectory(ref path) => {
+            if ws.file_explorer.expanded.contains(path) {
+                ws.file_explorer.expanded.remove(path);
+            } else {
+                ws.file_explorer.expanded.insert(path.clone());
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::TreeLoaded(..) => {
+            // Handled via FilesScanned at the App level
+            UpdateResult::Handled(iced::Task::none())
+        }
+        other => UpdateResult::Unhandled(other),
+    }
+}
+
 // ── State ─────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

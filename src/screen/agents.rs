@@ -68,6 +68,52 @@ pub enum Message {
 /// the bottom of History bumps the visible limit by this amount.
 pub const HISTORY_PAGE_SIZE: usize = 10;
 
+/// Outcome of [`update`]: either the message was fully handled
+/// or it requires App-level state the screen module cannot access.
+pub enum UpdateResult {
+    /// The message was handled; carry the resulting task.
+    Handled(iced::Task<crate::Message>),
+    /// The message needs App-level handling; pass it back.
+    Unhandled(Message),
+}
+
+/// Process an agents-panel message, updating workshop state in place.
+///
+/// Handles simple UI-state-only variants (search, pagination toggles,
+/// collapse toggles). Complex variants that need App-level methods
+/// (`push_toast`, `next_terminal_id`, `global_config`) are returned as
+/// `UpdateResult::Unhandled`.
+pub fn update(ws: &mut crate::workshop::Workshop, msg: Message) -> UpdateResult {
+    match msg {
+        Message::SearchChanged(query) => {
+            ws.agents_panel.search = query;
+            ws.agents_panel.history_limit = HISTORY_PAGE_SIZE;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::LoadMoreHistory => {
+            ws.agents_panel.history_limit += HISTORY_PAGE_SIZE;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ToggleStaleCollapsed => {
+            ws.agents_panel.stale_collapsed = !ws.agents_panel.stale_collapsed;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ToggleHeadExpanded(session_id) => {
+            if !ws.agents_panel.collapsed_heads.remove(&session_id) {
+                ws.agents_panel.collapsed_heads.insert(session_id);
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ToggleCrewExpanded(crew_id) => {
+            if !ws.agents_panel.collapsed_crews.remove(&crew_id) {
+                ws.agents_panel.collapsed_crews.insert(crew_id);
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        other => UpdateResult::Unhandled(other),
+    }
+}
+
 /// Per-panel UI state held on the Workshop. Pure data so it survives
 /// Workshop ticks without forcing agents.rs to manage its own subscription.
 #[derive(Debug, Clone)]
@@ -1190,6 +1236,11 @@ mod tests {
             completed_at: None,
             handoff_to: None,
             handoff_reason: None,
+            assignment_phase: None,
+            phase_changed_at: None,
+            phase_changed_by: None,
+            phase_actor_role: None,
+            phase_event_id: None,
         }
     }
 

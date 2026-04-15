@@ -874,6 +874,111 @@ pub enum Message {
     FocusAgentSession(String),
 }
 
+/// Outcome of [`update`]: either the message was fully handled
+/// or it requires App-level state the screen module cannot access.
+pub enum UpdateResult {
+    /// The message was handled; carry the resulting task.
+    Handled(iced::Task<crate::Message>),
+    /// The message needs App-level handling; pass it back.
+    Unhandled(Message),
+}
+
+/// Process a spark-detail message, updating workshop state in place.
+///
+/// Handles simple UI-state-only variants (form field changes, contract
+/// form toggles, description editing, confirm/cancel dialogs).
+/// Complex variants that need App-level methods (`push_toast`,
+/// `self.update`, `persist_acceptance_criteria`, `commit_assignee_edit`)
+/// are returned as `UpdateResult::Unhandled`.
+pub fn update(ws: &mut crate::workshop::Workshop, msg: Message) -> UpdateResult {
+    match msg {
+        Message::ShowCreateContract => {
+            ws.contract_create_form.visible = true;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CancelCreateContract => {
+            ws.contract_create_form.reset();
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CycleContractKind => {
+            ws.contract_create_form.kind = next_contract_kind(ws.contract_create_form.kind);
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ToggleContractEnforcement => {
+            ws.contract_create_form.enforcement =
+                toggle_enforcement(ws.contract_create_form.enforcement);
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ContractDescriptionChanged(val) => {
+            ws.contract_create_form.description = val;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ContractCheckCommandChanged(val) => {
+            ws.contract_create_form.check_command = val;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::AcceptanceCriterionChanged(i, val) => {
+            if let Some(slot) = ws.acceptance_criteria_edit.items.get_mut(i) {
+                *slot = val;
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ConfirmClosedEdit => {
+            let _ = ws.spark_edit_session.confirm_closed_edit();
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CancelClosedEdit => {
+            ws.spark_edit_session.cancel_closed_edit();
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::TitleChanged(val) => {
+            if let Some(ref mut edit) = ws.spark_edit {
+                edit.update_draft(Field::Title, val);
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::AssigneeInputChanged(val) => {
+            ws.assignee_edit.input = val;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::DescriptionClicked => {
+            ws.begin_description_edit();
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::DescriptionAction(action) => {
+            if let Some(ref mut content) = ws.description_editor {
+                content.perform(action);
+                let text = content.text();
+                let stripped = text.strip_suffix('\n').unwrap_or(&text).to_string();
+                if let Some(ref mut edit) = ws.spark_edit {
+                    edit.drafts.insert(Field::Description, stripped);
+                }
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::DescriptionRevert => {
+            ws.revert_description_edit();
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::NavPromptCancel => {
+            ws.pending_nav_prompt = None;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::ProblemAction(action) => {
+            if let Some(edit) = ws.problem_edit.as_mut() {
+                edit.content.perform(action);
+            }
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::CancelProblem => {
+            ws.problem_edit = None;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        // Complex variants that need App-level state
+        other => UpdateResult::Unhandled(other),
+    }
+}
+
 // ── Dropdown option lists ────────────────────────────
 
 /// Priority labels rendered in the priority pick_list. Index in this

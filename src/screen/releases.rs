@@ -25,6 +25,35 @@ pub enum Message {
     TogglePastReleases,
 }
 
+/// Outcome of [`update`]: either the message was fully handled
+/// (returning an optional task), or it requires App-level methods
+/// the screen module cannot access (e.g. push_toast).
+pub enum UpdateResult {
+    /// The message was handled; carry the resulting task.
+    Handled(iced::Task<crate::Message>),
+    /// The message needs App-level handling; pass it back.
+    Unhandled(Message),
+}
+
+/// Process a releases message, updating workshop state in place.
+///
+/// Messages that require App-level methods (e.g. `RequestClose` which
+/// calls `push_toast`) are returned as `UpdateResult::Unhandled` so the
+/// caller can handle them.
+pub fn update(ws: &mut crate::workshop::Workshop, msg: Message) -> UpdateResult {
+    match msg {
+        Message::Back => {
+            ws.show_releases = false;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        Message::TogglePastReleases => {
+            ws.releases_state.past_expanded = !ws.releases_state.past_expanded;
+            UpdateResult::Handled(iced::Task::none())
+        }
+        other => UpdateResult::Unhandled(other),
+    }
+}
+
 // ── State ───────────────────────────────────────────
 
 /// UI state for the releases panel, held on the Workshop.

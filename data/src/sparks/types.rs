@@ -732,8 +732,10 @@ impl AssignmentRole {
     }
 }
 
+/// A session-level hand assignment with heartbeat tracking (old system).
+/// Used by `assignment_repo.rs` and `transition.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct Assignment {
+pub struct HandAssignment {
     pub id: i64,
     pub session_id: String,
     pub spark_id: String,
@@ -762,10 +764,7 @@ pub struct Assignment {
     pub phase_event_id: Option<i64>,
 }
 
-/// Backward-compatible alias for code that still references HandAssignment.
-pub type HandAssignment = Assignment;
-
-pub struct NewAssignment {
+pub struct NewHandAssignment {
     pub session_id: String,
     pub spark_id: String,
     pub role: AssignmentRole,
@@ -773,53 +772,8 @@ pub struct NewAssignment {
     pub target_branch: Option<String>,
 }
 
-// ── Assignment Phase (transition state machine) ─────
-
-/// The workflow phase of an assignment, governed by a strict transition
-/// validator. Only the `transition::transition_assignment_phase` function
-/// may advance this value — direct UPDATEs are forbidden.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AssignmentPhase {
-    Assigned,
-    InProgress,
-    AwaitingReview,
-    Approved,
-    Rejected,
-    InRepair,
-    ReadyForMerge,
-    Merged,
-}
-
-impl AssignmentPhase {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Assigned => "assigned",
-            Self::InProgress => "in_progress",
-            Self::AwaitingReview => "awaiting_review",
-            Self::Approved => "approved",
-            Self::Rejected => "rejected",
-            Self::InRepair => "in_repair",
-            Self::ReadyForMerge => "ready_for_merge",
-            Self::Merged => "merged",
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "assigned" => Some(Self::Assigned),
-            "in_progress" => Some(Self::InProgress),
-            "awaiting_review" => Some(Self::AwaitingReview),
-            "approved" => Some(Self::Approved),
-            "rejected" => Some(Self::Rejected),
-            "in_repair" => Some(Self::InRepair),
-            "ready_for_merge" => Some(Self::ReadyForMerge),
-            "merged" => Some(Self::Merged),
-            _ => None,
-        }
-    }
-}
+// ── Assignment Phase and Transition Roles ─────────────
+// (AssignmentPhase enum is defined below in the "Assignment (phase-based)" section.)
 
 /// Role of the actor performing a phase transition. This is distinct from
 /// `AgentRole` (Director/Head/Hand hierarchy) and `AssignmentRole`
@@ -869,9 +823,6 @@ impl TransitionActorRole {
         matches!(self, Self::Head | Self::Director)
     }
 }
-
-/// Backward-compatible alias for code that still references NewHandAssignment.
-pub type NewHandAssignment = NewAssignment;
 
 // ── Crew ──────────────────────────────────────────────
 
@@ -1330,6 +1281,22 @@ pub struct Assignment {
     pub event_version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Fields required to create a new phase-lifecycle assignment.
+pub struct NewAssignment {
+    pub spark_id: String,
+    pub actor_id: String,
+    pub assignment_phase: AssignmentPhase,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+}
+
+/// Optional fields for updating an existing phase-lifecycle assignment.
+pub struct UpdateAssignment {
+    pub event_version: Option<i64>,
+    pub source_branch: Option<Option<String>>,
+    pub target_branch: Option<Option<String>>,
 }
 
 #[cfg(test)]
