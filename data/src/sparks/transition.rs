@@ -4,7 +4,7 @@
 //! Assignment-phase transition validator with role-based ownership.
 //!
 //! This module is the **sole code path** that may mutate
-//! `hand_assignments.assignment_phase`. Direct SQL UPDATEs to that column
+//! `assignments.assignment_phase`. Direct SQL UPDATEs to that column
 //! from any other module are forbidden.
 //!
 //! # Legal transition map

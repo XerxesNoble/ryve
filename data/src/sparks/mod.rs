@@ -7,7 +7,6 @@ pub mod agent_session_repo;
 pub mod alloy_repo;
 pub mod assign_repo;
 pub mod assignment_repo;
-pub mod assignment_state_machine;
 pub mod bond_repo;
 pub mod comment_repo;
 pub mod commit_link_repo;
