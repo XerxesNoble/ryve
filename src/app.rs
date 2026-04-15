@@ -22,6 +22,16 @@ use crate::widget::{self};
 use crate::workshop::{self, SparkPatch, Workshop};
 use crate::{agent_prompts, font_intern, tmux};
 
+struct WorkshopReadyData {
+    id: Uuid,
+    pool: sqlx::SqlitePool,
+    config: data::ryve_dir::WorkshopConfig,
+    custom_agents: Vec<data::ryve_dir::AgentDef>,
+    agent_context: Option<String>,
+    agent_context_sync_cache: std::sync::Arc<std::sync::Mutex<data::agent_context::SyncCache>>,
+    ui_state: data::ryve_dir::UiState,
+}
+
 /// Slot the std `UnixListener` returned by `ipc::acquire` waits in until
 /// the iced subscription wakes up and takes ownership of it. We can't
 /// hand it directly to iced from `main()` because the subscription
@@ -878,15 +888,15 @@ impl App {
                 agent_context,
                 agent_context_sync_cache,
                 ui_state,
-            } => self.handle_workshop_ready(
+            } => self.handle_workshop_ready(WorkshopReadyData {
                 id,
                 pool,
-                *config,
+                config: *config,
                 custom_agents,
                 agent_context,
                 agent_context_sync_cache,
-                *ui_state,
-            ),
+                ui_state: *ui_state,
+            }),
             Message::SparksLoaded(id, sparks) => self.handle_sparks_loaded(id, sparks),
             Message::SparkCreated(id, new_id, sparks) => {
                 self.handle_spark_created(id, new_id, sparks)
@@ -3016,16 +3026,16 @@ impl App {
         )
     }
 
-    fn handle_workshop_ready(
-        &mut self,
-        id: Uuid,
-        pool: sqlx::SqlitePool,
-        config: data::ryve_dir::WorkshopConfig,
-        custom_agents: Vec<data::ryve_dir::AgentDef>,
-        agent_context: Option<String>,
-        agent_context_sync_cache: std::sync::Arc<std::sync::Mutex<data::agent_context::SyncCache>>,
-        ui_state: data::ryve_dir::UiState,
-    ) -> Task<Message> {
+    fn handle_workshop_ready(&mut self, data: WorkshopReadyData) -> Task<Message> {
+        let WorkshopReadyData {
+            id,
+            pool,
+            config,
+            custom_agents,
+            agent_context,
+            agent_context_sync_cache,
+            ui_state,
+        } = data;
         let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
         let Some(idx) = ws_idx else {
             return Task::none();
