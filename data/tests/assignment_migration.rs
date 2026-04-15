@@ -1,13 +1,4 @@
-//! Tests for migration 013_hand_assignment_to_assignment.
-//!
-//! `#[sqlx::test]` runs all migrations before the test body, so migration 013
-//! has already executed against an empty `hand_assignments` table. We verify:
-//!
-//!   1. The `assignments` table exists with the new columns (phase, event_version,
-//!      source_branch, target_branch).
-//!   2. The `hand_assignments` backward-compatible view exposes the original columns.
-//!   3. Data inserted into `assignments` is visible through the view.
-//!   4. Re-running the migration SQL is idempotent — no errors, no duplicates.
+//! Tests for migration `013_assignments.sql`.
 
 async fn seed_session_and_spark(pool: &sqlx::SqlitePool, session_id: &str, spark_id: &str) {
     sqlx::query(
@@ -31,117 +22,110 @@ async fn seed_session_and_spark(pool: &sqlx::SqlitePool, session_id: &str, spark
 }
 
 #[sqlx::test]
-async fn assignments_table_has_new_columns(pool: sqlx::SqlitePool) {
+async fn assignments_table_has_canonical_columns(pool: sqlx::SqlitePool) {
     seed_session_and_spark(&pool, "sess-1234abcd", "sp-test-1").await;
 
-    // Insert via the assignments table with new columns.
     sqlx::query(
-        "INSERT INTO assignments (session_id, spark_id, status, role, phase, event_version, source_branch, target_branch, assigned_at)
-         VALUES ('sess-1234abcd', 'sp-test-1', 'active', 'owner', 'assigned', 0, 'hand/sess-123', 'main', '2026-04-09T00:00:00Z')",
+        "INSERT INTO assignments (
+            assignment_id, spark_id, actor_id, assignment_phase,
+            source_branch, target_branch, event_version, created_at, updated_at
+         ) VALUES (
+            'asgn-1', 'sp-test-1', 'sess-1234abcd', 'assigned',
+            'hand/sess-123', 'main', 0, '2026-04-09T00:00:00Z', '2026-04-09T00:00:00Z'
+         )",
     )
     .execute(&pool)
     .await
-    .expect("insert into assignments with new columns");
+    .expect("insert canonical assignment");
 
-    // Verify new columns are readable.
-    let (phase, ev, src, tgt): (String, i64, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT phase, event_version, source_branch, target_branch FROM assignments WHERE spark_id = 'sp-test-1'",
+    let row: (String, String, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT actor_id, assignment_phase, source_branch, target_branch, event_version
+         FROM assignments WHERE assignment_id = 'asgn-1'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
 
-    assert_eq!(phase, "assigned");
-    assert_eq!(ev, 0);
-    assert_eq!(src.as_deref(), Some("hand/sess-123"));
-    assert_eq!(tgt.as_deref(), Some("main"));
+    assert_eq!(row.0, "sess-1234abcd");
+    assert_eq!(row.1, "assigned");
+    assert_eq!(row.2.as_deref(), Some("hand/sess-123"));
+    assert_eq!(row.3.as_deref(), Some("main"));
+    assert_eq!(row.4, 0);
 }
 
 #[sqlx::test]
-async fn hand_assignments_view_reflects_assignments(pool: sqlx::SqlitePool) {
+async fn legacy_hand_assignments_table_still_works(pool: sqlx::SqlitePool) {
     seed_session_and_spark(&pool, "sess-viewtest1", "sp-view-1").await;
 
     sqlx::query(
-        "INSERT INTO assignments (session_id, spark_id, status, role, phase, event_version, source_branch, target_branch, assigned_at)
-         VALUES ('sess-viewtest1', 'sp-view-1', 'active', 'owner', 'assigned', 0, 'hand/sess-vie', 'main', '2026-04-09T00:00:00Z')",
+        "INSERT INTO hand_assignments (session_id, spark_id, status, role, assigned_at)
+         VALUES ('sess-viewtest1', 'sp-view-1', 'active', 'owner', '2026-04-09T00:00:00Z')",
     )
     .execute(&pool)
     .await
-    .expect("insert assignment");
+    .expect("insert legacy hand assignment");
 
-    // Query through the backward-compatible view.
-    let (session_id, spark_id, status, role): (String, String, String, String) = sqlx::query_as(
-        "SELECT session_id, spark_id, status, role FROM hand_assignments WHERE spark_id = 'sp-view-1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("view should return rows");
-
-    assert_eq!(session_id, "sess-viewtest1");
-    assert_eq!(spark_id, "sp-view-1");
-    assert_eq!(status, "active");
-    assert_eq!(role, "owner");
-}
-
-#[sqlx::test]
-async fn insert_or_ignore_prevents_duplicates(pool: sqlx::SqlitePool) {
-    // Verify that the INSERT OR IGNORE in the migration prevents duplicates
-    // when a row with the same (session_id, spark_id) already exists.
-    seed_session_and_spark(&pool, "sess-idempot01", "sp-idemp-1").await;
-
-    sqlx::query(
-        "INSERT INTO assignments (session_id, spark_id, status, role, phase, event_version, assigned_at)
-         VALUES ('sess-idempot01', 'sp-idemp-1', 'active', 'owner', 'assigned', 0, '2026-04-09T00:00:00Z')",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed assignment");
-
-    let count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assignments")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-    // Attempt to insert the same row again — must be silently skipped.
-    sqlx::query(
-        "INSERT OR IGNORE INTO assignments (session_id, spark_id, status, role, phase, event_version, assigned_at)
-         VALUES ('sess-idempot01', 'sp-idemp-1', 'active', 'owner', 'assigned', 0, '2026-04-09T00:00:00Z')",
-    )
-    .execute(&pool)
-    .await
-    .expect("duplicate insert should succeed silently");
-
-    let count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assignments")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        count_before, count_after,
-        "duplicate insert must not create new rows"
-    );
-}
-
-#[sqlx::test]
-async fn phase_defaults_match_status(pool: sqlx::SqlitePool) {
-    // Verify the default phase value is applied correctly.
-    seed_session_and_spark(&pool, "sess-phase-01", "sp-phase-1").await;
-
-    sqlx::query(
-        "INSERT INTO assignments (session_id, spark_id, status, role, assigned_at)
-         VALUES ('sess-phase-01', 'sp-phase-1', 'active', 'owner', '2026-04-09T00:00:00Z')",
-    )
-    .execute(&pool)
-    .await
-    .expect("insert with defaults");
-
-    let (phase, ev): (String, i64) = sqlx::query_as(
-        "SELECT phase, event_version FROM assignments WHERE spark_id = 'sp-phase-1'",
+    let row: (String, String, String, String) = sqlx::query_as(
+        "SELECT session_id, spark_id, status, role
+         FROM hand_assignments WHERE spark_id = 'sp-view-1'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
 
-    assert_eq!(phase, "assigned", "default phase should be 'assigned'");
-    assert_eq!(ev, 0, "default event_version should be 0");
+    assert_eq!(row.0, "sess-viewtest1");
+    assert_eq!(row.1, "sp-view-1");
+    assert_eq!(row.2, "active");
+    assert_eq!(row.3, "owner");
+}
+
+#[sqlx::test]
+async fn migrated_rows_can_be_copied_from_hand_assignments(pool: sqlx::SqlitePool) {
+    seed_session_and_spark(&pool, "sess-migrate1", "sp-migrate-1").await;
+
+    sqlx::query(
+        "INSERT INTO hand_assignments (
+            session_id, spark_id, status, role, assigned_at, completed_at
+         ) VALUES (
+            'sess-migrate1', 'sp-migrate-1', 'completed', 'owner',
+            '2026-04-09T00:00:00Z', '2026-04-09T01:00:00Z'
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert legacy row");
+
+    sqlx::query(
+        "INSERT INTO assignments (
+            assignment_id, spark_id, actor_id, assignment_phase,
+            source_branch, target_branch, event_version, created_at, updated_at
+         )
+         SELECT
+            'asgn-migrated-' || id,
+            spark_id,
+            session_id,
+            CASE status WHEN 'completed' THEN 'merged' ELSE 'assigned' END,
+            'hand/' || substr(session_id, 1, 8),
+            'main',
+            0,
+            assigned_at,
+            COALESCE(completed_at, last_heartbeat_at, assigned_at)
+         FROM hand_assignments
+         WHERE spark_id = 'sp-migrate-1'",
+    )
+    .execute(&pool)
+    .await
+    .expect("copy legacy row into canonical assignments");
+
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT actor_id, assignment_phase, target_branch
+         FROM assignments WHERE spark_id = 'sp-migrate-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, "sess-migrate1");
+    assert_eq!(row.1, "merged");
+    assert_eq!(row.2, "main");
 }

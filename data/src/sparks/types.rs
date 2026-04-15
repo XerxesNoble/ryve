@@ -733,7 +733,7 @@ impl AssignmentRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct Assignment {
+pub struct HandAssignment {
     pub id: i64,
     pub session_id: String,
     pub spark_id: String,
@@ -762,15 +762,37 @@ pub struct Assignment {
     pub phase_event_id: Option<i64>,
 }
 
-/// Backward-compatible alias for code that still references HandAssignment.
-pub type HandAssignment = Assignment;
-
-pub struct NewAssignment {
+pub struct NewHandAssignment {
     pub session_id: String,
     pub spark_id: String,
     pub role: AssignmentRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Assignment {
+    pub assignment_id: String,
+    pub spark_id: String,
+    pub actor_id: String,
+    pub assignment_phase: String,
     pub source_branch: Option<String>,
     pub target_branch: Option<String>,
+    pub event_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub struct NewAssignment {
+    pub spark_id: String,
+    pub actor_id: String,
+    pub assignment_phase: AssignmentPhase,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+}
+
+pub struct UpdateAssignment {
+    pub event_version: Option<i64>,
+    pub source_branch: Option<Option<String>>,
+    pub target_branch: Option<Option<String>>,
 }
 
 // ── Assignment Phase (transition state machine) ─────
@@ -819,6 +841,17 @@ impl AssignmentPhase {
             _ => None,
         }
     }
+
+    pub const ALL: &'static [Self] = &[
+        Self::Assigned,
+        Self::InProgress,
+        Self::AwaitingReview,
+        Self::Approved,
+        Self::Rejected,
+        Self::InRepair,
+        Self::ReadyForMerge,
+        Self::Merged,
+    ];
 }
 
 /// Role of the actor performing a phase transition. This is distinct from
@@ -869,9 +902,6 @@ impl TransitionActorRole {
         matches!(self, Self::Head | Self::Director)
     }
 }
-
-/// Backward-compatible alias for code that still references NewHandAssignment.
-pub type NewHandAssignment = NewAssignment;
 
 // ── Crew ──────────────────────────────────────────────
 
@@ -1250,86 +1280,6 @@ pub struct ReleaseEpic {
     pub release_id: String,
     pub spark_id: String,
     pub added_at: String,
-}
-
-// ── Assignment (phase-based) ────────────────────────
-//
-// A phase-lifecycle assignment linking an actor to a spark. Distinct from
-// `HandAssignment` which tracks session-level claims with heartbeats.
-// Schema version 1 — adding a phase variant requires a schema_version bump.
-
-/// Phase of an assignment's lifecycle.
-///
-/// **Invariant:** variant order is stable and versioned. Adding a new phase
-/// requires a corresponding schema_version bump in the assignments table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum AssignmentPhase {
-    Assigned,
-    InProgress,
-    AwaitingReview,
-    Approved,
-    Rejected,
-    InRepair,
-    ReadyForMerge,
-    Merged,
-}
-
-impl AssignmentPhase {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Assigned => "assigned",
-            Self::InProgress => "in_progress",
-            Self::AwaitingReview => "awaiting_review",
-            Self::Approved => "approved",
-            Self::Rejected => "rejected",
-            Self::InRepair => "in_repair",
-            Self::ReadyForMerge => "ready_for_merge",
-            Self::Merged => "merged",
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "assigned" => Some(Self::Assigned),
-            "in_progress" => Some(Self::InProgress),
-            "awaiting_review" => Some(Self::AwaitingReview),
-            "approved" => Some(Self::Approved),
-            "rejected" => Some(Self::Rejected),
-            "in_repair" => Some(Self::InRepair),
-            "ready_for_merge" => Some(Self::ReadyForMerge),
-            "merged" => Some(Self::Merged),
-            _ => None,
-        }
-    }
-
-    /// All phases in lifecycle order.
-    pub const ALL: &'static [Self] = &[
-        Self::Assigned,
-        Self::InProgress,
-        Self::AwaitingReview,
-        Self::Approved,
-        Self::Rejected,
-        Self::InRepair,
-        Self::ReadyForMerge,
-        Self::Merged,
-    ];
-}
-
-/// A phase-lifecycle assignment row from the `assignments` table.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct Assignment {
-    pub assignment_id: String,
-    pub spark_id: String,
-    pub actor_id: String,
-    pub assignment_phase: String,
-    pub source_branch: Option<String>,
-    pub target_branch: Option<String>,
-    pub event_version: i64,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[cfg(test)]
