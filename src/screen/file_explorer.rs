@@ -251,6 +251,16 @@ fn file_explorer_hash(state: &FileExplorerState) -> u64 {
         p.hash(&mut h);
         std::mem::discriminant(s).hash(&mut h);
     }
+    // Hash individual diff-stat entries (path + additions + deletions)
+    // deterministically so the +/- badges invalidate when a file's diff
+    // numbers change but the entry count does not (Copilot PR #23 review).
+    let mut ds_sorted: Vec<(&PathBuf, &DiffStat)> = state.diff_stats.iter().collect();
+    ds_sorted.sort_by_key(|(p, _)| *p);
+    for (p, d) in ds_sorted {
+        p.hash(&mut h);
+        d.additions.hash(&mut h);
+        d.deletions.hash(&mut h);
+    }
     h.finish()
 }
 

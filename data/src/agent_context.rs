@@ -192,6 +192,17 @@ fn cache_set(cache: &Mutex<SyncCache>, path: PathBuf, hash: u64) {
         .insert(path, hash);
 }
 
+/// Drop a cache entry — used when we observe a tracked file has disappeared
+/// from disk so the next sync will recreate it instead of skipping via the
+/// warm-cache fast path.
+fn cache_forget(cache: &Mutex<SyncCache>, path: &Path) {
+    cache
+        .lock()
+        .expect("agent_context sync cache mutex poisoned")
+        .file_hashes
+        .remove(path);
+}
+
 // ── WORKSHOP.md generation ────────────────────────────
 
 fn generate_workshop_md() -> String {
@@ -601,14 +612,26 @@ async fn inject_pointer_if_changed(
     let path = workshop_dir.join(relative);
 
     // Cheap path: if we previously wrote or observed a correct file at this
-    // path, the injected pointer block is constant (deterministic), so the
-    // file is still correct. Skip all I/O. External edits self-correct on the
-    // next cold start (fresh cache).
+    // path *and* the file still exists, the injected pointer block is
+    // constant (deterministic), so the file is still correct. Skip all I/O.
+    // External edits self-correct on the next cold start (fresh cache).
+    //
+    // We verify existence here so that a mid-run deletion of the pointer
+    // file is repaired on the next sync rather than being "forgotten" until
+    // a fresh cache is constructed (Copilot PR #23 review).
     if cache_has_entry(cache, &path) {
-        return Ok(());
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => return Ok(()),
+            Err(_) => {
+                // File was deleted out from under us — invalidate the cache
+                // entry and fall through to recreate it.
+                cache_forget(cache, &path);
+            }
+        }
     }
 
-    // Cache miss (cold cache or first encounter) — fall through to read/write.
+    // Cache miss (cold cache, first encounter, or repaired deletion) —
+    // fall through to read/write.
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -906,15 +929,25 @@ mod tests {
         assert!(md.contains("ryve spark edit"));
     }
 
-    /// Spark ryve-f84c676f: warm-cache sync must skip I/O entirely for
-    /// pointer injection files. We verify by making the target files
-    /// read-only after the first sync — if the second sync attempts to
-    /// read or write them, it would succeed (reads still work on
-    /// read-only files), but modifying permissions lets us confirm the
-    /// cache is the only thing consulted.
+    /// Spark ryve-f84c676f: warm-cache sync must not add new cache entries
+    /// on a second pass, which would indicate it re-hashed and re-wrote
+    /// files it had already observed.
     ///
-    /// More importantly, this test checks that `inject_pointer_if_changed`
-    /// short-circuits via `cache_has_entry` *before* any filesystem access.
+    /// What this test actually asserts (kept narrow to avoid filesystem
+    /// timing flakiness in CI):
+    /// 1. After the first sync, the cache contains an entry for every
+    ///    file sync is responsible for (WORKSHOP.md + each target file).
+    /// 2. A second sync with that warm cache produces no additional
+    ///    entries, which is the observable signature of the fast path in
+    ///    `inject_pointer_if_changed` short-circuiting via
+    ///    `cache_has_entry` before any disk I/O.
+    ///
+    /// This is an indirect but deterministic check. A stricter "no I/O"
+    /// assertion (e.g. chmod the target read-only and confirm no write
+    /// error surfaces) was intentionally not used: read-only permissions
+    /// do not block reads, and syscall-level verification is platform-
+    /// specific. The cache-size invariant is sufficient to catch the
+    /// regression we care about (Copilot PR #23 review).
     #[tokio::test]
     async fn warm_cache_sync_does_not_read_pointer_files() {
         let tmp = tempfile::tempdir().unwrap();

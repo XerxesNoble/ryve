@@ -532,6 +532,15 @@ fn sparks_list_hash(
         s.updated_at.hash(&mut h);
     }
     blocked_ids.len().hash(&mut h);
+    // Deterministic: hash sorted blocked IDs, not just the count. The
+    // blocked set can churn membership without changing size, and the
+    // blocked/unblocked styling in the list depends on its contents
+    // (Copilot PR #23 review).
+    let mut blocked_sorted: Vec<&String> = blocked_ids.iter().collect();
+    blocked_sorted.sort_unstable();
+    for id in blocked_sorted {
+        id.hash(&mut h);
+    }
     collapsed.len().hash(&mut h);
     // Deterministic: hash sorted collapsed IDs.
     let mut collapsed_sorted: Vec<&String> = collapsed.iter().collect();
@@ -542,6 +551,15 @@ fn sparks_list_hash(
     status_menu.open_for.hash(&mut h);
     status_menu.close_stage.hash(&mut h);
     agent_sessions.len().hash(&mut h);
+    // Assignee link rendering resolves sessions by id and renders their
+    // name, so sessions churning without count change must invalidate the
+    // cache (Copilot PR #23 review). Hash in the natural slice order —
+    // `agent_sessions` is already deterministically ordered by the
+    // workshop loader.
+    for s in agent_sessions {
+        s.id.hash(&mut h);
+        s.name.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -2417,13 +2435,12 @@ mod tests {
             group_per_iter.as_nanos() as f64 / hash_per_iter.as_nanos().max(1) as f64
         );
 
-        // On a cache hit, lazy only pays the hash cost. On a miss it pays
-        // hash + full rebuild. The hash must be cheaper than group_by_epic
-        // alone to show measurable improvement.
-        assert!(
-            hash_per_iter < group_per_iter,
-            "hash ({hash_per_iter:?}) should be cheaper than group_by_epic ({group_per_iter:?})"
-        );
+        // Intentionally not asserting `hash_per_iter < group_per_iter`:
+        // wall-clock comparisons are flaky under CI load and across
+        // machines. The timings are printed above for ad-hoc inspection;
+        // quantitative perf tracking lives in the Criterion benches under
+        // `perf_core/benches` (Copilot PR #23 review). This unit test
+        // only covers the functional properties asserted below.
 
         // Verify hash stability: same input → same output.
         let h1 = sparks_list_hash(&sparks, &blocked_ids, &collapsed, &status_menu, &sessions);

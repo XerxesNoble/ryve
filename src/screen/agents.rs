@@ -505,6 +505,13 @@ fn agents_panel_hash(
         .map(|d| d.as_secs() / 5)
         .unwrap_or(0);
     time_bucket.hash(&mut h);
+    // `last_output_at` drives idle/working status color relative to
+    // `Instant::now()`. Bucket the elapsed time at the same 5-second
+    // cadence as `time_bucket` so a session crossing an idle threshold
+    // within a bucket window still invalidates the lazy cache
+    // (Copilot PR #23 review). Capture `now` once here so all sessions
+    // share the same reference point for a stable hash within one frame.
+    let now = Instant::now();
     sessions.len().hash(&mut h);
     for s in sessions {
         s.id.hash(&mut h);
@@ -514,6 +521,13 @@ fn agents_panel_hash(
         s.tmux_session_live.hash(&mut h);
         s.parent_session_id.hash(&mut h);
         s.session_label.hash(&mut h);
+        match s.last_output_at {
+            Some(t) => {
+                let elapsed_bucket = now.saturating_duration_since(t).as_secs() / 5;
+                (1u8, elapsed_bucket).hash(&mut h);
+            }
+            None => 0u8.hash(&mut h),
+        }
     }
     assignments.len().hash(&mut h);
     for a in assignments {
@@ -1312,17 +1326,7 @@ mod tests {
     fn view_renders_with_empty_sessions() {
         // Smoke test: building the view with no sessions must not panic.
         let state = AgentsPanelState::default();
-        let _ = view(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &state,
-            Palette::dark(),
-            Instant::now(),
-            chrono::Utc::now(),
-        );
+        let _ = view(&[], &[], &[], &[], &[], &state, Palette::dark());
     }
 
     #[test]
@@ -1335,17 +1339,7 @@ mod tests {
             },
         ];
         let state = AgentsPanelState::default();
-        let _ = view(
-            &sessions,
-            &[],
-            &[],
-            &[],
-            &[],
-            &state,
-            Palette::dark(),
-            Instant::now(),
-            chrono::Utc::now(),
-        );
+        let _ = view(&sessions, &[], &[], &[], &[], &state, Palette::dark());
     }
 
     #[test]
@@ -1727,17 +1721,7 @@ mod tests {
         // `view` function — the session appears in Active with no panic.
         let sessions = vec![s];
         let state = AgentsPanelState::default();
-        let _ = view(
-            &sessions,
-            &[],
-            &[],
-            &[],
-            &[],
-            &state,
-            pal,
-            Instant::now(),
-            chrono::Utc::now(),
-        );
+        let _ = view(&sessions, &[], &[], &[], &[], &state, pal);
     }
 
     #[test]
@@ -1751,16 +1735,6 @@ mod tests {
         let pal = Palette::dark();
         let sessions = vec![s];
         let state = AgentsPanelState::default();
-        let _ = view(
-            &sessions,
-            &[],
-            &[],
-            &[],
-            &[],
-            &state,
-            pal,
-            Instant::now(),
-            chrono::Utc::now(),
-        );
+        let _ = view(&sessions, &[], &[], &[], &[], &state, pal);
     }
 }

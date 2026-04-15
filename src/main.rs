@@ -6613,9 +6613,13 @@ impl App {
             None => self.appearance.palette(),
         };
 
-        // Compute clock snapshots once per frame so row renderers avoid
-        // per-row Instant::now() / Utc::now() calls. Spark ryve-252c5b6e.
-        let frame_now = std::time::Instant::now();
+        // Compute the wall-clock snapshot once per frame so downstream row
+        // renderers avoid per-row Utc::now() calls. Spark ryve-252c5b6e.
+        // (A monotonic `Instant::now()` snapshot used to live here too but
+        // the surviving consumer — `screen::agents::view` — takes its own
+        // `Instant::now()` inside its `lazy()` closure, where the call
+        // only fires on cache miss, so plumbing it through added no win.
+        // Removed per Copilot PR #23 review.)
         let frame_utc_now = chrono::Utc::now();
 
         // -- Left sidebar: files (top) + agents (bottom) --
@@ -6627,7 +6631,7 @@ impl App {
             .height(Length::FillPortion((ws.sidebar_split() * 100.0) as u16))
             .style(move |_theme: &Theme| style::glass_panel(&pal, has_bg));
 
-        let agents_panel = container(self.view_agents(ws, has_bg, &pal, frame_now, frame_utc_now))
+        let agents_panel = container(self.view_agents(ws, has_bg, &pal))
             .width(Length::Fill)
             .height(Length::FillPortion(
                 ((1.0 - ws.sidebar_split()) * 100.0) as u16,
@@ -6915,8 +6919,6 @@ impl App {
         ws: &'a Workshop,
         _has_bg: bool,
         pal: &style::Palette,
-        _now: std::time::Instant,
-        _utc_now: chrono::DateTime<chrono::Utc>,
     ) -> Element<'a, Message> {
         screen::agents::view(
             &ws.agent_sessions,
