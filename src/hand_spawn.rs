@@ -35,7 +35,8 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::agent_prompts::{
-    HeadArchetype, compose_hand_prompt, compose_head_prompt, compose_merger_prompt,
+    HeadArchetype, compose_hand_prompt, compose_head_prompt, compose_investigator_prompt,
+    compose_merger_prompt,
 };
 use crate::coding_agents::CodingAgent;
 use crate::tmux::{self, TmuxClient, TmuxError};
@@ -55,6 +56,15 @@ pub enum HandKind {
     /// records `AssignmentRole::Owner` against the parent epic because
     /// the Head "owns" that epic for the lifetime of its crew.
     Head,
+    /// A read-only **Investigator** Hand. Spawned by a Research Head to
+    /// audit code and post findings as comments. Mechanically identical
+    /// to an Owner Hand (same worktree, same session row, same launch
+    /// flow), distinguished by `agent_sessions.session_label =
+    /// "investigator"` and by the read-only system prompt composed via
+    /// [`compose_investigator_prompt`]. The assignment row records
+    /// `AssignmentRole::Owner` against the audit spark because the
+    /// investigator "owns" that spark for the lifetime of its sweep.
+    Investigator,
     /// The crew's integrator. Requires `crew_id` to be set.
     Merger,
 }
@@ -67,7 +77,23 @@ impl HandKind {
             // semantics as an Owner Hand, just a different session_label
             // and system prompt.
             Self::Head => AssignmentRole::Owner,
+            // Investigators claim the audit spark they are sweeping —
+            // same assignment semantics as an Owner Hand, just a
+            // different session_label and a read-only system prompt.
+            Self::Investigator => AssignmentRole::Owner,
             Self::Merger => AssignmentRole::Merger,
+        }
+    }
+
+    /// The value written to `agent_sessions.session_label` and used as the
+    /// crew_members role label. Kept here so spawn, crew-add, tmux-name,
+    /// and tests all share one source of truth.
+    fn session_label(self) -> &'static str {
+        match self {
+            Self::Owner => "hand",
+            Self::Head => "head",
+            Self::Investigator => "investigator",
+            Self::Merger => "merger",
         }
     }
 }
@@ -271,11 +297,7 @@ pub async fn spawn_hand(
         agent_name: agent.display_name.clone(),
         agent_command: agent.command.clone(),
         agent_args: agent.args.clone(),
-        session_label: Some(match kind {
-            HandKind::Owner => "hand".to_string(),
-            HandKind::Head => "head".to_string(),
-            HandKind::Merger => "merger".to_string(),
-        }),
+        session_label: Some(kind.session_label().to_string()),
         child_pid: None,
         resume_id: None,
         log_path: Some(log_path.to_string_lossy().into_owned()),
@@ -296,12 +318,7 @@ pub async fn spawn_hand(
 
     // 4. Add to crew if requested.
     if let Some(cid) = crew_id {
-        let role_label = match kind {
-            HandKind::Owner => "hand",
-            HandKind::Head => "head",
-            HandKind::Merger => "merger",
-        };
-        crew_repo::add_member(pool, cid, &session_id, Some(role_label)).await?;
+        crew_repo::add_member(pool, cid, &session_id, Some(kind.session_label())).await?;
     }
 
     // 5. Compose the prompt.
@@ -326,6 +343,18 @@ pub async fn spawn_hand(
             // we still compose a prompt with just the id.
             let epic_title = spark_repo::get(pool, spark_id).await.ok().map(|s| s.title);
             compose_head_prompt(HeadArchetype::Build, Some(spark_id), epic_title.as_deref())
+        }
+        HandKind::Investigator => {
+            let sparks = spark_repo::list(
+                pool,
+                SparkFilter {
+                    workshop_id: Some(workshop_id_for(workshop_dir)),
+                    ..SparkFilter::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|_| Vec::<Spark>::new());
+            compose_investigator_prompt(&sparks, spark_id)
         }
         HandKind::Merger => compose_merger_prompt(crew_id.unwrap_or(""), spark_id),
     };
@@ -560,12 +589,7 @@ pub async fn spawn_head(
 /// Derive the tmux session name from the kind and session id.
 /// Invariant: one tmux session per `agent_sessions` row.
 fn tmux_session_name(kind: HandKind, session_id: &str) -> String {
-    let prefix = match kind {
-        HandKind::Owner => "hand",
-        HandKind::Head => "head",
-        HandKind::Merger => "merger",
-    };
-    format!("{prefix}-{session_id}")
+    format!("{}-{}", kind.session_label(), session_id)
 }
 
 /// Launch the coding agent inside a tmux session on Ryve's private socket.
@@ -1208,6 +1232,133 @@ mod tests {
     }
 
     // ─── Spark ryve-c44b92e5: actor-scoped branches + cross-user refusal ──
+
+    // ─── Spark ryve-a2d447d1: HandKind::Investigator + CLI --role investigator ──
+
+    /// `HandKind::Investigator` carries the session_label "investigator"
+    /// (written to `agent_sessions.session_label` and to the crew_members
+    /// role column) and claims its spark with `AssignmentRole::Owner` —
+    /// same as a regular Owner Hand. The invariant-preserving test for
+    /// acceptance criterion (3) of spark ryve-a2d447d1.
+    #[test]
+    fn investigator_kind_maps_to_owner_role_and_investigator_label() {
+        assert_eq!(HandKind::Investigator.role(), AssignmentRole::Owner);
+        assert_eq!(HandKind::Investigator.session_label(), "investigator");
+        // And the existing three kinds keep their labels.
+        assert_eq!(HandKind::Owner.session_label(), "hand");
+        assert_eq!(HandKind::Head.session_label(), "head");
+        assert_eq!(HandKind::Merger.session_label(), "merger");
+    }
+
+    /// End-to-end: `spawn_hand` with `HandKind::Investigator` must persist
+    /// `session_label = "investigator"` on the `agent_sessions` row AND on
+    /// the `crew_members` row, and must claim the spark with
+    /// `AssignmentRole::Owner`. Acceptance criterion (4) of spark
+    /// ryve-a2d447d1.
+    #[tokio::test]
+    async fn spawn_hand_records_investigator_label_on_session_and_crew() {
+        if !bundled_tmux_available_for_tests() {
+            eprintln!("bundled tmux not available — skipping investigator spawn test");
+            return;
+        }
+        let (workshop_dir, pool, _out_path) = setup_workshop().await;
+        let stub_path = workshop_dir.join("stub-agent.sh");
+
+        let workshop_id = workshop_id_for(&workshop_dir);
+        let spark = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "audit spark".into(),
+                description: "investigator sweep".into(),
+                spark_type: SparkType::Epic,
+                priority: 2,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // A crew to verify the crew_members role column gets the
+        // "investigator" label too (invariant: the crew add-member path
+        // tags investigator members with role label "investigator", not
+        // "hand").
+        let crew = crew_repo::create(
+            &pool,
+            NewCrew {
+                name: "research crew".into(),
+                purpose: None,
+                workshop_id: workshop_id.clone(),
+                head_session_id: None,
+                parent_spark_id: Some(spark.id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent = CodingAgent {
+            display_name: "stub".into(),
+            command: stub_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            resume: ResumeStrategy::None,
+            compatibility: crate::coding_agents::CompatStatus::Unknown,
+        };
+
+        let spawned = spawn_hand(
+            &workshop_dir,
+            &pool,
+            &agent,
+            &spark.id,
+            HandKind::Investigator,
+            SpawnContext {
+                crew_id: Some(&crew.id),
+                ..SpawnContext::default()
+            },
+        )
+        .await
+        .expect("spawn_hand with HandKind::Investigator should succeed");
+
+        // 1. agent_sessions.session_label == "investigator".
+        let sessions_db = agent_session_repo::list_for_workshop(&pool, &workshop_id)
+            .await
+            .expect("list sessions");
+        let row = sessions_db
+            .iter()
+            .find(|s| s.id == spawned.session_id)
+            .expect("session row for spawned investigator");
+        assert_eq!(row.session_label.as_deref(), Some("investigator"));
+
+        // 2. Assignment row claims the spark with AssignmentRole::Owner.
+        //    We assert this indirectly via is_spark_claimed + actor lookup
+        //    (same hooks the branch validator and UI use).
+        let claimed = data::sparks::assignment_repo::is_spark_claimed(&pool, &spark.id)
+            .await
+            .unwrap();
+        assert!(claimed, "investigator must claim its audit spark");
+
+        // 3. crew_members row for this session carries role = "investigator".
+        let members = crew_repo::members(&pool, &crew.id).await.unwrap();
+        let member = members
+            .iter()
+            .find(|m| m.session_id == spawned.session_id)
+            .expect("investigator must be registered as a crew member");
+        assert_eq!(
+            member.role.as_deref(),
+            Some("investigator"),
+            "crew member role must be 'investigator', not 'hand'"
+        );
+
+        let tmux_name = format!("investigator-{}", spawned.session_id);
+        cleanup_tmux(&workshop_dir, &tmux_name);
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
 
     /// `validate_actor` accepts any non-empty single-segment string and
     /// rejects anything that would produce an invalid git ref or collide

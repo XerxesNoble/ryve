@@ -506,6 +506,119 @@ pub fn compose_perf_head_prompt(epic_id: Option<&str>, epic_title: Option<&str>)
     prompt
 }
 
+/// Compose the initial prompt for an **Investigator** Hand — a read-only
+/// Hand whose only outputs are structured findings posted as comments on
+/// the parent spark.
+///
+/// The investigator is the worker archetype a Research Head spawns
+/// (`head_archetype.rs:151`). It must never edit source, never run
+/// destructive git/shell, and never create files outside the `.ryve/`
+/// scratch area. Findings are emitted exclusively via
+/// `ryve comment add <spark_id>` using the structured schema defined in
+/// the prompt (severity, category, file:line, evidence, recommendation).
+///
+/// The prompt includes the parent spark's title, problem, and acceptance
+/// criteria so the investigator can scope its sweep without a second
+/// round-trip. If the spark is absent from `sparks`, the prompt tells the
+/// investigator to load it with `ryve spark show` before proceeding.
+// Not yet wired into the spawn path; that is the explicit non-goal of
+// spark ryve-c0733c9c. Downstream spark ryve-985e4967 (HandKind + CLI)
+// will call this. Mirrors the `compose_perf_head_prompt` pattern above.
+#[allow(dead_code)]
+pub fn compose_investigator_prompt(sparks: &[Spark], spark_id: &str) -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str(
+        "EXECUTE THE ASSIGNMENT BELOW IMMEDIATELY. Do not acknowledge, summarize, \
+         or wait for confirmation — start running read-only tools right away. \
+         You are an **Investigator Hand** in a Ryve workshop. Your ENTIRE output \
+         is structured findings posted as comments on the parent spark. You do \
+         not write code. You do not edit files. You do not run destructive \
+         commands.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "ASSIGNMENT: spark {spark_id} (role: INVESTIGATOR). Mark it in progress \
+         now: `ryve spark status {spark_id} in_progress`. When your sweep is \
+         complete and every finding has been posted as a comment, close the \
+         spark: `ryve spark close {spark_id} completed`.\n\n"
+    ));
+
+    prompt.push_str("PARENT SPARK — scope your investigation to this intent:\n\n");
+    if let Some(spark) = sparks.iter().find(|s| s.id == spark_id) {
+        push_spark_details(&mut prompt, spark);
+    } else {
+        prompt.push_str(&format!(
+            "(Spark {spark_id} details not in cache — run `ryve spark show {spark_id}` \
+             to load its title, problem statement, invariants, and acceptance criteria \
+             before posting any findings.)\n"
+        ));
+    }
+
+    prompt.push_str(
+        "\nREAD-ONLY DISCIPLINE (non-negotiable):\n\
+         - You MUST NOT use Edit, Write, or NotebookEdit tools. You MUST NOT \
+           mutate any file in the worktree outside the `.ryve/` scratch area.\n\
+         - You MUST NOT run destructive git: no `git reset --hard`, no \
+           `git push --force` / force-push of any kind, no `git branch -D`, no \
+           `git checkout -- <path>`, no `git clean -f`. Do not pass \
+           `--no-verify` to any git command.\n\
+         - Shell is limited to READ commands (`ls`, `cat`, `rg`, `grep`, \
+           `find`, `git log`, `git show`, `git diff`, `git blame`, `git status`, \
+           `wc`, `head`, `tail`) and the `ryve` CLI. No package installs, no \
+           build/test steps that mutate on-disk state, no network uploads, no \
+           `rm`, no `mv`, no `chmod`.\n\
+         - Use `ryve` for ALL workgraph operations (`ryve spark show`, \
+           `ryve bond list`, `ryve comment add`, etc.). NEVER touch \
+           `.ryve/sparks.db` directly with sqlite3.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "FINDING CONTRACT — structured schema. Every finding you emit is a \
+         SINGLE comment on spark `{spark_id}` via:\n\n\
+         \x20\x20\x20\x20ryve comment add {spark_id} '<finding body>'\n\n\
+         Each finding body MUST use this exact block format (one block per \
+         comment; do not batch multiple findings into one comment):\n\n\
+         \x20\x20\x20\x20FINDING\n\
+         \x20\x20\x20\x20severity: <blocker|high|medium|low|info>\n\
+         \x20\x20\x20\x20category: <correctness|security|performance|reliability|maintainability|docs|other>\n\
+         \x20\x20\x20\x20location: <path/to/file.rs:LINE> [, <path/to/other.rs:LINE> ...]\n\
+         \x20\x20\x20\x20evidence: <what you observed — quote code, command output, or doc text>\n\
+         \x20\x20\x20\x20recommendation: <concrete next step; may reference a follow-up spark>\n\n\
+         Rules for findings:\n\
+         - EVERY finding MUST include at least one `file:line` reference in \
+           `location`. A finding without a file:line is invalid and MUST NOT be \
+           posted.\n\
+         - Findings go ONLY as comments via `ryve comment add`. Do NOT create \
+           new files, do NOT write reports to disk, do NOT stash findings in \
+           `.ryve/` — the comment thread on the parent spark is the only \
+           deliverable.\n\
+         - If you believe a finding warrants a new spark (a concrete fix), say \
+           so in `recommendation`; do not create the spark yourself unless the \
+           parent intent explicitly asks for it.\n\
+         - When your sweep is finished, post a final SUMMARY comment listing \
+           every finding id/line-range and your overall read of the scope. \
+           Then close the spark.\n\n",
+    ));
+
+    prompt.push_str(
+        "HARD RULES:\n\
+         - You are read-only. Edit/Write/NotebookEdit are forbidden. \
+           `git reset --hard`, `git push --force` / force-push, and \
+           `--no-verify` are forbidden by name.\n\
+         - Findings are emitted ONLY via `ryve comment add`. Never as code \
+           changes, never as new files outside `.ryve/` scratch.\n\
+         - Every finding cites at least one `file:line` as evidence.\n\
+         - Reference the parent spark id `[sp-xxxx]` in any cross-links or \
+           follow-up sparks.\n\
+         - Respect user overrides: if the parent spark is closed or \
+           redirected while you are working, stop and exit.\n\n\
+         Begin the sweep now.\n",
+    );
+
+    prompt
+}
+
 /// Compose the initial prompt for a Merger Hand — a Hand whose only job is
 /// to integrate the worktree branches of every other Hand in its Crew into
 /// one PR for review.
@@ -651,6 +764,33 @@ fn push_spark_details(prompt: &mut String, spark: &Spark) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_spark(id: &str, title: &str) -> Spark {
+        Spark {
+            id: id.to_string(),
+            title: title.to_string(),
+            description: String::new(),
+            status: "open".to_string(),
+            priority: 2,
+            spark_type: "task".to_string(),
+            assignee: None,
+            owner: None,
+            parent_id: None,
+            workshop_id: "ws-1".to_string(),
+            estimated_minutes: None,
+            github_issue_number: None,
+            github_repo: None,
+            metadata: "{}".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            closed_at: None,
+            closed_reason: None,
+            due_at: None,
+            defer_until: None,
+            risk_level: None,
+            scope_boundary: None,
+        }
+    }
 
     #[test]
     fn hand_prompt_includes_house_rules_and_assignment() {
@@ -944,6 +1084,74 @@ mod tests {
         assert!(p.contains("-b crew/cr-aaaa"));
         assert!(p.contains("ryve spark close sp-merge1 completed"));
         assert!(p.contains("Do **not** merge to main automatically"));
+    }
+
+    /// sp-ryve-c0733c9c: Investigator prompt must open with READ-ONLY
+    /// discipline, instruct posting findings via `ryve comment add`, carry
+    /// the parent spark id and title, and banish destructive git commands
+    /// by name so a future edit can't silently soften the contract.
+    #[test]
+    fn investigator_prompt_enforces_read_only_and_finding_contract() {
+        let sparks = vec![make_spark("sp-inv1", "Audit perf hot paths")];
+        let p = compose_investigator_prompt(&sparks, "sp-inv1");
+
+        // READ-ONLY discipline and comment-add contract are mandatory.
+        assert!(p.contains("READ-ONLY"), "missing READ-ONLY section");
+        assert!(
+            p.contains("ryve comment add"),
+            "missing `ryve comment add` finding channel"
+        );
+
+        // Parent spark id + title are included so the investigator scopes.
+        assert!(p.contains("sp-inv1"), "missing parent spark id");
+        assert!(
+            p.contains("Audit perf hot paths"),
+            "missing parent spark title"
+        );
+
+        // Destructive git commands banished by name.
+        assert!(p.contains("--no-verify"), "must forbid --no-verify by name");
+        assert!(p.contains("force-push"), "must forbid force-push by name");
+        assert!(
+            p.contains("git reset --hard"),
+            "must forbid `git reset --hard` by name"
+        );
+    }
+
+    /// The investigator prompt must forbid editor tools (Edit/Write/
+    /// NotebookEdit) and require file:line evidence in every finding —
+    /// these are the structural invariants of the role.
+    #[test]
+    fn investigator_prompt_forbids_edits_and_requires_file_line_evidence() {
+        let p = compose_investigator_prompt(&[], "sp-missing");
+
+        // Editor tool ban.
+        assert!(p.contains("Edit"), "must name Edit tool as forbidden");
+        assert!(p.contains("Write"), "must name Write tool as forbidden");
+        assert!(
+            p.contains("NotebookEdit"),
+            "must name NotebookEdit tool as forbidden"
+        );
+
+        // Finding schema fields.
+        for field in [
+            "severity",
+            "category",
+            "location",
+            "evidence",
+            "recommendation",
+        ] {
+            assert!(p.contains(field), "finding schema must include `{field}`");
+        }
+
+        // file:line evidence is non-negotiable.
+        assert!(p.contains("file:line"), "must require file:line citations");
+
+        // Missing-spark fallback tells investigator to run `ryve spark show`.
+        assert!(
+            p.contains("ryve spark show sp-missing"),
+            "missing-spark fallback must prompt a `ryve spark show` call"
+        );
     }
 
     /// The Merger MUST do every merge inside a dedicated worktree it creates

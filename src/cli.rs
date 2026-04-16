@@ -280,7 +280,9 @@ fn print_usage() {
     eprintln!("  crew remove-member <crew_id> <session_id>");
     eprintln!("  crew status <crew_id> active|merging|completed|abandoned");
     eprintln!();
-    eprintln!("  hand spawn <spark_id> [--agent <name>] [--role owner|head|merger] [--crew <id>]");
+    eprintln!(
+        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|merger] [--crew <id>]"
+    );
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
     eprintln!();
@@ -1750,7 +1752,7 @@ async fn handle_hand(
             }
             if args.len() < 2 {
                 die(
-                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
+                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
                 );
             }
             let spark_id = args[1].clone();
@@ -1773,10 +1775,11 @@ async fn handle_hand(
                             role = match args[i].as_str() {
                                 "owner" | "hand" => HandKind::Owner,
                                 "head" => HandKind::Head,
+                                "investigator" => HandKind::Investigator,
                                 "merger" => HandKind::Merger,
-                                other => {
-                                    die(&format!("invalid role '{other}' (owner|head|merger)"))
-                                }
+                                other => die(&format!(
+                                    "invalid role '{other}' (owner|head|investigator|merger)"
+                                )),
                             };
                         }
                     }
@@ -1886,7 +1889,7 @@ worktree under `.ryve/worktrees/<short>/` on branch `hand/<short>`. Hands
 are the only layer that edits code.
 
 USAGE:
-  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|merger] [--crew <id>]
+  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|merger] [--crew <id>]
   ryve hand list
   ryve hand --help
   ryve hand spawn --help
@@ -1896,13 +1899,16 @@ SUBCOMMANDS:
   list     Show active hand assignments (ownership + role + heartbeat).
 
 ROLES:
-  owner    (default) Standard worker. Claims the spark, works in its own
-           worktree, closes the spark when DONE.md passes.
-  head     Crew orchestrator. Takes an epic, decomposes it into child
-           sparks, spawns sub-Hands, and supervises them. Prefer the
-           dedicated `ryve head spawn` wrapper — it reads more naturally.
-  merger   Crew integrator. Collects sibling worktrees, merges them into a
-           single `crew/<id>` branch, and opens one PR. Requires --crew.
+  owner         (default) Standard worker. Claims the spark, works in its own
+                worktree, closes the spark when DONE.md passes.
+  head          Crew orchestrator. Takes an epic, decomposes it into child
+                sparks, spawns sub-Hands, and supervises them. Prefer the
+                dedicated `ryve head spawn` wrapper — it reads more naturally.
+  investigator  Read-only auditor. Sweeps code and posts findings as comments
+                on the parent spark; may not edit files or run destructive git.
+                Typically spawned by a Research Head.
+  merger        Crew integrator. Collects sibling worktrees, merges them into a
+                single `crew/<id>` branch, and opens one PR. Requires --crew.
 
 See also:
   ryve head --help                    Head-specific documentation.
@@ -1927,10 +1933,11 @@ OPTIONS:
   --agent <name>           Coding agent to run (claude, codex, aider,
                            opencode, …). Defaults to the first detected
                            agent on your PATH.
-  --role <role>            owner | head | merger. Default: owner.
-                             owner  — standard worker Hand.
-                             head   — crew orchestrator (prefer `ryve head spawn`).
-                             merger — crew integrator (requires --crew).
+  --role <role>            owner | head | investigator | merger. Default: owner.
+                             owner        — standard worker Hand.
+                             head         — crew orchestrator (prefer `ryve head spawn`).
+                             investigator — read-only auditor; posts findings via comments.
+                             merger       — crew integrator (requires --crew).
   --crew <crew_id>         Attach the new Hand to an existing crew as a
                            member. Required when --role merger.
 
@@ -1938,7 +1945,7 @@ EFFECTS:
   1. Creates a git worktree at `.ryve/worktrees/<short>/` on branch
      `hand/<short>`.
   2. Persists an `agent_sessions` row (session_label = hand / head /
-     merger) and a `hand_assignments` row claiming the spark.
+     investigator / merger) and a `hand_assignments` row claiming the spark.
   3. If --crew is set, inserts a `crew_members` row.
   4. Writes a role-specific initial prompt under `.ryve/prompts/` and
      launches the chosen coding agent in full-auto mode, detached, with
