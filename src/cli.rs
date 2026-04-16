@@ -61,6 +61,7 @@ pub const CLI_COMMANDS: &[&str] = &[
     "worktree",
     "worktrees",
     "wt",
+    "tmux",
     "hot",
     "status",
     "init",
@@ -176,6 +177,7 @@ pub async fn run(args: Vec<String>) {
         "worktree" | "worktrees" | "wt" => {
             handle_worktree(&pool, &workshop_root, &args_clean[2..], json_mode).await
         }
+        "tmux" => handle_tmux(&pool, &workshop_root, &ws_id, &args_clean[2..], json_mode).await,
         "hot" => handle_hot(&pool, &ws_id, json_mode).await,
         "status" => handle_status(&pool, &ws_id).await,
         "backup" | "backups" => {
@@ -2545,6 +2547,90 @@ async fn handle_worktree(
     match args[0].as_str() {
         "prune" => handle_worktree_prune(pool, workshop_root, &args[1..], json_mode).await,
         other => die(&format!("unknown worktree subcommand '{other}'")),
+    }
+}
+
+/// `ryve tmux` — tmux session introspection and reconciliation.
+///
+/// Primarily consumed by the integration tests (sp-0285181c) so they can
+/// exercise the real production code paths (`tmux::reconcile_sessions` and
+/// `TmuxClient::attach_command`) from a separate process. Also a useful
+/// admin tool when Ryve's UI is not running.
+async fn handle_tmux(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    ws_id: &str,
+    args: &[String],
+    json_mode: bool,
+) {
+    if args.is_empty() {
+        die("tmux subcommand required (reconcile, attach-cmd, has-session)");
+    }
+    match args[0].as_str() {
+        "reconcile" => {
+            let result = crate::tmux::reconcile_sessions(workshop_root, pool, ws_id).await;
+            if json_mode {
+                let payload = serde_json::json!({
+                    "confirmed_live": result.confirmed_live,
+                    "marked_stopped": result.marked_stopped,
+                    "orphaned_tmux": result.orphaned_tmux,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                println!("confirmed_live: {} session(s)", result.confirmed_live.len());
+                for id in &result.confirmed_live {
+                    println!("  {id}");
+                }
+                println!("marked_stopped: {} session(s)", result.marked_stopped.len());
+                for id in &result.marked_stopped {
+                    println!("  {id}");
+                }
+                println!("orphaned_tmux:  {} session(s)", result.orphaned_tmux.len());
+                for n in &result.orphaned_tmux {
+                    println!("  {n}");
+                }
+            }
+        }
+        "attach-cmd" => {
+            if args.len() < 2 {
+                die("tmux attach-cmd requires <session_name>");
+            }
+            let name = &args[1];
+            let tmux_bin = match crate::tmux::resolve_tmux_bin() {
+                Some(b) => b,
+                None => die("no tmux binary available (RYVE_TMUX_PATH unset and not on PATH)"),
+            };
+            let ryve_dir = RyveDir::new(workshop_root);
+            let client = crate::tmux::TmuxClient::new(tmux_bin, ryve_dir.root());
+            let cmd = client.attach_command(name);
+            let program = cmd.get_program().to_string_lossy().into_owned();
+            let argv: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            if json_mode {
+                let payload = serde_json::json!({
+                    "program": program,
+                    "args": argv,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                print!("{program}");
+                for a in &argv {
+                    print!(" {a}");
+                }
+                println!();
+            }
+        }
+        other => die(&format!(
+            "unknown tmux subcommand '{other}' (reconcile, attach-cmd)"
+        )),
     }
 }
 

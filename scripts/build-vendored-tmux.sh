@@ -46,7 +46,23 @@ tar xzf "$TARBALL" -C "$BUILD_DIR"
 
 # Build
 cd "$BUILD_DIR/tmux-$VERSION"
-./configure --prefix="$BUILD_DIR/install" --enable-static 2>&1 | tail -5
+
+# macOS does not support `--enable-static` (the linker cannot statically link
+# against system libraries like libSystem). Use it only on Linux, where it
+# reduces runtime library dependencies and improves portability of the binary.
+CONFIGURE_ARGS=(--prefix="$BUILD_DIR/install")
+# utf8proc is optional for rendering wide/emoji characters. tmux 3.5+ requires
+# an explicit choice. We disable it to keep the dependency surface small; tmux
+# still handles UTF-8 correctly, it just falls back to its built-in width
+# tables instead of utf8proc's Unicode database.
+CONFIGURE_ARGS+=(--disable-utf8proc)
+case "$(uname -s)" in
+  Linux) CONFIGURE_ARGS+=(--enable-static) ;;
+  Darwin) ;; # rely on dynamic linking to system libevent/ncurses
+  *) ;;
+esac
+
+./configure "${CONFIGURE_ARGS[@]}" 2>&1 | tail -5
 make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" 2>&1 | tail -5
 
 # Install the binary only
