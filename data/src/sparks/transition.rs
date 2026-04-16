@@ -38,7 +38,8 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use super::error::TransitionError;
-use super::types::{Assignment, AssignmentPhase, TransitionActorRole};
+use super::event_repo;
+use super::types::{Assignment, AssignmentPhase, NewEvent, TransitionActorRole};
 
 /// A transition rule: (from_phase, to_phase) → list of authorized roles.
 struct TransitionRule {
@@ -148,21 +149,23 @@ pub fn validate_transition(
 
 pub async fn transition_assignment_phase(
     pool: &SqlitePool,
-    assignment_id: &str,
-    _actor_id: &str,
+    assignment_id: i64,
+    actor_id: &str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
-    _event_id: i64,
+    event_version: i64,
 ) -> Result<Assignment, TransitionError> {
     transition_assignment_phase_inner(
         pool,
         TransitionPhaseRequest {
             assignment_id,
+            actor_id,
             actor_role,
             target_phase,
             expected_previous_phase,
             override_role_check: false,
+            event_version,
         },
     )
     .await
@@ -170,34 +173,40 @@ pub async fn transition_assignment_phase(
 
 pub async fn transition_assignment_phase_override(
     pool: &SqlitePool,
-    assignment_id: &str,
-    _actor_id: &str,
+    assignment_id: i64,
+    actor_id: &str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
-    _event_id: i64,
+    event_version: i64,
 ) -> Result<Assignment, TransitionError> {
     transition_assignment_phase_inner(
         pool,
         TransitionPhaseRequest {
             assignment_id,
+            actor_id,
             actor_role,
             target_phase,
             expected_previous_phase,
             override_role_check: true,
+            event_version,
         },
     )
     .await
 }
 
 struct TransitionPhaseRequest<'a> {
-    assignment_id: &'a str,
+    assignment_id: i64,
+    actor_id: &'a str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
     override_role_check: bool,
+    event_version: i64,
 }
 
+/// Execute a phase transition: validate, UPDATE state + phase-tracking columns,
+/// INSERT an event into the outbox — all in a single transaction.
 async fn transition_assignment_phase_inner(
     pool: &SqlitePool,
     request: TransitionPhaseRequest<'_>,
@@ -206,13 +215,15 @@ async fn transition_assignment_phase_inner(
 
     let TransitionPhaseRequest {
         assignment_id,
+        actor_id,
         actor_role,
         target_phase,
         expected_previous_phase,
         override_role_check,
+        event_version,
     } = request;
 
-    let row = sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE assignment_id = ?")
+    let row = sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE id = ?")
         .bind(assignment_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -221,12 +232,12 @@ async fn transition_assignment_phase_inner(
         assignment_id: assignment_id.to_string(),
     })?;
 
-    let current_phase = AssignmentPhase::from_str(&assignment.assignment_phase).ok_or(
-        TransitionError::IllegalTransition {
+    let current_phase_str = assignment.assignment_phase.as_deref().unwrap_or("unknown");
+    let current_phase =
+        AssignmentPhase::from_str(current_phase_str).ok_or(TransitionError::IllegalTransition {
             from: "unknown",
             to: target_phase.as_str(),
-        },
-    )?;
+        })?;
 
     validate_transition(
         current_phase,
@@ -236,21 +247,49 @@ async fn transition_assignment_phase_inner(
         override_role_check,
     )?;
 
+    let event_id = event_repo::record_in_tx(
+        &mut tx,
+        NewEvent {
+            spark_id: assignment.spark_id.clone(),
+            actor: actor_id.to_string(),
+            field_name: "assignment_phase".into(),
+            old_value: Some(current_phase.as_str().to_string()),
+            new_value: Some(target_phase.as_str().to_string()),
+            reason: None,
+            actor_type: None,
+            change_nature: None,
+            session_id: None,
+        },
+    )
+    .await
+    .map_err(|e| {
+        TransitionError::Database(match e {
+            super::error::SparksError::Database(db_err) => db_err,
+            other => sqlx::Error::Protocol(other.to_string()),
+        })
+    })?;
+
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE assignments SET assignment_phase = ?, updated_at = ? WHERE assignment_id = ?",
+        "UPDATE assignments SET assignment_phase = ?, event_version = ?, updated_at = ?, \
+         phase_changed_at = ?, phase_changed_by = ?, phase_actor_role = ?, phase_event_id = ? \
+         WHERE id = ?",
     )
     .bind(target_phase.as_str())
+    .bind(event_version)
     .bind(&now)
+    .bind(&now)
+    .bind(actor_id)
+    .bind(actor_role.as_str())
+    .bind(event_id)
     .bind(assignment_id)
     .execute(&mut *tx)
     .await?;
 
-    let updated =
-        sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE assignment_id = ?")
-            .bind(assignment_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let updated = sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE id = ?")
+        .bind(assignment_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     tx.commit().await?;
 
