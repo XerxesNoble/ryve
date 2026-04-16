@@ -160,6 +160,13 @@ already tracks.
 - **Inputs:** A Crew id whose member sparks are all `completed`.
 - **Outputs:** An integration branch (`crew/<id>`), a single PR linking every
   member spark, a comment on the merge spark with the PR URL.
+- **Isolation invariant:** The Merger NEVER changes the branch checked out
+  in the workshop root — the user works there, and moving its HEAD is
+  disruptive. All merge work happens inside a dedicated worktree at
+  `.ryve/worktrees/merge-<crew_id>/` that the Merger creates via
+  `git worktree add -b crew/<id> origin/main` and removes via
+  `git worktree remove` on exit. `git checkout`, `git switch`, `git pull`,
+  and `git reset --hard` are forbidden in the workshop root.
 - **Acceptance bar:** PR is open, builds, and lists every member spark.
   The Merger should rarely hit conflicts: the Head that spawned the Crew
   is required to apply merge-clean bond discipline

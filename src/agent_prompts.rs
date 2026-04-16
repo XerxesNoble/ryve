@@ -524,22 +524,31 @@ pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
          each worked in their own git worktree under `.ryve/worktrees/<short>/` on a \
          branch named `hand/<short>`. Your job is to integrate every member branch \
          into a single PR for human review.\n\n\
+         YOU MUST NEVER change the branch checked out in the workshop root. \
+         The user works there, and switching its HEAD out from under them is \
+         disruptive. All merge work happens in your own dedicated worktree \
+         (created in step 2) — never in the main checkout.\n\n\
          Workflow:\n\
          1. Wait until every spark in `ryve crew show {crew_id}` is closed with \
             status `completed`. Poll every 30 seconds with `ryve crew show {crew_id}`. \
             Do not start merging while any sibling is still in progress.\n\
-         2. From the workshop root, create an integration branch off of `main`:\n\
-            `git checkout main && git pull --ff-only && git checkout -b crew/{crew_id}`\n\
-         3. Discover every member branch with `git worktree list`. For each \
-            `hand/<short>` branch belonging to a crew member, in the order the \
-            sparks were closed, run:\n\
+         2. Create a dedicated merge worktree — do NOT touch the workshop root's HEAD. \
+            From the workshop root, fetch then add a worktree:\n\
+            `git fetch origin main && \\\n\
+             git worktree add .ryve/worktrees/merge-{crew_id} -b crew/{crew_id} origin/main`\n\
+            Every subsequent git command runs inside that worktree. \
+            `cd .ryve/worktrees/merge-{crew_id}` (or pass `-C` on each git call).\n\
+         3. From inside the merge worktree, discover every member branch with \
+            `git worktree list`. For each `hand/<short>` branch belonging to a crew \
+            member, in the order the sparks were closed, run:\n\
             `git merge --no-ff -m 'merge hand/<short> into crew/{crew_id} [sp-xxxx]' hand/<short>`\n\
             If a merge has conflicts you cannot resolve mechanically, that is a \
             bond-discipline failure by the Head (two siblings edited the same file \
             without a `blocks` bond between them). Run\n\
             `ryve comment add {merge_spark_id} 'bond-discipline conflict in <file> between hand/<a> and hand/<b>: <details>'` and\n\
-            `ryve spark status {merge_spark_id} blocked`, then exit.\n\
-         4. Push the integration branch:\n\
+            `ryve spark status {merge_spark_id} blocked`, then run step 7 to remove \
+            the merge worktree, then exit.\n\
+         4. Push the integration branch from the merge worktree:\n\
             `git push -u origin crew/{crew_id}`\n\
          5. Open a single pull request listing every member spark in the body:\n\
             `gh pr create --base main --head crew/{crew_id} --title '<title>' \\\n\
@@ -548,17 +557,27 @@ pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
             completed:\n\
             `ryve comment add {merge_spark_id} '<pr-url>'`\n\
             `ryve spark close {merge_spark_id} completed`\n\
-         7. Exit. Do **not** merge to main automatically — human review is required.\n\n",
+         7. Clean up the merge worktree from the workshop root (NOT from inside it):\n\
+            `git worktree remove .ryve/worktrees/merge-{crew_id}`\n\
+            The branch `crew/{crew_id}` is preserved on origin via the push in step 4, \
+            so removing the local worktree is safe.\n\
+         8. Exit. Do **not** merge to main automatically — human review is required.\n\n",
     ));
 
     prompt.push_str(
         "HARD RULES:\n\
          - You are the only Hand in the crew that runs destructive git commands. \
            Do not edit any source file outside of merge-conflict resolution.\n\
+         - NEVER change the branch checked out in the workshop root. No \
+           `git checkout` / `git switch` / `git reset --hard` / \
+           `git pull` in the workshop root — all of those shift the user's HEAD. \
+           All merge operations happen inside the dedicated `merge-<crew_id>` \
+           worktree you create in step 2. Fetches are fine (they don't move HEAD); \
+           checkouts and resets are not.\n\
          - Never force-push, never `--no-verify`, never bypass git hooks.\n\
          - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\
          - If the user closes the crew or the merge spark while you are working, \
-           stop and exit.\n",
+           stop, remove the merge worktree (step 7), and exit.\n",
     );
 
     prompt
@@ -922,8 +941,46 @@ mod tests {
         let p = compose_merger_prompt("cr-aaaa", "sp-merge1");
         assert!(p.contains("crew `cr-aaaa`"));
         assert!(p.contains("ASSIGNMENT: spark sp-merge1"));
-        assert!(p.contains("git checkout -b crew/cr-aaaa"));
+        assert!(p.contains("git worktree add .ryve/worktrees/merge-cr-aaaa"));
+        assert!(p.contains("-b crew/cr-aaaa"));
         assert!(p.contains("ryve spark close sp-merge1 completed"));
         assert!(p.contains("Do **not** merge to main automatically"));
+    }
+
+    /// The Merger MUST do every merge inside a dedicated worktree it creates
+    /// itself. It must never run `git checkout` (or other HEAD-moving commands)
+    /// in the workshop root — that yanks the user's working branch out from
+    /// under them. If a future edit lets the Merger touch the root's HEAD,
+    /// this test fails.
+    #[test]
+    fn merger_prompt_never_changes_workshop_root_branch() {
+        let p = compose_merger_prompt("cr-aaaa", "sp-merge1");
+
+        // Positive: uses a dedicated merge worktree.
+        assert!(
+            p.contains("git worktree add .ryve/worktrees/merge-cr-aaaa"),
+            "merger must create a dedicated merge worktree"
+        );
+        assert!(
+            p.contains("NEVER change the branch checked out in the workshop root"),
+            "merger must be explicitly forbidden from changing the workshop root's HEAD"
+        );
+        // Cleanup is mandatory so the workshop doesn't accumulate worktrees.
+        assert!(
+            p.contains("git worktree remove .ryve/worktrees/merge-cr-aaaa"),
+            "merger must remove its merge worktree when done"
+        );
+
+        // Negative: the old `git checkout main && ... && git checkout -b` flow
+        // is the exact anti-pattern we are banning. Keep these forbidden.
+        assert!(
+            !p.contains("git checkout main"),
+            "merger must not check out main in the workshop root"
+        );
+        assert!(
+            !p.contains("git checkout -b crew/"),
+            "merger must not branch via `git checkout -b` in the workshop root \
+             (use `git worktree add -b` instead)"
+        );
     }
 }
