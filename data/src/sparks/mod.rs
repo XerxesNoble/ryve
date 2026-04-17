@@ -20,6 +20,7 @@ pub mod event_repo;
 pub mod file_link_repo;
 pub mod graph;
 pub mod id;
+pub mod irc_repo;
 pub mod open_tab_repo;
 pub mod projector;
 pub mod relay;
