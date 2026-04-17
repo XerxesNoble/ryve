@@ -415,6 +415,11 @@ pub struct PersistedAgentSession {
     /// Hands panel to attribute solo Hands to their parent Head when the
     /// child is not in any of the Head's crews.
     pub parent_session_id: Option<String>,
+    /// Hand archetype id the session was spawned under (see
+    /// `src/hand_archetypes.rs`). `None` for older rows predating the
+    /// archetype registry and for legacy Owner/Merger/Head/Investigator
+    /// spawns that still key off `session_label`.
+    pub archetype_id: Option<String>,
 }
 
 pub struct NewAgentSession {
@@ -428,6 +433,7 @@ pub struct NewAgentSession {
     pub resume_id: Option<String>,
     pub log_path: Option<String>,
     pub parent_session_id: Option<String>,
+    pub archetype_id: Option<String>,
 }
 
 // ── Structured Intent ────────────────────────────────

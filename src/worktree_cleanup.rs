@@ -338,8 +338,18 @@ pub fn process_is_alive(pid: u32) -> bool {
 /// tree is clean, so `--force` here is purely defensive against git's
 /// own conservative checks.
 ///
+/// If the worktree was locked read-only by a read-only archetype
+/// ([`crate::hand_archetypes::apply_tool_policy`]), its files and dirs
+/// need their `w` bit restored before git can unlink them — otherwise
+/// `git worktree remove --force` fails with `Permission denied` on
+/// every child. The restore call is a no-op on trees that were never
+/// locked, so it is safe to invoke unconditionally.
+///
 /// Returns `Ok` on success, `Err(stderr)` on failure.
 pub fn run_worktree_remove(repo: &Path, worktree: &Path) -> Result<(), String> {
+    if let Err(e) = crate::hand_archetypes::unlock_worktree(worktree) {
+        return Err(format!("unlock read-only worktree: {e}"));
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)

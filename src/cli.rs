@@ -22,6 +22,7 @@ use data::sparks::{
 
 use crate::agent_prompts::HeadArchetype;
 use crate::coding_agents::{self, CodingAgent};
+use crate::hand_archetypes::{self, Action as PolicyAction, CallerArchetype};
 use crate::hand_spawn::{self, HandKind};
 use crate::worktree_cleanup::{
     self, PruneCandidate, PruneSummary, WorktreeFacts, WorktreeStatus, classify_worktree,
@@ -196,6 +197,44 @@ fn die(msg: &str) -> ! {
     process::exit(1);
 }
 
+/// Resolve the archetype of the caller invoking this CLI command.
+///
+/// Every Hand subprocess Ryve spawns is handed `RYVE_HAND_SESSION_ID`
+/// in its env so nested `ryve ...` invocations know who they are. This
+/// helper looks that session up in `agent_sessions` and reads its
+/// `session_label`, then maps the label to a
+/// [`CallerArchetype`] via
+/// [`hand_archetypes::caller_archetype_for_label`]. The result drives
+/// the Release Manager allow-list in
+/// [`hand_archetypes::enforce_action`] — spark ryve-e6713ee7
+/// [sp-2a82fee7].
+///
+/// Returns [`CallerArchetype::Unrestricted`] for direct-human CLI use
+/// (no env), for sessions missing from the DB (worktree reused across
+/// workshops, stale env), and for any label not in the restricted
+/// archetype set. Restricting by default would break every existing
+/// human-driven workflow, so the policy is additive.
+async fn current_caller_archetype(pool: &sqlx::SqlitePool) -> CallerArchetype {
+    let Ok(session_id) = std::env::var("RYVE_HAND_SESSION_ID") else {
+        return CallerArchetype::Unrestricted;
+    };
+    let label = match agent_session_repo::get(pool, &session_id).await {
+        Ok(Some(row)) => row.session_label,
+        _ => None,
+    };
+    hand_archetypes::caller_archetype_for_label(label.as_deref())
+}
+
+/// Enforce the caller's archetype against a candidate action and die
+/// with a non-zero exit on any violation. The CLI-side complement of
+/// the pure [`hand_archetypes::enforce_action`] check, wired into every
+/// mutation entry point the Release Manager archetype restricts.
+fn enforce_or_die(caller: CallerArchetype, action: &PolicyAction<'_>) {
+    if let Err(e) = hand_archetypes::enforce_action(caller, action) {
+        die(&format!("{e}"));
+    }
+}
+
 /// Walk up the directory tree from `start` looking for a directory
 /// that contains a `.ryve/sparks.db`. Returns the workshop root path.
 ///
@@ -281,7 +320,7 @@ fn print_usage() {
     eprintln!("  crew status <crew_id> active|merging|completed|abandoned");
     eprintln!();
     eprintln!(
-        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|merger] [--crew <id>]"
+        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]"
     );
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
@@ -1014,6 +1053,24 @@ async fn handle_comment(pool: &sqlx::SqlitePool, args: &[String], json_mode: boo
             if args.len() < 3 {
                 die("comment add requires <spark_id> <body>");
             }
+            // Archetype policy gate (spark ryve-e6713ee7): the Release
+            // Manager may only comment on sparks that are members of
+            // some release — Atlas polls those; every other target is
+            // outside the Atlas-only comms graph. Resolved with one
+            // `SELECT 1 FROM release_epics` and combined with the
+            // caller's archetype before the DB write.
+            let caller = current_caller_archetype(pool).await;
+            let is_release_spark = match release_repo::is_release_member(pool, &args[1]).await {
+                Ok(v) => v,
+                Err(e) => die(&format!("{e}")),
+            };
+            enforce_or_die(
+                caller,
+                &PolicyAction::CommentAdd {
+                    spark_id: &args[1],
+                    is_release_spark,
+                },
+            );
             let body = args[2..].join(" ");
             let new = NewComment {
                 spark_id: args[1].clone(),
@@ -1269,6 +1326,13 @@ async fn handle_ember(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
             Err(e) => die(&format!("{e}")),
         },
         "send" => {
+            // Archetype policy gate (spark ryve-e6713ee7): embers are
+            // broadcasts and therefore outside the Release Manager's
+            // Atlas-only comms graph.
+            enforce_or_die(
+                current_caller_archetype(pool).await,
+                &PolicyAction::EmberSend,
+            );
             if args.len() < 3 {
                 die("ember send requires <type> <content>");
             }
@@ -1746,13 +1810,21 @@ async fn handle_hand(
     }
     match args[0].as_str() {
         "spawn" => {
+            // Archetype policy gate (spark ryve-e6713ee7): a Release
+            // Manager may not spawn any Hand. Enforced here, before any
+            // DB write or worktree creation, so the refusal leaves no
+            // trace in the workgraph.
+            enforce_or_die(
+                current_caller_archetype(pool).await,
+                &PolicyAction::SpawnHand,
+            );
             if args.len() >= 2 && matches!(args[1].as_str(), "help" | "--help" | "-h") {
                 print_hand_spawn_usage();
                 return;
             }
             if args.len() < 2 {
                 die(
-                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
+                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|architect|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
                 );
             }
             let spark_id = args[1].clone();
@@ -1776,9 +1848,16 @@ async fn handle_hand(
                                 "owner" | "hand" => HandKind::Owner,
                                 "head" => HandKind::Head,
                                 "investigator" => HandKind::Investigator,
+                                "architect" => HandKind::Architect,
+                                "release_manager" | "release-manager" => HandKind::ReleaseManager,
+                                "bug_hunter" | "bug-hunter" => HandKind::BugHunter,
+                                "performance_engineer"
+                                | "performance-engineer"
+                                | "perf_engineer"
+                                | "perf-engineer" => HandKind::PerformanceEngineer,
                                 "merger" => HandKind::Merger,
                                 other => die(&format!(
-                                    "invalid role '{other}' (owner|head|investigator|merger)"
+                                    "invalid role '{other}' (owner|head|investigator|architect|release_manager|bug_hunter|performance_engineer|merger)"
                                 )),
                             };
                         }
@@ -1889,7 +1968,7 @@ worktree under `.ryve/worktrees/<short>/` on branch `hand/<short>`. Hands
 are the only layer that edits code.
 
 USAGE:
-  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|merger] [--crew <id>]
+  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]
   ryve hand list
   ryve hand --help
   ryve hand spawn --help
@@ -1899,21 +1978,39 @@ SUBCOMMANDS:
   list     Show active hand assignments (ownership + role + heartbeat).
 
 ROLES:
-  owner         (default) Standard worker. Claims the spark, works in its own
-                worktree, closes the spark when DONE.md passes.
-  head          Crew orchestrator. Takes an epic, decomposes it into child
-                sparks, spawns sub-Hands, and supervises them. Prefer the
-                dedicated `ryve head spawn` wrapper — it reads more naturally.
-  investigator  Read-only auditor. Sweeps code and posts findings as comments
-                on the parent spark; may not edit files or run destructive git.
-                Typically spawned by a Research Head.
-  merger        Crew integrator. Collects sibling worktrees, merges them into a
-                single `crew/<id>` branch, and opens one PR. Requires --crew.
+  owner             (default) Standard worker. Claims the spark, works in its
+                    own worktree, closes the spark when DONE.md passes.
+  head              Crew orchestrator. Takes an epic, decomposes it into child
+                    sparks, spawns sub-Hands, and supervises them. Prefer the
+                    dedicated `ryve head spawn` wrapper — it reads more naturally.
+  investigator      Read-only auditor. Sweeps code and posts findings as
+                    comments on the parent spark; may not edit files or run
+                    destructive git. Typically spawned by a Research Head.
+  architect         Read-only design reviewer. Produces recommendations,
+                    tradeoffs, and risks as structured comments on the parent
+                    spark; never edits code. Typically spawned by a Review Head.
+  release_manager   Atlas-only Release steward. Runs `ryve release *`, commits
+                    to `release/*`, comments on release member sparks only.
+                    Cannot spawn Hands/Heads, cannot send embers. Singleton per
+                    release (see docs/HAND_ARCHETYPES.md).
+  bug_hunter        Triager+Surgeon hybrid specialised on small defects.
+                    Reproduces the bug with a failing test, lands the smallest
+                    possible diff that flips it green. Write-capable; scope is
+                    policed by the prompt, not a CLI gate.
+  performance_engineer
+                    Refactorer+Cartographer hybrid specialised on measurable
+                    improvements. Baselines, profiles, proposes, and verifies,
+                    recording before/after numbers as spark comments. Write-
+                    capable; scope is policed by the prompt, not a CLI gate.
+  merger            Crew integrator. Collects sibling worktrees, merges them
+                    into a single `crew/<id>` branch, and opens one PR.
+                    Requires --crew.
 
 See also:
   ryve head --help                    Head-specific documentation.
   docs/AGENT_HIERARCHY.md              Atlas → Head → Hand overview.
   docs/HAND_CAPABILITIES.md            Hand capability classes.
+  docs/HAND_ARCHETYPES.md              Concrete Hand archetypes (Architect, …).
 "
     );
 }
@@ -1933,11 +2030,18 @@ OPTIONS:
   --agent <name>           Coding agent to run (claude, codex, aider,
                            opencode, …). Defaults to the first detected
                            agent on your PATH.
-  --role <role>            owner | head | investigator | merger. Default: owner.
-                             owner        — standard worker Hand.
-                             head         — crew orchestrator (prefer `ryve head spawn`).
-                             investigator — read-only auditor; posts findings via comments.
-                             merger       — crew integrator (requires --crew).
+  --role <role>            owner | head | investigator | architect | release_manager | bug_hunter | performance_engineer | merger.
+                           Default: owner.
+                             owner            — standard worker Hand.
+                             head             — crew orchestrator (prefer `ryve head spawn`).
+                             investigator     — read-only auditor; posts findings via comments.
+                             architect        — read-only design reviewer; posts recommendations,
+                                                tradeoffs, and risks as comments (see docs/HAND_ARCHETYPES.md).
+                             release_manager  — Atlas-only Release steward; see docs/HAND_ARCHETYPES.md.
+                             bug_hunter       — Triager+Surgeon hybrid; failing test → smallest diff.
+                             performance_engineer
+                                              — Refactorer+Cartographer hybrid; baseline → profile → propose → verify.
+                             merger           — crew integrator (requires --crew).
   --crew <crew_id>         Attach the new Hand to an existing crew as a
                            member. Required when --role merger.
 
@@ -1945,7 +2049,8 @@ EFFECTS:
   1. Creates a git worktree at `.ryve/worktrees/<short>/` on branch
      `hand/<short>`.
   2. Persists an `agent_sessions` row (session_label = hand / head /
-     investigator / merger) and a `hand_assignments` row claiming the spark.
+     investigator / architect / release_manager / bug_hunter / performance_engineer / merger)
+     and a `hand_assignments` row claiming the spark.
   3. If --crew is set, inserts a `crew_members` row.
   4. Writes a role-specific initial prompt under `.ryve/prompts/` and
      launches the chosen coding agent in full-auto mode, detached, with
@@ -2103,6 +2208,12 @@ async fn handle_head(
     }
     match args[0].as_str() {
         "spawn" => {
+            // Archetype policy gate (spark ryve-e6713ee7): Release
+            // Manager may not spawn a Head either.
+            enforce_or_die(
+                current_caller_archetype(pool).await,
+                &PolicyAction::SpawnHead,
+            );
             if args.len() >= 2 && matches!(args[1].as_str(), "help" | "--help" | "-h") {
                 print_head_spawn_usage();
                 return;

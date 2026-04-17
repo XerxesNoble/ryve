@@ -2986,6 +2986,7 @@ impl App {
                         log_path: None,
                         // UI-spawned: no parent Hand.
                         parent_session_id: None,
+                        archetype_id: None,
                     };
                     tasks.push(Task::perform(
                         async move {
@@ -4994,6 +4995,7 @@ impl App {
                         resume_id: None,
                         log_path: None,
                         parent_session_id: None,
+                        archetype_id: None,
                     };
                     tasks.push(Task::perform(
                         async move {
@@ -5238,6 +5240,7 @@ impl App {
                 log_path: None,
                 // UI-spawned Hand: no orchestrator parent.
                 parent_session_id: None,
+                archetype_id: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -5340,6 +5343,7 @@ impl App {
                 log_path: None,
                 // A Head is itself a top-level orchestrator — no parent.
                 parent_session_id: None,
+                archetype_id: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -5459,6 +5463,7 @@ impl App {
                 resume_id: None,
                 log_path: None,
                 parent_session_id: None,
+                archetype_id: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -7139,6 +7144,7 @@ mod tests {
                 resume_id: None,
                 log_path: Some("/tmp/fake.log".into()),
                 parent_session_id: None,
+                archetype_id: None,
             },
         )
         .await

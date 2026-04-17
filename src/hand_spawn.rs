@@ -35,12 +35,13 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::agent_prompts::{
-    HeadArchetype, compose_hand_prompt, compose_head_prompt, compose_investigator_prompt,
-    compose_merger_prompt,
+    HeadArchetype, compose_architect_prompt, compose_bug_hunter_prompt, compose_hand_prompt,
+    compose_head_prompt, compose_investigator_prompt, compose_merger_prompt,
+    compose_performance_engineer_prompt, compose_release_manager_prompt,
 };
 use crate::coding_agents::CodingAgent;
 use crate::tmux::{self, TmuxClient, TmuxError};
-use crate::workshop;
+use crate::{hand_archetypes, workshop};
 
 /// What kind of Hand we are spawning. Determines which initial prompt is
 /// composed and which `AssignmentRole` is recorded.
@@ -65,6 +66,64 @@ pub enum HandKind {
     /// `AssignmentRole::Owner` against the audit spark because the
     /// investigator "owns" that spark for the lifetime of its sweep.
     Investigator,
+    /// A **Release Manager** Hand. A singleton-shaped archetype whose
+    /// entire job is steering a Release: cutting the branch, advancing
+    /// status, add/remove epics, tag, artifact, close. Its communication
+    /// graph is deliberately narrow — it takes direction only from Atlas
+    /// and reports only to Atlas — and its tool policy is an allow-list
+    /// (`ryve release *`, read-only workgraph queries, commits to the
+    /// release branch, comments targeted at Atlas on release sparks). The
+    /// enforcement is mechanical via
+    /// [`crate::hand_archetypes::enforce_action`], not a prompt
+    /// suggestion. Mechanically identical to an Owner Hand on the DB
+    /// side (same worktree, same session row, same launch flow),
+    /// distinguished by `agent_sessions.session_label = "release_manager"`
+    /// and by the composer [`compose_release_manager_prompt`]. Spark
+    /// ryve-e6713ee7 / [sp-2a82fee7].
+    ReleaseManager,
+    /// A **Bug Hunter** Hand — a Triager + Surgeon hybrid specialised on
+    /// small defects. Reproduces the bug with a failing test, localises
+    /// the root cause, and lands the smallest possible diff that makes
+    /// the test pass. Write-capable (it needs to edit code) but scoped
+    /// by its prompt: the acceptance bar is "failing test → passing
+    /// test plus smallest possible diff", not "feature shipped".
+    /// Language-agnostic — the archetype makes no assumptions about
+    /// project language, test runner, or framework; the agent chooses
+    /// whichever toolchain the repo already uses. Mechanically
+    /// identical to an Owner Hand on the DB side (same worktree, same
+    /// session row, same launch flow), distinguished by
+    /// `agent_sessions.session_label = "bug_hunter"` and by the
+    /// composer [`compose_bug_hunter_prompt`]. Spark ryve-e5688777 /
+    /// [sp-1471f46a].
+    BugHunter,
+    /// A **Performance Engineer** Hand — a Refactorer + Cartographer
+    /// hybrid specialised on measurable performance improvements. Its
+    /// acceptance bar is a measured delta against a baseline, not a
+    /// test pass: baseline → profile → propose → verify, with
+    /// before/after numbers recorded as spark comments so post-mortems
+    /// can diff them. Write-capable (it must be able to land the fix)
+    /// but its scope is policed by the prompt, not a CLI allow-list.
+    /// Language-agnostic — the archetype makes no assumptions about
+    /// profiling tools or benchmark harnesses; the agent picks tools
+    /// appropriate to the repo it is in. Mechanically identical to an
+    /// Owner Hand on the DB side (same worktree, same session row,
+    /// same launch flow), distinguished by `agent_sessions.session_label
+    /// = "performance_engineer"` and by the composer
+    /// [`compose_performance_engineer_prompt`]. Spark ryve-1c099466 /
+    /// [sp-1471f46a].
+    PerformanceEngineer,
+    /// A read-only **Architect** Hand. Spawned by a Review Head (or
+    /// directly by Atlas) to produce design and architecture
+    /// recommendations on the parent spark. Capability class is
+    /// Reviewer/Cartographer: the Architect reads code and design
+    /// artifacts, then posts structured recommendations, tradeoffs, and
+    /// risks as comments on the parent spark — never diffs. Mechanically
+    /// identical to an Investigator at the DB layer (session_label =
+    /// "architect", `AssignmentRole::Owner`); the read-only contract is
+    /// enforced by [`compose_architect_prompt`] and by the same
+    /// capability-gate policy that binds the Investigator
+    /// (spark ryve-3f799949).
+    Architect,
     /// The crew's integrator. Requires `crew_id` to be set.
     Merger,
 }
@@ -81,6 +140,25 @@ impl HandKind {
             // same assignment semantics as an Owner Hand, just a
             // different session_label and a read-only system prompt.
             Self::Investigator => AssignmentRole::Owner,
+            // Release Managers claim the release-management spark they
+            // were spawned on — same assignment semantics as an Owner
+            // Hand, plus an archetype-level ToolPolicy allow-list that
+            // the CLI consults on every workgraph mutation.
+            Self::ReleaseManager => AssignmentRole::Owner,
+            // Bug Hunters claim the bug spark they were dispatched on —
+            // same assignment semantics as an Owner Hand, distinguished
+            // only by session_label + prompt composer.
+            Self::BugHunter => AssignmentRole::Owner,
+            // Performance Engineers claim the perf spark they were
+            // dispatched on — same assignment semantics as an Owner
+            // Hand, distinguished only by session_label + prompt
+            // composer. The "measured delta" acceptance bar is prose
+            // in the prompt; there is no CLI-level gate to add.
+            Self::PerformanceEngineer => AssignmentRole::Owner,
+            // Architects claim the design-review spark they are scoped
+            // to — same assignment semantics as an Owner Hand, different
+            // session_label and a read-only system prompt.
+            Self::Architect => AssignmentRole::Owner,
             Self::Merger => AssignmentRole::Merger,
         }
     }
@@ -93,6 +171,10 @@ impl HandKind {
             Self::Owner => "hand",
             Self::Head => "head",
             Self::Investigator => "investigator",
+            Self::ReleaseManager => "release_manager",
+            Self::BugHunter => "bug_hunter",
+            Self::PerformanceEngineer => "performance_engineer",
+            Self::Architect => "architect",
             Self::Merger => "merger",
         }
     }
@@ -154,6 +236,15 @@ pub enum HandSpawnError {
     /// or produce an invalid git ref.
     #[error("invalid actor id '{0}': must be non-empty and contain no '/'")]
     InvalidActor(String),
+    /// Applying the archetype's [`ToolPolicy`] to the worktree failed.
+    /// Surfaces with the archetype id so the operator can attribute the
+    /// failure (acceptance criterion (4) of spark ryve-8384b3cc).
+    #[error("archetype '{archetype}': failed to apply tool policy: {source}")]
+    ToolPolicy {
+        archetype: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Resolve the actor_id a UI-driven Hand spawn should use when no explicit
@@ -302,6 +393,7 @@ pub async fn spawn_hand(
         resume_id: None,
         log_path: Some(log_path.to_string_lossy().into_owned()),
         parent_session_id: parent_session_id.map(|s| s.to_string()),
+        archetype_id: Some(hand_archetypes::archetype_id_for(kind).to_string()),
     };
     agent_session_repo::create(pool, &new_session).await?;
 
@@ -356,6 +448,54 @@ pub async fn spawn_hand(
             .unwrap_or_else(|_| Vec::<Spark>::new());
             compose_investigator_prompt(&sparks, spark_id)
         }
+        HandKind::ReleaseManager => {
+            let sparks = spark_repo::list(
+                pool,
+                SparkFilter {
+                    workshop_id: Some(workshop_id_for(workshop_dir)),
+                    ..SparkFilter::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|_| Vec::<Spark>::new());
+            compose_release_manager_prompt(&sparks, spark_id)
+        }
+        HandKind::BugHunter => {
+            let sparks = spark_repo::list(
+                pool,
+                SparkFilter {
+                    workshop_id: Some(workshop_id_for(workshop_dir)),
+                    ..SparkFilter::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|_| Vec::<Spark>::new());
+            compose_bug_hunter_prompt(&sparks, spark_id)
+        }
+        HandKind::PerformanceEngineer => {
+            let sparks = spark_repo::list(
+                pool,
+                SparkFilter {
+                    workshop_id: Some(workshop_id_for(workshop_dir)),
+                    ..SparkFilter::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|_| Vec::<Spark>::new());
+            compose_performance_engineer_prompt(&sparks, spark_id)
+        }
+        HandKind::Architect => {
+            let sparks = spark_repo::list(
+                pool,
+                SparkFilter {
+                    workshop_id: Some(workshop_id_for(workshop_dir)),
+                    ..SparkFilter::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|_| Vec::<Spark>::new());
+            compose_architect_prompt(&sparks, spark_id)
+        }
         HandKind::Merger => compose_merger_prompt(crew_id.unwrap_or(""), spark_id),
     };
 
@@ -388,7 +528,26 @@ pub async fn spawn_hand(
     env_vars.push(("RYVE_HAND_SESSION_ID".to_string(), session_id.clone()));
     env_vars.push(("RYVE_ACTOR_ID".to_string(), actor.clone()));
 
-    // 8. Launch inside a tmux session. The session name is `hand-<session_id>`
+    // 8. Apply the archetype's tool policy to the worktree BEFORE the
+    //    subprocess starts. Read-only archetypes (Investigator) have the
+    //    tree chmod'd to `0o444 / 0o555` so any write the agent attempts
+    //    fails at the kernel boundary regardless of what its prompt says.
+    //    Spark ryve-8384b3cc: gating is mechanical, not a prompt
+    //    instruction. On failure, abort the spawn (no tmux launch) and
+    //    roll back the DB rows — a read-only invariant that was not
+    //    applied is worse than a Hand that never started.
+    let policy = hand_archetypes::tool_policy_for(kind);
+    let archetype_id = hand_archetypes::archetype_id_for(kind);
+    if let Err(e) = hand_archetypes::apply_tool_policy(&worktree_path, policy, archetype_id) {
+        let _ = assignment_repo::abandon(pool, &session_id, spark_id).await;
+        let _ = agent_session_repo::end_session(pool, &session_id).await;
+        return Err(HandSpawnError::ToolPolicy {
+            archetype: archetype_id,
+            source: e,
+        });
+    }
+
+    // 9. Launch inside a tmux session. The session name is `hand-<session_id>`
     //    (or `head-`/`merger-` for other kinds), matching the invariant that
     //    there is exactly one tmux session per agent_sessions row.
     let tmux_session_name = tmux_session_name(kind, &session_id);
@@ -502,6 +661,10 @@ pub async fn spawn_head(
         resume_id: None,
         log_path: Some(log_path.to_string_lossy().into_owned()),
         parent_session_id: parent_session_id.map(|s| s.to_string()),
+        // Heads select their flavour via the Head archetype recorded on
+        // the `archetype` column on the crew row, not the `agent_sessions`
+        // column introduced for Hand archetypes.
+        archetype_id: None,
     };
     agent_session_repo::create(pool, &new_session).await?;
 
@@ -1250,6 +1413,16 @@ mod tests {
         assert_eq!(HandKind::Merger.session_label(), "merger");
     }
 
+    /// Spark ryve-3f799949: `HandKind::Architect` shares the Owner
+    /// assignment semantics with the other read-only archetypes
+    /// (Investigator), but carries its own `session_label = "architect"`
+    /// so crew members and session rows render correctly.
+    #[test]
+    fn architect_kind_maps_to_owner_role_and_architect_label() {
+        assert_eq!(HandKind::Architect.role(), AssignmentRole::Owner);
+        assert_eq!(HandKind::Architect.session_label(), "architect");
+    }
+
     /// End-to-end: `spawn_hand` with `HandKind::Investigator` must persist
     /// `session_label = "investigator"` on the `agent_sessions` row AND on
     /// the `crew_members` row, and must claim the spark with
@@ -1562,6 +1735,7 @@ mod tests {
                 resume_id: None,
                 log_path: None,
                 parent_session_id: None,
+                archetype_id: None,
             },
         )
         .await
@@ -1699,6 +1873,7 @@ mod tests {
                 resume_id: None,
                 log_path: None,
                 parent_session_id: None,
+                archetype_id: None,
             },
         )
         .await
@@ -1765,6 +1940,219 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(recorded.as_deref(), Some("alice"));
+
+        let tmux_name = format!("hand-{}", spawned.session_id);
+        cleanup_tmux(&workshop_dir, &tmux_name);
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+
+    // ─── Spark ryve-8384b3cc: mechanical tool-policy gating at spawn time ──
+
+    /// Build a stub agent that attempts to write a marker file into its
+    /// cwd (the Hand's worktree) and then sleeps briefly so the tmux
+    /// session stays alive long enough for pipe-pane. Redirecting stderr
+    /// to /dev/null plus `|| true` keeps the stub from crashing when the
+    /// read-only policy blocks the write; the test checks the filesystem
+    /// afterwards, not the stub's exit status.
+    ///
+    /// The marker path is `$PWD/HAND_WROTE_HERE.txt` so the test can
+    /// look for it inside `spawned.worktree_path` without knowing any
+    /// internal state.
+    fn write_attempt_stub(workshop_dir: &Path) -> PathBuf {
+        let stub_path = workshop_dir.join("stub-write-agent.sh");
+        std::fs::write(
+            &stub_path,
+            "#!/bin/sh\n\
+             echo 'hand wrote here' > \"$PWD/HAND_WROTE_HERE.txt\" 2>/dev/null || true\n\
+             sleep 3\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub_path, perms).unwrap();
+        }
+        stub_path
+    }
+
+    /// Acceptance criterion for spark ryve-8384b3cc: spawning a
+    /// read-only archetype (Investigator) must mechanically block any
+    /// write the subprocess attempts into its worktree, regardless of
+    /// the system prompt.
+    ///
+    /// The stub agent tries to create `HAND_WROTE_HERE.txt` in its cwd
+    /// (the worktree). After the stub completes, the file must NOT
+    /// exist — the kernel rejected the write with `EACCES` because
+    /// `spawn_hand` chmod'd the worktree read-only before launching the
+    /// subprocess. Also asserts the session row was persisted, i.e. the
+    /// "agent_session completes without mutating the tree" half of the
+    /// acceptance criterion.
+    #[tokio::test]
+    async fn read_only_archetype_worktree_rejects_subprocess_writes() {
+        if !bundled_tmux_available_for_tests() {
+            eprintln!("bundled tmux not available — skipping read-only policy integration test");
+            return;
+        }
+        let (workshop_dir, pool, _out_path) = setup_workshop().await;
+        let stub_path = write_attempt_stub(&workshop_dir);
+
+        let workshop_id = workshop_id_for(&workshop_dir);
+        let spark = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "investigator write-gate".into(),
+                description: "audit spark for tool-policy test".into(),
+                spark_type: SparkType::Epic,
+                priority: 1,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent = CodingAgent {
+            display_name: "stub".into(),
+            command: stub_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            resume: ResumeStrategy::None,
+            compatibility: crate::coding_agents::CompatStatus::Unknown,
+        };
+
+        let spawned = spawn_hand(
+            &workshop_dir,
+            &pool,
+            &agent,
+            &spark.id,
+            HandKind::Investigator,
+            SpawnContext::default(),
+        )
+        .await
+        .expect("spawn_hand with HandKind::Investigator should succeed");
+
+        // Wait long enough for the stub's write attempt to complete.
+        // The stub sleeps 3s after its attempt, so 1s is plenty of head
+        // room for the redirect+echo to have run (or been rejected).
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        let marker = spawned.worktree_path.join("HAND_WROTE_HERE.txt");
+        assert!(
+            !marker.exists(),
+            "read-only archetype's write must have been rejected by the \
+             kernel; marker file exists at {}",
+            marker.display()
+        );
+
+        // The agent_session row still exists — the gate rejected writes,
+        // not the session itself. That's the "session completes without
+        // mutating the tree" half of the invariant.
+        let sessions_db = agent_session_repo::list_for_workshop(&pool, &workshop_id)
+            .await
+            .expect("list sessions");
+        assert!(
+            sessions_db.iter().any(|s| s.id == spawned.session_id),
+            "read-only spawn must still persist its agent_sessions row"
+        );
+
+        // Unlock the worktree so the tempdir cleanup can remove files
+        // whose dirs lost the `w` bit under the read-only chmod.
+        let _ = crate::hand_archetypes::unlock_worktree(&spawned.worktree_path);
+        let tmux_name = format!("investigator-{}", spawned.session_id);
+        cleanup_tmux(&workshop_dir, &tmux_name);
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+
+    /// Acceptance criterion for spark ryve-8384b3cc: spawning a
+    /// write-capable archetype (Owner Hand — the "Bug Hunter" shape)
+    /// must behave exactly as today. The invariant "no regressions on
+    /// write-capable archetypes" is the flip side of the read-only gate
+    /// test above — a blanket chmod that also locked down Owner Hands
+    /// would break every build Crew.
+    ///
+    /// The same stub is used; this time the marker file IS expected to
+    /// exist after the subprocess runs.
+    #[tokio::test]
+    async fn write_capable_archetype_worktree_still_accepts_writes() {
+        if !bundled_tmux_available_for_tests() {
+            eprintln!(
+                "bundled tmux not available — skipping write-capable policy integration test"
+            );
+            return;
+        }
+        let (workshop_dir, pool, _out_path) = setup_workshop().await;
+        let stub_path = write_attempt_stub(&workshop_dir);
+
+        let workshop_id = workshop_id_for(&workshop_dir);
+        let spark = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "bug-hunter write path".into(),
+                description: "owner hand spark for tool-policy regression test".into(),
+                spark_type: SparkType::Epic,
+                priority: 1,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent = CodingAgent {
+            display_name: "stub".into(),
+            command: stub_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            resume: ResumeStrategy::None,
+            compatibility: crate::coding_agents::CompatStatus::Unknown,
+        };
+
+        let spawned = spawn_hand(
+            &workshop_dir,
+            &pool,
+            &agent,
+            &spark.id,
+            HandKind::Owner,
+            SpawnContext::default(),
+        )
+        .await
+        .expect("spawn_hand with HandKind::Owner should succeed");
+
+        // Poll for the marker file; the stub writes it within a few ms
+        // of exec. Use the same 5s budget as the other spawn tests to
+        // ride out slow CI runners.
+        let marker = spawned.worktree_path.join("HAND_WROTE_HERE.txt");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let created = loop {
+            if marker.exists() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            created,
+            "write-capable archetype must be able to create files in its \
+             worktree — expected marker at {} (log: {})",
+            marker.display(),
+            std::fs::read_to_string(&spawned.log_path).unwrap_or_default(),
+        );
 
         let tmux_name = format!("hand-{}", spawned.session_id);
         cleanup_tmux(&workshop_dir, &tmux_name);

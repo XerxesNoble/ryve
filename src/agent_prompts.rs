@@ -582,7 +582,7 @@ pub fn compose_investigator_prompt(sparks: &[Spark], spark_id: &str) -> String {
          \x20\x20\x20\x20FINDING\n\
          \x20\x20\x20\x20severity: <blocker|high|medium|low|info>\n\
          \x20\x20\x20\x20category: <correctness|security|performance|reliability|maintainability|docs|other>\n\
-         \x20\x20\x20\x20location: <path/to/file.rs:LINE> [, <path/to/other.rs:LINE> ...]\n\
+         \x20\x20\x20\x20location: <path/to/file:LINE> [, <path/to/other:LINE> ...]\n\
          \x20\x20\x20\x20evidence: <what you observed — quote code, command output, or doc text>\n\
          \x20\x20\x20\x20recommendation: <concrete next step; may reference a follow-up spark>\n\n\
          Rules for findings:\n\
@@ -614,6 +614,172 @@ pub fn compose_investigator_prompt(sparks: &[Spark], spark_id: &str) -> String {
          - Respect user overrides: if the parent spark is closed or \
            redirected while you are working, stop and exit.\n\n\
          Begin the sweep now.\n",
+    );
+
+    prompt
+}
+
+/// Compose the initial prompt for an **Architect** Hand — a strictly
+/// read-only design reviewer (spark ryve-3f799949).
+///
+/// The Architect is the Hand archetype that inspects a design or the
+/// current shape of the codebase and produces *written recommendations*:
+/// proposed boundaries, tradeoffs, risks, alternatives. It is distinct
+/// from the generic [`compose_investigator_prompt`] in intent — the
+/// Investigator *maps* existing code (hot paths, call graphs, logging
+/// gaps), the Architect *proposes* how it should be shaped going forward.
+/// The invariant list is identical in letter (no `Edit`/`Write`/
+/// `NotebookEdit`, no destructive git, no filesystem mutation outside
+/// `.ryve/` scratch) but the deliverable differs: findings vs.
+/// recommendations.
+///
+/// Capability class is Reviewer / Cartographer from
+/// `docs/HAND_CAPABILITIES.md`: Reviewer because the output is a
+/// critique-shaped comment thread with blocking/should-fix/risk items,
+/// Cartographer because the Architect may sketch a proposed module
+/// boundary before critiquing it.
+///
+/// The prompt is deliberately **language-neutral**. Examples cite
+/// generic design patterns (layering, module boundary, dependency
+/// inversion, event fan-out, read/write split) rather than framework
+/// names, so the same Architect Hand runs against a Python + TypeScript
+/// monorepo, a Rust crate, or a mixed-stack service without re-tuning.
+///
+/// The parent spark's intent — title, problem, acceptance criteria — is
+/// embedded so the Architect scopes its review without a second
+/// workgraph round-trip. When the spark is absent from the cache, the
+/// prompt tells the Architect to load it with `ryve spark show`.
+pub fn compose_architect_prompt(sparks: &[Spark], spark_id: &str) -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str(
+        "EXECUTE THE ASSIGNMENT BELOW IMMEDIATELY. Do not acknowledge, summarize, \
+         or wait for confirmation — start running read-only tools right away. \
+         You are an **Architect Hand** in a Ryve workshop. Your capability class \
+         is Reviewer / Cartographer: you review design and architecture, and \
+         produce written recommendations. You do not write code. You do not \
+         edit files. You do not run destructive commands. Your ENTIRE output \
+         is structured recommendations posted as comments on the parent spark.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "ASSIGNMENT: spark {spark_id} (role: ARCHITECT). Mark it in progress \
+         now: `ryve spark status {spark_id} in_progress`. When every \
+         recommendation has been posted as a comment and a final SUMMARY comment \
+         exists on the parent spark, close the spark: \
+         `ryve spark close {spark_id} completed`.\n\n"
+    ));
+
+    prompt.push_str("PARENT SPARK — scope your review to this intent:\n\n");
+    if let Some(spark) = sparks.iter().find(|s| s.id == spark_id) {
+        push_spark_details(&mut prompt, spark);
+    } else {
+        prompt.push_str(&format!(
+            "(Spark {spark_id} details not in cache — run `ryve spark show {spark_id}` \
+             to load its title, problem statement, invariants, and acceptance criteria \
+             before posting any recommendations.)\n"
+        ));
+    }
+
+    prompt.push_str(
+        "\nREAD-ONLY DISCIPLINE (non-negotiable):\n\
+         - You MUST NOT use Edit, Write, or NotebookEdit tools. You MUST NOT \
+           mutate any file in the worktree outside the `.ryve/` scratch area. \
+           Architects never produce diffs; proposing a diff means turning the \
+           recommendation into a follow-up spark for a writing Hand.\n\
+         - You MUST NOT run destructive git: no `git reset --hard`, no \
+           `git push --force` / force-push of any kind, no `git branch -D`, no \
+           `git checkout -- <path>`, no `git clean -f`. Do not pass \
+           `--no-verify` to any git command.\n\
+         - Shell is limited to READ commands (`ls`, `cat`, `rg`, `grep`, \
+           `find`, `git log`, `git show`, `git diff`, `git blame`, `git status`, \
+           `wc`, `head`, `tail`) and the `ryve` CLI. No package installs, no \
+           build/test steps that mutate on-disk state, no network uploads, no \
+           `rm`, no `mv`, no `chmod`.\n\
+         - Use `ryve` for ALL workgraph operations (`ryve spark show`, \
+           `ryve bond list`, `ryve comment add`, `ryve constraint list`, etc.). \
+           NEVER touch `.ryve/sparks.db` directly with sqlite3.\n\n",
+    );
+
+    prompt.push_str(
+        "NON-GOALS:\n\
+         - Do NOT propose, draft, or edit Architecture Decision Records (ADRs) \
+           yourself. If a recommendation warrants an ADR, say so in the \
+           recommendation body and open a follow-up spark scoped to a writing \
+           Hand — but do not create or modify files under any `docs/adr/` or \
+           similar path.\n\
+         - Do NOT rewrite the current design in a diff. Your output is \
+           prose-shaped comments, not code.\n\
+         - Do NOT make framework or language-specific assumptions. Ground \
+           recommendations in generic design concerns (coupling, cohesion, \
+           layering, ownership, feedback loops, failure modes) rather than \
+           vendor features.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "RECOMMENDATION CONTRACT — structured schema. Every recommendation you \
+         emit is a SINGLE comment on spark `{spark_id}` via:\n\n\
+         \x20\x20\x20\x20ryve comment add {spark_id} '<recommendation body>'\n\n\
+         Each recommendation body MUST use this exact block format (one block \
+         per comment; do not batch multiple recommendations into one comment):\n\n\
+         \x20\x20\x20\x20RECOMMENDATION\n\
+         \x20\x20\x20\x20severity: <blocker|high|medium|low|info>\n\
+         \x20\x20\x20\x20category: <boundary|coupling|cohesion|layering|data-flow|ownership|observability|evolvability|other>\n\
+         \x20\x20\x20\x20location: <path/to/file>:<LINE> [, <path/to/other>:<LINE> ...]\n\
+         \x20\x20\x20\x20recommendation: <the proposed design change, in prose>\n\
+         \x20\x20\x20\x20tradeoffs: <what the proposal costs — perf, complexity, migration effort>\n\
+         \x20\x20\x20\x20risks: <what could go wrong; blast radius; rollback story>\n\
+         \x20\x20\x20\x20alternatives: <other shapes considered, and why this one wins>\n\n\
+         Rules for recommendations:\n\
+         - EVERY recommendation MUST include at least one `file:line` reference \
+           in `location`. A recommendation without any `file:line` is a \
+           whitepaper, not an Architect deliverable, and MUST NOT be posted.\n\
+         - Category names are generic design concerns, NOT language or \
+           framework names. Never put a framework, library, or vendor \
+           product name in `category:` — if a concrete technology is \
+           relevant, mention it inside `recommendation`, not the category.\n\
+         - Recommendations go ONLY as comments via `ryve comment add`. Do NOT \
+           create new files, do NOT write design docs to disk, do NOT stash \
+           drafts in `.ryve/` — the comment thread on the parent spark is the \
+           only deliverable.\n\
+         - If a recommendation warrants concrete follow-up work (a migration, \
+           a refactor spark, a new test harness), say so at the end of \
+           `recommendation` with a suggested spark title. Do not create the \
+           spark yourself unless the parent intent explicitly asks for it.\n\
+         - When your review is finished, post a final SUMMARY comment listing \
+           every recommendation and your overall read of the design. Then \
+           close the spark.\n\n",
+    ));
+
+    prompt.push_str(
+        "EXAMPLE — language-neutral. Given a codebase where the same data \
+         transformation lives in two siblings (an API handler and a background \
+         job), a valid Architect recommendation names the duplication as a \
+         coupling / cohesion issue and proposes a single owning module, with \
+         tradeoffs (one extra import boundary, a thinner handler) and risks \
+         (call sites missed in the cut-over). The example does NOT name a \
+         specific web framework, ORM, or queue library — those details live \
+         inside the recommendation body, not the category.\n\n",
+    );
+
+    prompt.push_str(
+        "HARD RULES:\n\
+         - You are read-only. Edit/Write/NotebookEdit are forbidden. \
+           `git reset --hard`, `git push --force` / force-push, and \
+           `--no-verify` are forbidden by name.\n\
+         - Recommendations are emitted ONLY via `ryve comment add`. Never as \
+           code changes, never as new files outside `.ryve/` scratch, never as \
+           ADRs.\n\
+         - Every recommendation cites at least one `file:line` as evidence.\n\
+         - The prompt is language-neutral — your recommendations must be too. \
+           Use generic design patterns (layering, boundary, ownership, data \
+           flow, feedback loop) as the vocabulary; reference specific \
+           frameworks only inside a recommendation body, never as a category.\n\
+         - Reference the parent spark id `[sp-xxxx]` in any cross-links or \
+           follow-up sparks.\n\
+         - Respect user overrides: if the parent spark is closed or \
+           redirected while you are working, stop and exit.\n\n\
+         Begin the review now.\n",
     );
 
     prompt
@@ -695,6 +861,445 @@ pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
     prompt
 }
 
+/// Compose the initial prompt for a **Release Manager** Hand — the
+/// archetype whose entire job is steering one Release through its
+/// lifecycle on behalf of Atlas. Spark ryve-e6713ee7 / [sp-2a82fee7].
+///
+/// Unlike Owner Hands, the Release Manager's communication graph is
+/// deliberately narrow: it takes direction only from Atlas and reports
+/// only to Atlas. The *prompt* repeats this contract for the agent's
+/// benefit, but the binding enforcement lives in
+/// [`crate::hand_archetypes::enforce_action`] — the CLI rejects any
+/// `ryve hand spawn`, `ryve head spawn`, or off-release `ryve comment
+/// add` invocation regardless of what the prompt says. Embers are
+/// similarly refused.
+///
+/// The prompt carries the release-management spark's title and intent
+/// so the RM knows which release it is steering without a second
+/// round-trip, and lays out the `ryve release *` workflow the RM is
+/// allowed to drive.
+pub fn compose_release_manager_prompt(sparks: &[Spark], spark_id: &str) -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str(
+        "EXECUTE THE ASSIGNMENT BELOW IMMEDIATELY. Do not acknowledge, summarize, \
+         or wait for confirmation — start running tools right away. You are a \
+         **Release Manager Hand** in a Ryve workshop. Your ENTIRE job is steering \
+         one Release through its lifecycle on Atlas's behalf. Your communication \
+         graph is deliberately narrow: you take direction ONLY from Atlas and you \
+         report ONLY to Atlas. Every other channel is closed at the tool-policy \
+         layer — the CLI rejects any forbidden action regardless of what this \
+         prompt says.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "ASSIGNMENT: spark {spark_id} (role: RELEASE MANAGER). Mark it in progress \
+         now: `ryve spark status {spark_id} in_progress`. When the release is \
+         closed and every acceptance criterion is satisfied, close this spark: \
+         `ryve spark close {spark_id} completed`.\n\n"
+    ));
+
+    prompt.push_str("RELEASE-MANAGEMENT SPARK — scope your work to this intent:\n\n");
+    if let Some(spark) = sparks.iter().find(|s| s.id == spark_id) {
+        push_spark_details(&mut prompt, spark);
+    } else {
+        prompt.push_str(&format!(
+            "(Spark {spark_id} details not in cache — run `ryve spark show {spark_id}` \
+             to load its title, problem statement, invariants, and acceptance \
+             criteria before taking any action on the release.)\n"
+        ));
+    }
+
+    prompt.push_str(
+        "\nTOOL POLICY — allow-list (enforced mechanically by the CLI):\n\
+         - `ryve release *` subcommands (`create`, `list`, `show`, `add-epic`, \
+           `remove-epic`, `status`, `close`). These are the levers you pull to \
+           steer the release.\n\
+         - Read-only workgraph queries (`ryve spark list/show`, `ryve bond list`, \
+           `ryve release list/show`, `ryve crew list/show`, `ryve assign list`, \
+           `ryve contract list`, `ryve ember list`, `ryve comment list`). Use them \
+           freely to read state.\n\
+         - Git on `release/*` branches only. Clone / fetch / commit / tag inside \
+           the release worktree. You may NOT push force, you may NOT rewrite \
+           history, you may NOT touch any branch outside `release/*`.\n\
+         - `ryve comment add <spark_id> <body>` ONLY when `<spark_id>` is a \
+           member of a release (epic attached via `ryve release add-epic`). \
+           Atlas polls those sparks — comments there are the only channel you \
+           have back to Atlas. A comment on any other spark is rejected by the \
+           CLI before it reaches the workgraph.\n\n\
+         FORBIDDEN (rejected at the CLI, not just discouraged):\n\
+         - `ryve hand spawn ...` and `ryve head spawn ...` — you MUST NOT spawn \
+           any subordinate. Atlas decides which work goes into the release; your \
+           job is to execute the plan, not to delegate.\n\
+         - `ryve ember send ...` — embers broadcast beyond Atlas and break the \
+           narrow comms graph; forbidden outright.\n\
+         - `ryve comment add` targeted at any spark that is not a release \
+           member — including parent epics, siblings, unrelated work, or the \
+           workshop root itself.\n\n",
+    );
+
+    prompt.push_str(
+        "WORKFLOW — the levers you pull, in the order Atlas expects them:\n\
+         1. Read the release you are managing: `ryve release show <release_id>`. \
+            The release id lives on the spark's intent or in Atlas's brief to \
+            you; if you cannot find it, comment on this spark asking Atlas for \
+            the id, then stop until Atlas replies.\n\
+         2. Verify scope: `ryve release show <release_id>` lists member epics. \
+            Atlas decides scope — if you believe an epic is missing or extra, \
+            post a comment on this spark for Atlas. Do NOT call `ryve release \
+            add-epic` or `ryve release remove-epic` without explicit direction \
+            from Atlas on this spark's comment thread.\n\
+         3. Cut the release branch when Atlas directs: `ryve release status \
+            <release_id> cut`. This transitions the release row and asserts the \
+            branch exists.\n\
+         4. Drive member epics to completion by reading their assignments \
+            (`ryve assign list <epic_id>`) and their contracts (`ryve contract \
+            list <epic_id>`). Flag any blocker as a comment on the relevant \
+            release member spark — Atlas reads those.\n\
+         5. Close the release when every member is done: `ryve release close \
+            <release_id>`. That command runs verify → tag → build → record \
+            artifact → transition to closed, and rolls back on any failure. \
+            Treat any non-zero exit as a blocker and comment on this spark.\n\
+         6. Mark this management spark completed with `ryve spark close \
+            {spark_id} completed`.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "HARD RULES:\n\
+         - You are the ONLY Release Manager on this release. Do not spawn a \
+           second one; do not suggest parallel Release Managers to Atlas.\n\
+         - Atlas decides which epics belong in the release. You execute, you do \
+           not decide scope. If the brief is ambiguous, ask Atlas via a comment \
+           on THIS spark ({spark_id}) — Atlas polls it.\n\
+         - Never use `--no-verify`, `git push --force`, `git reset --hard`, \
+           `git branch -D`, or `git checkout -- <path>` on any branch.\n\
+         - Reference the spark id `[sp-xxxx]` in every commit.\n\
+         - If Atlas closes this spark or redirects while you are working, stop \
+           and exit.\n\n\
+         Begin the work now.\n"
+    ));
+
+    prompt
+}
+
+/// Compose the initial prompt for a **Bug Hunter** Hand — a Triager +
+/// Surgeon hybrid specialised on small defects. Spark ryve-e5688777 /
+/// [sp-1471f46a].
+///
+/// A Bug Hunter reproduces a bug with a failing test FIRST, localises
+/// the root cause, and lands the smallest possible diff that flips the
+/// test from red to green. Its acceptance bar is deliberately narrow:
+/// "failing test → passing test + smallest possible diff", not "feature
+/// shipped". Refactoring, cleanups, and adjacent improvements belong
+/// in separate sparks.
+///
+/// The archetype is **language-agnostic**: the prompt makes no
+/// assumptions about the project's language, test runner, or
+/// framework. The Bug Hunter is instructed to use whichever toolchain
+/// the repo already uses (derived from `Cargo.toml` / `package.json` /
+/// `pyproject.toml` / `go.mod` / similar). Writing the test and the
+/// fix are left to the agent; auto-running tests is an explicit
+/// non-goal of the parent spark — the agent decides when to run what.
+///
+/// Tool policy is write-capable (no kernel-level gate): Bug Hunters
+/// must edit code to land the fix and the regression test. Scope is
+/// policed by this prompt and the DONE checklist, not by
+/// [`crate::hand_archetypes::enforce_action`].
+pub fn compose_bug_hunter_prompt(sparks: &[Spark], spark_id: &str) -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str(
+        "EXECUTE THE ASSIGNMENT BELOW IMMEDIATELY. Do not acknowledge, summarize, \
+         or wait for confirmation — start running tools and editing code right \
+         away. You are a **Bug Hunter Hand** in a Ryve workshop: a Triager + \
+         Surgeon hybrid specialised on small defects. You reproduce the bug \
+         with a failing test FIRST, localise the root cause, and land the \
+         smallest possible diff that flips the test from red to green. Anything \
+         beyond that — refactors, cleanups, adjacent improvements — is out of \
+         scope; file a follow-up spark instead.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "ASSIGNMENT: spark {spark_id} (role: BUG HUNTER). Mark it in progress \
+         now: `ryve spark status {spark_id} in_progress`. When the regression \
+         test you wrote passes on the fixed code AND the diff is as small as \
+         you can make it, close the spark: `ryve spark close {spark_id} \
+         completed`.\n\n"
+    ));
+
+    prompt.push_str("BUG SPARK — scope your fix to this intent:\n\n");
+    if let Some(spark) = sparks.iter().find(|s| s.id == spark_id) {
+        push_spark_details(&mut prompt, spark);
+    } else {
+        prompt.push_str(&format!(
+            "(Spark {spark_id} details not in cache — run `ryve spark show {spark_id}` \
+             to load its title, problem statement, invariants, and acceptance criteria \
+             before touching code.)\n"
+        ));
+    }
+
+    prompt.push_str(
+        "\nACCEPTANCE BAR — non-negotiable:\n\
+         1. A failing test exists that reproduces the bug on the current code. \
+            Write it as a new test in the project's existing test layout; do \
+            not invent a parallel test harness. The test MUST fail before your \
+            fix and MUST pass after it.\n\
+         2. The fix is the smallest diff that flips the test. Prefer a \
+            one-line change to a ten-line change; prefer a ten-line change to \
+            touching a second file. If you find yourself refactoring, stop — \
+            scope creep on a Bug Hunter task is a spark-splitting signal, not \
+            a free cleanup.\n\
+         3. No existing tests regress. The agent decides when to run the \
+            suite; running it is not automatic, but shipping without having \
+            checked is not acceptable.\n\n",
+    );
+
+    prompt.push_str(
+        "LANGUAGE-AGNOSTIC WORKFLOW — adapt to the repo you are in:\n\
+         1. REPRODUCE. Inspect the repo to identify the language, test \
+            runner, and framework. Look at the manifest in the project root \
+            (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, \
+            `pom.xml`, `build.gradle`, `Gemfile`, `mix.exs`, etc.) and the \
+            existing tests under the conventional directories (`tests/`, \
+            `src/**/*_test.*`, `spec/`, `__tests__/`, etc.). Mirror the \
+            project's own test style — do not introduce a new testing \
+            library.\n\
+         2. WRITE THE FAILING TEST. Add the smallest test that captures the \
+            reported behaviour. If the bug description does not specify a \
+            reproducer, derive one from the problem statement. Commit the \
+            failing test first if the project's git flow benefits — otherwise \
+            bundle it with the fix in one commit. Either way, the commit \
+            message references the spark id `[sp-xxxx]`.\n\
+         3. LOCALISE. Read the code along the failing code-path. `git blame` \
+            and `git log -p` help identify the introducing change. Prefer \
+            fixing at the root cause, not at the symptom — but do not \
+            rewrite unrelated code.\n\
+         4. FIX. Apply the smallest change that flips the test. If two fixes \
+            are equally small, prefer the one that touches fewer files or \
+            stays closer to the bug's module.\n\
+         5. VERIFY. Re-run the failing test and confirm it now passes. Run \
+            whatever broader test command the project uses (`cargo test`, \
+            `npm test`, `pytest`, `go test ./...`, `mvn test`, etc.) to \
+            check for regressions. Fix any regression you caused; if you \
+            did not cause it, file a new spark and stop.\n\
+         6. CLOSE. When the DONE checklist passes, close the spark with \
+            `ryve spark close <id> completed` and exit.\n\n",
+    );
+
+    prompt.push_str(
+        "HARD RULES:\n\
+         - Your deliverable is a failing-then-passing test plus the smallest \
+           possible diff. Nothing else.\n\
+         - Do NOT refactor, rename, reformat, or re-style unrelated code. \
+           If you believe a refactor is warranted, file a new spark \
+           (`ryve spark create --type refactor …`) and leave a comment \
+           linking it on THIS spark. Then continue with the minimal fix \
+           only.\n\
+         - Do NOT widen the test harness: add to the project's existing \
+           test layout and runner, never introduce a new one.\n\
+         - Do NOT commit secrets, binary blobs, generated artefacts, or \
+           lockfile churn unrelated to the fix.\n\
+         - Never use `--no-verify`, `git push --force` / force-push of any \
+           kind, `git reset --hard` on shared branches, `git branch -D`, or \
+           `git checkout -- <path>`. These are destructive and out of scope \
+           for a Bug Hunter task.\n\
+         - Reference the spark id `[sp-xxxx]` in every commit.\n\
+         - Respect user overrides: if the spark is closed or redirected \
+           while you are working, stop and exit.\n\n\
+         Begin the hunt now.\n",
+    );
+
+    prompt
+}
+
+/// Compose the initial prompt for a **Performance Engineer** Hand — a
+/// Refactorer + Cartographer hybrid specialised on measurable
+/// performance improvements. Spark ryve-1c099466 / [sp-1471f46a].
+///
+/// Unlike a Bug Hunter (whose acceptance bar is a failing-then-passing
+/// test) and unlike an Architect (who never edits code), a Performance
+/// Engineer's acceptance bar is a **measured delta vs a baseline**. The
+/// workflow is deliberately shaped in four phases — BASELINE, PROFILE,
+/// PROPOSE, VERIFY — and the archetype's deliverables are (a) the fix
+/// and (b) before/after numbers recorded as spark comments so
+/// post-mortems can diff them.
+///
+/// The archetype is **language-agnostic**: the prompt describes WHAT
+/// to do (measure a baseline, profile the hot path, propose a targeted
+/// fix, verify the improvement) and leaves WHICH tool to use up to the
+/// agent. Rust projects would reach for `cargo bench` / `criterion` /
+/// `perf` / `samply`; Node for `node --prof` / `clinic`; Python for
+/// `cProfile` / `py-spy`; etc. Hard-coding any one of them at the
+/// archetype layer would stop the Performance Engineer from being
+/// useful in the other repos it lands in.
+///
+/// Tool policy is write-capable (no kernel-level gate): Performance
+/// Engineers must edit code to land the improvement. Scope is policed
+/// by this prompt and the DONE checklist — not by
+/// [`crate::hand_archetypes::enforce_action`].
+///
+/// Non-goals of the parent spark (explicit): shipping a profiler or
+/// benchmark harness, and automated baseline capture. Both are named
+/// in the HARD RULES below so the prompt mechanically leaves those to
+/// the agent / to the repo.
+pub fn compose_performance_engineer_prompt(sparks: &[Spark], spark_id: &str) -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str(
+        "EXECUTE THE ASSIGNMENT BELOW IMMEDIATELY. Do not acknowledge, summarize, \
+         or wait for confirmation — start running tools and editing code right \
+         away. You are a **Performance Engineer Hand** in a Ryve workshop: a \
+         Refactorer + Cartographer hybrid specialised on measurable performance \
+         improvements. Your acceptance bar is a measured delta vs a baseline, \
+         NOT a test pass — you ship a fix with before/after numbers, and you \
+         record those numbers as comments on the spark so post-mortems can \
+         diff them.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "ASSIGNMENT: spark {spark_id} (role: PERFORMANCE ENGINEER). Mark it in \
+         progress now: `ryve spark status {spark_id} in_progress`. When the \
+         measured delta meets the spark's target AND you have posted at least \
+         one comment on {spark_id} carrying both the baseline and the post-fix \
+         numbers, close the spark: `ryve spark close {spark_id} completed`.\n\n"
+    ));
+
+    prompt.push_str("PERF SPARK — scope your improvement to this intent:\n\n");
+    if let Some(spark) = sparks.iter().find(|s| s.id == spark_id) {
+        push_spark_details(&mut prompt, spark);
+    } else {
+        prompt.push_str(&format!(
+            "(Spark {spark_id} details not in cache — run `ryve spark show {spark_id}` \
+             to load its title, problem statement, invariants, and acceptance criteria \
+             before touching code.)\n"
+        ));
+    }
+
+    prompt.push_str(&format!(
+        "\nACCEPTANCE BAR — non-negotiable:\n\
+         1. A baseline measurement exists, captured BEFORE you change any \
+            code. Name the hot path, the metric (latency, throughput, \
+            allocations, bytes transferred, memory residency, etc.), the \
+            measurement method, and the raw number. A vibes-based \"feels \
+            slow\" is not a baseline — you must be able to reproduce it.\n\
+         2. A post-fix measurement exists, captured the same way as the \
+            baseline, on the same workload, same hardware, and (where \
+            applicable) the same toolchain / runtime / input size. Same \
+            method, same inputs — otherwise the delta is meaningless.\n\
+         3. The delta meets the spark's acceptance criterion. If the spark \
+            does not name a numeric target, ask yourself: is the improvement \
+            meaningful relative to the measurement's noise floor? If it is \
+            inside noise, the fix is not done — profile harder, propose a \
+            different change, or file a new spark documenting why this hot \
+            path is not improvable by this approach.\n\
+         4. Before/after numbers are recorded on THIS spark as a comment: \
+            `ryve comment add {spark_id} '<baseline metric → post-fix metric \
+            (method, workload)>'`. Post-mortems diff these comments; a \
+            closed perf spark with no recorded numbers is treated as \
+            unverifiable regardless of the diff it shipped.\n\
+         5. No existing tests or benchmarks regress. The agent decides when \
+            to run the broader suite; running it is not automatic, but \
+            shipping without having checked is not acceptable.\n\n"
+    ));
+
+    prompt.push_str(&format!(
+        "LANGUAGE-AGNOSTIC WORKFLOW — adapt to the repo you are in. The \
+         archetype makes NO assumptions about profiling tools or benchmark \
+         harnesses; pick whichever fits the project.\n\n\
+         1. BASELINE. Inspect the repo to identify the language, the \
+            existing benchmark / profiling surface, and the shape of the \
+            hot path named in the spark. Look at the manifest \
+            (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, \
+            `pom.xml`, etc.) and any existing `bench/`, `benches/`, or \
+            `perf/` directory. If a benchmark already exists for the hot \
+            path, run it and record the number. If one does not, \
+            construct the smallest reproducer that drives the hot path \
+            in a deterministic, re-runnable way — a throwaway script, a \
+            one-shot binary, a `main` harness, whichever the repo \
+            prefers. Record the baseline number with units, method, and \
+            workload description as a comment on the spark BEFORE you \
+            edit production code.\n\
+         2. PROFILE. Use whatever profiler is idiomatic for the language \
+            and the measurement — `cargo bench` / `criterion` / `perf` / \
+            `samply` / `flamegraph` for Rust; `node --prof` / `clinic` / \
+            Chrome devtools for Node; `cProfile` / `py-spy` / `scalene` \
+            for Python; `pprof` for Go; `async-profiler` / `JFR` for \
+            JVM; `Instruments` / `dtrace` on macOS; `perf` on Linux; \
+            etc. Do NOT bring in a new profiler dependency if the repo \
+            already uses one. Identify the specific function, call \
+            site, allocation, or syscall that dominates the metric.\n\
+         3. PROPOSE. Draft the smallest targeted change that addresses \
+            the dominant cost. Prefer algorithmic improvement to \
+            micro-optimisation; prefer removing an allocation over \
+            caching around it; prefer a cheap fast path over a more \
+            clever data structure. If the right fix would grow well \
+            beyond the spark's scope, STOP and file a new spark — do \
+            not widen this one. A Performance Engineer ships focused \
+            deltas, not rewrites.\n\
+         4. VERIFY. Re-run the exact baseline measurement on the patched \
+            code. Capture the post-fix number the same way you captured \
+            the baseline. If the improvement is smaller than expected \
+            or inside the noise floor, go back to PROFILE — do not ship \
+            the fix on a hunch. When the delta is real, run whatever \
+            broader test / benchmark suite the project uses \
+            (`cargo test`, `cargo bench`, `npm test`, `pytest`, `go \
+            test ./...`, etc.) to confirm no regression elsewhere. Fix \
+            any regression you caused; if a regression is not yours, \
+            file a new spark and stop.\n\
+         5. RECORD & CLOSE. Post a comment on THIS spark carrying the \
+            baseline metric, the post-fix metric, the method, and the \
+            workload — in a single line a post-mortem can grep. \
+            Example: `ryve comment add {spark_id} 'render_frame p99: \
+            18.4ms → 7.1ms (criterion --bench render, workload=large, \
+            same laptop)'`. Then close the spark with `ryve spark close \
+            {spark_id} completed` and exit.\n\n"
+    ));
+
+    prompt.push_str(
+        "HARD RULES:\n\
+         - Your deliverable is a measured delta plus the targeted fix. \
+           A fix with no baseline, or a baseline with no fix, is \
+           incomplete — do not close the spark.\n\
+         - The before/after numbers MUST land as a comment on THIS \
+           spark via `ryve comment add`. Burying them in a commit \
+           message, the PR body, or the worktree log is not acceptable \
+           — post-mortems diff comments, not commit bodies.\n\
+         - Do NOT ship a profiler or a benchmark harness as part of \
+           this spark (the spark's non-goal). Use whatever profiling \
+           and benchmark surface the repo already has; if it has none, \
+           construct a throwaway reproducer just for this measurement \
+           and treat it as scaffolding, not a deliverable. If the repo \
+           genuinely needs a persistent harness, file a separate spark.\n\
+         - Do NOT add automated baseline capture (the spark's other \
+           non-goal). Baselining is your job this turn — not the \
+           workshop's job forever.\n\
+         - Do NOT refactor, rename, reformat, or re-style unrelated \
+           code. If you believe a refactor is warranted, file a new \
+           spark (`ryve spark create --type refactor …`) and leave a \
+           comment linking it on THIS spark. Then continue with the \
+           targeted fix only.\n\
+         - Do NOT change observable behaviour. The archetype is \
+           Refactorer-shaped: faster, same result. If a change would \
+           alter outputs, API, or correctness, stop and file a \
+           separate spark — that is a feature / bug decision, not a \
+           perf decision.\n\
+         - Do NOT commit secrets, binary blobs, benchmark artefacts, \
+           flamegraph outputs, or lockfile churn unrelated to the \
+           fix.\n\
+         - Never use `--no-verify`, `git push --force` / force-push of \
+           any kind, `git reset --hard` on shared branches, `git \
+           branch -D`, or `git checkout -- <path>`. These are \
+           destructive and out of scope for a Performance Engineer \
+           task.\n\
+         - Reference the spark id `[sp-xxxx]` in every commit.\n\
+         - Respect user overrides: if the spark is closed or \
+           redirected while you are working, stop and exit.\n\n\
+         Begin the measurement now.\n",
+    );
+
+    prompt
+}
+
 // ── helpers ────────────────────────────────────────────
 
 const HOUSE_RULES: &str = "EXECUTE THE ASSIGNMENT BELOW IMMEDIATELY. Do not acknowledge, summarize, \
@@ -722,8 +1327,8 @@ Violations are blocking.\n\
 /// time (expensive, human-gated) to planning time (cheap, automatic).
 const BOND_DISCIPLINE: &str = "MERGE-CLEAN BOND DISCIPLINE (non-negotiable). Before spawning any Hand, \
 enumerate the concrete file scope of each child spark you created. For every \
-pair of siblings whose scopes touch the same file (including shared `mod.rs`, \
-`Cargo.toml`, migrations directory, etc.), add a `blocks` bond: \
+pair of siblings whose scopes touch the same file (including shared module \
+indexes, package manifests, migrations directories, etc.), add a `blocks` bond: \
 `ryve bond create <earlier> <later> blocks`. Only siblings with genuinely \
 disjoint file scopes may run in parallel. The Merger integrates siblings onto \
 the epic branch in bond order and cannot mechanically resolve same-file \
@@ -1152,6 +1757,448 @@ mod tests {
             p.contains("ryve spark show sp-missing"),
             "missing-spark fallback must prompt a `ryve spark show` call"
         );
+    }
+
+    // ─── Release Manager prompt snapshot [sp-2a82fee7 / ryve-e6713ee7] ───
+
+    /// Snapshot-level lock for the Release Manager prompt skeleton.
+    /// Every assertion is deliberately behavioural — identity, allow-list,
+    /// forbidden actions, Atlas-only comms — so a future edit that
+    /// softens the contract fails the build.
+    #[test]
+    fn release_manager_prompt_locks_identity_and_allow_list_skeleton() {
+        let sparks = vec![make_spark("sp-rel1", "Manage release 0.1.0")];
+        let p = compose_release_manager_prompt(&sparks, "sp-rel1");
+
+        // Opens with the EXECUTE directive (spawn-time parity with
+        // hand/merger/investigator composers).
+        assert!(
+            p.starts_with("EXECUTE"),
+            "release manager prompt must lead with EXECUTE directive: {:?}",
+            p.chars().take(80).collect::<String>()
+        );
+
+        // Identity and Atlas-only comms discipline.
+        assert!(p.contains("Release Manager Hand"));
+        assert!(p.contains("ONLY from Atlas"));
+        assert!(p.contains("ONLY to Atlas"));
+
+        // Parent spark context: title + assignment id.
+        assert!(p.contains("sp-rel1"));
+        assert!(p.contains("Manage release 0.1.0"));
+        assert!(p.contains("ryve spark status sp-rel1 in_progress"));
+
+        // Allow-list positives.
+        assert!(p.contains("`ryve release *` subcommands"));
+        assert!(p.contains("Read-only workgraph queries"));
+        assert!(p.contains("release/*"));
+        assert!(p.contains("ryve comment add"));
+
+        // Forbidden-action negatives. Named explicitly so the prompt
+        // and the mechanical enforcement stay aligned.
+        assert!(p.contains("`ryve hand spawn"));
+        assert!(p.contains("`ryve head spawn"));
+        assert!(p.contains("`ryve ember send"));
+
+        // Workflow steps — verify we reference release close flow.
+        assert!(p.contains("ryve release close"));
+        assert!(p.contains("ryve release show"));
+
+        // HARD RULES block with the singleton + scope invariants.
+        assert!(p.contains("HARD RULES"));
+        assert!(p.contains("ONLY Release Manager"));
+    }
+
+    /// Regression: when the management spark is absent from the cache,
+    /// the prompt must direct the RM to load it with `ryve spark show`
+    /// rather than proceeding blind.
+    #[test]
+    fn release_manager_prompt_falls_back_to_spark_show_when_cache_missing() {
+        let p = compose_release_manager_prompt(&[], "sp-missing");
+        assert!(
+            p.contains("ryve spark show sp-missing"),
+            "missing-spark fallback must prompt `ryve spark show`"
+        );
+    }
+
+    // ─── Bug Hunter prompt snapshot [sp-1471f46a / ryve-e5688777] ─────
+
+    /// Snapshot-level lock for the Bug Hunter prompt skeleton. Every
+    /// assertion is behavioural — identity, acceptance bar, language
+    /// agnosticism, scope guards — so a future edit that softens the
+    /// contract fails the build.
+    #[test]
+    fn bug_hunter_prompt_locks_identity_and_acceptance_bar_skeleton() {
+        let sparks = vec![make_spark("sp-bug1", "panic on empty input")];
+        let p = compose_bug_hunter_prompt(&sparks, "sp-bug1");
+
+        // Opens with the EXECUTE directive (spawn-time parity with the
+        // other composers — hand/merger/investigator/release_manager).
+        assert!(
+            p.starts_with("EXECUTE"),
+            "bug hunter prompt must lead with EXECUTE directive: {:?}",
+            p.chars().take(80).collect::<String>()
+        );
+
+        // Identity: names the archetype and its Triager+Surgeon shape.
+        assert!(p.contains("Bug Hunter Hand"));
+        assert!(p.contains("Triager"));
+        assert!(p.contains("Surgeon"));
+
+        // Parent spark context: title + assignment id.
+        assert!(p.contains("sp-bug1"));
+        assert!(p.contains("panic on empty input"));
+        assert!(p.contains("ryve spark status sp-bug1 in_progress"));
+        assert!(p.contains("ryve spark close sp-bug1 completed"));
+
+        // Acceptance bar — failing-then-passing test + smallest diff.
+        assert!(p.contains("failing test"));
+        assert!(p.contains("smallest"));
+        assert!(p.contains("regression"));
+
+        // Language-agnostic: names manifests from several ecosystems so
+        // a future edit that narrows the archetype to one language
+        // fails the build. We must not bake in assumptions about a
+        // specific test runner.
+        for manifest in ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"] {
+            assert!(
+                p.contains(manifest),
+                "prompt must remain language-agnostic; missing {manifest}"
+            );
+        }
+
+        // Workflow landmarks.
+        assert!(p.contains("REPRODUCE"));
+        assert!(p.contains("LOCALISE") || p.contains("LOCALIZE"));
+        assert!(p.contains("FIX"));
+        assert!(p.contains("VERIFY"));
+
+        // HARD RULES block with scope-creep guard and destructive-git
+        // bans aligned with the rest of the archetype family.
+        assert!(p.contains("HARD RULES"));
+        assert!(p.contains("Do NOT refactor"));
+        assert!(p.contains("--no-verify"));
+        assert!(p.contains("force-push"));
+        assert!(p.contains("git reset --hard"));
+    }
+
+    /// Regression: when the bug spark is absent from the cache, the
+    /// prompt must direct the Bug Hunter to load it with `ryve spark
+    /// show` rather than proceeding blind.
+    #[test]
+    fn bug_hunter_prompt_falls_back_to_spark_show_when_cache_missing() {
+        let p = compose_bug_hunter_prompt(&[], "sp-missing");
+        assert!(
+            p.contains("ryve spark show sp-missing"),
+            "missing-spark fallback must prompt `ryve spark show`"
+        );
+    }
+
+    /// Non-goal guard (sp-1471f46a): the Bug Hunter archetype must NOT
+    /// auto-run tests on the agent's behalf — the agent decides when to
+    /// run what. If a future edit slips an auto-run instruction into
+    /// the prompt skeleton, this test fails so the non-goal stays
+    /// mechanically enforced.
+    #[test]
+    fn bug_hunter_prompt_leaves_test_execution_to_the_agent() {
+        let p = compose_bug_hunter_prompt(&[], "sp-bug-autonomy");
+
+        // Must not tell the agent it will auto-run tests on its behalf
+        // (e.g. "the system will run your tests"). The wording here is
+        // deliberately cautious — we don't want to forbid the prompt
+        // from naming test commands, only from promising automation.
+        assert!(
+            !p.to_lowercase().contains("we will run your test"),
+            "prompt must not promise auto-running tests"
+        );
+        assert!(
+            !p.to_lowercase().contains("tests run automatically"),
+            "prompt must not promise auto-running tests"
+        );
+
+        // The agent's autonomy over test execution is the positive
+        // counterpart of the non-goal.
+        assert!(
+            p.contains("agent decides"),
+            "prompt must leave test-running to the agent explicitly"
+        );
+    }
+
+    // ─── Performance Engineer prompt snapshot [sp-1471f46a / ryve-1c099466] ─────
+
+    /// Snapshot-level lock for the Performance Engineer prompt skeleton.
+    /// Every assertion is behavioural — identity, acceptance bar,
+    /// measurement discipline, language agnosticism, non-goal guards —
+    /// so a future edit that softens the contract fails the build.
+    #[test]
+    fn performance_engineer_prompt_locks_identity_and_acceptance_bar_skeleton() {
+        let sparks = vec![make_spark("sp-perf1", "render_frame p99 too high")];
+        let p = compose_performance_engineer_prompt(&sparks, "sp-perf1");
+
+        // Opens with the EXECUTE directive (spawn-time parity with the
+        // other composers — hand/merger/investigator/release_manager/
+        // bug_hunter).
+        assert!(
+            p.starts_with("EXECUTE"),
+            "performance engineer prompt must lead with EXECUTE directive: {:?}",
+            p.chars().take(80).collect::<String>()
+        );
+
+        // Identity: names the archetype and its Refactorer+Cartographer
+        // shape (the capability-class hybrid called out in the spark).
+        assert!(p.contains("Performance Engineer Hand"));
+        assert!(p.contains("Refactorer"));
+        assert!(p.contains("Cartographer"));
+
+        // Parent spark context: title + assignment id.
+        assert!(p.contains("sp-perf1"));
+        assert!(p.contains("render_frame p99 too high"));
+        assert!(p.contains("ryve spark status sp-perf1 in_progress"));
+        assert!(p.contains("ryve spark close sp-perf1 completed"));
+
+        // Acceptance bar — the distinguishing invariant of this
+        // archetype: a MEASURED DELTA vs a baseline, not a test pass.
+        // Bug Hunter's "failing test" language must NOT appear as the
+        // primary acceptance bar.
+        assert!(p.contains("measured delta"));
+        assert!(p.contains("baseline"));
+        assert!(p.contains("before/after") || p.contains("post-fix"));
+        // Comments on the spark are the persistence surface for the
+        // before/after numbers; without this, post-mortems cannot diff.
+        assert!(p.contains("ryve comment add sp-perf1"));
+
+        // Four-phase workflow landmarks (BASELINE → PROFILE → PROPOSE →
+        // VERIFY). If any is removed the archetype's shape is broken.
+        assert!(p.contains("BASELINE"));
+        assert!(p.contains("PROFILE"));
+        assert!(p.contains("PROPOSE"));
+        assert!(p.contains("VERIFY"));
+
+        // Language-agnostic: names manifests from several ecosystems AND
+        // profilers from several ecosystems. A future edit that narrows
+        // the archetype to one language or one profiler fails here —
+        // the invariant from the parent spark ("The prompt makes no
+        // language-specific profiling tool assumptions") is mechanical.
+        for manifest in ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"] {
+            assert!(
+                p.contains(manifest),
+                "prompt must remain language-agnostic at the manifest layer; missing {manifest}"
+            );
+        }
+        // Profiler diversity: we don't care which *specific* tools land
+        // in the skeleton as long as several ecosystems are represented.
+        let profiler_hits = ["cargo bench", "perf", "py-spy", "pprof"]
+            .iter()
+            .filter(|name| p.contains(*name))
+            .count();
+        assert!(
+            profiler_hits >= 3,
+            "prompt must name profilers from multiple ecosystems; got {profiler_hits} hits"
+        );
+
+        // Non-goal guards (from the parent spark):
+        //   - Shipping a profiler or benchmark harness.
+        //   - Automated baseline capture.
+        // Both must be explicitly forbidden so a future edit that
+        // silently widens the archetype fails the build.
+        assert!(
+            p.contains("Do NOT ship a profiler") || p.contains("profiler or a benchmark harness"),
+            "non-goal guard (no profiler/harness shipping) must remain in prompt"
+        );
+        assert!(
+            p.contains("Do NOT add automated baseline capture") || p.contains("automated baseline"),
+            "non-goal guard (no automated baseline capture) must remain in prompt"
+        );
+
+        // HARD RULES block with scope-creep guard and destructive-git
+        // bans aligned with the rest of the archetype family.
+        assert!(p.contains("HARD RULES"));
+        assert!(p.contains("Do NOT refactor"));
+        assert!(p.contains("--no-verify"));
+        assert!(p.contains("force-push"));
+        assert!(p.contains("git reset --hard"));
+    }
+
+    /// Regression: when the perf spark is absent from the cache, the
+    /// prompt must direct the Performance Engineer to load it with
+    /// `ryve spark show` rather than proceeding blind.
+    #[test]
+    fn performance_engineer_prompt_falls_back_to_spark_show_when_cache_missing() {
+        let p = compose_performance_engineer_prompt(&[], "sp-missing");
+        assert!(
+            p.contains("ryve spark show sp-missing"),
+            "missing-spark fallback must prompt `ryve spark show`"
+        );
+    }
+
+    /// Invariant (sp-1471f46a): the before/after numbers MUST land as a
+    /// comment on the spark — not in the commit body, not in the PR
+    /// description, not in a log. Post-mortems diff comments. A future
+    /// edit that relocates the recording surface would silently break
+    /// the post-mortem workflow; this test guards it.
+    #[test]
+    fn performance_engineer_prompt_records_numbers_as_spark_comments() {
+        let p = compose_performance_engineer_prompt(&[], "sp-perf-rec");
+
+        // Positive: comment-based recording is named explicitly.
+        assert!(
+            p.contains("ryve comment add sp-perf-rec"),
+            "prompt must direct before/after numbers into a spark comment"
+        );
+
+        // Negative: the prompt must NOT instruct the agent to bury the
+        // measurement in a commit message or PR body as the primary
+        // recording surface. We phrase this as an explicit forbid so a
+        // future edit that softens the contract fails.
+        assert!(
+            p.contains("not acceptable") || p.contains("not the PR body"),
+            "prompt must explicitly reject commit-body / PR-body as the \
+             primary recording surface"
+        );
+    }
+
+    /// Spark ryve-3f799949: the Architect prompt skeleton is locked so
+    /// accidental drift is caught at build time. The invariants are the
+    /// ones the spark's intent names explicitly: (1) strict read-only
+    /// enforced via the same editor-tool ban as the Investigator, (2)
+    /// outputs as structured comments (recommendation / tradeoffs / risks)
+    /// — never diffs, (3) language-neutral prompt. The ADR non-goal is
+    /// also checked so a future edit cannot quietly re-enable automatic
+    /// ADR authoring.
+    #[test]
+    fn architect_prompt_locks_identity_and_read_only_contract() {
+        let sparks = vec![make_spark(
+            "sp-arch1",
+            "Review boundary between ingest and projection layers",
+        )];
+        let p = compose_architect_prompt(&sparks, "sp-arch1");
+
+        // Identity: declares the Architect role + capability class.
+        assert!(
+            p.contains("Architect Hand"),
+            "prompt must declare the Architect role"
+        );
+        assert!(
+            p.contains("Reviewer / Cartographer") || p.contains("Reviewer/Cartographer"),
+            "prompt must state capability class as Reviewer / Cartographer"
+        );
+
+        // Read-only contract — editor tools forbidden by name.
+        assert!(p.contains("READ-ONLY"));
+        for tool in ["Edit", "Write", "NotebookEdit"] {
+            assert!(
+                p.contains(tool),
+                "read-only ban must name `{tool}` explicitly"
+            );
+        }
+
+        // Destructive git banished by name.
+        assert!(p.contains("--no-verify"));
+        assert!(p.contains("force-push"));
+        assert!(p.contains("git reset --hard"));
+
+        // Outputs are comments, not diffs.
+        assert!(
+            p.contains("ryve comment add"),
+            "recommendations must flow via `ryve comment add`"
+        );
+        assert!(
+            p.contains("RECOMMENDATION"),
+            "prompt must lock the RECOMMENDATION block format"
+        );
+        for field in [
+            "severity",
+            "category",
+            "location",
+            "recommendation",
+            "tradeoffs",
+            "risks",
+            "alternatives",
+        ] {
+            assert!(
+                p.contains(field),
+                "recommendation schema must include `{field}`"
+            );
+        }
+
+        // Parent spark intent is carried forward.
+        assert!(p.contains("sp-arch1"));
+        assert!(p.contains("Review boundary between ingest and projection layers"));
+
+        // Non-goal: automatic ADR authoring.
+        assert!(
+            p.contains("ADR") || p.contains("Architecture Decision Record"),
+            "ADR non-goal must be explicit in the prompt"
+        );
+    }
+
+    /// The Architect prompt must be **language-neutral**: no framework
+    /// names, no vendor product names, no language-specific file
+    /// extensions leaking into the schema or the example. Recommendation
+    /// categories must be generic design concerns.
+    #[test]
+    fn architect_prompt_is_language_neutral() {
+        let p = compose_architect_prompt(&[], "sp-missing");
+
+        // Category list should be design-concern words, not framework names.
+        for generic_cat in [
+            "boundary",
+            "coupling",
+            "cohesion",
+            "layering",
+            "data-flow",
+            "ownership",
+            "observability",
+        ] {
+            assert!(
+                p.contains(generic_cat),
+                "category taxonomy must include generic design concern `{generic_cat}`"
+            );
+        }
+
+        // No framework / product names leaked into the skeleton. The test
+        // deliberately lists ones that are most likely to creep in via
+        // example code: web frameworks, ORMs, ML libs, queue runtimes.
+        for framework in [
+            "django",
+            "Django",
+            "flask",
+            "Flask",
+            "react",
+            "React",
+            "vue",
+            "Vue",
+            "angular",
+            "Angular",
+            "tokio",
+            "rails",
+            "Rails",
+            "spring",
+            "Spring",
+            "fastapi",
+            "FastAPI",
+            "next.js",
+            "Next.js",
+            "express.js",
+            "tensorflow",
+            "pytorch",
+        ] {
+            assert!(
+                !p.contains(framework),
+                "architect prompt skeleton must not name framework `{framework}`"
+            );
+        }
+
+        // The `file:line` placeholder in the schema uses a generic path
+        // shape — not a Rust-only `.rs`, Python-only `.py`, or TS-only
+        // `.ts` file extension baked into the example.
+        assert!(
+            p.contains("<path/to/file>"),
+            "location schema must use a language-neutral path placeholder"
+        );
+
+        // Missing-spark fallback tells architect to run `ryve spark show`.
+        assert!(p.contains("ryve spark show sp-missing"));
     }
 
     /// The Merger MUST do every merge inside a dedicated worktree it creates

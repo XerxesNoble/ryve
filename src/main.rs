@@ -7,6 +7,7 @@ mod cli;
 mod coding_agents;
 mod delegation;
 mod font_intern;
+mod hand_archetypes;
 mod hand_spawn;
 mod head;
 mod head_archetype;
