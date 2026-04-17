@@ -89,6 +89,12 @@ pub enum TransitionError {
     #[error("assignment {assignment_id} not found")]
     AssignmentNotFound { assignment_id: String },
 
+    #[error(
+        "reviewer {reviewer_actor_id} is also the author of the assignment; \
+         a reviewer must be a different actor than the author"
+    )]
+    ReviewerIsAuthor { reviewer_actor_id: String },
+
     #[error("database error during transition: {0}")]
     Database(#[from] sqlx::Error),
 }
