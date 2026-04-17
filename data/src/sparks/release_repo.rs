@@ -236,6 +236,20 @@ pub async fn list_member_epics(
     Ok(rows.into_iter().map(|(s,)| s).collect())
 }
 
+/// Return `true` if `spark_id` is currently a member of any release
+/// (i.e. present in the `release_epics` table). Used by the Release
+/// Manager archetype's comment-add gate in the CLI — a RM may only
+/// post comments on sparks that Atlas polls as release members
+/// ([sp-2a82fee7] / ryve-e6713ee7).
+pub async fn is_release_member(pool: &SqlitePool, spark_id: &str) -> Result<bool, SparksError> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM release_epics WHERE spark_id = ? LIMIT 1")
+            .bind(spark_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
 /// Record the tag name and artifact path on a release. Used by the close flow
 /// after tagging + building so the release row carries pointers to both.
 pub async fn record_close_metadata(

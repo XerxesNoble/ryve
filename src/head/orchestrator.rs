@@ -246,14 +246,20 @@ pub async fn spawn_crew(
 
     let mut owners = Vec::with_capacity(child_spark_ids.len());
     for spark_id in child_spark_ids {
+        // Children inherit the parent Head's actor via env resolution
+        // inside `spawn_hand`; leaving `actor_id: None` preserves that
+        // behaviour so the Head's own actor flows down into every child.
         let spawned = hand_spawn::spawn_hand(
             workshop_dir,
             pool,
             agent,
             spark_id,
             HandKind::Owner,
-            Some(&crew.id),
-            head_session_id,
+            hand_spawn::SpawnContext {
+                crew_id: Some(&crew.id),
+                parent_session_id: head_session_id,
+                actor_id: None,
+            },
         )
         .await?;
         owners.push(spawned.session_id);
@@ -394,8 +400,11 @@ pub async fn reassign_stalled(
             agent,
             spark_id,
             HandKind::Owner,
-            Some(&crew.crew_id),
-            head_session_id,
+            hand_spawn::SpawnContext {
+                crew_id: Some(&crew.crew_id),
+                parent_session_id: head_session_id,
+                actor_id: None,
+            },
         )
         .await?;
 
@@ -449,8 +458,11 @@ pub async fn finalize_with_merger(
         agent,
         merge_spark_id,
         HandKind::Merger,
-        Some(&crew.crew_id),
-        head_session_id,
+        hand_spawn::SpawnContext {
+            crew_id: Some(&crew.crew_id),
+            parent_session_id: head_session_id,
+            actor_id: None,
+        },
     )
     .await?;
 

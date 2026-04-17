@@ -107,6 +107,26 @@ already tracks.
   - "Document how `agent_sessions` rows are reaped on workshop close"
   - "Map every call site of `assignment_repo::assign` and classify by role"
   - "Audit places where `.ryve/sparks.db` is opened directly"
+- **Role in code.** Cartographer stays the canonical *capability-class*
+  name in this taxonomy; the Hand *role* that implements it is
+  `investigator`. Spawn one with:
+
+  ```sh
+  ryve hand spawn <spark_id> --role investigator --crew <crew_id> [--agent <a>]
+  ```
+
+  The spawn side is `HandKind::Investigator` in `src/hand_spawn.rs`
+  (persisted as `agent_sessions.session_label = "investigator"` and tagged
+  on `crew_members.role` as `"investigator"`). The system prompt is
+  emitted by `compose_investigator_prompt` in `src/agent_prompts.rs`,
+  which enforces the read-only investigator contract: no `Edit`/`Write`/
+  `NotebookEdit`, no destructive git, no filesystem mutation outside
+  `.ryve/` scratch, and findings delivered **only** as structured
+  `ryve comment add` posts on the parent spark — every finding cites at
+  least one `file:line`. This is the one Cartographer shape that is
+  directly wired through the CLI; freehand `docs/` writes still fall
+  under the broader Cartographer class but belong on a Scribe / Builder
+  spark, not an investigator Hand.
 
 ### 5. Scribe
 

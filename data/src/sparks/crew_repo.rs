@@ -215,6 +215,7 @@ mod tests {
                 resume_id: None,
                 log_path: None,
                 parent_session_id: None,
+                archetype_id: None,
             },
         )
         .await

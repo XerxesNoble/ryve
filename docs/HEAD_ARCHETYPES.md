@@ -91,9 +91,21 @@ needs mapping, or when a design decision needs evidence.
 2. Decompose into 1–4 investigation sparks
    (`ryve spark create --type spike --acceptance "answer X with
    evidence Y"`).
-3. Spawn read-only investigator Hands per spark — these Hands are
-   restricted to the Research Hand capability class (no writes outside
-   their notes).
+3. For each investigation spark, spawn a read-only **investigator
+   Hand** with the exact invocation:
+
+   ```sh
+   ryve hand spawn <spark_id> --role investigator --crew <crew_id> [--agent <a>]
+   ```
+
+   This boots the Hand via `HandKind::Investigator` in
+   `src/hand_spawn.rs` (session_label `"investigator"`) and attaches
+   the system prompt produced by `compose_investigator_prompt` in
+   `src/agent_prompts.rs`. The prompt enforces the Cartographer
+   capability contract (`docs/HAND_CAPABILITIES.md#4-cartographer`):
+   read-only, no writes outside `.ryve/` scratch, findings delivered
+   only as `ryve comment add` posts on the parent spark with
+   `file:line` evidence.
 4. Aggregate findings into a single recommendation: a comment on the
    parent spark containing (a) the question, (b) the evidence found,
    (c) a recommended next action (often: "spawn a Build Head with this
@@ -102,7 +114,8 @@ needs mapping, or when a design decision needs evidence.
    (`ryve engraving add` once exposed) so they survive past the spark.
 
 **Delegation scope.**
-- May spawn: investigator Hands only. **No Merger. No PRs.**
+- May spawn: investigator Hands only (via
+  `ryve hand spawn --role investigator`). **No Merger. No PRs.**
 - May create: `spike` sparks under its parent.
 - May NOT: edit code, create branches, run destructive commands,
   modify the workgraph beyond comments / new spike sparks, escalate

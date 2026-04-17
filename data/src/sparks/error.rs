@@ -50,6 +50,15 @@ pub enum SparksError {
     #[error("spark {spark_id} already belongs to another open release")]
     EpicAlreadyInOpenRelease { spark_id: String },
 
+    #[error(
+        "duplicate watch for target {target_spark_id} and intent {intent_label}: \
+         an active watch already exists"
+    )]
+    DuplicateWatch {
+        target_spark_id: String,
+        intent_label: String,
+    },
+
     #[error("{0}")]
     Transition(#[from] TransitionError),
 }
@@ -88,6 +97,12 @@ pub enum TransitionError {
 
     #[error("assignment {assignment_id} not found")]
     AssignmentNotFound { assignment_id: String },
+
+    #[error(
+        "reviewer {reviewer_actor_id} is also the author of the assignment; \
+         a reviewer must be a different actor than the author"
+    )]
+    ReviewerIsAuthor { reviewer_actor_id: String },
 
     #[error("database error during transition: {0}")]
     Database(#[from] sqlx::Error),

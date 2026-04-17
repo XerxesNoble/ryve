@@ -1,3 +1,4 @@
+use data::sparks::error::TransitionError;
 use data::sparks::transition;
 use data::sparks::types::{AssignmentPhase, TransitionActorRole};
 
@@ -19,8 +20,8 @@ async fn seed_assignment(pool: &sqlx::SqlitePool) -> i64 {
     .expect("seed spark");
 
     sqlx::query(
-        "INSERT INTO assignments (session_id, spark_id, status, role, phase, event_version, assigned_at, assignment_phase)
-         VALUES ('sess-trans-01', 'sp-trans-1', 'active', 'owner', 'assigned', 0, '2026-04-09T00:00:00Z', 'assigned')",
+        "INSERT INTO assignments (assignment_id, spark_id, actor_id, session_id, status, role, event_version, assigned_at, assignment_phase, created_at, updated_at)
+         VALUES ('asgn-trans-01', 'sp-trans-1', 'sess-trans-01', 'sess-trans-01', 'active', 'owner', 0, '2026-04-09T00:00:00Z', 'assigned', '2026-04-09T00:00:00Z', '2026-04-09T00:00:00Z')",
     )
     .execute(pool)
     .await
@@ -67,11 +68,40 @@ async fn transition_phase_assigned_to_in_progress(pool: sqlx::SqlitePool) {
         Some("hand"),
         "phase_actor_role should record the role"
     );
-    assert_eq!(
-        updated.phase_event_id,
-        Some(1),
-        "phase_event_id should record the event"
+    assert!(
+        updated.phase_event_id.is_some(),
+        "phase_event_id should reference the appended event"
     );
+}
+
+#[sqlx::test]
+async fn transition_phase_appends_event_atomically(pool: sqlx::SqlitePool) {
+    let assignment_id = seed_assignment(&pool).await;
+
+    let updated = transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "actor-hand-1",
+        TransitionActorRole::Hand,
+        AssignmentPhase::InProgress,
+        AssignmentPhase::Assigned,
+        1,
+    )
+    .await
+    .expect("transition should succeed");
+
+    let event_id = updated.phase_event_id.expect("event_id should be set");
+    let event = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        "SELECT field_name, old_value, new_value FROM events WHERE id = ?",
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("event should exist");
+
+    assert_eq!(event.0, "assignment_phase");
+    assert_eq!(event.1.as_deref(), Some("assigned"));
+    assert_eq!(event.2.as_deref(), Some("in_progress"));
 }
 
 #[sqlx::test]
@@ -129,5 +159,128 @@ async fn transition_phase_full_happy_path(pool: sqlx::SqlitePool) {
             Some(to.as_str()),
             "step {i}: phase should be {to:?}"
         );
+        assert!(
+            updated.phase_event_id.is_some(),
+            "step {i}: event must be recorded"
+        );
     }
+
+    let events = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM events WHERE spark_id = 'sp-trans-1' AND field_name = 'assignment_phase'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 5, "all 5 transitions should produce events");
+}
+
+/// Author is recorded as `assignments.actor_id = 'sess-trans-01'` by
+/// `seed_assignment`. A ReviewerHand whose `actor_id` matches must be
+/// refused when driving AwaitingReview → Approved, even though the role
+/// check alone would pass. This is the transition-time half of the
+/// reviewer-identity invariant; the selection-time half lives in the
+/// pure `ensure_reviewer_not_author` unit tests.
+#[sqlx::test]
+async fn reviewer_cannot_approve_own_assignment(pool: sqlx::SqlitePool) {
+    let assignment_id = seed_assignment(&pool).await;
+
+    transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::InProgress,
+        AssignmentPhase::Assigned,
+        1,
+    )
+    .await
+    .expect("author starts work");
+
+    transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::AwaitingReview,
+        AssignmentPhase::InProgress,
+        2,
+    )
+    .await
+    .expect("author submits for review");
+
+    // Same actor attempts to review their own work.
+    let err = transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::ReviewerHand,
+        AssignmentPhase::Approved,
+        AssignmentPhase::AwaitingReview,
+        3,
+    )
+    .await
+    .expect_err("reviewer == author must be refused");
+
+    match err {
+        TransitionError::ReviewerIsAuthor { reviewer_actor_id } => {
+            assert_eq!(reviewer_actor_id, "sess-trans-01");
+        }
+        other => panic!("expected ReviewerIsAuthor, got {other:?}"),
+    }
+
+    // Phase must remain AwaitingReview — no state mutation on rejection.
+    let phase =
+        sqlx::query_scalar::<_, String>("SELECT assignment_phase FROM assignments WHERE id = ?")
+            .bind(assignment_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "awaiting_review");
+}
+
+#[sqlx::test]
+async fn reviewer_distinct_from_author_can_approve(pool: sqlx::SqlitePool) {
+    let assignment_id = seed_assignment(&pool).await;
+
+    transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::InProgress,
+        AssignmentPhase::Assigned,
+        1,
+    )
+    .await
+    .unwrap();
+    transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::AwaitingReview,
+        AssignmentPhase::InProgress,
+        2,
+    )
+    .await
+    .unwrap();
+
+    let updated = transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "actor-reviewer-9",
+        TransitionActorRole::ReviewerHand,
+        AssignmentPhase::Approved,
+        AssignmentPhase::AwaitingReview,
+        3,
+    )
+    .await
+    .expect("distinct reviewer must succeed");
+
+    assert_eq!(updated.assignment_phase.as_deref(), Some("approved"));
+    assert_eq!(
+        updated.phase_changed_by.as_deref(),
+        Some("actor-reviewer-9")
+    );
+    assert_eq!(updated.phase_actor_role.as_deref(), Some("reviewer_hand"));
 }

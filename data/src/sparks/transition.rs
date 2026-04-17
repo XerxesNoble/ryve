@@ -33,12 +33,32 @@
 //!
 //! Head and Director may override any transition with the explicit
 //! `override_role_check` flag.
+//!
+//! # Reviewer identity invariant
+//!
+//! A `ReviewerHand` approving or rejecting an assignment MUST be a
+//! different actor than the assignment's author (`assignments.actor_id`).
+//! This is enforced in two places:
+//!
+//! 1. **Selection time** — callers picking a reviewer from a pool use
+//!    [`ensure_reviewer_not_author`] to reject a candidate whose
+//!    `actor_id` matches the author. This is the primary line of defence
+//!    and keeps the constraint visible to the selection policy.
+//! 2. **Transition time** — [`transition_assignment_phase`] re-checks
+//!    the identity before writing `Approved`/`Rejected`. This guards
+//!    against a ReviewerHand whose role was reassigned mid-flight or a
+//!    stale/forged selection, per the invariant that a reviewer cannot
+//!    approve their own work even if the actor role changes mid-flight.
+//!
+//! Head/Director overrides are unaffected because they do not use the
+//! `ReviewerHand` role.
 
 use chrono::Utc;
 use sqlx::SqlitePool;
 
 use super::error::TransitionError;
-use super::types::{Assignment, AssignmentPhase, TransitionActorRole};
+use super::event_repo;
+use super::types::{Assignment, AssignmentPhase, NewEvent, TransitionActorRole};
 
 /// A transition rule: (from_phase, to_phase) → list of authorized roles.
 struct TransitionRule {
@@ -146,23 +166,67 @@ pub fn validate_transition(
     Ok(())
 }
 
+/// Enforce the reviewer-identity invariant: a `ReviewerHand` driving an
+/// `Approved` or `Rejected` transition cannot be the author of the
+/// assignment.
+///
+/// Returns `Ok(())` for every non-reviewer role and for every target
+/// phase other than `Approved`/`Rejected` — this function is safe to
+/// call unconditionally from any transition path. Also used at selection
+/// time via [`ensure_reviewer_not_author`].
+pub fn validate_reviewer_not_author(
+    actor_role: TransitionActorRole,
+    target_phase: AssignmentPhase,
+    reviewer_actor_id: &str,
+    author_actor_id: &str,
+) -> Result<(), TransitionError> {
+    if actor_role != TransitionActorRole::ReviewerHand {
+        return Ok(());
+    }
+    if !matches!(
+        target_phase,
+        AssignmentPhase::Approved | AssignmentPhase::Rejected
+    ) {
+        return Ok(());
+    }
+    ensure_reviewer_not_author(reviewer_actor_id, author_actor_id)
+}
+
+/// Selection-time check: reject a reviewer candidate whose `actor_id`
+/// matches the assignment author's. Returns the same
+/// [`TransitionError::ReviewerIsAuthor`] the transition-time check would
+/// produce, so both paths surface identical error semantics.
+pub fn ensure_reviewer_not_author(
+    reviewer_actor_id: &str,
+    author_actor_id: &str,
+) -> Result<(), TransitionError> {
+    if reviewer_actor_id == author_actor_id {
+        return Err(TransitionError::ReviewerIsAuthor {
+            reviewer_actor_id: reviewer_actor_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 pub async fn transition_assignment_phase(
     pool: &SqlitePool,
-    assignment_id: &str,
-    _actor_id: &str,
+    assignment_id: i64,
+    actor_id: &str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
-    _event_id: i64,
+    event_version: i64,
 ) -> Result<Assignment, TransitionError> {
     transition_assignment_phase_inner(
         pool,
         TransitionPhaseRequest {
             assignment_id,
+            actor_id,
             actor_role,
             target_phase,
             expected_previous_phase,
             override_role_check: false,
+            event_version,
         },
     )
     .await
@@ -170,34 +234,40 @@ pub async fn transition_assignment_phase(
 
 pub async fn transition_assignment_phase_override(
     pool: &SqlitePool,
-    assignment_id: &str,
-    _actor_id: &str,
+    assignment_id: i64,
+    actor_id: &str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
-    _event_id: i64,
+    event_version: i64,
 ) -> Result<Assignment, TransitionError> {
     transition_assignment_phase_inner(
         pool,
         TransitionPhaseRequest {
             assignment_id,
+            actor_id,
             actor_role,
             target_phase,
             expected_previous_phase,
             override_role_check: true,
+            event_version,
         },
     )
     .await
 }
 
 struct TransitionPhaseRequest<'a> {
-    assignment_id: &'a str,
+    assignment_id: i64,
+    actor_id: &'a str,
     actor_role: TransitionActorRole,
     target_phase: AssignmentPhase,
     expected_previous_phase: AssignmentPhase,
     override_role_check: bool,
+    event_version: i64,
 }
 
+/// Execute a phase transition: validate, UPDATE state + phase-tracking columns,
+/// INSERT an event into the outbox — all in a single transaction.
 async fn transition_assignment_phase_inner(
     pool: &SqlitePool,
     request: TransitionPhaseRequest<'_>,
@@ -206,13 +276,15 @@ async fn transition_assignment_phase_inner(
 
     let TransitionPhaseRequest {
         assignment_id,
+        actor_id,
         actor_role,
         target_phase,
         expected_previous_phase,
         override_role_check,
+        event_version,
     } = request;
 
-    let row = sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE assignment_id = ?")
+    let row = sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE id = ?")
         .bind(assignment_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -221,12 +293,12 @@ async fn transition_assignment_phase_inner(
         assignment_id: assignment_id.to_string(),
     })?;
 
-    let current_phase = AssignmentPhase::from_str(&assignment.assignment_phase).ok_or(
-        TransitionError::IllegalTransition {
+    let current_phase_str = assignment.assignment_phase.as_deref().unwrap_or("unknown");
+    let current_phase =
+        AssignmentPhase::from_str(current_phase_str).ok_or(TransitionError::IllegalTransition {
             from: "unknown",
             to: target_phase.as_str(),
-        },
-    )?;
+        })?;
 
     validate_transition(
         current_phase,
@@ -236,21 +308,55 @@ async fn transition_assignment_phase_inner(
         override_role_check,
     )?;
 
+    // Reviewer identity: enforced independently of override_role_check
+    // because the rule ("a reviewer cannot approve their own work")
+    // follows the effective role, not the override path. Head/Director
+    // overrides skip this because they don't transition as ReviewerHand.
+    validate_reviewer_not_author(actor_role, target_phase, actor_id, &assignment.actor_id)?;
+
+    let event_id = event_repo::record_in_tx(
+        &mut tx,
+        NewEvent {
+            spark_id: assignment.spark_id.clone(),
+            actor: actor_id.to_string(),
+            field_name: "assignment_phase".into(),
+            old_value: Some(current_phase.as_str().to_string()),
+            new_value: Some(target_phase.as_str().to_string()),
+            reason: None,
+            actor_type: None,
+            change_nature: None,
+            session_id: None,
+        },
+    )
+    .await
+    .map_err(|e| {
+        TransitionError::Database(match e {
+            super::error::SparksError::Database(db_err) => db_err,
+            other => sqlx::Error::Protocol(other.to_string()),
+        })
+    })?;
+
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE assignments SET assignment_phase = ?, updated_at = ? WHERE assignment_id = ?",
+        "UPDATE assignments SET assignment_phase = ?, event_version = ?, updated_at = ?, \
+         phase_changed_at = ?, phase_changed_by = ?, phase_actor_role = ?, phase_event_id = ? \
+         WHERE id = ?",
     )
     .bind(target_phase.as_str())
+    .bind(event_version)
     .bind(&now)
+    .bind(&now)
+    .bind(actor_id)
+    .bind(actor_role.as_str())
+    .bind(event_id)
     .bind(assignment_id)
     .execute(&mut *tx)
     .await?;
 
-    let updated =
-        sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE assignment_id = ?")
-            .bind(assignment_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let updated = sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE id = ?")
+        .bind(assignment_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     tx.commit().await?;
 
@@ -608,6 +714,95 @@ mod tests {
                 panic!("expected {from:?} → {to:?} by {role:?} to succeed, got {e}")
             });
         }
+    }
+
+    // ── Reviewer identity invariant ─────────────────────
+
+    #[test]
+    fn ensure_reviewer_not_author_rejects_same_actor() {
+        let err =
+            ensure_reviewer_not_author("actor-42", "actor-42").expect_err("must reject identity");
+        match err {
+            TransitionError::ReviewerIsAuthor { reviewer_actor_id } => {
+                assert_eq!(reviewer_actor_id, "actor-42");
+            }
+            other => panic!("expected ReviewerIsAuthor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_reviewer_not_author_accepts_distinct_actors() {
+        assert!(ensure_reviewer_not_author("actor-reviewer", "actor-author").is_ok());
+    }
+
+    #[test]
+    fn validate_reviewer_not_author_blocks_self_approval() {
+        let err = validate_reviewer_not_author(
+            TransitionActorRole::ReviewerHand,
+            AssignmentPhase::Approved,
+            "actor-shared",
+            "actor-shared",
+        )
+        .expect_err("self-approval must be rejected");
+        assert!(matches!(err, TransitionError::ReviewerIsAuthor { .. }));
+    }
+
+    #[test]
+    fn validate_reviewer_not_author_blocks_self_rejection() {
+        let err = validate_reviewer_not_author(
+            TransitionActorRole::ReviewerHand,
+            AssignmentPhase::Rejected,
+            "actor-shared",
+            "actor-shared",
+        )
+        .expect_err("self-rejection must be rejected");
+        assert!(matches!(err, TransitionError::ReviewerIsAuthor { .. }));
+    }
+
+    #[test]
+    fn validate_reviewer_not_author_allows_different_reviewer() {
+        assert!(
+            validate_reviewer_not_author(
+                TransitionActorRole::ReviewerHand,
+                AssignmentPhase::Approved,
+                "actor-reviewer",
+                "actor-author",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_reviewer_not_author_is_noop_for_non_reviewer_roles() {
+        // A Hand advancing InProgress → AwaitingReview must not trip the
+        // reviewer-identity check even when author == actor (which is
+        // the usual case for an author driving their own work forward).
+        assert!(
+            validate_reviewer_not_author(
+                TransitionActorRole::Hand,
+                AssignmentPhase::AwaitingReview,
+                "actor-author",
+                "actor-author",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_reviewer_not_author_is_noop_for_non_review_targets() {
+        // ReviewerHand role on a non-Approved/Rejected target phase is
+        // illegal in `validate_transition`, but the identity check
+        // itself should ignore it — the guard is belt-and-suspenders
+        // and only fires on the approvals it protects.
+        assert!(
+            validate_reviewer_not_author(
+                TransitionActorRole::ReviewerHand,
+                AssignmentPhase::Merged,
+                "actor-shared",
+                "actor-shared",
+            )
+            .is_ok()
+        );
     }
 
     #[test]

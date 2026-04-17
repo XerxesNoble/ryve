@@ -398,6 +398,12 @@ pub struct Workshop {
     /// Cached total (non-stale) hand count for the status bar. Recomputed on
     /// `AgentSessionsLoaded` instead of every frame. Spark ryve-252c5b6e.
     pub cached_total_hands: usize,
+    /// Handle to the workshop's watch scheduler task. `Some` once the
+    /// sqlx pool has been opened and the task spawned; `None` before the
+    /// pool is ready or after the workshop has been torn down. Owned
+    /// here so `do_close_workshop` can await graceful shutdown.
+    /// Spark ryve-6ab1980c [sp-ee3f5c74].
+    pub watch_runner: Option<crate::watch_runner::WatchRunnerHandle>,
 }
 
 impl Workshop {
@@ -472,6 +478,7 @@ impl Workshop {
             cached_git_stats: Default::default(),
             cached_active_hands: 0,
             cached_total_hands: 0,
+            watch_runner: None,
         }
     }
 
@@ -1602,11 +1609,91 @@ pub fn compute_image_luminance(bytes: &[u8]) -> Option<f32> {
     Some((total / count as f64) as f32)
 }
 
+/// Validate a branch name against git's `check-ref-format` rules.
+///
+/// Mirrors `git check-ref-format refs/heads/<name>` so we can reject
+/// obviously bad names (whitespace, `..`, `~`, `^`, `:`, `@{`, trailing
+/// `.lock`, …) before shelling out to `git worktree add`. Pure Rust so
+/// unit tests don't need a git binary. Spark ryve-7aa05933.
+fn validate_git_branch_name(name: &str) -> Result<(), String> {
+    let reject = |reason: &str| Err(format!("invalid branch name '{name}': {reason}"));
+
+    if name.is_empty() {
+        return reject("branch name must not be empty");
+    }
+    if name == "@" {
+        return reject("branch name must not be a single '@'");
+    }
+    if name.starts_with('/') || name.ends_with('/') {
+        return reject("must not start or end with '/'");
+    }
+    if name.starts_with('.') {
+        return reject("must not start with '.'");
+    }
+    if name.ends_with('.') {
+        return reject("must not end with '.'");
+    }
+    if name.ends_with(".lock") {
+        return reject("must not end with '.lock'");
+    }
+    if name.contains("..") {
+        return reject("must not contain '..'");
+    }
+    if name.contains("//") {
+        return reject("must not contain '//'");
+    }
+    if name.contains("/.") {
+        return reject("path components must not start with '.'");
+    }
+    if name.contains("@{") {
+        return reject("must not contain '@{'");
+    }
+
+    for (i, ch) in name.char_indices() {
+        let code = ch as u32;
+        // ASCII control chars (0-31) and DEL (127).
+        if code < 0x20 || code == 0x7f {
+            return reject(&format!("contains control character at byte {i}"));
+        }
+        match ch {
+            ' ' => return reject("must not contain whitespace"),
+            '~' => return reject("must not contain '~'"),
+            '^' => return reject("must not contain '^'"),
+            ':' => return reject("must not contain ':'"),
+            '?' => return reject("must not contain '?'"),
+            '*' => return reject("must not contain '*'"),
+            '[' => return reject("must not contain '['"),
+            '\\' => return reject("must not contain '\\'"),
+            _ => {}
+        }
+    }
+
+    // Each slash-delimited component has its own rules.
+    for component in name.split('/') {
+        if component.is_empty() {
+            return reject("must not contain empty path component");
+        }
+        if component.ends_with(".lock") {
+            return reject("path component must not end with '.lock'");
+        }
+    }
+
+    Ok(())
+}
+
 /// Create a git worktree for a Hand session. Async: uses `tokio::process`
 /// and `tokio::fs` so callers in the UI thread can drive this via
 /// `Task::perform` without freezing the iced runtime. On large repos
 /// `git worktree add` takes 500ms-2s and must not block `App::update`.
 /// Spark ryve-885ed3eb.
+///
+/// The branch is named `<actor>/<short>` so every Hand lives in its own
+/// actor-scoped namespace (spark ryve-c44b92e5). `actor` must be a single
+/// path segment — no `/` — or the resulting ref would collide with
+/// `epic/` / `crew/` / `release/` prefixes the rest of the system relies on.
+/// The computed branch is also passed through [`validate_git_branch_name`]
+/// so a malformed `actor` (e.g. from a weird `$USER`) can't produce a ref
+/// git will choke on. Spark ryve-7aa05933.
 ///
 /// Visible to the rest of the crate so the `hand_spawn` CLI helper can call
 /// it without re-implementing the worktree convention.
@@ -1614,6 +1701,7 @@ pub(crate) async fn create_hand_worktree(
     workshop_dir: &Path,
     ryve_dir: &RyveDir,
     session_id: &str,
+    actor: &str,
 ) -> Result<PathBuf, String> {
     // Only create worktrees for git repos
     let git_dir = workshop_dir.join(".git");
@@ -1621,8 +1709,20 @@ pub(crate) async fn create_hand_worktree(
         return Err("not a git repository".to_string());
     }
 
+    if actor.is_empty() || actor.contains('/') {
+        return Err(format!(
+            "invalid actor segment '{actor}': must be non-empty and contain no '/'"
+        ));
+    }
+
     let short_id = &session_id[..8.min(session_id.len())];
-    let branch = format!("hand/{short_id}");
+    let branch = format!("{actor}/{short_id}");
+    // Spark ryve-7aa05933: `actor` can come from the `USER` env var, so the
+    // branch name may violate git ref-format rules (whitespace, `..`, `~`,
+    // `^`, `:`, `@{`, trailing `.lock`, …). Reject those up front with an
+    // actionable message instead of letting `git worktree add` produce a
+    // cryptic error — or worse, succeed with a surprising ref.
+    validate_git_branch_name(&branch)?;
     let wt_dir = ryve_dir.root().join("worktrees").join(short_id);
 
     // Skip if worktree already exists
@@ -2694,5 +2794,85 @@ mod tests {
         assert!((ws.config.background.dim_opacity - 0.42).abs() < f32::EPSILON);
         // The previously-shared Arc still holds the old value.
         assert!(!Arc::ptr_eq(&ws.config, &shared));
+    }
+
+    // ── Branch-name validation (spark ryve-7aa05933) ──
+
+    #[test]
+    fn validate_branch_name_accepts_typical_hand_branch() {
+        // `<actor>/<short>` — the shape `create_hand_worktree` always builds.
+        assert!(validate_git_branch_name("xerxes/abc12345").is_ok());
+        assert!(validate_git_branch_name("hand/5fd445bc").is_ok());
+        assert!(validate_git_branch_name("actor-1/deadbeef").is_ok());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_whitespace() {
+        let err = validate_git_branch_name("weird user/abc12345")
+            .expect_err("whitespace in actor must fail");
+        assert!(err.contains("whitespace"), "got: {err}");
+        assert!(err.contains("weird user/abc12345"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_dotdot() {
+        assert!(
+            validate_git_branch_name("foo/../bar")
+                .unwrap_err()
+                .contains("'..'")
+        );
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_reflog_syntax() {
+        assert!(
+            validate_git_branch_name("foo@{0}/abc12345")
+                .unwrap_err()
+                .contains("'@{'")
+        );
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_forbidden_metacharacters() {
+        for bad in [
+            "a~b/c", "a^b/c", "a:b/c", "a?b/c", "a*b/c", "a[b/c", "a\\b/c",
+        ] {
+            assert!(
+                validate_git_branch_name(bad).is_err(),
+                "expected {bad} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_lock_suffix() {
+        assert!(
+            validate_git_branch_name("user/abc.lock")
+                .unwrap_err()
+                .contains(".lock")
+        );
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_boundary_slashes_and_empty() {
+        assert!(validate_git_branch_name("").is_err());
+        assert!(validate_git_branch_name("/foo").is_err());
+        assert!(validate_git_branch_name("foo/").is_err());
+        assert!(validate_git_branch_name("@").is_err());
+        assert!(validate_git_branch_name(".hidden/abc").is_err());
+        assert!(validate_git_branch_name("foo/.hidden").is_err());
+        assert!(validate_git_branch_name("foo//bar").is_err());
+        assert!(validate_git_branch_name("foo.").is_err());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_control_characters() {
+        assert!(
+            validate_git_branch_name("foo\tbar/abc")
+                .unwrap_err()
+                .contains("control character")
+        );
+        assert!(validate_git_branch_name("foo\nbar/abc").is_err());
+        assert!(validate_git_branch_name("foo\x7fbar/abc").is_err());
     }
 }

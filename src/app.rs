@@ -234,6 +234,13 @@ pub(crate) enum Message {
     AgentSessionsLoaded(Uuid, Vec<PersistedAgentSession>, Vec<tmux::TmuxSession>),
     /// Agent session saved to DB
     AgentSessionSaved,
+    /// The watch-runner handle finished its shutdown await. Emitted when a
+    /// workshop is closed so the graceful-close `Task::batch` has a
+    /// terminal message to resolve to. Carries no payload and performs no
+    /// state mutation — the runner has already drained its in-flight tick
+    /// and dropped its DB handle by the time this fires.
+    /// Spark ryve-cc1ed0af [sp-20ffacac].
+    WatchRunnerStopped,
     /// Dead-session reconciliation completed. Carries the session IDs whose
     /// `agent_sessions` rows were ended and `hand_assignments` were
     /// abandoned. Spark `ryve-a677498c`.
@@ -475,6 +482,7 @@ impl std::fmt::Debug for Message {
                 )
             }
             Self::AgentSessionSaved => write!(f, "AgentSessionSaved"),
+            Self::WatchRunnerStopped => write!(f, "WatchRunnerStopped"),
             Self::DeadSessionsReconciled(ids) => {
                 write!(f, "DeadSessionsReconciled({} sessions)", ids.len())
             }
@@ -712,6 +720,23 @@ impl App {
                 )
             })
             .unwrap_or(Task::none());
+        // Spark ryve-6ab1980c [sp-ee3f5c74]: tell the watch scheduler to
+        // stop. Shutdown awaits the in-flight tick so any transactional
+        // WatchFired insert + mark_fired commit before the task exits;
+        // the task then drops its handle on the workshop pool.
+        let stop_watch_runner = self
+            .workshops
+            .get_mut(idx)
+            .and_then(|ws| ws.watch_runner.take())
+            .map(|handle| {
+                Task::perform(
+                    async move {
+                        handle.shutdown().await;
+                    },
+                    |_| Message::WatchRunnerStopped,
+                )
+            })
+            .unwrap_or(Task::none());
         self.workshops.remove(idx);
         if self.workshops.is_empty() {
             self.active_workshop = None;
@@ -722,7 +747,7 @@ impl App {
                 self.active_workshop = Some(idx.min(self.workshops.len() - 1));
             }
         }
-        Task::batch([snapshot, kill_agents])
+        Task::batch([snapshot, kill_agents, stop_watch_runner])
     }
 
     /// Push a new toast onto the stack and return a `Task` that will
@@ -976,6 +1001,8 @@ impl App {
             }
 
             Message::AgentSessionSaved => Task::none(),
+
+            Message::WatchRunnerStopped => Task::none(),
 
             Message::DeadSessionsReconciled(session_ids) => {
                 // The DB rows are already updated — the next poll cycle's
@@ -2986,6 +3013,7 @@ impl App {
                         log_path: None,
                         // UI-spawned: no parent Hand.
                         parent_session_id: None,
+                        archetype_id: None,
                     };
                     tasks.push(Task::perform(
                         async move {
@@ -3115,6 +3143,18 @@ impl App {
         };
         if let Some(ws) = self.workshops.get_mut(idx) {
             ws.sparks_db = Some(pool.clone());
+            // Spark ryve-6ab1980c [sp-ee3f5c74]: spawn the durable watch
+            // scheduler now that this workshop has a live sqlx pool. The
+            // runner is per-workshop — each workshop keeps its own
+            // `watches` rows in its own sparks.db — so spawning here
+            // (rather than once in main.rs) naturally scopes the task's
+            // lifetime to the workshop.
+            if ws.watch_runner.is_none() {
+                ws.watch_runner = Some(crate::watch_runner::spawn(
+                    pool.clone(),
+                    crate::watch_runner::tick_interval_from_env(),
+                ));
+            }
             ws.config = Arc::new(config);
             ws.custom_agents = custom_agents;
             ws.agent_context = agent_context;
@@ -4994,6 +5034,7 @@ impl App {
                         resume_id: None,
                         log_path: None,
                         parent_session_id: None,
+                        archetype_id: None,
                     };
                     tasks.push(Task::perform(
                         async move {
@@ -5130,10 +5171,15 @@ impl App {
                 workshop::PendingTerminalKind::CustomAgent(_) => None,
             });
 
+        // UI-driven spawn has no explicit actor scope yet, so resolve the
+        // current shell user or fall back to "hand" for the branch prefix.
+        // Spark ryve-c44b92e5: every Hand branch is actor-scoped.
+        let actor = crate::hand_spawn::resolve_ui_actor();
         Task::perform(
             async move {
                 let result =
-                    workshop::create_hand_worktree(&workshop_dir, &ryve_dir, &session_id).await;
+                    workshop::create_hand_worktree(&workshop_dir, &ryve_dir, &session_id, &actor)
+                        .await;
                 let system_prompt = match &prompt_flag {
                     Some((flag, is_file)) => {
                         workshop::resolve_system_prompt_async(
@@ -5233,6 +5279,7 @@ impl App {
                 log_path: None,
                 // UI-spawned Hand: no orchestrator parent.
                 parent_session_id: None,
+                archetype_id: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -5257,6 +5304,7 @@ impl App {
                         session_id: sid_for_assign,
                         spark_id: spark_id_clone,
                         role: data::sparks::types::AssignmentRole::Owner,
+                        actor_id: None,
                     };
                     let _ = data::sparks::assignment_repo::assign(&pool2, assignment).await;
                 },
@@ -5334,6 +5382,7 @@ impl App {
                 log_path: None,
                 // A Head is itself a top-level orchestrator — no parent.
                 parent_session_id: None,
+                archetype_id: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -5453,6 +5502,7 @@ impl App {
                 resume_id: None,
                 log_path: None,
                 parent_session_id: None,
+                archetype_id: None,
             };
             tasks.push(Task::perform(
                 async move {
@@ -7067,6 +7117,24 @@ mod tests {
         assert!(unsplash_attribution_label(&bg).is_none());
     }
 
+    /// Spark ryve-cc1ed0af [sp-20ffacac]: the watch-runner shutdown path
+    /// must emit its own Message variant rather than piggybacking on
+    /// `AgentSessionSaved`, so the close-workshop `Task::batch` is free of
+    /// spurious agent-session signals and trace output reflects intent.
+    #[test]
+    fn watch_runner_stopped_has_distinct_debug() {
+        assert_eq!(
+            format!("{:?}", Message::WatchRunnerStopped),
+            "WatchRunnerStopped",
+        );
+        // Sanity: distinct from AgentSessionSaved so log filters and any
+        // future match arms can discriminate the two.
+        assert_ne!(
+            format!("{:?}", Message::WatchRunnerStopped),
+            format!("{:?}", Message::AgentSessionSaved),
+        );
+    }
+
     /// Spark `ryve-a677498c` acceptance criterion: create session, kill
     /// session externally, next reconcile pass marks the row stopped.
     ///
@@ -7133,6 +7201,7 @@ mod tests {
                 resume_id: None,
                 log_path: Some("/tmp/fake.log".into()),
                 parent_session_id: None,
+                archetype_id: None,
             },
         )
         .await
@@ -7145,6 +7214,7 @@ mod tests {
                 session_id: session_id.clone(),
                 spark_id: spark.id.clone(),
                 role: AssignmentRole::Owner,
+                actor_id: None,
             },
         )
         .await

@@ -170,9 +170,29 @@ ryve crew create <name> --parent <epic_id> --head-session $RYVE_SESSION_ID
 ryve crew list
 ryve crew show <crew_id>
 
-ryve hand spawn <child_id> --agent <a> --crew <crew_id>            # worker Hand
-ryve hand spawn <merge_id> --role merger --crew <crew_id>          # Merger
+ryve hand spawn <child_id> --agent <a> --crew <crew_id>                       # worker Hand (owner)
+ryve hand spawn <merge_id> --role merger --crew <crew_id>                     # Merger
+ryve hand spawn <spike_id> --role investigator --crew <crew_id>               # read-only investigator
 ```
+
+### Hand roles
+
+`ryve hand spawn --role <role>` selects which contract the new Hand boots
+under. Every role below is a real value accepted by `src/cli.rs` and
+realised by a `HandKind` variant in `src/hand_spawn.rs`. The prompt is
+composed in `src/agent_prompts.rs`.
+
+| Role           | One-line description                                                    | Write contract |
+|----------------|-------------------------------------------------------------------------|----------------|
+| `owner`        | Default. Claims a task/bug spark and edits code in its own worktree.    | Worktree write |
+| `head`         | Orchestrates a Crew of Hands on an epic; never edits code itself.       | Read-only (delegates) |
+| `merger`       | Integrates a finished Crew's worktree branches into one PR for review.  | Integration only |
+| `investigator` | Read-only Cartographer Hand: posts structured findings as `ryve comment add` on the parent spark; no file edits, no destructive git. | **Read-only** |
+
+The `investigator` role implements the **Cartographer** capability class
+defined in [`docs/HAND_CAPABILITIES.md`](../docs/HAND_CAPABILITIES.md#4-cartographer),
+and is the only Hand a **Research Head** is permitted to spawn — see
+[`docs/HEAD_ARCHETYPES.md#research-head`](../docs/HEAD_ARCHETYPES.md).
 
 ### Worked example — OAuth login
 

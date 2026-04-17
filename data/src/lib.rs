@@ -7,6 +7,7 @@ pub mod db;
 pub mod git;
 pub mod github;
 pub mod migrations;
+pub mod pre_merge_validator;
 pub mod release_branch;
 pub mod release_version;
 pub mod ryve_dir;

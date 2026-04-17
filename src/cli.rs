@@ -13,15 +13,17 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use data::ryve_dir::RyveDir;
+use data::sparks::error::SparksError;
 use data::sparks::types::*;
 use data::sparks::{
     agent_session_repo, assignment_repo, bond_repo, comment_repo, commit_link_repo,
     constraint_helpers, contract_repo, crew_repo, ember_repo, event_repo, release_repo, spark_repo,
-    stamp_repo,
+    stamp_repo, watch_repo,
 };
 
 use crate::agent_prompts::HeadArchetype;
 use crate::coding_agents::{self, CodingAgent};
+use crate::hand_archetypes::{self, Action as PolicyAction, CallerArchetype};
 use crate::hand_spawn::{self, HandKind};
 use crate::worktree_cleanup::{
     self, PruneCandidate, PruneSummary, WorktreeFacts, WorktreeStatus, classify_worktree,
@@ -61,6 +63,10 @@ pub const CLI_COMMANDS: &[&str] = &[
     "worktree",
     "worktrees",
     "wt",
+    "tmux",
+    "sweep",
+    "watch",
+    "watches",
     "hot",
     "status",
     "init",
@@ -176,6 +182,9 @@ pub async fn run(args: Vec<String>) {
         "worktree" | "worktrees" | "wt" => {
             handle_worktree(&pool, &workshop_root, &args_clean[2..], json_mode).await
         }
+        "tmux" => handle_tmux(&pool, &workshop_root, &ws_id, &args_clean[2..], json_mode).await,
+        "sweep" => handle_sweep(&pool, &args_clean[2..], &ws_id, json_mode).await,
+        "watch" | "watches" => handle_watch(&pool, &args_clean[2..], json_mode).await,
         "hot" => handle_hot(&pool, &ws_id, json_mode).await,
         "status" => handle_status(&pool, &ws_id).await,
         "backup" | "backups" => {
@@ -192,6 +201,44 @@ pub async fn run(args: Vec<String>) {
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
     process::exit(1);
+}
+
+/// Resolve the archetype of the caller invoking this CLI command.
+///
+/// Every Hand subprocess Ryve spawns is handed `RYVE_HAND_SESSION_ID`
+/// in its env so nested `ryve ...` invocations know who they are. This
+/// helper looks that session up in `agent_sessions` and reads its
+/// `session_label`, then maps the label to a
+/// [`CallerArchetype`] via
+/// [`hand_archetypes::caller_archetype_for_label`]. The result drives
+/// the Release Manager allow-list in
+/// [`hand_archetypes::enforce_action`] — spark ryve-e6713ee7
+/// [sp-2a82fee7].
+///
+/// Returns [`CallerArchetype::Unrestricted`] for direct-human CLI use
+/// (no env), for sessions missing from the DB (worktree reused across
+/// workshops, stale env), and for any label not in the restricted
+/// archetype set. Restricting by default would break every existing
+/// human-driven workflow, so the policy is additive.
+async fn current_caller_archetype(pool: &sqlx::SqlitePool) -> CallerArchetype {
+    let Ok(session_id) = std::env::var("RYVE_HAND_SESSION_ID") else {
+        return CallerArchetype::Unrestricted;
+    };
+    let label = match agent_session_repo::get(pool, &session_id).await {
+        Ok(Some(row)) => row.session_label,
+        _ => None,
+    };
+    hand_archetypes::caller_archetype_for_label(label.as_deref())
+}
+
+/// Enforce the caller's archetype against a candidate action and die
+/// with a non-zero exit on any violation. The CLI-side complement of
+/// the pure [`hand_archetypes::enforce_action`] check, wired into every
+/// mutation entry point the Release Manager archetype restricts.
+fn enforce_or_die(caller: CallerArchetype, action: &PolicyAction<'_>) {
+    if let Err(e) = hand_archetypes::enforce_action(caller, action) {
+        die(&format!("{e}"));
+    }
 }
 
 /// Walk up the directory tree from `start` looking for a directory
@@ -278,7 +325,9 @@ fn print_usage() {
     eprintln!("  crew remove-member <crew_id> <session_id>");
     eprintln!("  crew status <crew_id> active|merging|completed|abandoned");
     eprintln!();
-    eprintln!("  hand spawn <spark_id> [--agent <name>] [--role owner|head|merger] [--crew <id>]");
+    eprintln!(
+        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]"
+    );
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
     eprintln!();
@@ -313,6 +362,21 @@ fn print_usage() {
         "  worktree prune [--yes]               Prune stale hand worktrees (dry-run by default)"
     );
     eprintln!("  wt prune                             Alias for worktree prune");
+    eprintln!();
+    eprintln!(
+        "  sweep stalls [--abandon]             Surface orphaned in_progress sparks (owner session ended)"
+    );
+    eprintln!();
+    eprintln!(
+        "  watch create <target_spark_id> --cadence <secs|cron:EXPR> \\\n      [--stop-condition <spec>] --intent <label>"
+    );
+    eprintln!("                                       Create a recurring watch");
+    eprintln!("  watch list [--target <id>] [--status active|completed|cancelled]  List watches");
+    eprintln!("  watch show <watch_id>                Show a watch's details");
+    eprintln!("  watch cancel <watch_id>              Soft-cancel a watch");
+    eprintln!(
+        "  watch replace <watch_id> --cadence <c> [--stop-condition <s>] [--intent <l>]\n      Atomically cancel and recreate a watch"
+    );
     eprintln!();
     eprintln!("FLAGS:");
     eprintln!("  --json    Output as JSON (for machine consumption)");
@@ -1010,6 +1074,24 @@ async fn handle_comment(pool: &sqlx::SqlitePool, args: &[String], json_mode: boo
             if args.len() < 3 {
                 die("comment add requires <spark_id> <body>");
             }
+            // Archetype policy gate (spark ryve-e6713ee7): the Release
+            // Manager may only comment on sparks that are members of
+            // some release — Atlas polls those; every other target is
+            // outside the Atlas-only comms graph. Resolved with one
+            // `SELECT 1 FROM release_epics` and combined with the
+            // caller's archetype before the DB write.
+            let caller = current_caller_archetype(pool).await;
+            let is_release_spark = match release_repo::is_release_member(pool, &args[1]).await {
+                Ok(v) => v,
+                Err(e) => die(&format!("{e}")),
+            };
+            enforce_or_die(
+                caller,
+                &PolicyAction::CommentAdd {
+                    spark_id: &args[1],
+                    is_release_spark,
+                },
+            );
             let body = args[2..].join(" ");
             let new = NewComment {
                 spark_id: args[1].clone(),
@@ -1265,6 +1347,13 @@ async fn handle_ember(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
             Err(e) => die(&format!("{e}")),
         },
         "send" => {
+            // Archetype policy gate (spark ryve-e6713ee7): embers are
+            // broadcasts and therefore outside the Release Manager's
+            // Atlas-only comms graph.
+            enforce_or_die(
+                current_caller_archetype(pool).await,
+                &PolicyAction::EmberSend,
+            );
             if args.len() < 3 {
                 die("ember send requires <type> <content>");
             }
@@ -1296,6 +1385,515 @@ async fn handle_ember(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, jso
             Err(e) => die(&format!("{e}")),
         },
         other => die(&format!("unknown ember subcommand '{other}'")),
+    }
+}
+
+// ── Sweep (workgraph stall detectors) ────────────────
+//
+// [sp-312b98ad] Build orchestration invariant: when all child sparks of
+// a build epic close, the merge/PR step must either complete, emit a
+// visible blocked/failure signal, or remain owned by a live coordinator.
+//
+// The failure mode this sweep targets: a Build Head spawns the Merger
+// via `finalize_with_merger` and exits. If the Merger subprocess later
+// dies (crash, token exhaustion, manual kill) before it closes its
+// merge spark, the `assignments` row is left `active` even though the
+// owning `agent_sessions` row flips to `ended`. Nobody is polling the
+// crew anymore, so the merge spark sits `in_progress` indefinitely —
+// exactly the silent stall observed on ryve-e208c8ac (merge of epic
+// ryve-18f4cec4). `sweep stalls` surfaces those orphans as flare
+// embers so Atlas, the UI, and humans can see them.
+
+async fn handle_sweep(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, json_mode: bool) {
+    if args.is_empty() {
+        die("sweep subcommand required (stalls)");
+    }
+    match args[0].as_str() {
+        "stalls" | "stall" => handle_sweep_stalls(pool, &args[1..], ws_id, json_mode).await,
+        other => die(&format!("unknown sweep subcommand '{other}'")),
+    }
+}
+
+async fn handle_sweep_stalls(
+    pool: &sqlx::SqlitePool,
+    args: &[String],
+    ws_id: &str,
+    json_mode: bool,
+) {
+    let mut abandon = false;
+    for a in args {
+        match a.as_str() {
+            "--abandon" => abandon = true,
+            other => die(&format!("unknown sweep stalls flag '{other}'")),
+        }
+    }
+
+    let orphans = match assignment_repo::find_orphaned_claims(pool, ws_id).await {
+        Ok(o) => o,
+        Err(e) => die(&format!("find_orphaned_claims failed: {e}")),
+    };
+
+    // Dedupe embers per (spark, session) pair so repeated sweeps do not
+    // spam the Ember bar. `find_recent_by_prefix` looks back far enough
+    // to cover the default ember TTL (1 h).
+    let mut emitted = Vec::with_capacity(orphans.len());
+    for o in &orphans {
+        let prefix = format!("stalled-claim {} ", o.spark_id);
+        let dedupe =
+            ember_repo::find_recent_by_prefix(pool, ws_id, EmberType::Flare, &prefix, 3600)
+                .await
+                .unwrap_or(None);
+        if dedupe.is_some() {
+            continue;
+        }
+        let content = format!(
+            "stalled-claim {} role={} session={} ended_at={} title={}",
+            o.spark_id,
+            o.role,
+            o.session_id,
+            o.session_ended_at.as_deref().unwrap_or("?"),
+            o.spark_title,
+        );
+        match ember_repo::create(
+            pool,
+            NewEmber {
+                ember_type: EmberType::Flare,
+                content: content.clone(),
+                source_agent: Some("ryve sweep".to_string()),
+                workshop_id: ws_id.to_string(),
+                ttl_seconds: None,
+            },
+        )
+        .await
+        {
+            Ok(e) => emitted.push(e.id),
+            Err(e) => eprintln!("warn: failed to emit ember for {}: {e}", o.spark_id),
+        }
+    }
+
+    let mut abandoned = Vec::new();
+    if abandon {
+        for o in &orphans {
+            if let Err(e) = assignment_repo::abandon(pool, &o.session_id, &o.spark_id).await {
+                eprintln!(
+                    "warn: failed to abandon phantom claim {}/{}: {e}",
+                    o.spark_id, o.session_id
+                );
+            } else {
+                abandoned.push((o.spark_id.clone(), o.session_id.clone()));
+            }
+        }
+    }
+
+    if json_mode {
+        let payload = serde_json::json!({
+            "workshop_id": ws_id,
+            "orphan_count": orphans.len(),
+            "emitted_embers": emitted,
+            "abandoned_claims": abandoned,
+            "orphans": orphans.iter().map(|o| serde_json::json!({
+                "spark_id": o.spark_id,
+                "spark_title": o.spark_title,
+                "spark_status": o.spark_status,
+                "role": o.role,
+                "session_id": o.session_id,
+                "assigned_at": o.assigned_at,
+                "last_heartbeat_at": o.last_heartbeat_at,
+                "session_ended_at": o.session_ended_at,
+            })).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        return;
+    }
+
+    if orphans.is_empty() {
+        println!("No stalled claims.");
+        return;
+    }
+
+    println!("{} stalled claim(s):", orphans.len());
+    for o in &orphans {
+        println!(
+            "  {} [{}] role={} session={} status={} ended_at={}",
+            o.spark_id,
+            o.spark_title,
+            o.role,
+            o.session_id,
+            o.spark_status,
+            o.session_ended_at.as_deref().unwrap_or("?"),
+        );
+    }
+    if !emitted.is_empty() {
+        println!("emitted {} flare ember(s)", emitted.len());
+    }
+    if abandon {
+        println!("abandoned {} phantom claim(s)", abandoned.len());
+    } else if !orphans.is_empty() {
+        println!(
+            "(pass --abandon to clear phantom assignments; re-running is idempotent via ember dedupe)"
+        );
+    }
+}
+
+// ── Watch ────────────────────────────────────────────
+//
+// `ryve watch` wires the [`data::sparks::watch_repo`] primitives (sp-ee3f5c74
+// S1) into a scriptable CLI surface so Atlas and humans can create, list,
+// inspect, cancel, and replace recurring watches from the terminal
+// [sp-ee3f5c74]. The CLI never writes SQL itself — every mutation goes
+// through the repo.
+
+async fn handle_watch(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch subcommand required (create, list, show, cancel, replace)");
+    }
+    match args[0].as_str() {
+        "create" => handle_watch_create(pool, &args[1..], json_mode).await,
+        "list" | "ls" => handle_watch_list(pool, &args[1..], json_mode).await,
+        "show" | "get" => handle_watch_show(pool, &args[1..], json_mode).await,
+        "cancel" => handle_watch_cancel(pool, &args[1..], json_mode).await,
+        "replace" => handle_watch_replace(pool, &args[1..], json_mode).await,
+        other => die(&format!("unknown watch subcommand '{other}'")),
+    }
+}
+
+/// Parse a cadence token into the typed enum. Accepts either a bare integer
+/// (seconds) or the `interval-secs:<N>` / `cron:<expr>` storage form so users
+/// can paste back what `watch show` prints.
+fn parse_cadence(raw: &str) -> WatchCadence {
+    if let Some(c) = WatchCadence::from_storage(raw) {
+        return c;
+    }
+    if let Ok(secs) = raw.parse::<u64>() {
+        return WatchCadence::Interval { secs };
+    }
+    die(&format!(
+        "invalid --cadence '{raw}' (expected integer seconds, 'interval-secs:N', or 'cron:<expr>')"
+    ));
+}
+
+/// Parse a stop-condition spec. Accepts the repo's JSON storage form so a
+/// round-trip through `watch show --json` works, plus two ergonomic shorthand
+/// forms: `event:<type>` and `status:<spark_id>=<status>`.
+fn parse_stop_condition(raw: &str) -> WatchStopCondition {
+    if raw.eq_ignore_ascii_case("never") {
+        return WatchStopCondition::Never;
+    }
+    if let Some(c) = WatchStopCondition::from_storage(raw) {
+        return c;
+    }
+    if let Some(event_type) = raw.strip_prefix("event:") {
+        return WatchStopCondition::UntilEventType {
+            event_type: event_type.to_string(),
+        };
+    }
+    if let Some(rest) = raw.strip_prefix("status:")
+        && let Some((spark_id, status)) = rest.split_once('=')
+    {
+        return WatchStopCondition::UntilSparkStatus {
+            spark_id: spark_id.to_string(),
+            status: status.to_string(),
+        };
+    }
+    die(&format!(
+        "invalid --stop-condition '{raw}' (expected 'never', 'event:<type>', \
+         'status:<spark_id>=<status>', or the JSON form from `watch show --json`)"
+    ));
+}
+
+/// Compute an initial `next_fire_at` for a freshly created watch. Interval
+/// cadences are deterministic (`now + secs`); cron expressions are stored
+/// unparsed and handed to the scheduler sibling for real evaluation — for now
+/// the CLI seeds `next_fire_at = now` so the scheduler tick will pick the
+/// watch up immediately and compute the proper instant.
+fn initial_next_fire_at(cadence: &WatchCadence) -> String {
+    let now = chrono::Utc::now();
+    match cadence {
+        WatchCadence::Interval { secs } => {
+            (now + chrono::Duration::seconds(*secs as i64)).to_rfc3339()
+        }
+        WatchCadence::Cron { .. } => now.to_rfc3339(),
+    }
+}
+
+fn print_watch(w: &Watch, json_mode: bool) {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(w).unwrap_or_default());
+        return;
+    }
+    println!("ID:             {}", w.id);
+    println!("Target:         {}", w.target_spark_id);
+    println!("Cadence:        {}", w.cadence);
+    println!(
+        "Stop condition: {}",
+        w.stop_condition.as_deref().unwrap_or("never")
+    );
+    println!("Intent:         {}", w.intent_label);
+    println!("Status:         {}", w.status);
+    println!(
+        "Last fired:     {}",
+        w.last_fired_at.as_deref().unwrap_or("-")
+    );
+    println!("Next fire:      {}", w.next_fire_at);
+    println!("Created:        {}", w.created_at);
+    println!("Updated:        {}", w.updated_at);
+    if let Some(by) = &w.created_by {
+        println!("Created by:     {by}");
+    }
+}
+
+fn print_watch_list(rows: &[Watch], json_mode: bool) {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(rows).unwrap_or_default());
+        return;
+    }
+    if rows.is_empty() {
+        println!("No watches.");
+        return;
+    }
+    println!(
+        "{:<16} {:<22} {:<10} {:<22} {:<24} INTENT",
+        "ID", "TARGET", "STATUS", "CADENCE", "NEXT_FIRE_AT"
+    );
+    println!("{}", "-".repeat(110));
+    for w in rows {
+        println!(
+            "{:<16} {:<22} {:<10} {:<22} {:<24} {}",
+            w.id, w.target_spark_id, w.status, w.cadence, w.next_fire_at, w.intent_label,
+        );
+    }
+}
+
+async fn handle_watch_create(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch create requires <target_spark_id> --cadence <c> --intent <label>");
+    }
+    let target = args[0].clone();
+    let mut cadence: Option<String> = None;
+    let mut stop: Option<String> = None;
+    let mut intent: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cadence" => {
+                cadence = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--cadence requires a value");
+                }));
+                i += 2;
+            }
+            "--stop-condition" => {
+                stop = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--stop-condition requires a value");
+                }));
+                i += 2;
+            }
+            "--intent" => {
+                intent = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--intent requires a value");
+                }));
+                i += 2;
+            }
+            other => die(&format!("unknown watch create flag '{other}'")),
+        }
+    }
+
+    let cadence_raw = cadence.unwrap_or_else(|| die("watch create requires --cadence"));
+    let intent_label = intent.unwrap_or_else(|| die("watch create requires --intent"));
+    let cadence = parse_cadence(&cadence_raw);
+    let stop_condition = stop.map(|s| parse_stop_condition(&s));
+    let next_fire_at = initial_next_fire_at(&cadence);
+
+    let new = NewWatch {
+        target_spark_id: target,
+        cadence,
+        stop_condition,
+        intent_label,
+        next_fire_at,
+        created_by: Some("cli".to_string()),
+    };
+
+    match watch_repo::create(pool, new).await {
+        Ok(w) => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&w).unwrap_or_default());
+            } else {
+                println!("{}", w.id);
+            }
+        }
+        Err(SparksError::DuplicateWatch {
+            target_spark_id,
+            intent_label,
+        }) => {
+            // Surface the existing watch id so the caller can inspect or
+            // replace it instead of having to re-query the repo.
+            let existing_id = watch_repo::list(
+                pool,
+                WatchFilter {
+                    status: Some(WatchStatus::Active),
+                    target_spark_id: Some(target_spark_id),
+                },
+            )
+            .await
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|w| w.intent_label == intent_label)
+                    .map(|w| w.id)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+            eprintln!("watch already exists: {existing_id}");
+            process::exit(1);
+        }
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_watch_list(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    let mut target: Option<String> = None;
+    let mut status: Option<WatchStatus> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target" => {
+                target = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--target requires a value");
+                }));
+                i += 2;
+            }
+            "--status" => {
+                let raw = args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--status requires a value");
+                });
+                status = Some(WatchStatus::parse(&raw).unwrap_or_else(|| {
+                    die(&format!(
+                        "invalid --status '{raw}' (expected active, completed, cancelled)"
+                    ))
+                }));
+                i += 2;
+            }
+            other => die(&format!("unknown watch list flag '{other}'")),
+        }
+    }
+
+    let filter = WatchFilter {
+        status,
+        target_spark_id: target,
+    };
+    match watch_repo::list(pool, filter).await {
+        Ok(rows) => print_watch_list(&rows, json_mode),
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_watch_show(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch show requires <watch_id>");
+    }
+    match watch_repo::get(pool, &args[0]).await {
+        Ok(w) => print_watch(&w, json_mode),
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_watch_cancel(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch cancel requires <watch_id>");
+    }
+    match watch_repo::cancel(pool, &args[0]).await {
+        Ok(w) => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&w).unwrap_or_default());
+            } else {
+                println!("cancelled {}", w.id);
+            }
+        }
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_watch_replace(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch replace requires <watch_id> --cadence <c>");
+    }
+    let existing_id = args[0].clone();
+    let mut cadence: Option<String> = None;
+    let mut stop_raw: Option<String> = None;
+    let mut stop_flag_seen = false;
+    let mut intent: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cadence" => {
+                cadence = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--cadence requires a value");
+                }));
+                i += 2;
+            }
+            "--stop-condition" => {
+                stop_flag_seen = true;
+                stop_raw = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--stop-condition requires a value");
+                }));
+                i += 2;
+            }
+            "--intent" => {
+                intent = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--intent requires a value");
+                }));
+                i += 2;
+            }
+            other => die(&format!("unknown watch replace flag '{other}'")),
+        }
+    }
+
+    let existing = match watch_repo::get(pool, &existing_id).await {
+        Ok(w) => w,
+        Err(e) => die(&format!("{e}")),
+    };
+
+    // Missing flags inherit from the existing watch so callers can re-tune a
+    // single axis without re-specifying the rest.
+    let cadence = match cadence {
+        Some(c) => parse_cadence(&c),
+        None => existing.parsed_cadence().unwrap_or_else(|| {
+            die(&format!(
+                "existing watch {} has malformed cadence '{}' — specify --cadence explicitly",
+                existing.id, existing.cadence,
+            ))
+        }),
+    };
+    let stop_condition = if stop_flag_seen {
+        stop_raw.map(|s| parse_stop_condition(&s))
+    } else {
+        existing.parsed_stop_condition().and_then(|sc| match sc {
+            WatchStopCondition::Never => None,
+            other => Some(other),
+        })
+    };
+    let intent_label = intent.unwrap_or_else(|| existing.intent_label.clone());
+    let next_fire_at = initial_next_fire_at(&cadence);
+
+    let new = NewWatch {
+        target_spark_id: existing.target_spark_id.clone(),
+        cadence,
+        stop_condition,
+        intent_label,
+        next_fire_at,
+        created_by: Some("cli".to_string()),
+    };
+
+    match watch_repo::replace(pool, &existing_id, new).await {
+        Ok(w) => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&w).unwrap_or_default());
+            } else {
+                println!("{}", w.id);
+            }
+        }
+        Err(e) => die(&format!("{e}")),
     }
 }
 
@@ -1353,6 +1951,7 @@ async fn handle_assignment(pool: &sqlx::SqlitePool, args: &[String], json_mode: 
                 session_id: sid.clone(),
                 spark_id: args[2].clone(),
                 role: AssignmentRole::Owner,
+                actor_id: None,
             };
             match assignment_repo::assign(pool, new).await {
                 Ok(a) => println!("{} claimed by {} ({})", a.spark_id, a.session_id, a.role),
@@ -1741,19 +2340,36 @@ async fn handle_hand(
     }
     match args[0].as_str() {
         "spawn" => {
+            // Archetype policy gate (spark ryve-e6713ee7): a Release
+            // Manager may not spawn any Hand. Enforced here, before any
+            // DB write or worktree creation, so the refusal leaves no
+            // trace in the workgraph.
+            enforce_or_die(
+                current_caller_archetype(pool).await,
+                &PolicyAction::SpawnHand,
+            );
             if args.len() >= 2 && matches!(args[1].as_str(), "help" | "--help" | "-h") {
                 print_hand_spawn_usage();
                 return;
             }
             if args.len() < 2 {
                 die(
-                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
+                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
                 );
             }
             let spark_id = args[1].clone();
             let mut agent_name: Option<String> = None;
             let mut role = HandKind::Owner;
             let mut crew_id: Option<String> = None;
+            let mut actor_override: Option<String> = None;
+            // Reviewer-only inputs. `candidates` is a repeatable
+            // `--candidate actor:vendor` flag; `author_actor` /
+            // `author_vendor` name the Hand whose work is under review;
+            // `seed` is the deterministic tiebreaker (default 0).
+            let mut author_actor: Option<String> = None;
+            let mut author_vendor: Option<String> = None;
+            let mut reviewer_candidates: Vec<hand_spawn::ReviewerCandidate> = Vec::new();
+            let mut reviewer_seed: u64 = 0;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1769,10 +2385,19 @@ async fn handle_hand(
                             role = match args[i].as_str() {
                                 "owner" | "hand" => HandKind::Owner,
                                 "head" => HandKind::Head,
+                                "investigator" => HandKind::Investigator,
+                                "architect" => HandKind::Architect,
+                                "reviewer" => HandKind::Reviewer,
+                                "release_manager" | "release-manager" => HandKind::ReleaseManager,
+                                "bug_hunter" | "bug-hunter" => HandKind::BugHunter,
+                                "performance_engineer"
+                                | "performance-engineer"
+                                | "perf_engineer"
+                                | "perf-engineer" => HandKind::PerformanceEngineer,
                                 "merger" => HandKind::Merger,
-                                other => {
-                                    die(&format!("invalid role '{other}' (owner|head|merger)"))
-                                }
+                                other => die(&format!(
+                                    "invalid role '{other}' (owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger)"
+                                )),
                             };
                         }
                     }
@@ -1780,6 +2405,48 @@ async fn handle_hand(
                         i += 1;
                         if i < args.len() {
                             crew_id = Some(args[i].clone());
+                        }
+                    }
+                    "--actor" => {
+                        i += 1;
+                        if i < args.len() {
+                            actor_override = Some(args[i].clone());
+                        }
+                    }
+                    "--author-actor" => {
+                        i += 1;
+                        if i < args.len() {
+                            author_actor = Some(args[i].clone());
+                        }
+                    }
+                    "--author-vendor" => {
+                        i += 1;
+                        if i < args.len() {
+                            author_vendor = Some(args[i].clone());
+                        }
+                    }
+                    "--candidate" => {
+                        i += 1;
+                        if i < args.len() {
+                            let raw = &args[i];
+                            let (actor, vendor) = raw.split_once(':').unwrap_or_else(|| {
+                                die(&format!(
+                                    "--candidate '{raw}' must be <actor>:<vendor> \
+                                     (e.g. alice:claude)"
+                                ))
+                            });
+                            reviewer_candidates.push(hand_spawn::ReviewerCandidate {
+                                actor_id: actor.trim().to_string(),
+                                vendor: vendor.trim().to_string(),
+                            });
+                        }
+                    }
+                    "--seed" => {
+                        i += 1;
+                        if i < args.len() {
+                            reviewer_seed = args[i].parse().unwrap_or_else(|_| {
+                                die(&format!("--seed '{}' must be a u64", args[i]))
+                            });
                         }
                     }
                     other => die(&format!("unknown hand spawn flag '{other}'")),
@@ -1796,40 +2463,124 @@ async fn handle_hand(
             // env var set and the column will be NULL.
             let parent_session_id = std::env::var("RYVE_HAND_SESSION_ID").ok();
 
-            match hand_spawn::spawn_hand(
-                workshop_root,
-                pool,
-                &agent,
-                &spark_id,
-                role,
-                crew_id.as_deref(),
-                parent_session_id.as_deref(),
-            )
-            .await
-            {
-                Ok(spawned) => {
-                    if json_mode {
-                        let payload = serde_json::json!({
-                            "session_id": spawned.session_id,
-                            "spark_id": spawned.spark_id,
-                            "worktree": spawned.worktree_path,
-                            "log": spawned.log_path,
-                            "pid": spawned.child_pid,
-                        });
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&payload).unwrap_or_default()
-                        );
-                    } else {
-                        println!(
-                            "spawned hand {} on spark {} (pid {:?})",
-                            spawned.session_id, spawned.spark_id, spawned.child_pid
-                        );
-                        println!("  worktree: {}", spawned.worktree_path.display());
-                        println!("  log:      {}", spawned.log_path.display());
+            // Reviewer spawns dispatch through the policy-aware
+            // `spawn_reviewer` path (deterministic cross-vendor-preferring
+            // selection, `reviewer_policy_relaxed` on same-vendor fallback,
+            // `awaiting_reviewer_availability` + flare ember when no
+            // reviewer is eligible). Standard Hand kinds use the generic
+            // `spawn_hand` path.
+            if matches!(role, HandKind::Reviewer) {
+                let Some(aa) = author_actor.as_deref() else {
+                    die("--role reviewer requires --author-actor <id>");
+                };
+                let Some(av) = author_vendor.as_deref() else {
+                    die("--role reviewer requires --author-vendor <vendor>");
+                };
+                match hand_spawn::spawn_reviewer(
+                    workshop_root,
+                    pool,
+                    &agent,
+                    &spark_id,
+                    hand_spawn::ReviewerRequest {
+                        author_actor: aa,
+                        author_vendor: av,
+                        candidates: &reviewer_candidates,
+                        seed: reviewer_seed,
+                    },
+                    hand_spawn::SpawnContext {
+                        crew_id: crew_id.as_deref(),
+                        parent_session_id: parent_session_id.as_deref(),
+                        actor_id: actor_override.as_deref(),
+                    },
+                )
+                .await
+                {
+                    Ok(hand_spawn::ReviewerSpawnOutcome::Spawned { hand, selection }) => {
+                        if json_mode {
+                            let payload = serde_json::json!({
+                                "outcome": "spawned",
+                                "selection": selection.as_str(),
+                                "session_id": hand.session_id,
+                                "spark_id": hand.spark_id,
+                                "worktree": hand.worktree_path,
+                                "log": hand.log_path,
+                                "pid": hand.child_pid,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!(
+                                "spawned reviewer {} on spark {} (selection {}, pid {:?})",
+                                hand.session_id,
+                                hand.spark_id,
+                                selection.as_str(),
+                                hand.child_pid
+                            );
+                            println!("  worktree: {}", hand.worktree_path.display());
+                            println!("  log:      {}", hand.log_path.display());
+                        }
                     }
+                    Ok(hand_spawn::ReviewerSpawnOutcome::AwaitingAvailability { ember_id }) => {
+                        if json_mode {
+                            let payload = serde_json::json!({
+                                "outcome": "awaiting_reviewer_availability",
+                                "spark_id": spark_id,
+                                "ember_id": ember_id,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!(
+                                "spark {spark_id}: awaiting_reviewer_availability \
+                                 (ember {ember_id}) — no eligible reviewer in pool"
+                            );
+                        }
+                    }
+                    Err(e) => die(&format!("{e}")),
                 }
-                Err(e) => die(&format!("{e}")),
+            } else {
+                match hand_spawn::spawn_hand(
+                    workshop_root,
+                    pool,
+                    &agent,
+                    &spark_id,
+                    role,
+                    hand_spawn::SpawnContext {
+                        crew_id: crew_id.as_deref(),
+                        parent_session_id: parent_session_id.as_deref(),
+                        actor_id: actor_override.as_deref(),
+                    },
+                )
+                .await
+                {
+                    Ok(spawned) => {
+                        if json_mode {
+                            let payload = serde_json::json!({
+                                "session_id": spawned.session_id,
+                                "spark_id": spawned.spark_id,
+                                "worktree": spawned.worktree_path,
+                                "log": spawned.log_path,
+                                "pid": spawned.child_pid,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!(
+                                "spawned hand {} on spark {} (pid {:?})",
+                                spawned.session_id, spawned.spark_id, spawned.child_pid
+                            );
+                            println!("  worktree: {}", spawned.worktree_path.display());
+                            println!("  log:      {}", spawned.log_path.display());
+                        }
+                    }
+                    Err(e) => die(&format!("{e}")),
+                }
             }
         }
         "list" | "ls" => match assignment_repo::list_active(pool).await {
@@ -1873,7 +2624,7 @@ worktree under `.ryve/worktrees/<short>/` on branch `hand/<short>`. Hands
 are the only layer that edits code.
 
 USAGE:
-  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|merger] [--crew <id>]
+  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]
   ryve hand list
   ryve hand --help
   ryve hand spawn --help
@@ -1883,18 +2634,44 @@ SUBCOMMANDS:
   list     Show active hand assignments (ownership + role + heartbeat).
 
 ROLES:
-  owner    (default) Standard worker. Claims the spark, works in its own
-           worktree, closes the spark when DONE.md passes.
-  head     Crew orchestrator. Takes an epic, decomposes it into child
-           sparks, spawns sub-Hands, and supervises them. Prefer the
-           dedicated `ryve head spawn` wrapper — it reads more naturally.
-  merger   Crew integrator. Collects sibling worktrees, merges them into a
-           single `crew/<id>` branch, and opens one PR. Requires --crew.
+  owner             (default) Standard worker. Claims the spark, works in its
+                    own worktree, closes the spark when DONE.md passes.
+  head              Crew orchestrator. Takes an epic, decomposes it into child
+                    sparks, spawns sub-Hands, and supervises them. Prefer the
+                    dedicated `ryve head spawn` wrapper — it reads more naturally.
+  investigator      Read-only auditor. Sweeps code and posts findings as
+                    comments on the parent spark; may not edit files or run
+                    destructive git. Typically spawned by a Research Head.
+  architect         Read-only design reviewer. Produces recommendations,
+                    tradeoffs, and risks as structured comments on the parent
+                    spark; never edits code. Typically spawned by a Review Head.
+  reviewer          Read-only code reviewer. Approves or rejects a spark's
+                    AwaitingReview phase against its acceptance criteria.
+                    Spawned via the Reviewer spawn path with deterministic,
+                    cross-vendor-preferring selection (see
+                    `hand_spawn::spawn_reviewer`).
+  release_manager   Atlas-only Release steward. Runs `ryve release *`, commits
+                    to `release/*`, comments on release member sparks only.
+                    Cannot spawn Hands/Heads, cannot send embers. Singleton per
+                    release (see docs/HAND_ARCHETYPES.md).
+  bug_hunter        Triager+Surgeon hybrid specialised on small defects.
+                    Reproduces the bug with a failing test, lands the smallest
+                    possible diff that flips it green. Write-capable; scope is
+                    policed by the prompt, not a CLI gate.
+  performance_engineer
+                    Refactorer+Cartographer hybrid specialised on measurable
+                    improvements. Baselines, profiles, proposes, and verifies,
+                    recording before/after numbers as spark comments. Write-
+                    capable; scope is policed by the prompt, not a CLI gate.
+  merger            Crew integrator. Collects sibling worktrees, merges them
+                    into a single `crew/<id>` branch, and opens one PR.
+                    Requires --crew.
 
 See also:
   ryve head --help                    Head-specific documentation.
   docs/AGENT_HIERARCHY.md              Atlas → Head → Hand overview.
   docs/HAND_CAPABILITIES.md            Hand capability classes.
+  docs/HAND_ARCHETYPES.md              Concrete Hand archetypes (Architect, …).
 "
     );
 }
@@ -1914,18 +2691,44 @@ OPTIONS:
   --agent <name>           Coding agent to run (claude, codex, aider,
                            opencode, …). Defaults to the first detected
                            agent on your PATH.
-  --role <role>            owner | head | merger. Default: owner.
-                             owner  — standard worker Hand.
-                             head   — crew orchestrator (prefer `ryve head spawn`).
-                             merger — crew integrator (requires --crew).
+  --role <role>            owner | head | investigator | architect | reviewer | release_manager | bug_hunter | performance_engineer | merger.
+                           Default: owner.
+                             owner            — standard worker Hand.
+                             head             — crew orchestrator (prefer `ryve head spawn`).
+                             investigator     — read-only auditor; posts findings via comments.
+                             architect        — read-only design reviewer; posts recommendations,
+                                                tradeoffs, and risks as comments (see docs/HAND_ARCHETYPES.md).
+                             reviewer         — read-only code reviewer; approves/rejects
+                                                AwaitingReview (see hand_spawn::spawn_reviewer).
+                             release_manager  — Atlas-only Release steward; see docs/HAND_ARCHETYPES.md.
+                             bug_hunter       — Triager+Surgeon hybrid; failing test → smallest diff.
+                             performance_engineer
+                                              — Refactorer+Cartographer hybrid; baseline → profile → propose → verify.
+                             merger           — crew integrator (requires --crew).
   --crew <crew_id>         Attach the new Hand to an existing crew as a
                            member. Required when --role merger.
+  --author-actor <id>      (--role reviewer) Actor of the Hand whose work is
+                           under review. The reviewer is selected to be
+                           different from this actor.
+  --author-vendor <vendor> (--role reviewer) Vendor of the author (e.g.
+                           claude, codex). The selection prefers a
+                           cross-vendor reviewer and falls back to
+                           same-vendor with a reviewer_policy_relaxed
+                           event recorded on the spark.
+  --candidate <actor:vendor>
+                           (--role reviewer, repeatable) Reviewer pool
+                           entry. Pass one per candidate; the author is
+                           excluded automatically.
+  --seed <u64>             (--role reviewer) Deterministic tiebreaker for
+                           selection. Same inputs + same seed always
+                           produce the same reviewer. Default: 0.
 
 EFFECTS:
   1. Creates a git worktree at `.ryve/worktrees/<short>/` on branch
      `hand/<short>`.
   2. Persists an `agent_sessions` row (session_label = hand / head /
-     merger) and a `hand_assignments` row claiming the spark.
+     investigator / architect / release_manager / bug_hunter / performance_engineer / merger)
+     and a `hand_assignments` row claiming the spark.
   3. If --crew is set, inserts a `crew_members` row.
   4. Writes a role-specific initial prompt under `.ryve/prompts/` and
      launches the chosen coding agent in full-auto mode, detached, with
@@ -2083,6 +2886,12 @@ async fn handle_head(
     }
     match args[0].as_str() {
         "spawn" => {
+            // Archetype policy gate (spark ryve-e6713ee7): Release
+            // Manager may not spawn a Head either.
+            enforce_or_die(
+                current_caller_archetype(pool).await,
+                &PolicyAction::SpawnHead,
+            );
             if args.len() >= 2 && matches!(args[1].as_str(), "help" | "--help" | "-h") {
                 print_head_spawn_usage();
                 return;
@@ -2096,6 +2905,7 @@ async fn handle_head(
             let mut archetype_name: Option<String> = None;
             let mut agent_name: Option<String> = None;
             let mut crew_id: Option<String> = None;
+            let mut actor_override: Option<String> = None;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -2115,6 +2925,12 @@ async fn handle_head(
                         i += 1;
                         if i < args.len() {
                             crew_id = Some(args[i].clone());
+                        }
+                    }
+                    "--actor" => {
+                        i += 1;
+                        if i < args.len() {
+                            actor_override = Some(args[i].clone());
                         }
                     }
                     other => die(&format!(
@@ -2144,8 +2960,11 @@ async fn handle_head(
                 &agent,
                 &epic_id,
                 archetype,
-                crew_id.as_deref(),
-                parent_session_id.as_deref(),
+                hand_spawn::SpawnContext {
+                    crew_id: crew_id.as_deref(),
+                    parent_session_id: parent_session_id.as_deref(),
+                    actor_id: actor_override.as_deref(),
+                },
             )
             .await
             {
@@ -2545,6 +3364,90 @@ async fn handle_worktree(
     match args[0].as_str() {
         "prune" => handle_worktree_prune(pool, workshop_root, &args[1..], json_mode).await,
         other => die(&format!("unknown worktree subcommand '{other}'")),
+    }
+}
+
+/// `ryve tmux` — tmux session introspection and reconciliation.
+///
+/// Primarily consumed by the integration tests (sp-0285181c) so they can
+/// exercise the real production code paths (`tmux::reconcile_sessions` and
+/// `TmuxClient::attach_command`) from a separate process. Also a useful
+/// admin tool when Ryve's UI is not running.
+async fn handle_tmux(
+    pool: &sqlx::SqlitePool,
+    workshop_root: &Path,
+    ws_id: &str,
+    args: &[String],
+    json_mode: bool,
+) {
+    if args.is_empty() {
+        die("tmux subcommand required (reconcile, attach-cmd, has-session)");
+    }
+    match args[0].as_str() {
+        "reconcile" => {
+            let result = crate::tmux::reconcile_sessions(workshop_root, pool, ws_id).await;
+            if json_mode {
+                let payload = serde_json::json!({
+                    "confirmed_live": result.confirmed_live,
+                    "marked_stopped": result.marked_stopped,
+                    "orphaned_tmux": result.orphaned_tmux,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                println!("confirmed_live: {} session(s)", result.confirmed_live.len());
+                for id in &result.confirmed_live {
+                    println!("  {id}");
+                }
+                println!("marked_stopped: {} session(s)", result.marked_stopped.len());
+                for id in &result.marked_stopped {
+                    println!("  {id}");
+                }
+                println!("orphaned_tmux:  {} session(s)", result.orphaned_tmux.len());
+                for n in &result.orphaned_tmux {
+                    println!("  {n}");
+                }
+            }
+        }
+        "attach-cmd" => {
+            if args.len() < 2 {
+                die("tmux attach-cmd requires <session_name>");
+            }
+            let name = &args[1];
+            let tmux_bin = match crate::tmux::resolve_tmux_bin() {
+                Some(b) => b,
+                None => die("no tmux binary available (RYVE_TMUX_PATH unset and not on PATH)"),
+            };
+            let ryve_dir = RyveDir::new(workshop_root);
+            let client = crate::tmux::TmuxClient::new(tmux_bin, ryve_dir.root());
+            let cmd = client.attach_command(name);
+            let program = cmd.get_program().to_string_lossy().into_owned();
+            let argv: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            if json_mode {
+                let payload = serde_json::json!({
+                    "program": program,
+                    "args": argv,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                print!("{program}");
+                for a in &argv {
+                    print!(" {a}");
+                }
+                println!();
+            }
+        }
+        other => die(&format!(
+            "unknown tmux subcommand '{other}' (reconcile, attach-cmd)"
+        )),
     }
 }
 
