@@ -181,6 +181,8 @@ pub fn compose_atlas_prompt() -> String {
          report.\n\n",
     );
 
+    prompt.push_str(ATLAS_WATCH_SECTION);
+
     prompt.push_str(
         "HARD RULES:\n\
          - You are the Director. You coordinate; you do not execute. No file \
@@ -1459,6 +1461,93 @@ step, not a merge-time problem. Record your scope-overlap reasoning as a \
 comment on the parent epic (`ryve comment add <epic> '<reasoning>'`) so the \
 decision is auditable.\n\n";
 
+/// Watch-primitive section for the Atlas prompt. Atlas is the primary
+/// consumer of `ryve watch` — the durable, restart-safe scheduler that
+/// fires `WatchFired` events on a cadence until a stop condition is met
+/// (spark ryve-638c69fd / [sp-ee3f5c74]). This block documents four
+/// things every Atlas session must know:
+///
+/// 1. WHEN to create a watch (unattended coordination / release
+///    monitoring / PR follow-through — cases where a human would
+///    otherwise have to poll manually).
+/// 2. HOW to configure cadence + stop-condition so the watch actually
+///    terminates instead of firing forever.
+/// 3. HOW to react to a `WatchFired` event — run the *next* queued
+///    coordination step (PR open → merge → rebase → release edits) and
+///    record it in the workgraph so the audit trail survives restart.
+/// 4. The DUPLICATE-PREVENTION contract: `(target_spark_id, intent_label)`
+///    is unique for non-cancelled rows, so a second `watch create` on the
+///    same pair exits non-zero and names the existing id. Atlas treats
+///    that as "already covered" and reads the existing watch instead of
+///    stacking a duplicate.
+///
+/// The section is pulled into `compose_atlas_prompt` (above) and pinned
+/// by `atlas_prompt_documents_watch_primitive` so a future edit that
+/// drops it is caught by the test suite.
+const ATLAS_WATCH_SECTION: &str = "WATCH PRIMITIVE — unattended coordination. The `ryve watch` family is your \
+durable scheduler for multi-step flows where the next step only makes sense \
+after an external condition holds (PR open → merge → rebase main → release \
+edits). A watch is a workgraph row that fires on a cadence and emits a \
+`WatchFired` event into the outbox; firing survives process restarts and is \
+deduplicated per `(watch_id, scheduled_fire_at)` slot.\n\n\
+WHEN TO CREATE A WATCH:\n\
+- UNATTENDED COORDINATION. You need a follow-up step that can only run once \
+  something external completes (e.g. `gh pr merge` must wait for CI green).\n\
+- RELEASE MONITORING. You are shepherding a release and need to track \
+  until a target spark reaches `closed completed`.\n\
+- PR FOLLOW-THROUGH. A Merger posted a PR; the next queued step \
+  (rebase main, run release edits, tag the version) needs to run only \
+  after human review lands — without you re-polling in a tight loop.\n\n\
+HOW TO CREATE ONE — cadence + stop-condition are both required by discipline:\n\
+    ryve watch create <target_spark_id> --cadence <secs-or-expr> \\\n\
+        --stop-condition <spec> --intent <label>\n\
+Cadence forms: a bare integer (seconds) or the storage round-trip forms \
+`interval-secs:<N>` / `cron:<expr>`. Stop-condition forms: `never` (avoid — \
+watches with no terminator leak), `status:<spark_id>=<status>` (stop when \
+the target spark reaches that status — this is the common case), \
+`event:<type>` (stop when an event of that type lands in the outbox), or \
+the JSON form from `watch show --json`. Always set an intent label — it is \
+the second half of the dedup key and it is what you match on when reacting.\n\n\
+HOW TO REACT TO A `WatchFired` EVENT — each fire is your cue to advance the \
+next queued coordination step, not just to re-poll. On wake:\n\
+1. List your current watches: `ryve watch list --json`.\n\
+2. For each recent fire (`ryve event list <target_spark_id>` filtered on \
+   `event_type = 'WatchFired'`), read the `intent_label` in the payload — \
+   it tells you WHICH queued step is unblocked.\n\
+3. Execute the next step on the target spark (open the PR, dispatch the \
+   merge, trigger the rebase, run the release edits, etc.). Record the \
+   step in the workgraph so the audit trail survives: either a \
+   `ryve comment add <target> '<what you just did + why>'`, a status \
+   transition, or a bond/contract update. Never advance a coordination \
+   flow without a workgraph breadcrumb.\n\
+4. If the step completes the coordination, cancel the watch: \
+   `ryve watch cancel <watch_id>`. If it changes the cadence or stop \
+   condition, use `ryve watch replace <watch_id> --cadence ... --stop-condition ...` \
+   — replace is atomic and preserves the dedup contract.\n\
+5. If the `WatchFired` payload reports `stop_condition_satisfied = true`, \
+   the watch already transitioned to `completed` in the same transaction \
+   as the firing; no cancel needed. Just run whatever final step the \
+   completion implies (e.g. post the PR URL back to the user).\n\n\
+DUPLICATE-PREVENTION CONTRACT. The watches table has a partial unique index \
+on `(target_spark_id, intent_label)` for non-cancelled rows. A second \
+`watch create` on the same pair exits non-zero and prints \
+`watch already exists: <existing_id>` on stderr. Treat that as \
+\"already covered\" — resolve it by running `ryve watch show <existing_id>` \
+and either reusing the existing watch or calling `ryve watch replace` if \
+the cadence / stop-condition genuinely needs to change. NEVER retry create \
+with a mutated intent label just to dodge the error: intent labels are \
+what the reaction step dispatches on, and drifting them fragments the \
+audit trail.\n\n\
+HARD WATCH RULES:\n\
+- Interact with watches ONLY through the `ryve watch` CLI and read \
+  `ryve event list`. Do not touch `.ryve/sparks.db` or `watches.*` tables \
+  directly — that bypasses the transactional fire-and-advance invariant.\n\
+- Every coordination step triggered by a `WatchFired` must leave a \
+  workgraph breadcrumb (spark transition, event, or comment). A silent \
+  reaction is a policy failure.\n\
+- Prefer bounded stop-conditions (`status:...=closed` or explicit event \
+  types) over `never`. A watch you forgot to cancel is a rogue cron job.\n\n";
+
 fn push_spark_details(prompt: &mut String, spark: &Spark) {
     prompt.push_str(&format!("Title: {}\n", spark.title));
     if !spark.description.is_empty() {
@@ -1552,6 +1641,102 @@ mod tests {
         assert!(
             !hand.contains("Read these rules carefully"),
             "obsolete passive framing leaked back into HOUSE_RULES"
+        );
+    }
+
+    /// Spark ryve-638c69fd [sp-ee3f5c74] — Atlas is the primary consumer of
+    /// the watch primitive. Its system prompt must document when to create
+    /// a watch, how to configure cadence + stop-condition, how to react to
+    /// a `WatchFired` event, and the duplicate-prevention contract on
+    /// `(target_spark_id, intent_label)`. The assertions are behavioural
+    /// so future edits cannot quietly drop a pillar of the contract.
+    #[test]
+    fn atlas_prompt_documents_watch_primitive() {
+        let p = compose_atlas_prompt();
+
+        // Section header / identity.
+        assert!(
+            p.contains("WATCH PRIMITIVE"),
+            "Atlas prompt must call out the watch primitive as a first-class coordination tool"
+        );
+
+        // When to create a watch — the three named triggers from the
+        // acceptance criteria.
+        assert!(
+            p.contains("UNATTENDED COORDINATION"),
+            "watch section must name unattended coordination as a trigger"
+        );
+        assert!(
+            p.contains("RELEASE MONITORING"),
+            "watch section must name release monitoring as a trigger"
+        );
+        assert!(
+            p.contains("PR FOLLOW-THROUGH"),
+            "watch section must name PR follow-through as a trigger"
+        );
+
+        // How to set cadence + stop-condition — the CLI surface Atlas uses.
+        assert!(
+            p.contains("ryve watch create"),
+            "watch section must document `ryve watch create` as the entry point"
+        );
+        assert!(
+            p.contains("--cadence") && p.contains("--stop-condition"),
+            "watch section must document both cadence and stop-condition flags"
+        );
+        assert!(
+            p.contains("--intent"),
+            "watch section must document the intent label (half of the dedup key)"
+        );
+        assert!(
+            p.contains("status:") && p.contains("=") || p.contains("UntilSparkStatus"),
+            "watch section must show the common `status:<spark>=<status>` stop form"
+        );
+
+        // How to react to a WatchFired event — consume the next queued step
+        // and leave an audit-trail breadcrumb.
+        assert!(
+            p.contains("WatchFired"),
+            "watch section must reference the WatchFired event type"
+        );
+        assert!(
+            p.contains("ryve watch list"),
+            "watch section must show how to list live watches on wake"
+        );
+        assert!(
+            p.contains("ryve event list") || p.contains("event list"),
+            "watch section must point at the event outbox as the source of fires"
+        );
+        assert!(
+            p.contains("next step")
+                || p.contains("next queued")
+                || p.contains("queued coordination"),
+            "watch section must frame each fire as a cue to advance the next queued step"
+        );
+        assert!(
+            p.contains("breadcrumb") || p.contains("audit trail") || p.contains("ryve comment add"),
+            "watch section must require a workgraph breadcrumb per reaction"
+        );
+
+        // Duplicate-prevention contract on (target, intent).
+        assert!(
+            p.contains("DUPLICATE-PREVENTION") || p.contains("watch already exists"),
+            "watch section must document the duplicate-prevention contract"
+        );
+        assert!(
+            p.contains("(target_spark_id, intent_label)")
+                || (p.contains("target_spark_id") && p.contains("intent_label")),
+            "watch section must name the (target, intent) unique key"
+        );
+        assert!(
+            p.contains("ryve watch replace"),
+            "watch section must point at `watch replace` as the correct way to re-tune"
+        );
+
+        // CLI-only discipline — Atlas never touches the DB directly.
+        assert!(
+            p.contains("ryve watch") && p.contains(".ryve/sparks.db"),
+            "watch section must forbid direct DB access and mandate the CLI"
         );
     }
 

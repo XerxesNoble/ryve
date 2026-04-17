@@ -398,6 +398,12 @@ pub struct Workshop {
     /// Cached total (non-stale) hand count for the status bar. Recomputed on
     /// `AgentSessionsLoaded` instead of every frame. Spark ryve-252c5b6e.
     pub cached_total_hands: usize,
+    /// Handle to the workshop's watch scheduler task. `Some` once the
+    /// sqlx pool has been opened and the task spawned; `None` before the
+    /// pool is ready or after the workshop has been torn down. Owned
+    /// here so `do_close_workshop` can await graceful shutdown.
+    /// Spark ryve-6ab1980c [sp-ee3f5c74].
+    pub watch_runner: Option<crate::watch_runner::WatchRunnerHandle>,
 }
 
 impl Workshop {
@@ -472,6 +478,7 @@ impl Workshop {
             cached_git_stats: Default::default(),
             cached_active_hands: 0,
             cached_total_hands: 0,
+            watch_runner: None,
         }
     }
 
