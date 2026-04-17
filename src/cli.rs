@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use data::ryve_dir::RyveDir;
+use data::sparks::error::SparksError;
 use data::sparks::types::*;
 use data::sparks::{
     agent_session_repo, assignment_repo, bond_repo, comment_repo, commit_link_repo,
     constraint_helpers, contract_repo, crew_repo, ember_repo, event_repo, release_repo, spark_repo,
-    stamp_repo,
+    stamp_repo, watch_repo,
 };
 
 use crate::agent_prompts::HeadArchetype;
@@ -64,6 +65,8 @@ pub const CLI_COMMANDS: &[&str] = &[
     "wt",
     "tmux",
     "sweep",
+    "watch",
+    "watches",
     "hot",
     "status",
     "init",
@@ -181,6 +184,7 @@ pub async fn run(args: Vec<String>) {
         }
         "tmux" => handle_tmux(&pool, &workshop_root, &ws_id, &args_clean[2..], json_mode).await,
         "sweep" => handle_sweep(&pool, &args_clean[2..], &ws_id, json_mode).await,
+        "watch" | "watches" => handle_watch(&pool, &args_clean[2..], json_mode).await,
         "hot" => handle_hot(&pool, &ws_id, json_mode).await,
         "status" => handle_status(&pool, &ws_id).await,
         "backup" | "backups" => {
@@ -361,6 +365,17 @@ fn print_usage() {
     eprintln!();
     eprintln!(
         "  sweep stalls [--abandon]             Surface orphaned in_progress sparks (owner session ended)"
+    );
+    eprintln!();
+    eprintln!(
+        "  watch create <target_spark_id> --cadence <secs|cron:EXPR> \\\n      [--stop-condition <spec>] --intent <label>"
+    );
+    eprintln!("                                       Create a recurring watch");
+    eprintln!("  watch list [--target <id>] [--status active|completed|cancelled]  List watches");
+    eprintln!("  watch show <watch_id>                Show a watch's details");
+    eprintln!("  watch cancel <watch_id>              Soft-cancel a watch");
+    eprintln!(
+        "  watch replace <watch_id> --cadence <c> [--stop-condition <s>] [--intent <l>]\n      Atomically cancel and recreate a watch"
     );
     eprintln!();
     eprintln!("FLAGS:");
@@ -1520,6 +1535,365 @@ async fn handle_sweep_stalls(
         println!(
             "(pass --abandon to clear phantom assignments; re-running is idempotent via ember dedupe)"
         );
+    }
+}
+
+// ── Watch ────────────────────────────────────────────
+//
+// `ryve watch` wires the [`data::sparks::watch_repo`] primitives (sp-ee3f5c74
+// S1) into a scriptable CLI surface so Atlas and humans can create, list,
+// inspect, cancel, and replace recurring watches from the terminal
+// [sp-ee3f5c74]. The CLI never writes SQL itself — every mutation goes
+// through the repo.
+
+async fn handle_watch(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch subcommand required (create, list, show, cancel, replace)");
+    }
+    match args[0].as_str() {
+        "create" => handle_watch_create(pool, &args[1..], json_mode).await,
+        "list" | "ls" => handle_watch_list(pool, &args[1..], json_mode).await,
+        "show" | "get" => handle_watch_show(pool, &args[1..], json_mode).await,
+        "cancel" => handle_watch_cancel(pool, &args[1..], json_mode).await,
+        "replace" => handle_watch_replace(pool, &args[1..], json_mode).await,
+        other => die(&format!("unknown watch subcommand '{other}'")),
+    }
+}
+
+/// Parse a cadence token into the typed enum. Accepts either a bare integer
+/// (seconds) or the `interval-secs:<N>` / `cron:<expr>` storage form so users
+/// can paste back what `watch show` prints.
+fn parse_cadence(raw: &str) -> WatchCadence {
+    if let Some(c) = WatchCadence::from_storage(raw) {
+        return c;
+    }
+    if let Ok(secs) = raw.parse::<u64>() {
+        return WatchCadence::Interval { secs };
+    }
+    die(&format!(
+        "invalid --cadence '{raw}' (expected integer seconds, 'interval-secs:N', or 'cron:<expr>')"
+    ));
+}
+
+/// Parse a stop-condition spec. Accepts the repo's JSON storage form so a
+/// round-trip through `watch show --json` works, plus two ergonomic shorthand
+/// forms: `event:<type>` and `status:<spark_id>=<status>`.
+fn parse_stop_condition(raw: &str) -> WatchStopCondition {
+    if raw.eq_ignore_ascii_case("never") {
+        return WatchStopCondition::Never;
+    }
+    if let Some(c) = WatchStopCondition::from_storage(raw) {
+        return c;
+    }
+    if let Some(event_type) = raw.strip_prefix("event:") {
+        return WatchStopCondition::UntilEventType {
+            event_type: event_type.to_string(),
+        };
+    }
+    if let Some(rest) = raw.strip_prefix("status:")
+        && let Some((spark_id, status)) = rest.split_once('=')
+    {
+        return WatchStopCondition::UntilSparkStatus {
+            spark_id: spark_id.to_string(),
+            status: status.to_string(),
+        };
+    }
+    die(&format!(
+        "invalid --stop-condition '{raw}' (expected 'never', 'event:<type>', \
+         'status:<spark_id>=<status>', or the JSON form from `watch show --json`)"
+    ));
+}
+
+/// Compute an initial `next_fire_at` for a freshly created watch. Interval
+/// cadences are deterministic (`now + secs`); cron expressions are stored
+/// unparsed and handed to the scheduler sibling for real evaluation — for now
+/// the CLI seeds `next_fire_at = now` so the scheduler tick will pick the
+/// watch up immediately and compute the proper instant.
+fn initial_next_fire_at(cadence: &WatchCadence) -> String {
+    let now = chrono::Utc::now();
+    match cadence {
+        WatchCadence::Interval { secs } => {
+            (now + chrono::Duration::seconds(*secs as i64)).to_rfc3339()
+        }
+        WatchCadence::Cron { .. } => now.to_rfc3339(),
+    }
+}
+
+fn print_watch(w: &Watch, json_mode: bool) {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(w).unwrap_or_default());
+        return;
+    }
+    println!("ID:             {}", w.id);
+    println!("Target:         {}", w.target_spark_id);
+    println!("Cadence:        {}", w.cadence);
+    println!(
+        "Stop condition: {}",
+        w.stop_condition.as_deref().unwrap_or("never")
+    );
+    println!("Intent:         {}", w.intent_label);
+    println!("Status:         {}", w.status);
+    println!(
+        "Last fired:     {}",
+        w.last_fired_at.as_deref().unwrap_or("-")
+    );
+    println!("Next fire:      {}", w.next_fire_at);
+    println!("Created:        {}", w.created_at);
+    println!("Updated:        {}", w.updated_at);
+    if let Some(by) = &w.created_by {
+        println!("Created by:     {by}");
+    }
+}
+
+fn print_watch_list(rows: &[Watch], json_mode: bool) {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(rows).unwrap_or_default());
+        return;
+    }
+    if rows.is_empty() {
+        println!("No watches.");
+        return;
+    }
+    println!(
+        "{:<16} {:<22} {:<10} {:<22} {:<24} INTENT",
+        "ID", "TARGET", "STATUS", "CADENCE", "NEXT_FIRE_AT"
+    );
+    println!("{}", "-".repeat(110));
+    for w in rows {
+        println!(
+            "{:<16} {:<22} {:<10} {:<22} {:<24} {}",
+            w.id, w.target_spark_id, w.status, w.cadence, w.next_fire_at, w.intent_label,
+        );
+    }
+}
+
+async fn handle_watch_create(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch create requires <target_spark_id> --cadence <c> --intent <label>");
+    }
+    let target = args[0].clone();
+    let mut cadence: Option<String> = None;
+    let mut stop: Option<String> = None;
+    let mut intent: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cadence" => {
+                cadence = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--cadence requires a value");
+                }));
+                i += 2;
+            }
+            "--stop-condition" => {
+                stop = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--stop-condition requires a value");
+                }));
+                i += 2;
+            }
+            "--intent" => {
+                intent = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--intent requires a value");
+                }));
+                i += 2;
+            }
+            other => die(&format!("unknown watch create flag '{other}'")),
+        }
+    }
+
+    let cadence_raw = cadence.unwrap_or_else(|| die("watch create requires --cadence"));
+    let intent_label = intent.unwrap_or_else(|| die("watch create requires --intent"));
+    let cadence = parse_cadence(&cadence_raw);
+    let stop_condition = stop.map(|s| parse_stop_condition(&s));
+    let next_fire_at = initial_next_fire_at(&cadence);
+
+    let new = NewWatch {
+        target_spark_id: target,
+        cadence,
+        stop_condition,
+        intent_label,
+        next_fire_at,
+        created_by: Some("cli".to_string()),
+    };
+
+    match watch_repo::create(pool, new).await {
+        Ok(w) => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&w).unwrap_or_default());
+            } else {
+                println!("{}", w.id);
+            }
+        }
+        Err(SparksError::DuplicateWatch {
+            target_spark_id,
+            intent_label,
+        }) => {
+            // Surface the existing watch id so the caller can inspect or
+            // replace it instead of having to re-query the repo.
+            let existing_id = watch_repo::list(
+                pool,
+                WatchFilter {
+                    status: Some(WatchStatus::Active),
+                    target_spark_id: Some(target_spark_id),
+                },
+            )
+            .await
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|w| w.intent_label == intent_label)
+                    .map(|w| w.id)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+            eprintln!("watch already exists: {existing_id}");
+            process::exit(1);
+        }
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_watch_list(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    let mut target: Option<String> = None;
+    let mut status: Option<WatchStatus> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target" => {
+                target = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--target requires a value");
+                }));
+                i += 2;
+            }
+            "--status" => {
+                let raw = args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--status requires a value");
+                });
+                status = Some(WatchStatus::parse(&raw).unwrap_or_else(|| {
+                    die(&format!(
+                        "invalid --status '{raw}' (expected active, completed, cancelled)"
+                    ))
+                }));
+                i += 2;
+            }
+            other => die(&format!("unknown watch list flag '{other}'")),
+        }
+    }
+
+    let filter = WatchFilter {
+        status,
+        target_spark_id: target,
+    };
+    match watch_repo::list(pool, filter).await {
+        Ok(rows) => print_watch_list(&rows, json_mode),
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_watch_show(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch show requires <watch_id>");
+    }
+    match watch_repo::get(pool, &args[0]).await {
+        Ok(w) => print_watch(&w, json_mode),
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_watch_cancel(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch cancel requires <watch_id>");
+    }
+    match watch_repo::cancel(pool, &args[0]).await {
+        Ok(w) => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&w).unwrap_or_default());
+            } else {
+                println!("cancelled {}", w.id);
+            }
+        }
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_watch_replace(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("watch replace requires <watch_id> --cadence <c>");
+    }
+    let existing_id = args[0].clone();
+    let mut cadence: Option<String> = None;
+    let mut stop_raw: Option<String> = None;
+    let mut stop_flag_seen = false;
+    let mut intent: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cadence" => {
+                cadence = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--cadence requires a value");
+                }));
+                i += 2;
+            }
+            "--stop-condition" => {
+                stop_flag_seen = true;
+                stop_raw = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--stop-condition requires a value");
+                }));
+                i += 2;
+            }
+            "--intent" => {
+                intent = Some(args.get(i + 1).cloned().unwrap_or_else(|| {
+                    die("--intent requires a value");
+                }));
+                i += 2;
+            }
+            other => die(&format!("unknown watch replace flag '{other}'")),
+        }
+    }
+
+    let existing = match watch_repo::get(pool, &existing_id).await {
+        Ok(w) => w,
+        Err(e) => die(&format!("{e}")),
+    };
+
+    // Missing flags inherit from the existing watch so callers can re-tune a
+    // single axis without re-specifying the rest.
+    let cadence = match cadence {
+        Some(c) => parse_cadence(&c),
+        None => existing.parsed_cadence().unwrap_or_else(|| {
+            die(&format!(
+                "existing watch {} has malformed cadence '{}' — specify --cadence explicitly",
+                existing.id, existing.cadence,
+            ))
+        }),
+    };
+    let stop_condition = if stop_flag_seen {
+        stop_raw.map(|s| parse_stop_condition(&s))
+    } else {
+        existing.parsed_stop_condition().and_then(|sc| match sc {
+            WatchStopCondition::Never => None,
+            other => Some(other),
+        })
+    };
+    let intent_label = intent.unwrap_or_else(|| existing.intent_label.clone());
+    let next_fire_at = initial_next_fire_at(&cadence);
+
+    let new = NewWatch {
+        target_spark_id: existing.target_spark_id.clone(),
+        cadence,
+        stop_condition,
+        intent_label,
+        next_fire_at,
+        created_by: Some("cli".to_string()),
+    };
+
+    match watch_repo::replace(pool, &existing_id, new).await {
+        Ok(w) => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&w).unwrap_or_default());
+            } else {
+                println!("{}", w.id);
+            }
+        }
+        Err(e) => die(&format!("{e}")),
     }
 }
 

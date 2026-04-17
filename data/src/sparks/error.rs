@@ -50,6 +50,15 @@ pub enum SparksError {
     #[error("spark {spark_id} already belongs to another open release")]
     EpicAlreadyInOpenRelease { spark_id: String },
 
+    #[error(
+        "duplicate watch for target {target_spark_id} and intent {intent_label}: \
+         an active watch already exists"
+    )]
+    DuplicateWatch {
+        target_spark_id: String,
+        intent_label: String,
+    },
+
     #[error("{0}")]
     Transition(#[from] TransitionError),
 }
