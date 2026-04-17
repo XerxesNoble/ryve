@@ -104,6 +104,12 @@ async fn migrate_v1_ensure_base_layout(ryve_dir: &RyveDir) -> std::io::Result<()
         tokio::fs::write(ryve_dir.done_md_path(), ryve_dir::DEFAULT_DONE_MD).await?;
     }
 
+    // Write the universal CLI reference / agent skill file at the workshop
+    // root (not inside .ryve/) so every coding agent can discover it.
+    if !ryve_dir.ryve_md_path().exists() {
+        tokio::fs::write(ryve_dir.ryve_md_path(), ryve_dir::DEFAULT_RYVE_MD).await?;
+    }
+
     Ok(())
 }
 

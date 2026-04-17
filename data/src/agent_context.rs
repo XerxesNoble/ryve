@@ -60,6 +60,7 @@ const MARKER_END: &str = "<!-- RYVE:END -->";
 const DEFAULT_TARGETS: &[&str] = &[
     "CLAUDE.md",
     "OPENCODE.md",
+    "AGENTS.md",
     ".cursorrules",
     ".github/copilot-instructions.md",
 ];
@@ -96,10 +97,16 @@ pub async fn sync(
         inject_pointer_if_changed(workshop_dir, rel, cache).await?;
     }
 
-    // Propagate WORKSHOP.md + pointers into every active worktree.
-    // The per-file helpers (`write_if_changed`, `inject_pointer_if_changed`)
-    // each short-circuit on a warm cache hit with zero I/O, so the only
-    // remaining cost on a steady-state tick is the directory listing itself.
+    // Write RYVE.md at the workshop root if missing or changed.
+    let ryve_md = crate::ryve_dir::DEFAULT_RYVE_MD;
+    let ryve_md_hash = hash_str(ryve_md);
+    write_if_changed(ryve_dir.ryve_md_path(), ryve_md, ryve_md_hash, cache).await?;
+
+    // Propagate WORKSHOP.md, RYVE.md, and pointers into every active
+    // worktree. The per-file helpers (`write_if_changed`,
+    // `inject_pointer_if_changed`) each short-circuit on a warm cache hit
+    // with zero I/O, so the only remaining cost on a steady-state tick is
+    // the directory listing itself.
     let worktrees_dir = ryve_dir.root().join("worktrees");
     if let Ok(mut entries) = tokio::fs::read_dir(&worktrees_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -114,6 +121,9 @@ pub async fn sync(
                 let _ =
                     write_if_changed(wt_workshop_md, &workshop_md, workshop_md_hash, cache).await;
             }
+            // Write RYVE.md at the worktree root
+            let wt_ryve_md = wt_path.join("RYVE.md");
+            let _ = write_if_changed(wt_ryve_md, ryve_md, ryve_md_hash, cache).await;
             // Re-inject pointers into the worktree's agent boot files
             for rel in &targets {
                 let _ = inject_pointer_if_changed(&wt_path, rel, cache).await;
@@ -582,8 +592,9 @@ fn pointer_line() -> String {
         "{}\n\
          ## Ryve Workshop — MANDATORY\n\
          \n\
-         This project is managed by **Ryve**. You MUST read `.ryve/WORKSHOP.md` before doing \
-         ANY work — it contains the rules, CLI commands, and coordination protocol you must follow.\n\
+         This project is managed by **Ryve**. You MUST read `RYVE.md` before doing \
+         ANY work — it is the universal CLI reference, house rules, and coordination \
+         protocol for all coding agents.\n\
          \n\
          **Work in your current directory.** Do not navigate to parent directories or other \
          worktrees. Run `ryve spark list` to see active tasks and find work to claim.\n\
@@ -959,9 +970,9 @@ mod tests {
         // First sync: populates disk and cache.
         sync(&dir, &ryve_dir, &config, &cache).await.unwrap();
 
-        // Count cache entries — should cover WORKSHOP.md + all target files.
+        // Count cache entries — should cover WORKSHOP.md + RYVE.md + all target files.
         let cached_count = cache.lock().unwrap().file_hashes.len();
-        let expected_files = 1 + resolve_targets(&config).len(); // WORKSHOP.md + targets
+        let expected_files = 2 + resolve_targets(&config).len(); // WORKSHOP.md + RYVE.md + targets
         assert_eq!(
             cached_count, expected_files,
             "cache should have an entry for every file sync touches"

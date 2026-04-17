@@ -69,6 +69,18 @@ impl RyveDir {
         self.root.join("WORKSHOP.md")
     }
 
+    /// The workshop root directory (parent of `.ryve/`).
+    pub fn workshop_dir(&self) -> &Path {
+        self.root
+            .parent()
+            .expect(".ryve/ must have a parent directory")
+    }
+
+    /// Path to the universal `RYVE.md` skill file at the workshop root.
+    pub fn ryve_md_path(&self) -> PathBuf {
+        self.workshop_dir().join("RYVE.md")
+    }
+
     /// Per-workshop UI state (collapsed epic groups, etc.) stored in
     /// `.ryve/ui_state.json`. Kept separate from `config.toml` so frequent
     /// UI-driven writes don't churn the canonical config file.
@@ -453,6 +465,11 @@ pub async fn init_ryve_dir(ryve_dir: &RyveDir) -> Result<(), std::io::Error> {
 
 pub(crate) const DEFAULT_AGENTS_MD: &str =
     "# Agent Instructions\n\nAdd project-specific instructions for coding agents here.\n";
+
+/// Universal CLI reference and agent skill file, written to the workshop
+/// root as `RYVE.md` during init and propagated to every Hand worktree
+/// via agent-context sync. Source of truth: `data/defaults/RYVE.md`.
+pub(crate) const DEFAULT_RYVE_MD: &str = include_str!("../defaults/RYVE.md");
 
 pub(crate) const DEFAULT_DONE_MD: &str = r#"# DONE Checklist
 
