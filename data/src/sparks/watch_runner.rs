@@ -98,7 +98,7 @@ pub async fn tick(pool: &SqlitePool, now: DateTime<Utc>) -> Result<TickOutcome, 
                 outcome.fired += 1;
                 outcome.completed += 1;
             }
-            FireOutcome::Skipped => outcome.skipped += 1,
+            FireOutcome::Skipped | FireOutcome::LostRace => outcome.skipped += 1,
         }
     }
     Ok(outcome)
@@ -108,6 +108,11 @@ enum FireOutcome {
     Fired,
     FiredAndCompleted,
     Skipped,
+    /// Another concurrent tick already claimed this `(watch, slot)` pair:
+    /// the conditional update in `mark_fired_in_tx`/`mark_completed_in_tx`
+    /// matched 0 rows, so this tx rolled back without emitting an outbox
+    /// row. Spark ryve-934807b1 [sp-20ffacac].
+    LostRace,
 }
 
 async fn fire_one(
@@ -131,6 +136,29 @@ async fn fire_one(
     let mut tx = pool.begin().await?;
 
     let stop_satisfied = evaluate_stop_condition_in_tx(&mut tx, watch).await?;
+
+    // Attempt to claim the slot via a conditional update BEFORE emitting
+    // the outbox row. If another tick already advanced `next_fire_at` or
+    // transitioned `status`, the update matches 0 rows and we must roll
+    // back without writing a duplicate `WatchFired`. Spark ryve-934807b1
+    // [sp-20ffacac].
+    let claimed = if stop_satisfied {
+        watch_repo::mark_completed_in_tx(&mut tx, &watch.id, &watch.next_fire_at, &now_str).await?
+    } else {
+        watch_repo::mark_fired_in_tx(
+            &mut tx,
+            &watch.id,
+            &watch.next_fire_at,
+            &now_str,
+            &next_fire_at.to_rfc3339(),
+        )
+        .await?
+    };
+
+    if !claimed {
+        tx.rollback().await?;
+        return Ok(FireOutcome::LostRace);
+    }
 
     let payload = WatchFiredPayload {
         watch_id: watch.id.clone(),
@@ -158,13 +186,6 @@ async fn fire_one(
     .bind(&payload_json)
     .execute(&mut *tx)
     .await?;
-
-    if stop_satisfied {
-        watch_repo::mark_completed_in_tx(&mut tx, &watch.id, &now_str).await?;
-    } else {
-        watch_repo::mark_fired_in_tx(&mut tx, &watch.id, &now_str, &next_fire_at.to_rfc3339())
-            .await?;
-    }
 
     tx.commit().await?;
 
@@ -253,6 +274,7 @@ fn parse_rfc3339(s: &str) -> Result<DateTime<Utc>, SparksError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sparks::watch_repo;
 
     #[test]
     fn interval_next_slot_skips_past_now() {
@@ -313,5 +335,112 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let back: WatchFiredPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(payload, back);
+    }
+
+    /// A second `fire_one` call that still holds the pre-claim
+    /// `next_fire_at` must not emit a second `WatchFired` row once
+    /// another tx has claimed the slot. Exercises the caller-side
+    /// rollback path added in spark ryve-934807b1 [sp-20ffacac].
+    #[sqlx::test]
+    async fn fire_one_rolls_back_when_slot_already_claimed(pool: SqlitePool) {
+        let t0: DateTime<Utc> = "2026-04-17T12:00:00+00:00".parse().unwrap();
+        let watch = watch_repo::create(
+            &pool,
+            NewWatch {
+                target_spark_id: "ryve-target".into(),
+                cadence: WatchCadence::Interval { secs: 60 },
+                stop_condition: None,
+                intent_label: "race-test".into(),
+                next_fire_at: t0.to_rfc3339(),
+                created_by: Some("test".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Snapshot the watch as a "second tick" observed it — still
+        // holding the original due slot.
+        let stale_snapshot = watch.clone();
+
+        // First claim: runs a full tick, commits outbox + advances
+        // next_fire_at.
+        let outcome = tick(&pool, t0).await.unwrap();
+        assert_eq!(outcome.fired, 1);
+        assert_eq!(outcome.skipped, 0);
+
+        let fired_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE event_type = 'WatchFired'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fired_count, 1);
+
+        // Second claim with the stale snapshot: mark_fired_in_tx's
+        // conditional WHERE must miss, fire_one must roll back and
+        // return LostRace without writing a second outbox row.
+        let outcome = fire_one(&pool, &stale_snapshot, t0).await.unwrap();
+        assert!(matches!(outcome, FireOutcome::LostRace));
+
+        let fired_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE event_type = 'WatchFired'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fired_count, 1, "stale tick must not duplicate the event");
+    }
+
+    /// Same race against the stop-condition path: once the first tick
+    /// marks the watch `completed`, a stale follow-up that would have
+    /// also satisfied the stop condition must roll back cleanly.
+    #[sqlx::test]
+    async fn fire_one_rolls_back_completion_when_slot_already_claimed(pool: SqlitePool) {
+        // Seed a spark whose status satisfies the watch's stop
+        // condition so both ticks would otherwise emit a
+        // "FiredAndCompleted".
+        sqlx::query(
+            "INSERT INTO sparks ( \
+                 id, title, description, status, priority, spark_type, \
+                 workshop_id, metadata, created_at, updated_at \
+             ) VALUES (?, '', '', 'closed', 2, 'task', 'ws', '{}', ?, ?)",
+        )
+        .bind("ryve-stop")
+        .bind("2026-04-17T11:59:00+00:00")
+        .bind("2026-04-17T11:59:00+00:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let t0: DateTime<Utc> = "2026-04-17T12:00:00+00:00".parse().unwrap();
+        let watch = watch_repo::create(
+            &pool,
+            NewWatch {
+                target_spark_id: "ryve-stop".into(),
+                cadence: WatchCadence::Interval { secs: 60 },
+                stop_condition: Some(WatchStopCondition::UntilSparkStatus {
+                    spark_id: "ryve-stop".into(),
+                    status: "closed".into(),
+                }),
+                intent_label: "race-complete".into(),
+                next_fire_at: t0.to_rfc3339(),
+                created_by: Some("test".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let stale_snapshot = watch.clone();
+
+        let first = fire_one(&pool, &watch, t0).await.unwrap();
+        assert!(matches!(first, FireOutcome::FiredAndCompleted));
+
+        let second = fire_one(&pool, &stale_snapshot, t0).await.unwrap();
+        assert!(matches!(second, FireOutcome::LostRace));
+
+        let fired_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE event_type = 'WatchFired'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fired_count, 1);
     }
 }

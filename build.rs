@@ -8,9 +8,19 @@
 //! - Set `RYVE_TMUX_DEV_PATH` to the development-layout path
 //!   (`<repo>/vendor/tmux/bin/tmux`) for the dev-build fallback.
 //! - Ensure a real tmux binary is present at `RYVE_TMUX_DEV_PATH` on unix
-//!   hosts by invoking `scripts/build-vendored-tmux.sh` when it is missing,
-//!   so a fresh clone of the repo yields a working `bundled_tmux_path()`
-//!   without a separate manual step. See `docs/VENDORED_TMUX.md`.
+//!   hosts by invoking `scripts/build-vendored-tmux.sh` when it is missing
+//!   OR when `vendor/tmux/VERSION` has changed since the last successful
+//!   build (detected via the `.version` stamp file the script writes into
+//!   `vendor/tmux/bin/`). See `docs/VENDORED_TMUX.md`.
+//!
+//! If the native build prerequisites (libevent / ncurses dev headers) are
+//! missing — typical on minimal Linux CI images that only run `cargo check`
+//! or `cargo clippy` — we emit a `cargo:warning` and skip the auto-build
+//! rather than failing the compile. Downstream callers that actually need
+//! the binary gate on `bundled_tmux_path()` returning `Some(...)`.
+
+#[path = "build_vendored_tmux_support.rs"]
+mod support;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,12 +41,12 @@ fn main() {
     println!("cargo:rustc-env=RYVE_TMUX_DEV_PATH={}", dev_path.display());
 
     // Rebuild whenever the pinned version or the build script changes so we
-    // notice version bumps and script edits. (The absence/presence of the
-    // produced binary is handled explicitly below; we do NOT emit a
-    // `rerun-if-changed` for `bin/tmux` because cargo would then treat every
-    // invocation of the build script — which (re)touches the binary — as a
-    // source change and re-run it on every `cargo check`, even when the
-    // binary is already up to date.)
+    // notice version bumps and script edits. (The presence of the produced
+    // binary is handled explicitly below; we do NOT emit a `rerun-if-changed`
+    // for `bin/tmux` because cargo would then treat every invocation of the
+    // build script — which (re)touches the binary — as a source change and
+    // re-run it on every `cargo check`, even when the binary is already up
+    // to date.)
     println!("cargo:rerun-if-changed=vendor/tmux/VERSION");
     println!("cargo:rerun-if-changed=scripts/build-vendored-tmux.sh");
 
@@ -48,11 +58,38 @@ fn main() {
         .unwrap_or(false);
     println!("cargo:rerun-if-env-changed=RYVE_SKIP_VENDORED_TMUX_BUILD");
 
-    if skip || !is_unix() || dev_path.exists() {
+    if skip || !is_unix() {
+        return;
+    }
+
+    let bin_dir = dev_path.parent().expect("dev tmux path must have a parent");
+    let stamp = support::stamp_path(bin_dir);
+    if dev_path.exists() && support::stamp_matches(&stamp, &version) {
+        return;
+    }
+
+    if !has_tmux_build_deps() {
+        println!(
+            "cargo:warning=vendored tmux build skipped: libevent/ncurses development headers \
+             not found via pkg-config. Install the prerequisites from docs/VENDORED_TMUX.md \
+             (Linux: apt-get install libevent-dev libncurses-dev pkg-config) and re-run, or \
+             set RYVE_SKIP_VENDORED_TMUX_BUILD=1 to silence this warning. Code paths that \
+             need tmux will fall back via bundled_tmux_path()."
+        );
         return;
     }
 
     build_vendored_tmux(&manifest_dir, &dev_path, &version);
+
+    // Defensive: the build script writes the stamp itself, but write it
+    // again here so a successful run always leaves a valid stamp even if a
+    // future script refactor forgets. Intentional duplication — not churn.
+    if let Err(e) = support::write_stamp(&stamp, &version) {
+        println!(
+            "cargo:warning=failed to write vendored tmux stamp {}: {e}",
+            stamp.display()
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -65,12 +102,48 @@ fn is_unix() -> bool {
     false
 }
 
+/// Probe for the native build prerequisites of tmux (libevent + ncurses dev
+/// headers) via `pkg-config`. Matches what tmux's own `configure` uses, so a
+/// positive probe here is a strong signal that `./scripts/build-vendored-tmux.sh`
+/// will succeed. Absent pkg-config (or a missing `.pc` for libevent/ncurses)
+/// returns `false` — the caller then skips the auto-build with a warning.
+fn has_tmux_build_deps() -> bool {
+    if !pkg_config_available() {
+        return false;
+    }
+
+    if !pkg_config_has("libevent") {
+        return false;
+    }
+
+    // ncurses ships under different .pc names depending on distro: `ncurses`
+    // and `ncursesw` on Debian/Ubuntu, sometimes `tinfo` alone on minimal
+    // images. Accept any match.
+    pkg_config_has("ncurses") || pkg_config_has("ncursesw") || pkg_config_has("tinfo")
+}
+
+fn pkg_config_available() -> bool {
+    Command::new("pkg-config")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn pkg_config_has(pkg: &str) -> bool {
+    Command::new("pkg-config")
+        .args(["--exists", pkg])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Invoke `scripts/build-vendored-tmux.sh` to produce `vendor/tmux/bin/tmux`.
 ///
-/// Any failure here is a fatal build error: the rest of the crate assumes
-/// `bundled_tmux_path()` resolves to a working executable in the dev layout,
-/// and silently continuing would push the failure to `cargo run` time with a
-/// far less obvious error ("tmux session not created").
+/// Any failure here is a fatal build error when we reach this point: we've
+/// already confirmed the prerequisites are present via `has_tmux_build_deps`,
+/// so a script failure is something unexpected (network, disk, script bug)
+/// that the developer needs to see, not silently skip.
 fn build_vendored_tmux(manifest_dir: &Path, dev_path: &Path, version: &str) {
     let script = manifest_dir.join("scripts/build-vendored-tmux.sh");
     if !script.exists() {
@@ -82,7 +155,7 @@ fn build_vendored_tmux(manifest_dir: &Path, dev_path: &Path, version: &str) {
     }
 
     println!(
-        "cargo:warning=building vendored tmux {version} via {} (first-time clone; subsequent builds skip this step)",
+        "cargo:warning=building vendored tmux {version} via {} (first build or version change; subsequent builds skip this step)",
         script.display()
     );
 

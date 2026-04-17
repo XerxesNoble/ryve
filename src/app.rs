@@ -234,6 +234,13 @@ pub(crate) enum Message {
     AgentSessionsLoaded(Uuid, Vec<PersistedAgentSession>, Vec<tmux::TmuxSession>),
     /// Agent session saved to DB
     AgentSessionSaved,
+    /// The watch-runner handle finished its shutdown await. Emitted when a
+    /// workshop is closed so the graceful-close `Task::batch` has a
+    /// terminal message to resolve to. Carries no payload and performs no
+    /// state mutation — the runner has already drained its in-flight tick
+    /// and dropped its DB handle by the time this fires.
+    /// Spark ryve-cc1ed0af [sp-20ffacac].
+    WatchRunnerStopped,
     /// Dead-session reconciliation completed. Carries the session IDs whose
     /// `agent_sessions` rows were ended and `hand_assignments` were
     /// abandoned. Spark `ryve-a677498c`.
@@ -475,6 +482,7 @@ impl std::fmt::Debug for Message {
                 )
             }
             Self::AgentSessionSaved => write!(f, "AgentSessionSaved"),
+            Self::WatchRunnerStopped => write!(f, "WatchRunnerStopped"),
             Self::DeadSessionsReconciled(ids) => {
                 write!(f, "DeadSessionsReconciled({} sessions)", ids.len())
             }
@@ -725,7 +733,7 @@ impl App {
                     async move {
                         handle.shutdown().await;
                     },
-                    |_| Message::AgentSessionSaved,
+                    |_| Message::WatchRunnerStopped,
                 )
             })
             .unwrap_or(Task::none());
@@ -993,6 +1001,8 @@ impl App {
             }
 
             Message::AgentSessionSaved => Task::none(),
+
+            Message::WatchRunnerStopped => Task::none(),
 
             Message::DeadSessionsReconciled(session_ids) => {
                 // The DB rows are already updated — the next poll cycle's
@@ -7105,6 +7115,24 @@ mod tests {
             unsplash_photographer_url: None,
         };
         assert!(unsplash_attribution_label(&bg).is_none());
+    }
+
+    /// Spark ryve-cc1ed0af [sp-20ffacac]: the watch-runner shutdown path
+    /// must emit its own Message variant rather than piggybacking on
+    /// `AgentSessionSaved`, so the close-workshop `Task::batch` is free of
+    /// spurious agent-session signals and trace output reflects intent.
+    #[test]
+    fn watch_runner_stopped_has_distinct_debug() {
+        assert_eq!(
+            format!("{:?}", Message::WatchRunnerStopped),
+            "WatchRunnerStopped",
+        );
+        // Sanity: distinct from AgentSessionSaved so log filters and any
+        // future match arms can discriminate the two.
+        assert_ne!(
+            format!("{:?}", Message::WatchRunnerStopped),
+            format!("{:?}", Message::AgentSessionSaved),
+        );
     }
 
     /// Spark `ryve-a677498c` acceptance criterion: create session, kill

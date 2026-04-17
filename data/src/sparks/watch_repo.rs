@@ -191,25 +191,36 @@ pub async fn mark_fired(
 /// inside the same transaction as the `WatchFired` outbox insert so the
 /// event row and the advanced `next_fire_at` commit together — a crash
 /// between the two is impossible. Spark ryve-6ab1980c [sp-ee3f5c74].
+///
+/// The `WHERE` clause is conditional on both `status = 'active'` and
+/// `next_fire_at = expected_fire_at` so a second scheduler tick that
+/// observed the same due row cannot re-fire it after the first tick
+/// already claimed the slot. Returns `true` when the update claimed the
+/// slot (rows_affected == 1) and `false` when another tx won the race;
+/// the caller must skip the outbox emit in the latter case to preserve
+/// "exactly-once per (watch_id, scheduled_fire_at)". Spark ryve-934807b1
+/// [sp-20ffacac].
 pub async fn mark_fired_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &str,
+    expected_fire_at: &str,
     fired_at: &str,
     next_fire_at: &str,
-) -> Result<(), SparksError> {
+) -> Result<bool, SparksError> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE watches
             SET last_fired_at = ?, next_fire_at = ?, updated_at = ?
-          WHERE id = ?",
+          WHERE id = ? AND status = 'active' AND next_fire_at = ?",
     )
     .bind(fired_at)
     .bind(next_fire_at)
     .bind(&now)
     .bind(id)
+    .bind(expected_fire_at)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Transactional stop-condition transition: mark a watch `completed` and
@@ -217,23 +228,30 @@ pub async fn mark_fired_in_tx(
 /// `WatchFired` outbox insert. Used by the scheduler when the watch's
 /// stop condition is satisfied on this tick; future ticks will not see
 /// it (`due_at` filters `status = 'active'`). Spark ryve-6ab1980c.
+///
+/// The `WHERE` clause is conditional on both `status = 'active'` and
+/// `next_fire_at = expected_fire_at` — same claim semantics as
+/// [`mark_fired_in_tx`]. Returns `true` when this tx claimed the slot.
+/// Spark ryve-934807b1 [sp-20ffacac].
 pub async fn mark_completed_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &str,
+    expected_fire_at: &str,
     fired_at: &str,
-) -> Result<(), SparksError> {
+) -> Result<bool, SparksError> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE watches
             SET status = 'completed', last_fired_at = ?, updated_at = ?
-          WHERE id = ?",
+          WHERE id = ? AND status = 'active' AND next_fire_at = ?",
     )
     .bind(fired_at)
     .bind(&now)
     .bind(id)
+    .bind(expected_fire_at)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Return every active watch whose `next_fire_at <= now`. Used by the
@@ -477,6 +495,128 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, SparksError::NotFound(_)));
+    }
+
+    #[sqlx::test]
+    async fn mark_fired_in_tx_claims_slot_only_when_expected_fire_at_matches(pool: SqlitePool) {
+        // Simulates two concurrent ticks both observing the same due
+        // watch: the first claim advances `next_fire_at`, the second
+        // sees a stale `expected_fire_at` and must return `false` so
+        // the caller can skip the outbox emit. Spark ryve-934807b1
+        // [sp-20ffacac].
+        let w = create(
+            &pool,
+            sample_new("ryve-race", "intent", "2026-04-17T07:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+        let original_slot = w.next_fire_at.clone();
+        let second_slot = "2026-04-17T07:01:00+00:00";
+
+        // Tick A: claims the slot.
+        let mut tx_a = pool.begin().await.unwrap();
+        let claimed_a = mark_fired_in_tx(
+            &mut tx_a,
+            &w.id,
+            &original_slot,
+            "2026-04-17T07:00:05+00:00",
+            second_slot,
+        )
+        .await
+        .unwrap();
+        assert!(claimed_a, "first caller must claim the slot");
+        tx_a.commit().await.unwrap();
+
+        // Tick B: observed the same due row before A committed, so it
+        // still holds the original `expected_fire_at`. Now that A has
+        // advanced `next_fire_at`, B's conditional update must match
+        // zero rows.
+        let mut tx_b = pool.begin().await.unwrap();
+        let claimed_b = mark_fired_in_tx(
+            &mut tx_b,
+            &w.id,
+            &original_slot,
+            "2026-04-17T07:00:05+00:00",
+            "2026-04-17T07:02:00+00:00",
+        )
+        .await
+        .unwrap();
+        assert!(!claimed_b, "stale expected_fire_at must not re-claim");
+        tx_b.rollback().await.unwrap();
+
+        // Post-conditions: only tick A's update is visible.
+        let after = get(&pool, &w.id).await.unwrap();
+        assert_eq!(after.next_fire_at, second_slot);
+        assert_eq!(
+            after.last_fired_at.as_deref(),
+            Some("2026-04-17T07:00:05+00:00")
+        );
+    }
+
+    #[sqlx::test]
+    async fn mark_fired_in_tx_rejects_cancelled_watch(pool: SqlitePool) {
+        // A cancelled row must not be re-claimed even if the caller
+        // somehow presents the original `next_fire_at` — the status
+        // clause in the conditional update guards against this.
+        let w = create(
+            &pool,
+            sample_new("ryve-cancel-race", "intent", "2026-04-17T07:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+        cancel(&pool, &w.id).await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let claimed = mark_fired_in_tx(
+            &mut tx,
+            &w.id,
+            &w.next_fire_at,
+            "2026-04-17T07:00:05+00:00",
+            "2026-04-17T07:01:00+00:00",
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(!claimed);
+    }
+
+    #[sqlx::test]
+    async fn mark_completed_in_tx_claims_slot_only_when_expected_fire_at_matches(pool: SqlitePool) {
+        let w = create(
+            &pool,
+            sample_new("ryve-complete-race", "intent", "2026-04-17T07:00:00+00:00"),
+        )
+        .await
+        .unwrap();
+
+        let mut tx_a = pool.begin().await.unwrap();
+        let claimed_a = mark_completed_in_tx(
+            &mut tx_a,
+            &w.id,
+            &w.next_fire_at,
+            "2026-04-17T07:00:05+00:00",
+        )
+        .await
+        .unwrap();
+        assert!(claimed_a);
+        tx_a.commit().await.unwrap();
+
+        // Second tick: row is now `completed`, so the conditional
+        // update (which requires status='active') must not match.
+        let mut tx_b = pool.begin().await.unwrap();
+        let claimed_b = mark_completed_in_tx(
+            &mut tx_b,
+            &w.id,
+            &w.next_fire_at,
+            "2026-04-17T07:00:05+00:00",
+        )
+        .await
+        .unwrap();
+        assert!(!claimed_b);
+        tx_b.rollback().await.unwrap();
+
+        let after = get(&pool, &w.id).await.unwrap();
+        assert_eq!(after.status, "completed");
     }
 
     #[sqlx::test]
