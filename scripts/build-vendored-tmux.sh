@@ -70,5 +70,10 @@ mkdir -p "$BIN_DIR"
 cp tmux "$BIN_DIR/tmux"
 chmod +x "$BIN_DIR/tmux"
 
+# Stamp the install with the version we just built so build.rs can detect
+# a VERSION bump and re-run the script even when a binary is already on
+# disk. Keep in sync with build_vendored_tmux_support::stamp_path().
+printf '%s\n' "$VERSION" > "$BIN_DIR/.version"
+
 echo "==> Installed tmux $VERSION at $BIN_DIR/tmux"
 "$BIN_DIR/tmux" -V
