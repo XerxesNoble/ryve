@@ -712,6 +712,23 @@ impl App {
                 )
             })
             .unwrap_or(Task::none());
+        // Spark ryve-6ab1980c [sp-ee3f5c74]: tell the watch scheduler to
+        // stop. Shutdown awaits the in-flight tick so any transactional
+        // WatchFired insert + mark_fired commit before the task exits;
+        // the task then drops its handle on the workshop pool.
+        let stop_watch_runner = self
+            .workshops
+            .get_mut(idx)
+            .and_then(|ws| ws.watch_runner.take())
+            .map(|handle| {
+                Task::perform(
+                    async move {
+                        handle.shutdown().await;
+                    },
+                    |_| Message::AgentSessionSaved,
+                )
+            })
+            .unwrap_or(Task::none());
         self.workshops.remove(idx);
         if self.workshops.is_empty() {
             self.active_workshop = None;
@@ -722,7 +739,7 @@ impl App {
                 self.active_workshop = Some(idx.min(self.workshops.len() - 1));
             }
         }
-        Task::batch([snapshot, kill_agents])
+        Task::batch([snapshot, kill_agents, stop_watch_runner])
     }
 
     /// Push a new toast onto the stack and return a `Task` that will
@@ -3116,6 +3133,18 @@ impl App {
         };
         if let Some(ws) = self.workshops.get_mut(idx) {
             ws.sparks_db = Some(pool.clone());
+            // Spark ryve-6ab1980c [sp-ee3f5c74]: spawn the durable watch
+            // scheduler now that this workshop has a live sqlx pool. The
+            // runner is per-workshop — each workshop keeps its own
+            // `watches` rows in its own sparks.db — so spawning here
+            // (rather than once in main.rs) naturally scopes the task's
+            // lifetime to the workshop.
+            if ws.watch_runner.is_none() {
+                ws.watch_runner = Some(crate::watch_runner::spawn(
+                    pool.clone(),
+                    crate::watch_runner::tick_interval_from_env(),
+                ));
+            }
             ws.config = Arc::new(config);
             ws.custom_agents = custom_agents;
             ws.agent_context = agent_context;

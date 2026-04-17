@@ -29,6 +29,7 @@ pub mod stamp_repo;
 pub mod transition;
 pub mod types;
 pub mod watch_repo;
+pub mod watch_runner;
 
 pub use error::{SparksError, TransitionError};
 pub use types::*;

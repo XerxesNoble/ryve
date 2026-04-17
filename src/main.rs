@@ -21,6 +21,7 @@ mod screen;
 mod sparks_filter;
 mod style;
 mod tmux;
+mod watch_runner;
 mod widget;
 mod workshop;
 mod worktree_cleanup;

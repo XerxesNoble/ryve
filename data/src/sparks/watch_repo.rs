@@ -187,6 +187,55 @@ pub async fn mark_fired(
     get(pool, id).await
 }
 
+/// Transactional variant of [`mark_fired`]. The scheduler calls this
+/// inside the same transaction as the `WatchFired` outbox insert so the
+/// event row and the advanced `next_fire_at` commit together — a crash
+/// between the two is impossible. Spark ryve-6ab1980c [sp-ee3f5c74].
+pub async fn mark_fired_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    fired_at: &str,
+    next_fire_at: &str,
+) -> Result<(), SparksError> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE watches
+            SET last_fired_at = ?, next_fire_at = ?, updated_at = ?
+          WHERE id = ?",
+    )
+    .bind(fired_at)
+    .bind(next_fire_at)
+    .bind(&now)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Transactional stop-condition transition: mark a watch `completed` and
+/// stamp `last_fired_at` in the same transaction as the final
+/// `WatchFired` outbox insert. Used by the scheduler when the watch's
+/// stop condition is satisfied on this tick; future ticks will not see
+/// it (`due_at` filters `status = 'active'`). Spark ryve-6ab1980c.
+pub async fn mark_completed_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    fired_at: &str,
+) -> Result<(), SparksError> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE watches
+            SET status = 'completed', last_fired_at = ?, updated_at = ?
+          WHERE id = ?",
+    )
+    .bind(fired_at)
+    .bind(&now)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Return every active watch whose `next_fire_at <= now`. Used by the
 /// scheduler tick to find work that needs firing.
 pub async fn due_at(pool: &SqlitePool, now: &str) -> Result<Vec<Watch>, SparksError> {
