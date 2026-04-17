@@ -51,6 +51,15 @@ fn fresh_workshop() -> PathBuf {
         .output()
         .expect("spawn git init");
     assert!(git_init.status.success(), "git init failed");
+    let git_config = Command::new("git")
+        .args(["config", "commit.gpgsign", "false"])
+        .current_dir(&root)
+        .output()
+        .expect("spawn git config");
+    assert!(
+        git_config.status.success(),
+        "git config commit.gpgsign failed"
+    );
     let git_commit = Command::new("git")
         .args(["commit", "--allow-empty", "-m", "init"])
         .current_dir(&root)

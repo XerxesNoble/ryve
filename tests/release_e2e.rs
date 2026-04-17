@@ -38,6 +38,8 @@ fn fresh_workshop() -> PathBuf {
     fs::create_dir_all(&root).expect("create tempdir");
 
     git(&root, &["init", "--initial-branch", "main"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    git(&root, &["config", "--local", "tag.gpgSign", "false"]);
 
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
