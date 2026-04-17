@@ -83,6 +83,13 @@ pub fn tool_policy_for(kind: HandKind) -> ToolPolicy {
         // strictly read-only — enforced via the same chmod gate as
         // Investigator. Spark ryve-3f799949 / [sp-1471f46a].
         HandKind::Architect => ToolPolicy::ReadOnly,
+        // Reviewer reads the author's branch and posts approve/reject
+        // transitions + actionable comments. It never lands a diff —
+        // rejections come back to the author for repair — so the
+        // filesystem policy is strictly read-only, enforced via the
+        // same chmod gate as Investigator/Architect.
+        // Spark ryve-b0a369dc / [sp-f6259067].
+        HandKind::Reviewer => ToolPolicy::ReadOnly,
         // Standard worker, Head (orchestrator), Merger (integrator) all
         // require worktree writes today. Changing these to read-only
         // would regress existing Crews.
@@ -102,6 +109,7 @@ pub fn archetype_id_for(kind: HandKind) -> &'static str {
         HandKind::BugHunter => "bug_hunter",
         HandKind::PerformanceEngineer => "performance_engineer",
         HandKind::Architect => "architect",
+        HandKind::Reviewer => "reviewer",
         HandKind::Merger => "merger",
     }
 }
@@ -468,7 +476,19 @@ mod tests {
             archetype_id_for(HandKind::PerformanceEngineer),
             "performance_engineer"
         );
+        assert_eq!(archetype_id_for(HandKind::Architect), "architect");
+        assert_eq!(archetype_id_for(HandKind::Reviewer), "reviewer");
         assert_eq!(archetype_id_for(HandKind::Merger), "merger");
+    }
+
+    /// Invariant (spark ryve-b0a369dc / [sp-f6259067]): the Reviewer Hand
+    /// is strictly read-only — it reads the author's branch, approves or
+    /// rejects the assignment, and posts comments. A reviewer that could
+    /// silently edit the worktree would undermine the "second pair of
+    /// eyes" contract. Regression guard.
+    #[test]
+    fn reviewer_is_read_only() {
+        assert_eq!(tool_policy_for(HandKind::Reviewer), ToolPolicy::ReadOnly);
     }
 
     // ─── Release Manager allow-list [sp-2a82fee7] ──────────────────

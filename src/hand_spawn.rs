@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::agent_prompts::{
     HeadArchetype, compose_architect_prompt, compose_bug_hunter_prompt, compose_hand_prompt,
     compose_head_prompt, compose_investigator_prompt, compose_merger_prompt,
-    compose_performance_engineer_prompt, compose_release_manager_prompt,
+    compose_performance_engineer_prompt, compose_release_manager_prompt, compose_reviewer_prompt,
 };
 use crate::coding_agents::CodingAgent;
 use crate::tmux::{self, TmuxClient, TmuxError};
@@ -124,6 +124,16 @@ pub enum HandKind {
     /// capability-gate policy that binds the Investigator
     /// (spark ryve-3f799949).
     Architect,
+    /// A **Reviewer** Hand. Spawned by [`spawn_reviewer`] on a spark whose
+    /// author Hand has handed off for code review. Mechanically identical
+    /// to an Owner Hand at the DB layer (same session row, same
+    /// assignment row) but distinguished by `agent_sessions.session_label
+    /// = "reviewer"` and by [`compose_reviewer_prompt`]. The Reviewer has
+    /// authority over `AwaitingReview → Approved | Rejected` transitions
+    /// (see data/src/sparks/transition.rs). Selection is deterministic
+    /// and author-excluded; the spawn path is cross-vendor-preferring
+    /// with a logged fallback. Spark ryve-b0a369dc / [sp-f6259067].
+    Reviewer,
     /// The crew's integrator. Requires `crew_id` to be set.
     Merger,
 }
@@ -159,6 +169,16 @@ impl HandKind {
             // to — same assignment semantics as an Owner Hand, different
             // session_label and a read-only system prompt.
             Self::Architect => AssignmentRole::Owner,
+            // Reviewers sit alongside the author's Owner assignment
+            // rather than replacing it — they transition the
+            // `AwaitingReview → Approved|Rejected` phase without
+            // claiming ownership of the spark. `Observer` lets the
+            // reviewer's session row coexist with the author's Owner
+            // row (the unique-active-owner check on `assignment_repo`
+            // is scoped to `role = 'owner'`) and accurately describes
+            // the relationship: the reviewer watches and judges the
+            // author's work but does not take it over.
+            Self::Reviewer => AssignmentRole::Observer,
             Self::Merger => AssignmentRole::Merger,
         }
     }
@@ -175,6 +195,7 @@ impl HandKind {
             Self::BugHunter => "bug_hunter",
             Self::PerformanceEngineer => "performance_engineer",
             Self::Architect => "architect",
+            Self::Reviewer => "reviewer",
             Self::Merger => "merger",
         }
     }
@@ -352,7 +373,15 @@ pub async fn spawn_hand(
     // Cross-user refusal: if a parent session is running this spawn, its
     // active assignment pins the parent's actor. A parent cannot spawn a
     // Hand under a different actor's namespace.
-    if let Some(parent) = parent_session_id
+    //
+    // Carveout for HandKind::Reviewer: the reviewer role is required to
+    // be a different actor than the author (spark ryve-b0a369dc's
+    // "reviewer is never the author" invariant), so a cross-actor spawn
+    // is the *correct* behaviour for a reviewer and is always issued via
+    // `spawn_reviewer`. Enforcing the generic refusal here would make
+    // the reviewer policy un-implementable.
+    if !matches!(kind, HandKind::Reviewer)
+        && let Some(parent) = parent_session_id
         && let Some(parent_actor) =
             data::sparks::assignment_repo::actor_id_for_session(pool, parent).await?
         && parent_actor != actor
@@ -495,6 +524,18 @@ pub async fn spawn_hand(
             .await
             .unwrap_or_else(|_| Vec::<Spark>::new());
             compose_architect_prompt(&sparks, spark_id)
+        }
+        HandKind::Reviewer => {
+            let sparks = spark_repo::list(
+                pool,
+                SparkFilter {
+                    workshop_id: Some(workshop_id_for(workshop_dir)),
+                    ..SparkFilter::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|_| Vec::<Spark>::new());
+            compose_reviewer_prompt(&sparks, spark_id)
         }
         HandKind::Merger => compose_merger_prompt(crew_id.unwrap_or(""), spark_id),
     };
@@ -809,6 +850,356 @@ fn workshop_id_for(workshop_dir: &Path) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+// ── Reviewer spawn path ──────────────────────────────────
+//
+// The reviewer role is bound by the contract on epic ryve-b0a369dc:
+//   - Reviewer is never the author.
+//   - Reviewer is a fresh execution instance (no other active
+//     assignment in the same epic).
+//   - Selection is deterministic — same inputs always pick the same
+//     reviewer — so audits and replays agree.
+//   - Preference is cross-vendor (claude author → codex reviewer, …).
+//   - Fallback: if no cross-vendor reviewer exists, accept a same-vendor
+//     one but emit a `reviewer_policy_relaxed` event so the relaxation
+//     is visible in the audit trail.
+//   - Hard failure: if no eligible reviewer exists at all, the
+//     assignment is flagged `awaiting_reviewer_availability` and the
+//     workshop is notified via IRC (a `flare` ember).
+//
+// The selection function is pure (no wall-clock, no RNG without seed)
+// so the spawn path can be replayed by the projector and the same
+// reviewer is chosen every time.
+
+/// A candidate actor that may be picked as a reviewer. Callers enumerate
+/// the workshop's actor pool (typically via `assignment_repo` queries the
+/// caller composes) and filter out anyone who is not a fresh instance on
+/// the epic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerCandidate {
+    /// Stable actor identity. Matches the value written to
+    /// `assignments.actor_id` for the spawned reviewer Hand.
+    pub actor_id: String,
+    /// Vendor / model family (e.g. "claude", "codex", "aider"). Used by
+    /// [`select_reviewer`] to prefer cross-vendor picks.
+    pub vendor: String,
+}
+
+/// Outcome of a deterministic reviewer selection. `CrossVendor` is the
+/// default path; `SameVendorRelaxed` signals that no cross-vendor
+/// candidate was available and [`spawn_reviewer`] MUST emit the
+/// `reviewer_policy_relaxed` event so the relaxation is auditable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewerSelection {
+    /// A candidate with a different vendor than the author was selected —
+    /// the default discipline described in the epic contract.
+    CrossVendor,
+    /// No cross-vendor candidate was eligible, so the selection fell back
+    /// to a same-vendor candidate. The spawn path records this relaxation
+    /// as an event (`reviewer_policy_relaxed`).
+    SameVendorRelaxed,
+}
+
+impl ReviewerSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CrossVendor => "cross_vendor",
+            Self::SameVendorRelaxed => "same_vendor_relaxed",
+        }
+    }
+}
+
+/// Selection-time errors. The sole failure mode is "no eligible
+/// reviewer in the pool"; the spawn path turns that into an
+/// `awaiting_reviewer_availability` flag on the assignment plus a flare
+/// ember so a human can intervene.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReviewerSelectionError {
+    /// Nobody in the pool satisfies the reviewer contract (excluded
+    /// author, fresh instance). Carries the author identity in the
+    /// message so the IRC surface can name who is waiting for review.
+    #[error(
+        "no eligible reviewer for author '{author_actor}' (pool size {pool_size}): \
+         selection requires a fresh-instance actor different from the author"
+    )]
+    NoEligibleReviewer {
+        author_actor: String,
+        pool_size: usize,
+    },
+}
+
+/// Pure deterministic reviewer selection.
+///
+/// Inputs:
+/// - `author_actor`: the actor currently on the spark's Owner assignment.
+/// - `author_vendor`: that actor's vendor/model family. Used only to
+///   prefer cross-vendor reviewers; the author is excluded by
+///   `actor_id` regardless of vendor.
+/// - `pool`: the candidate reviewers. Callers pass in the subset of the
+///   workshop's actors that are fresh instances (no other active
+///   assignment on the epic).
+/// - `seed`: deterministic tiebreaker. Passing the same seed produces
+///   the same reviewer given the same `pool` — the invariant audits
+///   and replays rely on.
+///
+/// Rules, in order:
+/// 1. Exclude `author_actor` from consideration.
+/// 2. If any remaining candidate has a vendor different from
+///    `author_vendor`, pick deterministically from that sub-pool and
+///    return [`ReviewerSelection::CrossVendor`].
+/// 3. Otherwise, pick deterministically from the remaining same-vendor
+///    candidates and return [`ReviewerSelection::SameVendorRelaxed`].
+/// 4. If no candidate remains, return
+///    [`ReviewerSelectionError::NoEligibleReviewer`].
+///
+/// The deterministic picker is `sort_by(actor_id) then seed mod len` so
+/// the choice is a pure function of the arguments.
+pub fn select_reviewer<'a>(
+    author_actor: &str,
+    author_vendor: &str,
+    pool: &'a [ReviewerCandidate],
+    seed: u64,
+) -> Result<(&'a ReviewerCandidate, ReviewerSelection), ReviewerSelectionError> {
+    let pool_size = pool.len();
+    let eligible: Vec<&ReviewerCandidate> =
+        pool.iter().filter(|c| c.actor_id != author_actor).collect();
+    if eligible.is_empty() {
+        return Err(ReviewerSelectionError::NoEligibleReviewer {
+            author_actor: author_actor.to_string(),
+            pool_size,
+        });
+    }
+
+    let cross_vendor: Vec<&ReviewerCandidate> = eligible
+        .iter()
+        .copied()
+        .filter(|c| c.vendor != author_vendor)
+        .collect();
+
+    let (bucket, outcome) = if !cross_vendor.is_empty() {
+        (cross_vendor, ReviewerSelection::CrossVendor)
+    } else {
+        (eligible, ReviewerSelection::SameVendorRelaxed)
+    };
+
+    let mut sorted = bucket;
+    sorted.sort_by(|a, b| a.actor_id.cmp(&b.actor_id));
+    // `sorted.len()` is > 0: we returned early above when eligible was
+    // empty, and `bucket` either equals `eligible` or a non-empty
+    // subset of it. Modulo-by-len therefore cannot divide by zero.
+    let idx = (seed as usize) % sorted.len();
+    Ok((sorted[idx], outcome))
+}
+
+/// Outcome of [`spawn_reviewer`]. Separates the three terminal states so
+/// the caller (CLI, UI, or automated sweep) can act on each without
+/// re-inspecting DB rows.
+#[derive(Debug, Clone)]
+pub enum ReviewerSpawnOutcome {
+    /// A reviewer Hand was successfully spawned. `selection` records
+    /// whether the policy was honoured or relaxed; for
+    /// [`ReviewerSelection::SameVendorRelaxed`] a `reviewer_policy_relaxed`
+    /// event is recorded on the spark BEFORE the Hand is spawned so the
+    /// relaxation is visible even if the subprocess launch fails
+    /// downstream.
+    Spawned {
+        hand: SpawnedHand,
+        selection: ReviewerSelection,
+    },
+    /// The pool had no eligible reviewer. Instead of spawning a Hand the
+    /// spark has been flagged `awaiting_reviewer_availability` in the
+    /// event log and a `flare` ember has been raised so a human can
+    /// intervene. `ember_id` is returned so the caller can reference the
+    /// signal in output / tests.
+    AwaitingAvailability { ember_id: String },
+}
+
+/// Policy-level errors raised by [`spawn_reviewer`] *before* it delegates
+/// to [`spawn_hand`]. Spawn-time errors (tmux failure, DB error, cross-user
+/// refusal) are surfaced as [`HandSpawnError`] from the inner call.
+#[derive(Debug, thiserror::Error)]
+pub enum ReviewerSpawnError {
+    /// A workgraph write (event log, ember insert) failed before we even
+    /// attempted to launch the subprocess.
+    #[error("workgraph error: {0}")]
+    Sparks(#[from] data::sparks::SparksError),
+    /// Inner [`spawn_hand`] call failed after a reviewer was selected.
+    /// The `selection` field tells the caller whether the emitted
+    /// `reviewer_policy_relaxed` event (if any) had already been recorded
+    /// so a retry does not double-count.
+    #[error("reviewer spawn failed after selection ({selection:?}): {source}")]
+    HandSpawn {
+        selection: ReviewerSelection,
+        #[source]
+        source: HandSpawnError,
+    },
+}
+
+/// Inputs describing *who* is under review and *who* is available to
+/// review. Bundled into a single struct so [`spawn_reviewer`] keeps a
+/// readable signature at a call site and respects the
+/// `too_many_arguments` budget. The fields are borrows rather than owned
+/// strings so constructing a request is allocation-free at the call
+/// site.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewerRequest<'a> {
+    /// Actor whose work is under review. The selected reviewer MUST
+    /// differ from this actor (see [`select_reviewer`]).
+    pub author_actor: &'a str,
+    /// Vendor / model family of the author. Used to prefer cross-vendor
+    /// reviewers; a pure tiebreak hint, not an identity.
+    pub author_vendor: &'a str,
+    /// Candidate reviewers the caller has already narrowed to fresh-
+    /// instance actors (no other active assignment on the epic).
+    pub candidates: &'a [ReviewerCandidate],
+    /// Deterministic tiebreaker: same seed + same candidates ⇒ same
+    /// reviewer, so replays and audits agree.
+    pub seed: u64,
+}
+
+/// Spawn a Reviewer Hand for `spark_id` using deterministic, cross-vendor-
+/// preferring selection. `request` carries the author identity, the
+/// candidate pool, and the seed. See [`ReviewerRequest`] for the field
+/// contract.
+///
+/// Behaviour:
+/// 1. Call [`select_reviewer`].
+/// 2. If the selection is [`ReviewerSelection::SameVendorRelaxed`],
+///    record a `reviewer_policy_relaxed` event on the spark BEFORE
+///    spawning so the relaxation is visible even on downstream failure.
+/// 3. Delegate to [`spawn_hand`] with `HandKind::Reviewer` and the
+///    selected candidate's `actor_id` pinned on the spawn context.
+/// 4. On [`ReviewerSelectionError::NoEligibleReviewer`], record an
+///    `awaiting_reviewer_availability` event on the spark and raise a
+///    `flare` ember so the IRC / UI surface can page a human. No Hand
+///    is spawned.
+///
+/// Spark ryve-b0a369dc / [sp-f6259067].
+pub async fn spawn_reviewer(
+    workshop_dir: &Path,
+    pool: &SqlitePool,
+    agent: &CodingAgent,
+    spark_id: &str,
+    request: ReviewerRequest<'_>,
+    ctx: SpawnContext<'_>,
+) -> Result<ReviewerSpawnOutcome, ReviewerSpawnError> {
+    use data::sparks::types::{ActorType, EmberType, NewEmber, NewEvent};
+    use data::sparks::{ember_repo, event_repo};
+
+    let ReviewerRequest {
+        author_actor,
+        author_vendor,
+        candidates,
+        seed,
+    } = request;
+
+    let workshop_id = workshop_id_for(workshop_dir);
+
+    match select_reviewer(author_actor, author_vendor, candidates, seed) {
+        Ok((candidate, selection)) => {
+            if selection == ReviewerSelection::SameVendorRelaxed {
+                // Log the relaxation BEFORE the spawn so the policy
+                // change is visible even if the subprocess launch
+                // subsequently fails. `actor` is recorded as the
+                // reviewer being accepted so the audit trail names
+                // the concrete pick; `reason` carries the author so
+                // the downgrade is attributable to a specific diff.
+                event_repo::record(
+                    pool,
+                    NewEvent {
+                        spark_id: spark_id.to_string(),
+                        actor: candidate.actor_id.clone(),
+                        field_name: "reviewer_policy".to_string(),
+                        old_value: Some(ReviewerSelection::CrossVendor.as_str().to_string()),
+                        new_value: Some(ReviewerSelection::SameVendorRelaxed.as_str().to_string()),
+                        reason: Some(format!(
+                            "reviewer_policy_relaxed: no cross-vendor reviewer available \
+                             for author '{author_actor}' (vendor '{author_vendor}'); \
+                             accepting same-vendor reviewer '{}'",
+                            candidate.actor_id
+                        )),
+                        actor_type: Some(ActorType::System),
+                        change_nature: None,
+                        session_id: None,
+                    },
+                )
+                .await?;
+            }
+
+            // Pin the selected actor onto the spawn context so the
+            // reviewer Hand's worktree branch and assignment row both
+            // carry the reviewer's identity (not the author's).
+            let spawn_ctx = SpawnContext {
+                crew_id: ctx.crew_id,
+                parent_session_id: ctx.parent_session_id,
+                actor_id: Some(candidate.actor_id.as_str()),
+            };
+
+            let hand = spawn_hand(
+                workshop_dir,
+                pool,
+                agent,
+                spark_id,
+                HandKind::Reviewer,
+                spawn_ctx,
+            )
+            .await
+            .map_err(|source| ReviewerSpawnError::HandSpawn { selection, source })?;
+
+            Ok(ReviewerSpawnOutcome::Spawned { hand, selection })
+        }
+        Err(ReviewerSelectionError::NoEligibleReviewer {
+            author_actor: _,
+            pool_size,
+        }) => {
+            // Flag the assignment in the event log. No DB column change
+            // is required — `event_repo` is the workgraph's audit
+            // trail and `field_name = "reviewer_availability"` is how
+            // the projector / UI surface the awaiting state.
+            event_repo::record(
+                pool,
+                NewEvent {
+                    spark_id: spark_id.to_string(),
+                    actor: author_actor.to_string(),
+                    field_name: "reviewer_availability".to_string(),
+                    old_value: None,
+                    new_value: Some("awaiting_reviewer_availability".to_string()),
+                    reason: Some(format!(
+                        "no eligible reviewer in pool (size {pool_size}): selection \
+                         requires a fresh-instance actor different from the author"
+                    )),
+                    actor_type: Some(ActorType::System),
+                    change_nature: None,
+                    session_id: None,
+                },
+            )
+            .await?;
+
+            // Surface on IRC. `flare` is the right urgency tier per
+            // `.ryve/WORKSHOP.md`: "needs attention soon" — a spark is
+            // stuck waiting for a reviewer but it is not yet a
+            // blaze-level interrupt. Prefix the content with
+            // `awaiting_reviewer_availability` so the projector / UI
+            // can group these by type.
+            let ember = ember_repo::create(
+                pool,
+                NewEmber {
+                    ember_type: EmberType::Flare,
+                    content: format!(
+                        "awaiting_reviewer_availability: spark {spark_id} author \
+                         '{author_actor}' — reviewer pool exhausted (size {pool_size})"
+                    ),
+                    source_agent: Some("reviewer_spawn".to_string()),
+                    workshop_id,
+                    ttl_seconds: None,
+                },
+            )
+            .await?;
+
+            Ok(ReviewerSpawnOutcome::AwaitingAvailability { ember_id: ember.id })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2155,6 +2546,325 @@ mod tests {
         );
 
         let tmux_name = format!("hand-{}", spawned.session_id);
+        cleanup_tmux(&workshop_dir, &tmux_name);
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+
+    // ─── Reviewer selection + spawn path (spark ryve-f6259067) ─────
+
+    /// Helper: build a reviewer pool from `(actor_id, vendor)` pairs.
+    fn pool(entries: &[(&str, &str)]) -> Vec<ReviewerCandidate> {
+        entries
+            .iter()
+            .map(|(a, v)| ReviewerCandidate {
+                actor_id: (*a).to_string(),
+                vendor: (*v).to_string(),
+            })
+            .collect()
+    }
+
+    /// Invariant: the author is never chosen as their own reviewer, even
+    /// when they are the only candidate in the pool — that case must
+    /// surface as `NoEligibleReviewer`, not a silent self-approval.
+    #[test]
+    fn select_reviewer_excludes_author_even_as_sole_candidate() {
+        let pool = pool(&[("alice", "claude")]);
+        let err = select_reviewer("alice", "claude", &pool, 0)
+            .expect_err("author-only pool must be NoEligibleReviewer");
+        match err {
+            ReviewerSelectionError::NoEligibleReviewer {
+                author_actor,
+                pool_size,
+            } => {
+                assert_eq!(author_actor, "alice");
+                assert_eq!(pool_size, 1);
+            }
+        }
+    }
+
+    /// Invariant: when a cross-vendor candidate exists, the selection
+    /// returns `CrossVendor` and never falls back to a same-vendor peer.
+    #[test]
+    fn select_reviewer_prefers_cross_vendor_over_same_vendor() {
+        let pool = pool(&[("bob", "claude"), ("carol", "codex")]);
+        let (picked, outcome) = select_reviewer("alice", "claude", &pool, 0)
+            .expect("cross-vendor reviewer must be selectable");
+        assert_eq!(outcome, ReviewerSelection::CrossVendor);
+        assert_eq!(picked.actor_id, "carol");
+        assert_eq!(picked.vendor, "codex");
+    }
+
+    /// Invariant: when only same-vendor candidates remain, the
+    /// selection falls back and returns `SameVendorRelaxed`. The caller
+    /// (`spawn_reviewer`) is responsible for emitting
+    /// `reviewer_policy_relaxed` in this case.
+    #[test]
+    fn select_reviewer_falls_back_to_same_vendor_when_no_cross_vendor_available() {
+        let pool = pool(&[("bob", "claude"), ("carol", "claude")]);
+        let (picked, outcome) = select_reviewer("alice", "claude", &pool, 0)
+            .expect("same-vendor fallback must be selectable");
+        assert_eq!(outcome, ReviewerSelection::SameVendorRelaxed);
+        assert_eq!(picked.vendor, "claude");
+        assert_ne!(picked.actor_id, "alice");
+    }
+
+    /// Determinism invariant: identical inputs must always produce the
+    /// same reviewer. This is the property the audit/replay layer
+    /// depends on — a reviewer reassignment in the event log must be
+    /// reproducible bit-for-bit.
+    #[test]
+    fn select_reviewer_is_deterministic_for_fixed_seed() {
+        let pool = pool(&[("bob", "codex"), ("carol", "codex"), ("dave", "codex")]);
+        let first = select_reviewer("alice", "claude", &pool, 42).unwrap().0;
+        let second = select_reviewer("alice", "claude", &pool, 42).unwrap().0;
+        let third = select_reviewer("alice", "claude", &pool, 42).unwrap().0;
+        assert_eq!(first.actor_id, second.actor_id);
+        assert_eq!(second.actor_id, third.actor_id);
+    }
+
+    /// Determinism invariant (negative direction): different seeds must
+    /// be able to pick different reviewers when the pool has more than
+    /// one cross-vendor candidate, otherwise the seed argument is
+    /// vestigial and audits cannot distinguish distinct runs.
+    #[test]
+    fn select_reviewer_seed_spreads_over_eligible_bucket() {
+        let pool = pool(&[("bob", "codex"), ("carol", "codex")]);
+        let a = select_reviewer("alice", "claude", &pool, 0).unwrap().0;
+        let b = select_reviewer("alice", "claude", &pool, 1).unwrap().0;
+        assert_ne!(a.actor_id, b.actor_id);
+    }
+
+    /// Invariant: when the pool contains only the author, NoEligible is
+    /// raised regardless of vendor. Guards against a regression where a
+    /// same-vendor author might be rediscovered via the fallback
+    /// branch.
+    #[test]
+    fn select_reviewer_author_only_same_vendor_pool_still_fails() {
+        let pool = pool(&[("alice", "claude")]);
+        assert!(select_reviewer("alice", "claude", &pool, 7).is_err());
+    }
+
+    /// Integration invariant: when no eligible reviewer exists, the
+    /// spawn path MUST flag the spark and raise a flare ember rather
+    /// than silently doing nothing. This is the `awaiting_reviewer_
+    /// availability` surface the UI / sweep watches.
+    #[tokio::test]
+    async fn spawn_reviewer_without_eligible_pool_flags_and_raises_flare() {
+        use data::sparks::types::{EmberType, NewSpark, SparkType};
+        use data::sparks::{ember_repo, event_repo, spark_repo};
+
+        let (workshop_dir, pool, _out_path) = setup_workshop().await;
+
+        let spark = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "awaiting-reviewer smoke".into(),
+                description: "verify empty-pool path flags and raises".into(),
+                spark_type: SparkType::Epic,
+                priority: 2,
+                workshop_id: workshop_id_for(&workshop_dir),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // No tmux binary needed: we never reach the launch step because
+        // the pool is empty, so the agent's command is only referenced
+        // on the success branch.
+        let agent = CodingAgent {
+            display_name: "stub".into(),
+            command: "/nonexistent/stub-agent.sh".into(),
+            args: Vec::new(),
+            resume: ResumeStrategy::None,
+            compatibility: crate::coding_agents::CompatStatus::Unknown,
+        };
+
+        // Pool contains only the author — by contract, no eligible
+        // reviewer.
+        let author_only = vec![ReviewerCandidate {
+            actor_id: "alice".into(),
+            vendor: "claude".into(),
+        }];
+
+        let outcome = spawn_reviewer(
+            &workshop_dir,
+            &pool,
+            &agent,
+            &spark.id,
+            ReviewerRequest {
+                author_actor: "alice",
+                author_vendor: "claude",
+                candidates: &author_only,
+                seed: 0,
+            },
+            SpawnContext::default(),
+        )
+        .await
+        .expect("spawn_reviewer with no eligible pool must not error out — it flags");
+
+        match outcome {
+            ReviewerSpawnOutcome::AwaitingAvailability { ember_id } => {
+                assert!(!ember_id.is_empty(), "ember id must be returned");
+            }
+            ReviewerSpawnOutcome::Spawned { .. } => {
+                panic!("empty pool must not spawn a reviewer Hand");
+            }
+        }
+
+        // Event audit trail: the spark has an
+        // `awaiting_reviewer_availability` row on its event log.
+        let events = event_repo::list_for_spark(&pool, &spark.id).await.unwrap();
+        let availability_row = events
+            .iter()
+            .find(|e| e.field_name == "reviewer_availability")
+            .expect("reviewer_availability event must be recorded");
+        assert_eq!(
+            availability_row.new_value.as_deref(),
+            Some("awaiting_reviewer_availability"),
+            "event must carry the canonical awaiting-availability value",
+        );
+
+        // IRC surface: a `flare` ember was raised on this workshop.
+        let workshop_id = workshop_id_for(&workshop_dir);
+        let flares = ember_repo::list_by_type(&pool, &workshop_id, EmberType::Flare)
+            .await
+            .unwrap();
+        assert!(
+            flares
+                .iter()
+                .any(|e| e.content.contains("awaiting_reviewer_availability")
+                    && e.content.contains(&spark.id)),
+            "a flare ember scoping `awaiting_reviewer_availability` must exist; \
+             got {} flares: {:?}",
+            flares.len(),
+            flares.iter().map(|e| &e.content).collect::<Vec<_>>(),
+        );
+
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+
+    /// Integration invariant: on a same-vendor-only pool, `spawn_reviewer`
+    /// MUST record the `reviewer_policy_relaxed` event on the spark BEFORE
+    /// dispatching the spawn, so the relaxation is auditable even if the
+    /// subprocess launch downstream fails. The test reads the event log
+    /// directly — tmux is not required because the assertion is purely
+    /// on the workgraph write, not on the subprocess lifecycle.
+    #[tokio::test]
+    async fn spawn_reviewer_same_vendor_fallback_records_policy_relaxed_event() {
+        use data::sparks::types::{NewSpark, SparkType};
+        use data::sparks::{event_repo, spark_repo};
+
+        if !bundled_tmux_available_for_tests() {
+            eprintln!(
+                "bundled tmux not available — skipping: this test runs the \
+                 full spawn_reviewer happy path which requires tmux for the \
+                 inner spawn_hand call. The per-branch event write is still \
+                 covered unconditionally by the empty-pool test above."
+            );
+            return;
+        }
+
+        let (workshop_dir, pool, _out_path) = setup_workshop().await;
+        let stub_path = workshop_dir.join("stub-agent.sh");
+
+        let spark = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "reviewer-policy-relaxed smoke".into(),
+                description: "same-vendor fallback must log the relaxation".into(),
+                spark_type: SparkType::Epic,
+                priority: 2,
+                workshop_id: workshop_id_for(&workshop_dir),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent = CodingAgent {
+            display_name: "stub".into(),
+            command: stub_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            resume: ResumeStrategy::None,
+            compatibility: crate::coding_agents::CompatStatus::Unknown,
+        };
+
+        // Pool: only same-vendor candidates apart from the author →
+        // forces the fallback path.
+        let same_vendor_only = vec![
+            ReviewerCandidate {
+                actor_id: "alice".into(),
+                vendor: "claude".into(),
+            },
+            ReviewerCandidate {
+                actor_id: "bob".into(),
+                vendor: "claude".into(),
+            },
+        ];
+
+        let outcome = spawn_reviewer(
+            &workshop_dir,
+            &pool,
+            &agent,
+            &spark.id,
+            ReviewerRequest {
+                author_actor: "alice",
+                author_vendor: "claude",
+                candidates: &same_vendor_only,
+                seed: 0,
+            },
+            SpawnContext::default(),
+        )
+        .await
+        .expect("same-vendor fallback must succeed (spawn path returns Spawned)");
+
+        let (hand, selection) = match outcome {
+            ReviewerSpawnOutcome::Spawned { hand, selection } => (hand, selection),
+            ReviewerSpawnOutcome::AwaitingAvailability { .. } => {
+                panic!("with a non-empty same-vendor pool, a reviewer must be spawned");
+            }
+        };
+        assert_eq!(selection, ReviewerSelection::SameVendorRelaxed);
+
+        let events = event_repo::list_for_spark(&pool, &spark.id).await.unwrap();
+        let relaxed_row = events
+            .iter()
+            .find(|e| e.field_name == "reviewer_policy")
+            .expect("reviewer_policy event must be recorded on same-vendor fallback");
+        assert_eq!(
+            relaxed_row.new_value.as_deref(),
+            Some("same_vendor_relaxed"),
+            "event must carry the canonical relaxation marker",
+        );
+        assert_eq!(
+            relaxed_row.old_value.as_deref(),
+            Some("cross_vendor"),
+            "relaxation event must record the transition from cross_vendor",
+        );
+        assert!(
+            relaxed_row
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("reviewer_policy_relaxed")),
+            "event reason must name the relaxation explicitly",
+        );
+
+        let tmux_name = format!("reviewer-{}", hand.session_id);
         cleanup_tmux(&workshop_dir, &tmux_name);
         let _ = std::fs::remove_dir_all(&workshop_dir);
     }

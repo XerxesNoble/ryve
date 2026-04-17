@@ -322,7 +322,7 @@ fn print_usage() {
     eprintln!("  crew status <crew_id> active|merging|completed|abandoned");
     eprintln!();
     eprintln!(
-        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]"
+        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]"
     );
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
@@ -1980,7 +1980,7 @@ async fn handle_hand(
             }
             if args.len() < 2 {
                 die(
-                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|architect|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
+                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
                 );
             }
             let spark_id = args[1].clone();
@@ -1988,6 +1988,14 @@ async fn handle_hand(
             let mut role = HandKind::Owner;
             let mut crew_id: Option<String> = None;
             let mut actor_override: Option<String> = None;
+            // Reviewer-only inputs. `candidates` is a repeatable
+            // `--candidate actor:vendor` flag; `author_actor` /
+            // `author_vendor` name the Hand whose work is under review;
+            // `seed` is the deterministic tiebreaker (default 0).
+            let mut author_actor: Option<String> = None;
+            let mut author_vendor: Option<String> = None;
+            let mut reviewer_candidates: Vec<hand_spawn::ReviewerCandidate> = Vec::new();
+            let mut reviewer_seed: u64 = 0;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -2005,6 +2013,7 @@ async fn handle_hand(
                                 "head" => HandKind::Head,
                                 "investigator" => HandKind::Investigator,
                                 "architect" => HandKind::Architect,
+                                "reviewer" => HandKind::Reviewer,
                                 "release_manager" | "release-manager" => HandKind::ReleaseManager,
                                 "bug_hunter" | "bug-hunter" => HandKind::BugHunter,
                                 "performance_engineer"
@@ -2013,7 +2022,7 @@ async fn handle_hand(
                                 | "perf-engineer" => HandKind::PerformanceEngineer,
                                 "merger" => HandKind::Merger,
                                 other => die(&format!(
-                                    "invalid role '{other}' (owner|head|investigator|architect|release_manager|bug_hunter|performance_engineer|merger)"
+                                    "invalid role '{other}' (owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger)"
                                 )),
                             };
                         }
@@ -2030,6 +2039,42 @@ async fn handle_hand(
                             actor_override = Some(args[i].clone());
                         }
                     }
+                    "--author-actor" => {
+                        i += 1;
+                        if i < args.len() {
+                            author_actor = Some(args[i].clone());
+                        }
+                    }
+                    "--author-vendor" => {
+                        i += 1;
+                        if i < args.len() {
+                            author_vendor = Some(args[i].clone());
+                        }
+                    }
+                    "--candidate" => {
+                        i += 1;
+                        if i < args.len() {
+                            let raw = &args[i];
+                            let (actor, vendor) = raw.split_once(':').unwrap_or_else(|| {
+                                die(&format!(
+                                    "--candidate '{raw}' must be <actor>:<vendor> \
+                                     (e.g. alice:claude)"
+                                ))
+                            });
+                            reviewer_candidates.push(hand_spawn::ReviewerCandidate {
+                                actor_id: actor.trim().to_string(),
+                                vendor: vendor.trim().to_string(),
+                            });
+                        }
+                    }
+                    "--seed" => {
+                        i += 1;
+                        if i < args.len() {
+                            reviewer_seed = args[i].parse().unwrap_or_else(|_| {
+                                die(&format!("--seed '{}' must be a u64", args[i]))
+                            });
+                        }
+                    }
                     other => die(&format!("unknown hand spawn flag '{other}'")),
                 }
                 i += 1;
@@ -2044,43 +2089,124 @@ async fn handle_hand(
             // env var set and the column will be NULL.
             let parent_session_id = std::env::var("RYVE_HAND_SESSION_ID").ok();
 
-            match hand_spawn::spawn_hand(
-                workshop_root,
-                pool,
-                &agent,
-                &spark_id,
-                role,
-                hand_spawn::SpawnContext {
-                    crew_id: crew_id.as_deref(),
-                    parent_session_id: parent_session_id.as_deref(),
-                    actor_id: actor_override.as_deref(),
-                },
-            )
-            .await
-            {
-                Ok(spawned) => {
-                    if json_mode {
-                        let payload = serde_json::json!({
-                            "session_id": spawned.session_id,
-                            "spark_id": spawned.spark_id,
-                            "worktree": spawned.worktree_path,
-                            "log": spawned.log_path,
-                            "pid": spawned.child_pid,
-                        });
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&payload).unwrap_or_default()
-                        );
-                    } else {
-                        println!(
-                            "spawned hand {} on spark {} (pid {:?})",
-                            spawned.session_id, spawned.spark_id, spawned.child_pid
-                        );
-                        println!("  worktree: {}", spawned.worktree_path.display());
-                        println!("  log:      {}", spawned.log_path.display());
+            // Reviewer spawns dispatch through the policy-aware
+            // `spawn_reviewer` path (deterministic cross-vendor-preferring
+            // selection, `reviewer_policy_relaxed` on same-vendor fallback,
+            // `awaiting_reviewer_availability` + flare ember when no
+            // reviewer is eligible). Standard Hand kinds use the generic
+            // `spawn_hand` path.
+            if matches!(role, HandKind::Reviewer) {
+                let Some(aa) = author_actor.as_deref() else {
+                    die("--role reviewer requires --author-actor <id>");
+                };
+                let Some(av) = author_vendor.as_deref() else {
+                    die("--role reviewer requires --author-vendor <vendor>");
+                };
+                match hand_spawn::spawn_reviewer(
+                    workshop_root,
+                    pool,
+                    &agent,
+                    &spark_id,
+                    hand_spawn::ReviewerRequest {
+                        author_actor: aa,
+                        author_vendor: av,
+                        candidates: &reviewer_candidates,
+                        seed: reviewer_seed,
+                    },
+                    hand_spawn::SpawnContext {
+                        crew_id: crew_id.as_deref(),
+                        parent_session_id: parent_session_id.as_deref(),
+                        actor_id: actor_override.as_deref(),
+                    },
+                )
+                .await
+                {
+                    Ok(hand_spawn::ReviewerSpawnOutcome::Spawned { hand, selection }) => {
+                        if json_mode {
+                            let payload = serde_json::json!({
+                                "outcome": "spawned",
+                                "selection": selection.as_str(),
+                                "session_id": hand.session_id,
+                                "spark_id": hand.spark_id,
+                                "worktree": hand.worktree_path,
+                                "log": hand.log_path,
+                                "pid": hand.child_pid,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!(
+                                "spawned reviewer {} on spark {} (selection {}, pid {:?})",
+                                hand.session_id,
+                                hand.spark_id,
+                                selection.as_str(),
+                                hand.child_pid
+                            );
+                            println!("  worktree: {}", hand.worktree_path.display());
+                            println!("  log:      {}", hand.log_path.display());
+                        }
                     }
+                    Ok(hand_spawn::ReviewerSpawnOutcome::AwaitingAvailability { ember_id }) => {
+                        if json_mode {
+                            let payload = serde_json::json!({
+                                "outcome": "awaiting_reviewer_availability",
+                                "spark_id": spark_id,
+                                "ember_id": ember_id,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!(
+                                "spark {spark_id}: awaiting_reviewer_availability \
+                                 (ember {ember_id}) — no eligible reviewer in pool"
+                            );
+                        }
+                    }
+                    Err(e) => die(&format!("{e}")),
                 }
-                Err(e) => die(&format!("{e}")),
+            } else {
+                match hand_spawn::spawn_hand(
+                    workshop_root,
+                    pool,
+                    &agent,
+                    &spark_id,
+                    role,
+                    hand_spawn::SpawnContext {
+                        crew_id: crew_id.as_deref(),
+                        parent_session_id: parent_session_id.as_deref(),
+                        actor_id: actor_override.as_deref(),
+                    },
+                )
+                .await
+                {
+                    Ok(spawned) => {
+                        if json_mode {
+                            let payload = serde_json::json!({
+                                "session_id": spawned.session_id,
+                                "spark_id": spawned.spark_id,
+                                "worktree": spawned.worktree_path,
+                                "log": spawned.log_path,
+                                "pid": spawned.child_pid,
+                            });
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                            );
+                        } else {
+                            println!(
+                                "spawned hand {} on spark {} (pid {:?})",
+                                spawned.session_id, spawned.spark_id, spawned.child_pid
+                            );
+                            println!("  worktree: {}", spawned.worktree_path.display());
+                            println!("  log:      {}", spawned.log_path.display());
+                        }
+                    }
+                    Err(e) => die(&format!("{e}")),
+                }
             }
         }
         "list" | "ls" => match assignment_repo::list_active(pool).await {
@@ -2124,7 +2250,7 @@ worktree under `.ryve/worktrees/<short>/` on branch `hand/<short>`. Hands
 are the only layer that edits code.
 
 USAGE:
-  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]
+  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]
   ryve hand list
   ryve hand --help
   ryve hand spawn --help
@@ -2145,6 +2271,11 @@ ROLES:
   architect         Read-only design reviewer. Produces recommendations,
                     tradeoffs, and risks as structured comments on the parent
                     spark; never edits code. Typically spawned by a Review Head.
+  reviewer          Read-only code reviewer. Approves or rejects a spark's
+                    AwaitingReview phase against its acceptance criteria.
+                    Spawned via the Reviewer spawn path with deterministic,
+                    cross-vendor-preferring selection (see
+                    `hand_spawn::spawn_reviewer`).
   release_manager   Atlas-only Release steward. Runs `ryve release *`, commits
                     to `release/*`, comments on release member sparks only.
                     Cannot spawn Hands/Heads, cannot send embers. Singleton per
@@ -2186,13 +2317,15 @@ OPTIONS:
   --agent <name>           Coding agent to run (claude, codex, aider,
                            opencode, …). Defaults to the first detected
                            agent on your PATH.
-  --role <role>            owner | head | investigator | architect | release_manager | bug_hunter | performance_engineer | merger.
+  --role <role>            owner | head | investigator | architect | reviewer | release_manager | bug_hunter | performance_engineer | merger.
                            Default: owner.
                              owner            — standard worker Hand.
                              head             — crew orchestrator (prefer `ryve head spawn`).
                              investigator     — read-only auditor; posts findings via comments.
                              architect        — read-only design reviewer; posts recommendations,
                                                 tradeoffs, and risks as comments (see docs/HAND_ARCHETYPES.md).
+                             reviewer         — read-only code reviewer; approves/rejects
+                                                AwaitingReview (see hand_spawn::spawn_reviewer).
                              release_manager  — Atlas-only Release steward; see docs/HAND_ARCHETYPES.md.
                              bug_hunter       — Triager+Surgeon hybrid; failing test → smallest diff.
                              performance_engineer
@@ -2200,6 +2333,21 @@ OPTIONS:
                              merger           — crew integrator (requires --crew).
   --crew <crew_id>         Attach the new Hand to an existing crew as a
                            member. Required when --role merger.
+  --author-actor <id>      (--role reviewer) Actor of the Hand whose work is
+                           under review. The reviewer is selected to be
+                           different from this actor.
+  --author-vendor <vendor> (--role reviewer) Vendor of the author (e.g.
+                           claude, codex). The selection prefers a
+                           cross-vendor reviewer and falls back to
+                           same-vendor with a reviewer_policy_relaxed
+                           event recorded on the spark.
+  --candidate <actor:vendor>
+                           (--role reviewer, repeatable) Reviewer pool
+                           entry. Pass one per candidate; the author is
+                           excluded automatically.
+  --seed <u64>             (--role reviewer) Deterministic tiebreaker for
+                           selection. Same inputs + same seed always
+                           produce the same reviewer. Default: 0.
 
 EFFECTS:
   1. Creates a git worktree at `.ryve/worktrees/<short>/` on branch
