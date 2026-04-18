@@ -22,47 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Identifying fields of the epic that owns the event. [`channel_name`]
-/// derives the IRC channel from this pair so every relay/UI/test agrees
-/// on the canonical name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EpicRef {
-    pub id: String,
-    pub name: String,
-}
-
-/// Derive the canonical channel name for an epic: `#epic-<id>-<slug>`.
-///
-/// The slug is the epic name lowercased, with every run of non-`[a-z0-9]`
-/// characters replaced by a single `-`, and leading/trailing `-` trimmed.
-/// Empty / all-symbol names produce `#epic-<id>` with no trailing dash.
-pub fn channel_name(epic: &EpicRef) -> String {
-    let slug = slugify(&epic.name);
-    if slug.is_empty() {
-        format!("#epic-{}", epic.id)
-    } else {
-        format!("#epic-{}-{}", epic.id, slug)
-    }
-}
-
-fn slugify(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut last_was_dash = true; // suppress leading dashes
-    for ch in name.chars() {
-        let normalised = ch.to_ascii_lowercase();
-        if normalised.is_ascii_alphanumeric() {
-            out.push(normalised);
-            last_was_dash = false;
-        } else if !last_was_dash {
-            out.push('-');
-            last_was_dash = true;
-        }
-    }
-    if out.ends_with('-') {
-        out.pop();
-    }
-    out
-}
+pub use crate::channel_manager::{EpicRef, channel_name};
 
 /// IRC commands the renderer can emit. v1 only ever produces
 /// [`IrcCommand::Privmsg`]; the enum exists so downstream code can
