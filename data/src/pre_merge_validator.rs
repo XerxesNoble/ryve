@@ -169,6 +169,21 @@ pub enum PreMergeError {
         source_kind: &'static str,
         target_kind: &'static str,
     },
+
+    /// The Epic has at least one assignment in the `Stuck` phase. The
+    /// Merger must not integrate an Epic whose child work is unrecovered
+    /// — a Head or Director has to run `ryve assign override` first.
+    /// The reason names the stuck assignment so operators can find it
+    /// without a second query.
+    #[error(
+        "refusing to merge epic `{epic_spark_id}`: \
+         assignment `{assignment_id}` is in phase `stuck` and must be \
+         recovered via `ryve assign override` before the merge can proceed"
+    )]
+    EpicHasStuckAssignment {
+        epic_spark_id: String,
+        assignment_id: String,
+    },
 }
 
 /// Validate that a merge of `source` into `target` is legal under the
@@ -247,6 +262,56 @@ pub fn validate_premerge(actor: &str, source: &str, target: &str) -> Result<(), 
         });
     }
     validate_merge(source, target)
+}
+
+/// Minimal snapshot of an assignment's merge-relevant state. The
+/// pre-merge validator is deliberately pure and does not depend on the
+/// `data::sparks` types; callers that carry a full `Assignment` pass in
+/// just the fields this gate needs.
+///
+/// `phase` is the string form emitted by
+/// [`AssignmentPhase::as_str`](crate::sparks::types::AssignmentPhase)
+/// — the comparison is done against the literal `"stuck"` so the
+/// validator stays decoupled from the `AssignmentPhase` enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentSnapshot {
+    pub assignment_id: String,
+    pub phase: String,
+}
+
+impl AssignmentSnapshot {
+    pub fn new(assignment_id: impl Into<String>, phase: impl Into<String>) -> Self {
+        Self {
+            assignment_id: assignment_id.into(),
+            phase: phase.into(),
+        }
+    }
+
+    pub fn is_stuck(&self) -> bool {
+        self.phase == "stuck"
+    }
+}
+
+/// Validate that an Epic is safe to merge from the assignment state
+/// perspective: reject if any attached assignment is in the `Stuck`
+/// phase. The returned error names the first stuck assignment id so the
+/// Merger can report a specific target for the required override.
+///
+/// The validator only looks at the snapshots it is handed — callers
+/// must fetch them first. This keeps the module pure (no database) and
+/// lets the Merger, a CI gate, and unit tests share the exact same
+/// rule.
+pub fn validate_epic_assignments(
+    epic_spark_id: &str,
+    assignments: &[AssignmentSnapshot],
+) -> Result<(), PreMergeError> {
+    if let Some(stuck) = assignments.iter().find(|a| a.is_stuck()) {
+        return Err(PreMergeError::EpicHasStuckAssignment {
+            epic_spark_id: epic_spark_id.to_string(),
+            assignment_id: stuck.assignment_id.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn kind_name(k: &BranchKind) -> &'static str {
@@ -431,5 +496,64 @@ mod tests {
     fn unknown_source_or_target_is_rejected() {
         assert!(validate_merge("some-detached-ref", "main").is_err());
         assert!(validate_merge("alice/abc12345", "").is_err());
+    }
+
+    // ── Stuck-assignment gate ────────────────────────────
+
+    #[test]
+    fn stuck_assignment_blocks_epic_merge_with_clear_reason() {
+        let assignments = vec![
+            AssignmentSnapshot::new("asgn-alpha", "in_progress"),
+            AssignmentSnapshot::new("asgn-beta", "stuck"),
+            AssignmentSnapshot::new("asgn-gamma", "awaiting_review"),
+        ];
+        let err = validate_epic_assignments("ryve-epic-1", &assignments).unwrap_err();
+        match err {
+            PreMergeError::EpicHasStuckAssignment {
+                epic_spark_id,
+                assignment_id,
+            } => {
+                assert_eq!(epic_spark_id, "ryve-epic-1");
+                assert_eq!(assignment_id, "asgn-beta");
+            }
+            other => panic!("expected EpicHasStuckAssignment, got {other:?}"),
+        }
+        // And the Display form names both the epic and the stuck assignment.
+        let rendered = format!(
+            "{}",
+            PreMergeError::EpicHasStuckAssignment {
+                epic_spark_id: "ryve-epic-1".into(),
+                assignment_id: "asgn-beta".into(),
+            }
+        );
+        assert!(
+            rendered.contains("ryve-epic-1") && rendered.contains("asgn-beta"),
+            "error text must identify the epic and the stuck assignment: {rendered}"
+        );
+    }
+
+    #[test]
+    fn epic_with_no_stuck_assignments_merges() {
+        let assignments = vec![
+            AssignmentSnapshot::new("asgn-1", "merged"),
+            AssignmentSnapshot::new("asgn-2", "approved"),
+            AssignmentSnapshot::new("asgn-3", "in_progress"),
+        ];
+        validate_epic_assignments("ryve-epic-2", &assignments).unwrap();
+    }
+
+    #[test]
+    fn epic_with_zero_assignments_merges() {
+        // A brand-new epic or a stale closed one may have no assignments
+        // attached yet — the stuck gate is a veto, not a liveness check.
+        validate_epic_assignments("ryve-epic-empty", &[]).unwrap();
+    }
+
+    #[test]
+    fn assignment_snapshot_is_stuck_matches_only_stuck_phase() {
+        assert!(AssignmentSnapshot::new("a", "stuck").is_stuck());
+        assert!(!AssignmentSnapshot::new("a", "in_progress").is_stuck());
+        assert!(!AssignmentSnapshot::new("a", "Stuck").is_stuck());
+        assert!(!AssignmentSnapshot::new("a", "").is_stuck());
     }
 }

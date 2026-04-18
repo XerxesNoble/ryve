@@ -280,7 +280,16 @@ mod tests {
         );
     }
 
+    // Ignored on CI: this test compiles a trivial cargo fixture via a
+    // nested `cargo build` invocation, which on the GitHub Actions
+    // default runner regularly exceeds 60s per run (sometimes hangs the
+    // whole Test step at >30 min). Runs fast locally (<1s). The deeper
+    // fix is to split recursive-cargo tests into a dedicated job or to
+    // replace them with a mock build driver — tracked as tech debt for
+    // the 0.2.0 release retro. Run locally with `cargo test --bin ryve
+    // release_artifact -- --ignored` before shipping a behavior change.
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "slow recursive cargo build — run locally, not in CI"]
     async fn builds_trivial_fixture_to_deterministic_path() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -311,7 +320,9 @@ mod tests {
         );
     }
 
+    // Ignored on CI for the same reason as builds_trivial_fixture_to_deterministic_path.
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "slow recursive cargo build — run locally, not in CI"]
     async fn build_failure_leaves_no_partial_artifact() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();

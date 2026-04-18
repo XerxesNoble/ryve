@@ -112,7 +112,7 @@ impl RyveDir {
 // ── Workshop Config ────────────────────────────────────
 
 /// Per-workshop configuration stored in `.ryve/config.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkshopConfig {
     /// Workshop schema version. Compared against
     /// [`crate::migrations::CURRENT_SCHEMA_VERSION`] on workshop open;
@@ -174,6 +174,20 @@ pub struct WorkshopConfig {
     pub irc_nick: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub irc_password: Option<String>,
+
+    /// Seconds between `HeartbeatReceived` emissions from an active Hand
+    /// assignment. Per-workshop override for the liveness loop; default
+    /// [`DEFAULT_HEARTBEAT_INTERVAL_SECS`]. Part of parent epic
+    /// ryve-cf05fd85 (liveness + stuck detection).
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+
+    /// Seconds past the last heartbeat after which the watchdog transitions
+    /// an assignment to `Stuck`. Per-workshop override; default
+    /// [`DEFAULT_STUCK_THRESHOLD_SECS`]. Part of parent epic
+    /// ryve-cf05fd85 (liveness + stuck detection).
+    #[serde(default = "default_stuck_threshold_secs")]
+    pub stuck_threshold_secs: u64,
 }
 
 impl WorkshopConfig {
@@ -204,6 +218,45 @@ impl WorkshopConfig {
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| "ryve".to_string())
     }
+}
+
+impl Default for WorkshopConfig {
+    fn default() -> Self {
+        Self {
+            workshop_schema_version: 0,
+            name: None,
+            github: GitHubConfig::default(),
+            layout: LayoutConfig::default(),
+            default_assignee: None,
+            default_owner: None,
+            explorer: ExplorerConfig::default(),
+            background: BackgroundConfig::default(),
+            agents: AgentsConfig::default(),
+            atlas_agent: None,
+            irc_server: None,
+            irc_port: None,
+            irc_tls: None,
+            irc_nick: None,
+            irc_password: None,
+            heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
+            stuck_threshold_secs: DEFAULT_STUCK_THRESHOLD_SECS,
+        }
+    }
+}
+
+/// Default heartbeat emission cadence for a Hand.
+pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+/// Default threshold after which the watchdog flags an assignment as
+/// `Stuck`. Chosen as 10x the heartbeat interval so a single missed beat
+/// does not escalate, but sustained silence does.
+pub const DEFAULT_STUCK_THRESHOLD_SECS: u64 = 300;
+
+fn default_heartbeat_interval_secs() -> u64 {
+    DEFAULT_HEARTBEAT_INTERVAL_SECS
+}
+
+fn default_stuck_threshold_secs() -> u64 {
+    DEFAULT_STUCK_THRESHOLD_SECS
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

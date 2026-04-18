@@ -69,7 +69,15 @@ jobs:
       # new-session).
       - name: Build vendored tmux
         run: ./scripts/build-vendored-tmux.sh
-      - run: cargo test --workspace
+      # --test-threads=1 is the stable setting on the default GitHub
+      # Actions runner. Several hand_spawn tests share global state
+      # (tmux sockets, env vars, filesystem paths) and race under any
+      # parallelism; --test-threads=2 produced non-deterministic
+      # failures across multiple runs. Default parallelism additionally
+      # exhausted the runner's pthread/ulimit budget. Trades wall time
+      # for reliability; tech debt: instrument the shared state and
+      # restore parallelism via #[serial] on the offenders.
+      - run: cargo test --workspace -- --test-threads=1
 
   bundled-tmux:
     name: Bundled tmux builds and runs

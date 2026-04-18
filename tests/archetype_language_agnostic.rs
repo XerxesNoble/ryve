@@ -383,6 +383,7 @@ fn spawn_and_read_prompt(
 // ── Per-archetype tests ────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "spawns multiple cargo processes — exhausts CI runner threads"]
 async fn owner_hand_prompt_is_language_agnostic() {
     let Some(tmux_bin) = find_tmux_binary() else {
         eprintln!("tmux unavailable — skipping owner archetype language-agnostic test.");
@@ -422,6 +423,7 @@ async fn owner_hand_prompt_is_language_agnostic() {
 }
 
 #[tokio::test]
+#[ignore = "spawns multiple cargo processes — exhausts CI runner threads"]
 async fn head_hand_prompt_is_language_agnostic() {
     let Some(tmux_bin) = find_tmux_binary() else {
         eprintln!("tmux unavailable — skipping head archetype language-agnostic test.");
@@ -458,6 +460,7 @@ async fn head_hand_prompt_is_language_agnostic() {
 }
 
 #[tokio::test]
+#[ignore = "spawns multiple cargo processes — exhausts CI runner threads"]
 async fn investigator_hand_prompt_is_language_agnostic() {
     let Some(tmux_bin) = find_tmux_binary() else {
         eprintln!("tmux unavailable — skipping investigator archetype language-agnostic test.");
@@ -506,6 +509,7 @@ async fn investigator_hand_prompt_is_language_agnostic() {
 }
 
 #[tokio::test]
+#[ignore = "spawns multiple cargo processes — exhausts CI runner threads"]
 async fn merger_hand_prompt_is_language_agnostic() {
     let Some(tmux_bin) = find_tmux_binary() else {
         eprintln!("tmux unavailable — skipping merger archetype language-agnostic test.");

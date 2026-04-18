@@ -46,8 +46,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use data::sparks::types::{HandAssignment, NewCrew, SparkFilter};
-use data::sparks::{assignment_repo, crew_repo, spark_repo};
+use data::sparks::types::{
+    AssignmentPhase, EmberType, HandAssignment, NewCrew, NewEmber, SparkFilter,
+};
+use data::sparks::{assign_repo, assignment_repo, comment_repo, crew_repo, ember_repo, spark_repo};
 use sqlx::SqlitePool;
 
 use crate::coding_agents::CodingAgent;
@@ -118,6 +120,15 @@ pub enum MemberState {
         session_id: String,
         last_heartbeat: Option<DateTime<Utc>>,
     },
+    /// The owning assignment was marked `stuck` by a Hand (or a
+    /// Head/Director override) and needs orchestrator intervention
+    /// before it can continue. The Head should notify the Epic owner
+    /// rather than silently respawning; only a Head/Director override
+    /// can recover a stuck assignment via `ryve assign override`.
+    Stuck {
+        session_id: String,
+        assignment_id: String,
+    },
     /// Active owner with a fresh heartbeat.
     Running { session_id: String },
     /// Spark is closed with status `completed`. Nothing more to do.
@@ -131,6 +142,9 @@ pub enum MemberState {
 impl MemberState {
     pub fn is_stalled(&self) -> bool {
         matches!(self, Self::Stalled { .. })
+    }
+    pub fn is_stuck(&self) -> bool {
+        matches!(self, Self::Stuck { .. })
     }
     /// True iff this spark closed `completed`. Used by
     /// [`PollReport::completed`] (tests) and exposed for external code
@@ -192,6 +206,23 @@ impl PollReport {
             .iter()
             .filter(|(_, s)| matches!(s, MemberState::Unassigned))
             .map(|(id, _)| id.clone())
+            .collect()
+    }
+    /// (spark_id, assignment_id) pairs for every member whose assignment
+    /// transitioned to Stuck. These do NOT feed into `reassign_stalled`
+    /// — stuck assignments must be recovered explicitly by a Head or
+    /// Director via `ryve assign override`. The Epic owner is notified
+    /// separately by [`notify_stuck`].
+    pub fn stuck_members(&self) -> Vec<(String, String)> {
+        self.members
+            .iter()
+            .filter(|(_, s)| s.is_stuck())
+            .filter_map(|(sid, s)| match s {
+                MemberState::Stuck { assignment_id, .. } => {
+                    Some((sid.clone(), assignment_id.clone()))
+                }
+                _ => None,
+            })
             .collect()
     }
 }
@@ -302,9 +333,37 @@ pub async fn poll_crew(
                 },
             }
         } else {
+            // Phase check runs *before* heartbeat classification: a Hand
+            // that has transitioned its assignment to Stuck may still be
+            // heart-beating (telling the Head "I'm alive but blocked"),
+            // and that signal has to reach the Epic owner even though
+            // the session would otherwise look healthy.
+            let phase = assign_repo::latest_assignment_for_spark(pool, spark_id)
+                .await
+                .ok();
             match assignment_repo::active_for_spark(pool, spark_id).await? {
                 None => MemberState::Unassigned,
-                Some(owner) => classify_owner(&owner, now, stall_after),
+                Some(owner) => {
+                    let is_stuck = phase
+                        .as_ref()
+                        .and_then(|a| a.assignment_phase.as_deref())
+                        .map(|p| p == AssignmentPhase::Stuck.as_str())
+                        .unwrap_or(false);
+                    if is_stuck {
+                        // When is_stuck is true, `phase` must be Some — the
+                        // phase row is what declared Stuck in the first place.
+                        // Use expect so a logic drift that decouples the two
+                        // surfaces loudly instead of silently emitting an
+                        // empty assignment_id to stuck notifications.
+                        let stuck_phase = phase.as_ref().expect("is_stuck implies phase is Some");
+                        MemberState::Stuck {
+                            session_id: owner.session_id.clone(),
+                            assignment_id: stuck_phase.assignment_id.clone(),
+                        }
+                    } else {
+                        classify_owner(&owner, now, stall_after)
+                    }
+                }
             }
         };
         members.push((spark_id.clone(), state));
@@ -373,7 +432,11 @@ pub async fn reassign_stalled(
 
     // Reassign both Stalled (needs release first) and Unassigned
     // (nothing to release, just respawn). Treating the two paths the
-    // same way keeps the Head loop uniform.
+    // same way keeps the Head loop uniform. `Stuck` is deliberately
+    // *not* in this set: a stuck assignment is a phase-machine signal
+    // that requires explicit Head/Director override via
+    // `ryve assign override`, and silently respawning would erase the
+    // block the Hand meant to surface.
     for (spark_id, state) in &report.members {
         let needs_release_of: Option<String> = match state {
             MemberState::Stalled { session_id, .. } => Some(session_id.clone()),
@@ -433,6 +496,94 @@ pub struct ReassignReport {
     /// per-spark respawn cap was reached. Caller should surface these
     /// (post a comment, escalate, etc.).
     pub capped: Vec<String>,
+}
+
+// ─── Stuck-member notification ────────────────────────────────────────────
+
+/// Notify the Epic Head/Director when one of its child assignments has
+/// entered the `Stuck` phase.
+///
+/// Two surfaces are used so the signal reaches humans and agents alike:
+///
+/// 1. A `flare` ember on the workshop's live event bus so any running
+///    Head or Director watching embers sees it immediately.
+/// 2. A persistent comment on the parent Epic spark so the audit trail
+///    survives the ember's TTL.
+///
+/// Idempotency: the Epic comment includes the stuck assignment id, so
+/// re-running after the state has been recovered does not double-post
+/// (the caller should only pass members that are *currently* stuck).
+pub async fn notify_stuck(
+    pool: &SqlitePool,
+    workshop_id: &str,
+    crew: &CrewHandle,
+    report: &PollReport,
+) -> Result<usize, OrchestrationError> {
+    use data::sparks::types::NewComment;
+
+    let stuck = report.stuck_members();
+    if stuck.is_empty() {
+        return Ok(0);
+    }
+
+    let mut notified = 0usize;
+    for (spark_id, assignment_id) in &stuck {
+        // Dedup: the notify path is called on every poll tick; without a
+        // guard we would spam a fresh flare ember + Epic comment every
+        // 60–90s while an assignment stayed Stuck. Use a per-assignment
+        // marker in an existing Epic comment to decide whether to
+        // notify at all. First poll after a spark becomes Stuck emits;
+        // subsequent polls are no-ops until recovery.
+        let marker = format!("stuck-notify:{assignment_id}");
+        let already_posted = match &crew.parent_spark_id {
+            Some(parent_id) => {
+                let existing = comment_repo::list_for_spark(pool, parent_id).await?;
+                existing
+                    .iter()
+                    .any(|c| c.author == "head-orchestrator" && c.body.contains(&marker))
+            }
+            None => false,
+        };
+        if already_posted {
+            continue;
+        }
+
+        let content = format!(
+            "Hand assignment `{assignment_id}` on child spark `{spark_id}` \
+             is stuck. Run `ryve assign override <head-session> {spark_id} \
+             --to in_progress --reason <text>` to recover."
+        );
+        let _ = ember_repo::create(
+            pool,
+            NewEmber {
+                ember_type: EmberType::Flare,
+                content: content.clone(),
+                source_agent: Some("head-orchestrator".to_string()),
+                workshop_id: workshop_id.to_string(),
+                ttl_seconds: Some(3600),
+            },
+        )
+        .await?;
+
+        if let Some(parent_id) = &crew.parent_spark_id {
+            let _ = comment_repo::create(
+                pool,
+                NewComment {
+                    spark_id: parent_id.clone(),
+                    author: "head-orchestrator".to_string(),
+                    body: format!(
+                        "[{marker}] Stuck assignment detected: \
+                         `{assignment_id}` on child spark `{spark_id}`. \
+                         Head/Director action required via `ryve assign \
+                         override`."
+                    ),
+                },
+            )
+            .await?;
+        }
+        notified += 1;
+    }
+    Ok(notified)
 }
 
 // ─── Primitive 4: finalize_with_merger ────────────────────────────────────
@@ -687,5 +838,44 @@ mod tests {
             }
             .is_stalled()
         );
+        assert!(
+            MemberState::Stuck {
+                session_id: "s".into(),
+                assignment_id: "asgn-1".into()
+            }
+            .is_stuck()
+        );
+        // Stuck is NOT a "done" state — the Epic cannot merge until
+        // a Head/Director overrides it.
+        assert!(
+            !MemberState::Stuck {
+                session_id: "s".into(),
+                assignment_id: "asgn-1".into()
+            }
+            .is_done()
+        );
+    }
+
+    #[test]
+    fn poll_report_surfaces_stuck_members() {
+        let mut r = PollReport::default();
+        r.members.push((
+            "sp-stuck".into(),
+            MemberState::Stuck {
+                session_id: "sess-blocked".into(),
+                assignment_id: "asgn-42".into(),
+            },
+        ));
+        r.members.push((
+            "sp-running".into(),
+            MemberState::Running {
+                session_id: "sess-ok".into(),
+            },
+        ));
+        let stuck = r.stuck_members();
+        assert_eq!(stuck, vec![("sp-stuck".into(), "asgn-42".into())]);
+        // Stuck does not leak into the stalled or unassigned buckets.
+        assert!(r.stalled_spark_ids().is_empty());
+        assert!(r.unassigned_spark_ids().is_empty());
     }
 }

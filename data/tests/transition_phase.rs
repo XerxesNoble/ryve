@@ -1,6 +1,9 @@
 use data::sparks::error::TransitionError;
+use data::sparks::heartbeat_watchdog::{
+    LIVENESS_TRANSITIONED_EVENT_TYPE, LivenessTransitionedPayload,
+};
 use data::sparks::transition;
-use data::sparks::types::{AssignmentPhase, TransitionActorRole};
+use data::sparks::types::{AssignmentLiveness, AssignmentPhase, TransitionActorRole};
 
 async fn seed_assignment(pool: &sqlx::SqlitePool) -> i64 {
     sqlx::query(
@@ -283,4 +286,330 @@ async fn reviewer_distinct_from_author_can_approve(pool: sqlx::SqlitePool) {
         Some("actor-reviewer-9")
     );
     assert_eq!(updated.phase_actor_role.as_deref(), Some("reviewer_hand"));
+}
+
+// ── Repair-cycle counter + stuck escalation ────────────
+
+/// Walk a freshly-seeded assignment through
+/// Assigned → InProgress → AwaitingReview → Rejected and stop there so the
+/// repair-cycle tests can drive the Rejected → InRepair edge in isolation.
+/// Returns the assignment's integer primary key and the reviewer actor id
+/// so callers can keep pushing the state machine forward.
+async fn walk_to_rejected(pool: &sqlx::SqlitePool) -> (i64, &'static str) {
+    let assignment_id = seed_assignment(pool).await;
+    let reviewer = "actor-reviewer-42";
+
+    transition::transition_assignment_phase(
+        pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::InProgress,
+        AssignmentPhase::Assigned,
+        1,
+    )
+    .await
+    .expect("start work");
+    transition::transition_assignment_phase(
+        pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::AwaitingReview,
+        AssignmentPhase::InProgress,
+        2,
+    )
+    .await
+    .expect("submit for review");
+    transition::transition_assignment_phase(
+        pool,
+        assignment_id,
+        reviewer,
+        TransitionActorRole::ReviewerHand,
+        AssignmentPhase::Rejected,
+        AssignmentPhase::AwaitingReview,
+        3,
+    )
+    .await
+    .expect("reviewer rejects");
+
+    (assignment_id, reviewer)
+}
+
+async fn read_repair_count(pool: &sqlx::SqlitePool, assignment_id: i64) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT repair_cycle_count FROM assignments WHERE id = ?")
+        .bind(assignment_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn read_liveness(pool: &sqlx::SqlitePool, assignment_id: i64) -> AssignmentLiveness {
+    let s: String = sqlx::query_scalar("SELECT liveness FROM assignments WHERE id = ?")
+        .bind(assignment_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    AssignmentLiveness::from_str(&s).unwrap_or_else(|| panic!("unknown liveness {s:?}"))
+}
+
+/// A single Rejected → InRepair transition increments repair_cycle_count
+/// from 0 to 1 and, under the default limit of 3, does not escalate
+/// liveness. No canonical Stuck event should hit the outbox yet.
+#[sqlx::test]
+async fn rejected_to_in_repair_increments_repair_cycle_counter(pool: sqlx::SqlitePool) {
+    let (assignment_id, _reviewer) = walk_to_rejected(&pool).await;
+    assert_eq!(read_repair_count(&pool, assignment_id).await, 0);
+
+    transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::InRepair,
+        AssignmentPhase::Rejected,
+        4,
+    )
+    .await
+    .expect("enter repair");
+
+    assert_eq!(read_repair_count(&pool, assignment_id).await, 1);
+    assert_eq!(
+        read_liveness(&pool, assignment_id).await,
+        AssignmentLiveness::Healthy,
+        "under the repair_cycle_limit, liveness must remain Healthy"
+    );
+
+    let outbox_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_outbox \
+         WHERE assignment_id = (SELECT assignment_id FROM assignments WHERE id = ?) \
+         AND event_type = ?",
+    )
+    .bind(assignment_id)
+    .bind(LIVENESS_TRANSITIONED_EVENT_TYPE)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        outbox_count, 0,
+        "no LivenessTransitioned event should be emitted below the limit"
+    );
+}
+
+/// Exceeding workshop.repair_cycle_limit during a Rejected → InRepair
+/// transition must escalate the assignment to Stuck and emit the
+/// canonical LivenessTransitioned outbox row so downstream subscribers
+/// (IRC, projector) see the same event the watchdog writes.
+#[sqlx::test]
+async fn repair_cycle_limit_escalates_to_stuck_with_canonical_event(pool: sqlx::SqlitePool) {
+    let (assignment_id, reviewer) = walk_to_rejected(&pool).await;
+
+    // Default repair_cycle_limit is 3. Walk through Rejected → InRepair
+    // → AwaitingReview → Rejected three times so `repair_cycle_count`
+    // reaches 3 while liveness stays Healthy — the escalation fires
+    // only on the fourth re-entry into InRepair.
+    let mut version: i64 = 4;
+    for _ in 0..3 {
+        transition::transition_assignment_phase(
+            &pool,
+            assignment_id,
+            "sess-trans-01",
+            TransitionActorRole::Hand,
+            AssignmentPhase::InRepair,
+            AssignmentPhase::Rejected,
+            version,
+        )
+        .await
+        .expect("enter repair");
+        version += 1;
+        transition::transition_assignment_phase(
+            &pool,
+            assignment_id,
+            "sess-trans-01",
+            TransitionActorRole::Hand,
+            AssignmentPhase::AwaitingReview,
+            AssignmentPhase::InRepair,
+            version,
+        )
+        .await
+        .expect("resubmit for review");
+        version += 1;
+        transition::transition_assignment_phase(
+            &pool,
+            assignment_id,
+            reviewer,
+            TransitionActorRole::ReviewerHand,
+            AssignmentPhase::Rejected,
+            AssignmentPhase::AwaitingReview,
+            version,
+        )
+        .await
+        .expect("reviewer rejects again");
+        version += 1;
+    }
+    assert_eq!(read_repair_count(&pool, assignment_id).await, 3);
+    assert_eq!(
+        read_liveness(&pool, assignment_id).await,
+        AssignmentLiveness::Healthy,
+        "reaching the limit exactly must not escalate — only exceeding it"
+    );
+
+    // The fourth Rejected → InRepair pushes repair_cycle_count to 4,
+    // which is > 3 and therefore triggers the Stuck escalation.
+    transition::transition_assignment_phase(
+        &pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::InRepair,
+        AssignmentPhase::Rejected,
+        version,
+    )
+    .await
+    .expect("enter repair, exceeding limit");
+
+    assert_eq!(read_repair_count(&pool, assignment_id).await, 4);
+    assert_eq!(
+        read_liveness(&pool, assignment_id).await,
+        AssignmentLiveness::Stuck,
+        "exceeding repair_cycle_limit must escalate liveness to Stuck"
+    );
+
+    let rows = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT event_type, payload, actor_id FROM event_outbox \
+         WHERE assignment_id = (SELECT assignment_id FROM assignments WHERE id = ?) \
+         ORDER BY timestamp ASC",
+    )
+    .bind(assignment_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one canonical LivenessTransitioned row expected, got {rows:?}"
+    );
+    assert_eq!(rows[0].0, LIVENESS_TRANSITIONED_EVENT_TYPE);
+    assert_eq!(
+        rows[0].2,
+        transition::REPAIR_CYCLE_ESCALATION_ACTOR,
+        "actor_id distinguishes the repair-cycle escalation from watchdog traffic"
+    );
+
+    let payload: LivenessTransitionedPayload = serde_json::from_str(&rows[0].1).unwrap();
+    assert_eq!(payload.to_liveness, AssignmentLiveness::Stuck);
+    assert_eq!(payload.spark_id, "sp-trans-1");
+    assert_eq!(
+        payload.age_secs, 4,
+        "payload surfaces the repair_cycle_count that tripped the escalation"
+    );
+}
+
+/// Exceeding a caller-supplied repair_cycle_limit works identically to
+/// the default path — verifies `transition_assignment_phase_with_limit`
+/// honours workshop.repair_cycle_limit.
+#[sqlx::test]
+async fn custom_repair_cycle_limit_escalates_at_boundary(pool: sqlx::SqlitePool) {
+    let (assignment_id, _reviewer) = walk_to_rejected(&pool).await;
+
+    // Limit = 0 means the very first Rejected → InRepair (count becomes
+    // 1) exceeds the limit, so escalation must fire immediately.
+    transition::transition_assignment_phase_with_limit(
+        &pool,
+        transition::PhaseTransitionArgs {
+            assignment_id,
+            actor_id: "sess-trans-01",
+            actor_role: TransitionActorRole::Hand,
+            target_phase: AssignmentPhase::InRepair,
+            expected_previous_phase: AssignmentPhase::Rejected,
+            event_version: 4,
+            repair_cycle_limit: 0,
+        },
+    )
+    .await
+    .expect("custom-limit transition");
+
+    assert_eq!(read_repair_count(&pool, assignment_id).await, 1);
+    assert_eq!(
+        read_liveness(&pool, assignment_id).await,
+        AssignmentLiveness::Stuck
+    );
+}
+
+/// A Hand calling the direct liveness-to-Stuck API must be rejected with
+/// `Unauthorized` — Stuck is only emittable by watchdog (its own path)
+/// or by Head/Director overrides.
+#[sqlx::test]
+async fn hand_cannot_self_transition_to_stuck(pool: sqlx::SqlitePool) {
+    let assignment_id = seed_assignment(&pool).await;
+
+    let err = transition::transition_liveness_to_stuck(
+        &pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+    )
+    .await
+    .expect_err("Hand must not be able to self-transition to Stuck");
+
+    match err {
+        TransitionError::Unauthorized { role, to, .. } => {
+            assert_eq!(role, "hand");
+            assert_eq!(to, "stuck");
+        }
+        other => panic!("expected Unauthorized, got {other:?}"),
+    }
+
+    assert_eq!(
+        read_liveness(&pool, assignment_id).await,
+        AssignmentLiveness::Healthy,
+        "liveness must not mutate after a rejected Hand request"
+    );
+
+    let outbox_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_outbox \
+         WHERE assignment_id = (SELECT assignment_id FROM assignments WHERE id = ?)",
+    )
+    .bind(assignment_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outbox_count, 0, "rejected request must not emit outbox row");
+}
+
+/// A Head/Director override is allowed to drive the Stuck transition
+/// directly. This covers the recovery/override path named in the parent
+/// epic without needing the watchdog or a repair-cycle breach.
+#[sqlx::test]
+async fn head_override_can_transition_to_stuck(pool: sqlx::SqlitePool) {
+    let assignment_id = seed_assignment(&pool).await;
+
+    transition::transition_liveness_to_stuck(
+        &pool,
+        assignment_id,
+        "head-oncall-7",
+        TransitionActorRole::Head,
+    )
+    .await
+    .expect("Head override must succeed");
+
+    assert_eq!(
+        read_liveness(&pool, assignment_id).await,
+        AssignmentLiveness::Stuck
+    );
+
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT event_type, actor_id FROM event_outbox \
+         WHERE assignment_id = (SELECT assignment_id FROM assignments WHERE id = ?)",
+    )
+    .bind(assignment_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, LIVENESS_TRANSITIONED_EVENT_TYPE);
+    assert_eq!(
+        rows[0].1, "head-oncall-7",
+        "override path stamps the caller's actor_id"
+    );
 }

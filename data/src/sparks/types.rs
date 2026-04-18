@@ -703,6 +703,53 @@ impl AssignmentStatus {
     }
 }
 
+/// Derived health of an active assignment. The watchdog transitions an
+/// assignment through these states based on heartbeat age and repair-cycle
+/// count; the value is persisted in `assignments.liveness` so the
+/// state machine stays authoritative across restarts.
+///
+/// The `HeartbeatReceived` event variant that feeds this state lives on
+/// the outbox `Event` enum in [`super::projector::Event`] — the projector
+/// is the authoritative consumer, so the variant stays next to its
+/// reducer. See parent epic `ryve-cf05fd85`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentLiveness {
+    /// Heartbeats are arriving within the healthy window.
+    Healthy,
+    /// Heartbeat age has exceeded 2x the heartbeat interval but not yet
+    /// the stuck threshold. Observability-only: no merge gating yet.
+    AtRisk,
+    /// Heartbeat age or repair-cycle count exceeded the configured
+    /// thresholds. The companion `assignment_phase` is also flipped to
+    /// `Stuck`, and it is the **phase** check (in
+    /// `data/src/pre_merge_validator.rs`) that actually blocks merges —
+    /// not this liveness value. A Head/Director override
+    /// (`assign_repo::override_stuck_to_in_progress`) returns the phase
+    /// to `InProgress` and the assignment can re-enter the merge path.
+    Stuck,
+}
+
+impl AssignmentLiveness {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::AtRisk => "at_risk",
+            Self::Stuck => "stuck",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "healthy" => Some(Self::Healthy),
+            "at_risk" => Some(Self::AtRisk),
+            "stuck" => Some(Self::Stuck),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssignmentRole {
@@ -797,6 +844,8 @@ pub struct Assignment {
     /// PR number of the GitHub artifact mirroring this assignment.
     /// See [`github_artifact_branch`](Self::github_artifact_branch).
     pub github_artifact_pr_number: Option<i64>,
+    pub repair_cycle_count: i64,
+    pub liveness: String,
 }
 
 impl Assignment {
@@ -848,6 +897,11 @@ pub enum AssignmentPhase {
     InRepair,
     ReadyForMerge,
     Merged,
+    /// The assignment has become unworkable and needs orchestrator
+    /// intervention. A `Stuck` assignment blocks its Epic from merging;
+    /// only a Head or Director override can recover it back to
+    /// `InProgress` (see `assign_repo::override_stuck_to_in_progress`).
+    Stuck,
 }
 
 impl AssignmentPhase {
@@ -861,6 +915,7 @@ impl AssignmentPhase {
             Self::InRepair => "in_repair",
             Self::ReadyForMerge => "ready_for_merge",
             Self::Merged => "merged",
+            Self::Stuck => "stuck",
         }
     }
 
@@ -875,6 +930,7 @@ impl AssignmentPhase {
             "in_repair" => Some(Self::InRepair),
             "ready_for_merge" => Some(Self::ReadyForMerge),
             "merged" => Some(Self::Merged),
+            "stuck" => Some(Self::Stuck),
             _ => None,
         }
     }
@@ -888,6 +944,7 @@ impl AssignmentPhase {
         Self::InRepair,
         Self::ReadyForMerge,
         Self::Merged,
+        Self::Stuck,
     ];
 }
 
@@ -1655,6 +1712,7 @@ mod tests {
 
     #[test]
     fn assignment_phase_all_has_expected_count() {
-        assert_eq!(AssignmentPhase::ALL.len(), 8);
+        // 8 core phases + Stuck = 9.
+        assert_eq!(AssignmentPhase::ALL.len(), 9);
     }
 }
