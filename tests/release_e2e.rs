@@ -69,6 +69,15 @@ fn fresh_workshop() -> PathBuf {
         .expect("spawn ryve init");
     assert!(status.success(), "ryve init failed in {root:?}");
 
+    // `ryve init` writes RYVE.md (and may write other onboarding files in
+    // future); commit anything it produced so the working tree is clean
+    // before `ryve release create`, which refuses dirty trees.
+    git(&root, &["add", "."]);
+    let porcelain_after_add = git_output(&root, &["status", "--porcelain"]);
+    if !porcelain_after_add.is_empty() {
+        git(&root, &["commit", "-m", "ryve init"]);
+    }
+
     let porcelain = git_output(&root, &["status", "--porcelain"]);
     assert!(
         porcelain.is_empty(),

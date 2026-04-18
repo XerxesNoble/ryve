@@ -1482,6 +1482,70 @@ pub struct WatchFilter {
     pub target_spark_id: Option<String>,
 }
 
+// ── IRC Message ───────────────────────────────────────
+//
+// Durable record of a single IRC event delivered to a channel. Feeds the
+// UI's channel view, the crew / epic replay log, and the adversarial-review
+// audit trail. IRC messages are append-only — they are never edited or
+// deleted (spark `sp-ddf6fd7f` non-goal).
+
+/// One IRC command Ryve accepts from the relay. The FTS / search path is
+/// indifferent to the command, but persistence stores it so consumers can
+/// filter a channel's topic history from its privmsg traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum IrcCommand {
+    Privmsg,
+    Notice,
+    Topic,
+}
+
+impl IrcCommand {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Privmsg => "PRIVMSG",
+            Self::Notice => "NOTICE",
+            Self::Topic => "TOPIC",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "PRIVMSG" => Some(Self::Privmsg),
+            "NOTICE" => Some(Self::Notice),
+            "TOPIC" => Some(Self::Topic),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct IrcMessage {
+    pub id: i64,
+    pub epic_id: String,
+    pub channel: String,
+    pub irc_message_id: String,
+    pub sender_actor_id: Option<String>,
+    pub command: String,
+    pub raw_text: String,
+    pub structured_event_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Input payload for [`irc_repo::insert_message`]. `id` and `created_at`
+/// are assigned by the repo at insert time.
+#[derive(Debug, Clone)]
+pub struct NewIrcMessage {
+    pub epic_id: String,
+    pub channel: String,
+    pub irc_message_id: String,
+    pub sender_actor_id: Option<String>,
+    pub command: IrcCommand,
+    pub raw_text: String,
+    pub structured_event_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
