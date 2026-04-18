@@ -1,0 +1,25 @@
+{
+  "action": "opened",
+  "number": 42,
+  "pull_request": {
+    "number": 42,
+    "state": "open",
+    "merged": false,
+    "head": {
+      "ref": "feat/mirror-translator",
+      "sha": "abc123def456"
+    },
+    "base": {
+      "ref": "main"
+    },
+    "user": {
+      "login": "alice"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  },
+  "sender": {
+    "login": "alice"
+  }
+}

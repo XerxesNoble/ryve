@@ -1,0 +1,16 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 101
+  },
+  "comment": {
+    "id": 8888,
+    "body": "This is a plain issue, not a PR.",
+    "user": {
+      "login": "frank"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

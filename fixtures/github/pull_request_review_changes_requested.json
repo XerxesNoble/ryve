@@ -1,0 +1,25 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 9002,
+    "state": "changes_requested",
+    "body": "Please address the comments.",
+    "user": {
+      "login": "carol"
+    },
+    "commit_id": "fed987cba321"
+  },
+  "pull_request": {
+    "number": 42,
+    "state": "open",
+    "head": {
+      "ref": "feat/mirror-translator"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

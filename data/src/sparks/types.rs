@@ -788,6 +788,34 @@ pub struct Assignment {
     pub phase_changed_by: Option<String>,
     pub phase_actor_role: Option<String>,
     pub phase_event_id: Option<i64>,
+    /// Head branch of the pushed GitHub artifact mirroring this
+    /// assignment. Populated once the applier has opened (or adopted)
+    /// a PR — `None` until then. Stored together with
+    /// [`github_artifact_pr_number`](Self::github_artifact_pr_number);
+    /// use [`Assignment::github_artifact`] for the typed pair.
+    pub github_artifact_branch: Option<String>,
+    /// PR number of the GitHub artifact mirroring this assignment.
+    /// See [`github_artifact_branch`](Self::github_artifact_branch).
+    pub github_artifact_pr_number: Option<i64>,
+}
+
+impl Assignment {
+    /// Typed view of the GitHub artifact columns. Returns `Some` only
+    /// when both `github_artifact_branch` and `github_artifact_pr_number`
+    /// are populated — a half-populated row is treated as "no artifact
+    /// yet" because downstream code always needs both halves together.
+    pub fn github_artifact(&self) -> Option<crate::github::GitHubArtifactRef> {
+        match (
+            self.github_artifact_branch.as_deref(),
+            self.github_artifact_pr_number,
+        ) {
+            (Some(branch), Some(pr_number)) => Some(crate::github::GitHubArtifactRef {
+                branch: branch.to_string(),
+                pr_number,
+            }),
+            _ => None,
+        }
+    }
 }
 
 pub struct NewAssignment {

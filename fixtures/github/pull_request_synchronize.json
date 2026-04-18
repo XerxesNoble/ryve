@@ -1,0 +1,21 @@
+{
+  "action": "synchronize",
+  "number": 42,
+  "before": "abc123def456",
+  "after": "fed987cba321",
+  "pull_request": {
+    "number": 42,
+    "state": "open",
+    "merged": false,
+    "head": {
+      "ref": "feat/mirror-translator",
+      "sha": "fed987cba321"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}
