@@ -1,0 +1,24 @@
+{
+  "action": "completed",
+  "check_run": {
+    "id": 556,
+    "name": "ci/test",
+    "status": "completed",
+    "conclusion": "failure",
+    "head_sha": "fed987cba321",
+    "pull_requests": [
+      {
+        "number": 42,
+        "head": {
+          "ref": "feat/mirror-translator"
+        },
+        "base": {
+          "ref": "main"
+        }
+      }
+    ]
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

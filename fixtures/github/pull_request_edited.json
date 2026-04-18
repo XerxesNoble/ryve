@@ -1,0 +1,24 @@
+{
+  "action": "edited",
+  "number": 42,
+  "changes": {
+    "title": {
+      "from": "Old title"
+    }
+  },
+  "pull_request": {
+    "number": 42,
+    "state": "open",
+    "merged": false,
+    "head": {
+      "ref": "feat/mirror-translator",
+      "sha": "abc123def456"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

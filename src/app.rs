@@ -241,6 +241,12 @@ pub(crate) enum Message {
     /// and dropped its DB handle by the time this fires.
     /// Spark ryve-cc1ed0af [sp-20ffacac].
     WatchRunnerStopped,
+    /// The IRC runtime's graceful shutdown finished. Emitted from
+    /// `do_close_workshop` once the relay drained its pending outbox and
+    /// the client sent `QUIT :bye`. Carries no payload and performs no
+    /// state mutation — it just gives the batched-close `Task::batch` a
+    /// terminal message for the IRC arm. Spark ryve-5a0e1d97 [sp-ddf6fd7f].
+    IrcRuntimeStopped,
     /// Dead-session reconciliation completed. Carries the session IDs whose
     /// `agent_sessions` rows were ended and `hand_assignments` were
     /// abandoned. Spark `ryve-a677498c`.
@@ -483,6 +489,7 @@ impl std::fmt::Debug for Message {
             }
             Self::AgentSessionSaved => write!(f, "AgentSessionSaved"),
             Self::WatchRunnerStopped => write!(f, "WatchRunnerStopped"),
+            Self::IrcRuntimeStopped => write!(f, "IrcRuntimeStopped"),
             Self::DeadSessionsReconciled(ids) => {
                 write!(f, "DeadSessionsReconciled({} sessions)", ids.len())
             }
@@ -737,6 +744,22 @@ impl App {
                 )
             })
             .unwrap_or(Task::none());
+        // Spark ryve-5a0e1d97 [sp-ddf6fd7f]: tear down the IRC subsystem.
+        // The runtime drives a final outbox drain and sends QUIT on the
+        // client before returning — no orphaned connection is left behind.
+        let stop_irc_runtime = self
+            .workshops
+            .get(idx)
+            .and_then(|ws| ws.irc_runtime.lock().ok().and_then(|mut s| s.take()))
+            .map(|runtime| {
+                Task::perform(
+                    async move {
+                        runtime.shutdown().await;
+                    },
+                    |_| Message::IrcRuntimeStopped,
+                )
+            })
+            .unwrap_or(Task::none());
         self.workshops.remove(idx);
         if self.workshops.is_empty() {
             self.active_workshop = None;
@@ -747,7 +770,7 @@ impl App {
                 self.active_workshop = Some(idx.min(self.workshops.len() - 1));
             }
         }
-        Task::batch([snapshot, kill_agents, stop_watch_runner])
+        Task::batch([snapshot, kill_agents, stop_watch_runner, stop_irc_runtime])
     }
 
     /// Push a new toast onto the stack and return a `Task` that will
@@ -1003,6 +1026,8 @@ impl App {
             Message::AgentSessionSaved => Task::none(),
 
             Message::WatchRunnerStopped => Task::none(),
+
+            Message::IrcRuntimeStopped => Task::none(),
 
             Message::DeadSessionsReconciled(session_ids) => {
                 // The DB rows are already updated — the next poll cycle's
@@ -1487,6 +1512,74 @@ impl App {
             }
             ws.prev_blocked_spark_ids = current_blocked;
             ws.sparks_baseline_seen = true;
+
+            // Spark ryve-5a0e1d97 [sp-ddf6fd7f]: auto-create an IRC
+            // channel for every newly-observed open epic. Every path
+            // that creates an epic (UI form, CLI, GitHub sync) ends
+            // up rewriting `ws.sparks` through this handler, so a diff
+            // against `irc_known_epic_ids` catches them all without a
+            // dedicated signal. `ensure_channel` is idempotent on the
+            // IRC side, but we still gate on the set to avoid spamming
+            // JOIN on every 3-second poll.
+            let runtime_arc = Arc::clone(&ws.irc_runtime);
+            // Gate the "known" bookkeeping on the runtime being ready.
+            // If IRC boot is still in progress (runtime is None), skip
+            // the insert entirely so the next tick picks up these
+            // epics and calls `ensure_channel` once a client exists.
+            // Without this, an epic seen during boot would be
+            // permanently marked "known" but never get its channel.
+            let runtime_ready = ws
+                .irc_runtime
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|_| ()))
+                .is_some();
+            let mut new_epics: Vec<ipc::channel_manager::Epic> = Vec::new();
+            for sp in &sparks {
+                if sp.spark_type != "epic" {
+                    continue;
+                }
+                if sp.status == "closed" {
+                    continue;
+                }
+                if !runtime_ready {
+                    continue;
+                }
+                if ws.irc_known_epic_ids.insert(sp.id.clone()) {
+                    new_epics.push(ipc::channel_manager::Epic {
+                        id: sp.id.clone(),
+                        name: sp.title.clone(),
+                        status: sp.status.clone(),
+                    });
+                }
+            }
+            // Also forget epics that have since closed so that if they
+            // reopen we'll re-announce them on the next tick.
+            let live_open: HashSet<String> = sparks
+                .iter()
+                .filter(|s| s.spark_type == "epic" && s.status != "closed")
+                .map(|s| s.id.clone())
+                .collect();
+            ws.irc_known_epic_ids.retain(|id| live_open.contains(id));
+            if !new_epics.is_empty() {
+                tokio::spawn(async move {
+                    let client = {
+                        let guard = match runtime_arc.lock() {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                        guard.as_ref().map(|rt| Arc::clone(rt.client()))
+                    };
+                    let Some(client) = client else {
+                        return;
+                    };
+                    for epic in &new_epics {
+                        if let Err(e) = ipc::channel_manager::ensure_channel(&client, epic).await {
+                            log::warn!("irc: failed to ensure channel for epic {}: {e}", epic.id);
+                        }
+                    }
+                });
+            }
             // Replace (not append) so Refresh never duplicates
             // entries. Invariant from spark ryve-7805b38b.
             ws.sparks = sparks;
@@ -3159,6 +3252,48 @@ impl App {
                     pool.clone(),
                     crate::watch_runner::tick_interval_from_env(),
                 ));
+            }
+            // Spark ryve-5a0e1d97 [sp-ddf6fd7f]: start the IRC subsystem
+            // if the workshop has `irc_server` configured. Opt-in per
+            // workshop — without config the runtime is never constructed
+            // and the rest of the app proceeds normally. Connect failure
+            // is non-fatal: a flare ember is persisted and the workshop
+            // keeps running without IRC.
+            let ws_id_for_irc = ws.workshop_id();
+            if let Some(irc_cfg) =
+                ipc::lifecycle::IrcLifecycleConfig::from_workshop(&config, &ws_id_for_irc)
+            {
+                let runtime_slot = Arc::clone(&ws.irc_runtime);
+                let pool_for_irc = pool.clone();
+                let workshop_id_for_irc = ws_id_for_irc.clone();
+                tokio::spawn(async move {
+                    let executor: Arc<dyn ipc::irc_command_parser::CommandExecutor> =
+                        Arc::new(ipc::lifecycle::LoggingExecutor);
+                    match ipc::lifecycle::IrcRuntime::start(pool_for_irc.clone(), irc_cfg, executor)
+                        .await
+                    {
+                        Ok(runtime) => {
+                            if let Ok(mut slot) = runtime_slot.lock() {
+                                *slot = Some(runtime);
+                            }
+                            log::info!(
+                                "irc: workshop {workshop_id_for_irc} connected + relay running"
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "irc: workshop {workshop_id_for_irc} boot failed: {e}; \
+                                 continuing without IRC"
+                            );
+                            ipc::lifecycle::IrcRuntime::emit_connect_flare(
+                                &pool_for_irc,
+                                &workshop_id_for_irc,
+                                &e.to_string(),
+                            )
+                            .await;
+                        }
+                    }
+                });
             }
             ws.config = Arc::new(config);
             ws.custom_agents = custom_agents;
@@ -7154,6 +7289,21 @@ mod tests {
         assert_ne!(
             format!("{:?}", Message::WatchRunnerStopped),
             format!("{:?}", Message::AgentSessionSaved),
+        );
+    }
+
+    /// Spark ryve-5a0e1d97 [sp-ddf6fd7f]: the IRC runtime shutdown path
+    /// emits its own Message so the close-workshop `Task::batch` has a
+    /// terminal signal specifically for the IRC arm.
+    #[test]
+    fn irc_runtime_stopped_has_distinct_debug() {
+        assert_eq!(
+            format!("{:?}", Message::IrcRuntimeStopped),
+            "IrcRuntimeStopped",
+        );
+        assert_ne!(
+            format!("{:?}", Message::IrcRuntimeStopped),
+            format!("{:?}", Message::WatchRunnerStopped),
         );
     }
 

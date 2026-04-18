@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use data::sparks::projector::{AssignmentView, CURRENT_SCHEMA_VERSION, Event, WorldState, project};
-use data::sparks::types::AssignmentPhase;
+use data::sparks::types::{AssignmentLiveness, AssignmentPhase};
 
 /// A hand-written reducer used by the "live" side. Deliberately mirrors
 /// what the transactional writer will emit — if the projector and this
@@ -47,6 +47,8 @@ fn live_apply(state: &mut WorldState, event: &Event) {
                     created_at: timestamp.clone(),
                     updated_at: timestamp.clone(),
                     last_heartbeat_at: None,
+                    liveness: AssignmentLiveness::Healthy,
+                    repair_cycle_count: 0,
                     last_review_outcome: None,
                     last_review_at: None,
                     last_merge_precondition_failure: None,
@@ -57,11 +59,15 @@ fn live_apply(state: &mut WorldState, event: &Event) {
         Event::PhaseTransitioned {
             timestamp,
             assignment_id,
+            from_phase,
             to_phase,
             ..
         } => {
             let v = state.assignments.get_mut(assignment_id).unwrap();
             v.phase = *to_phase;
+            if *from_phase == AssignmentPhase::Rejected && *to_phase == AssignmentPhase::InRepair {
+                v.repair_cycle_count += 1;
+            }
             v.event_version += 1;
             v.updated_at = timestamp.clone();
         }
@@ -72,6 +78,17 @@ fn live_apply(state: &mut WorldState, event: &Event) {
         } => {
             let v = state.assignments.get_mut(assignment_id).unwrap();
             v.last_heartbeat_at = Some(timestamp.clone());
+            v.event_version += 1;
+            v.updated_at = timestamp.clone();
+        }
+        Event::LivenessTransitioned {
+            timestamp,
+            assignment_id,
+            to_liveness,
+            ..
+        } => {
+            let v = state.assignments.get_mut(assignment_id).unwrap();
+            v.liveness = *to_liveness;
             v.event_version += 1;
             v.updated_at = timestamp.clone();
         }

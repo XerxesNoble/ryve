@@ -1,0 +1,20 @@
+{
+  "action": "closed",
+  "number": 42,
+  "pull_request": {
+    "number": 42,
+    "state": "closed",
+    "merged": true,
+    "merge_commit_sha": "deadbeefcafef00d",
+    "head": {
+      "ref": "feat/mirror-translator",
+      "sha": "fed987cba321"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "action": "closed",
+  "number": 43,
+  "pull_request": {
+    "number": 43,
+    "state": "closed",
+    "merged": false,
+    "merge_commit_sha": null,
+    "head": {
+      "ref": "feat/abandoned",
+      "sha": "0000000000000000"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

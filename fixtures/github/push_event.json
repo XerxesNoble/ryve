@@ -1,0 +1,8 @@
+{
+  "ref": "refs/heads/main",
+  "before": "abc",
+  "after": "def",
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

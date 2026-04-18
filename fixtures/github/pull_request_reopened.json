@@ -1,0 +1,19 @@
+{
+  "action": "reopened",
+  "number": 43,
+  "pull_request": {
+    "number": 43,
+    "state": "open",
+    "merged": false,
+    "head": {
+      "ref": "feat/abandoned",
+      "sha": "0000000000000000"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

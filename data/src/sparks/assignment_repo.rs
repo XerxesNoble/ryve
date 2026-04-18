@@ -150,15 +150,19 @@ pub async fn abandon(
     Ok(())
 }
 
-/// Update the heartbeat timestamp for a Hand's assignment.
-pub async fn heartbeat(
+/// Update the `last_heartbeat_at` timestamp for an active assignment.
+/// Returns the number of rows touched so callers can distinguish "no
+/// active claim" (0) from "beat recorded" (1). Parent epic ryve-cf05fd85
+/// composes this with the watchdog and the outbox event writer to keep
+/// liveness state authoritative.
+pub async fn record_heartbeat(
     pool: &SqlitePool,
     session_id: &str,
     spark_id: &str,
-) -> Result<(), SparksError> {
+) -> Result<u64, SparksError> {
     let now = Utc::now().to_rfc3339();
 
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE assignments SET last_heartbeat_at = ? \
          WHERE session_id = ? AND spark_id = ? AND status = 'active'",
     )
@@ -168,7 +172,56 @@ pub async fn heartbeat(
     .execute(pool)
     .await?;
 
-    Ok(())
+    Ok(result.rows_affected())
+}
+
+/// Persist the watchdog's liveness verdict for an active assignment.
+/// Only the watchdog and Head/Director overrides should call this —
+/// Hands never set their own liveness (see epic ryve-cf05fd85 invariant).
+/// Returns the number of rows updated.
+pub async fn set_liveness(
+    pool: &SqlitePool,
+    session_id: &str,
+    spark_id: &str,
+    liveness: AssignmentLiveness,
+) -> Result<u64, SparksError> {
+    let result = sqlx::query(
+        "UPDATE assignments SET liveness = ? \
+         WHERE session_id = ? AND spark_id = ? AND status = 'active'",
+    )
+    .bind(liveness.as_str())
+    .bind(session_id)
+    .bind(spark_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Bump `repair_cycle_count` by one for an active assignment and return
+/// the new value. Called by the phase-transition path on each
+/// `Rejected -> InRepair` edge so the watchdog can escalate to Stuck once
+/// the workshop's repair_cycle_limit is exceeded.
+pub async fn increment_repair_cycle(
+    pool: &SqlitePool,
+    session_id: &str,
+    spark_id: &str,
+) -> Result<i64, SparksError> {
+    let row = sqlx::query_scalar::<_, i64>(
+        "UPDATE assignments SET repair_cycle_count = repair_cycle_count + 1 \
+         WHERE session_id = ? AND spark_id = ? AND status = 'active' \
+         RETURNING repair_cycle_count",
+    )
+    .bind(session_id)
+    .bind(spark_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.ok_or_else(|| {
+        SparksError::NotFound(format!(
+            "active assignment for session {session_id} on spark {spark_id}"
+        ))
+    })
 }
 
 /// Expire stale claims where the heartbeat is older than `max_age_seconds`.
@@ -600,5 +653,163 @@ mod tests {
         let ws_b = list_active_for_workshop(&pool, "ws-b").await.unwrap();
         assert_eq!(ws_b.len(), 1);
         assert_eq!(ws_b[0].spark_id, spark_b);
+    }
+
+    async fn read_assignment_row(
+        pool: &SqlitePool,
+        session_id: &str,
+        spark_id: &str,
+    ) -> (Option<String>, i64, String) {
+        sqlx::query_as::<_, (Option<String>, i64, String)>(
+            "SELECT last_heartbeat_at, repair_cycle_count, liveness \
+             FROM assignments WHERE session_id = ? AND spark_id = ?",
+        )
+        .bind(session_id)
+        .bind(spark_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn record_heartbeat_stamps_active_claim_and_ignores_inactive() {
+        let pool = fresh_pool().await;
+        let sess = make_session(&pool, "ws-a").await;
+        let spark = make_spark(&pool, "ws-a", "beating").await;
+
+        // Freshly-assigned row: last_heartbeat_at starts equal to assigned_at,
+        // liveness starts healthy, repair_cycle_count starts zero.
+        assign(
+            &pool,
+            NewHandAssignment {
+                session_id: sess.clone(),
+                spark_id: spark.clone(),
+                role: AssignmentRole::Owner,
+                actor_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (before_heartbeat, cycles, liveness) = read_assignment_row(&pool, &sess, &spark).await;
+        assert!(before_heartbeat.is_some(), "assign stamps an initial beat");
+        assert_eq!(cycles, 0);
+        assert_eq!(liveness, "healthy");
+
+        // Sleep a little so the new timestamp is strictly greater than the
+        // assign-time one; RFC3339 strings compare lexicographically.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let touched = record_heartbeat(&pool, &sess, &spark).await.unwrap();
+        assert_eq!(touched, 1, "active claim must be updated exactly once");
+
+        let (after_heartbeat, _, _) = read_assignment_row(&pool, &sess, &spark).await;
+        assert!(
+            after_heartbeat > before_heartbeat,
+            "record_heartbeat must advance last_heartbeat_at \
+             (before={before_heartbeat:?}, after={after_heartbeat:?})"
+        );
+
+        // Completed assignment: status!='active', so record_heartbeat is a no-op.
+        complete(&pool, &sess, &spark).await.unwrap();
+        let touched = record_heartbeat(&pool, &sess, &spark).await.unwrap();
+        assert_eq!(
+            touched, 0,
+            "record_heartbeat must not touch non-active rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_liveness_updates_only_the_liveness_column() {
+        let pool = fresh_pool().await;
+        let sess = make_session(&pool, "ws-a").await;
+        let spark = make_spark(&pool, "ws-a", "liveness").await;
+
+        assign(
+            &pool,
+            NewHandAssignment {
+                session_id: sess.clone(),
+                spark_id: spark.clone(),
+                role: AssignmentRole::Owner,
+                actor_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (hb_before, cycles_before, initial) = read_assignment_row(&pool, &sess, &spark).await;
+        assert_eq!(initial, "healthy");
+
+        // Healthy -> AtRisk -> Stuck must round-trip through storage.
+        for target in [AssignmentLiveness::AtRisk, AssignmentLiveness::Stuck] {
+            let touched = set_liveness(&pool, &sess, &spark, target).await.unwrap();
+            assert_eq!(touched, 1);
+            let (_, _, persisted) = read_assignment_row(&pool, &sess, &spark).await;
+            assert_eq!(
+                AssignmentLiveness::from_str(&persisted),
+                Some(target),
+                "persisted liveness must round-trip (got {persisted})",
+            );
+        }
+
+        // Sibling columns must not move — liveness is orthogonal to heartbeat
+        // and repair-cycle state.
+        let (hb_after, cycles_after, _) = read_assignment_row(&pool, &sess, &spark).await;
+        assert_eq!(
+            hb_after, hb_before,
+            "liveness write must not touch heartbeat"
+        );
+        assert_eq!(cycles_after, cycles_before);
+
+        // Non-active row is ignored.
+        complete(&pool, &sess, &spark).await.unwrap();
+        let touched = set_liveness(&pool, &sess, &spark, AssignmentLiveness::Healthy)
+            .await
+            .unwrap();
+        assert_eq!(touched, 0);
+    }
+
+    #[tokio::test]
+    async fn increment_repair_cycle_bumps_counter_and_errors_when_missing() {
+        let pool = fresh_pool().await;
+        let sess = make_session(&pool, "ws-a").await;
+        let spark = make_spark(&pool, "ws-a", "cycles").await;
+
+        assign(
+            &pool,
+            NewHandAssignment {
+                session_id: sess.clone(),
+                spark_id: spark.clone(),
+                role: AssignmentRole::Owner,
+                actor_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Counter starts at zero and advances monotonically.
+        for expected in 1..=3 {
+            let n = increment_repair_cycle(&pool, &sess, &spark).await.unwrap();
+            assert_eq!(n, expected, "repair_cycle_count must be monotonic");
+        }
+        let (_, persisted_cycles, _) = read_assignment_row(&pool, &sess, &spark).await;
+        assert_eq!(persisted_cycles, 3);
+
+        // A session with no active claim must surface NotFound rather than
+        // silently succeeding — the caller is the repair-path transition,
+        // which needs to know it missed.
+        let err = increment_repair_cycle(&pool, "ghost-sess", "ghost-spark")
+            .await
+            .expect_err("missing claim must error");
+        assert!(
+            matches!(err, SparksError::NotFound(_)),
+            "expected NotFound for ghost session, got {err:?}"
+        );
+
+        // Completing the assignment deactivates it; further increments also
+        // surface NotFound (status guard in WHERE clause).
+        complete(&pool, &sess, &spark).await.unwrap();
+        let err = increment_repair_cycle(&pool, &sess, &spark)
+            .await
+            .expect_err("inactive claim must error");
+        assert!(matches!(err, SparksError::NotFound(_)));
     }
 }

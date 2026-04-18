@@ -1,0 +1,24 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 9003,
+    "state": "commented",
+    "body": "Drive-by comment.",
+    "user": {
+      "login": "dave"
+    }
+  },
+  "pull_request": {
+    "number": 42,
+    "state": "open",
+    "head": {
+      "ref": "feat/mirror-translator"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

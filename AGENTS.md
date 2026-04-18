@@ -127,3 +127,11 @@ Alloys are currently managed from the Ryve UI and internal APIs — there is no 
 - **Check required contracts** before marking a spark as done.
 - If you discover a new bug or task while working, mention it so it can be tracked as a new spark.
 - Do not close or modify sparks directly — Ryve manages spark lifecycle.
+
+<!-- RYVE:START -->
+## Ryve Workshop — MANDATORY
+
+This project is managed by **Ryve**. You MUST read `RYVE.md` before doing ANY work — it is the universal CLI reference, house rules, and coordination protocol for all coding agents.
+
+**Work in your current directory.** Do not navigate to parent directories or other worktrees. Run `ryve spark list` to see active tasks and find work to claim.
+<!-- RYVE:END -->

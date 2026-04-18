@@ -1,0 +1,18 @@
+{
+  "action": "created",
+  "check_run": {
+    "id": 557,
+    "name": "ci/build",
+    "status": "in_progress",
+    "conclusion": null,
+    "head_sha": "fed987cba321",
+    "pull_requests": [
+      {
+        "number": 42
+      }
+    ]
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

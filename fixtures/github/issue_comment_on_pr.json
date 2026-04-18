@@ -1,0 +1,20 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 42,
+    "pull_request": {
+      "url": "https://api.github.com/repos/acme/widget/pulls/42",
+      "html_url": "https://github.com/acme/widget/pull/42"
+    }
+  },
+  "comment": {
+    "id": 7777,
+    "body": "Looks good, ship it.",
+    "user": {
+      "login": "erin"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widget"
+  }
+}

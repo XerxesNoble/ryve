@@ -13,10 +13,19 @@
 //! `Acquired::First` with no listener — multiple instances are still
 //! allowed there until a named-pipe implementation lands.
 
+pub mod irc_command_parser;
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod channel_manager;
+pub mod irc_client;
+pub mod irc_renderer;
+pub mod lifecycle;
+pub mod outbox_relay;
+pub mod signal_discipline;
 
 /// Returns the path for the IPC socket. We prefer `$XDG_RUNTIME_DIR`
 /// (cleared on logout, exactly the right scope), fall back to the user's
