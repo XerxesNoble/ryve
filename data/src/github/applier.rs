@@ -49,7 +49,7 @@ use uuid::Uuid;
 
 use super::types::CanonicalGitHubEvent;
 use crate::sparks::error::TransitionError;
-use crate::sparks::transition::validate_transition;
+use crate::sparks::transition::{validate_reviewer_not_author, validate_transition};
 use crate::sparks::types::{Assignment, AssignmentPhase, TransitionActorRole};
 
 /// Schema version stamped on every outbox row the applier writes.
@@ -196,10 +196,26 @@ pub async fn apply(
 
     let outcome = dispatch(tx, github_event_id, event).await;
 
-    // Mark seen even when dispatch returned an error — the Tx carries
-    // the warning row and we don't want to re-fire the same failing
-    // event on retry. The caller commits to persist both.
-    seen.mark_seen(tx, github_event_id, event.kind()).await?;
+    // Only mark seen for outcomes whose result is deterministic — i.e.
+    // re-running the same event on retry would produce the same effect.
+    // - `Ok(_)`               : effect persisted; future retries are
+    //                           wasted work and would re-trigger writes
+    //                           that should be idempotent but aren't free.
+    // - `Err(Transition(_))`  : validator rejected; warning row is in the
+    //                           Tx and the rejection won't change.
+    // - `Err(Serialization(_))`: payload schema mismatch; same input will
+    //                           always fail the same way.
+    // - `Err(Database(_))`    : likely transient (lock contention, brief
+    //                           connection drop, etc.). Leave the dedup
+    //                           slot open so the next ingestion attempt
+    //                           can retry the same event.
+    let mark = match &outcome {
+        Ok(_) | Err(ApplyError::Transition(_)) | Err(ApplyError::Serialization(_)) => true,
+        Err(ApplyError::Database(_)) => false,
+    };
+    if mark {
+        seen.mark_seen(tx, github_event_id, event.kind()).await?;
+    }
 
     outcome
 }
@@ -403,14 +419,23 @@ async fn apply_transition(
         })?;
 
     // Route through the same validator that `transition.rs` uses. No
-    // override — the mirror must obey the full role-ownership map.
-    if let Err(err) = validate_transition(
+    // override — the mirror must obey the full role-ownership map. Run
+    // both gates the core path runs (`validate_transition` for the
+    // role-ownership map, then `validate_reviewer_not_author` to forbid
+    // a ReviewerHand from approving/rejecting their own assignment) so
+    // mirror-driven transitions cannot bypass an invariant the in-process
+    // path enforces.
+    let combined = validate_transition(
         current_phase,
         target_phase,
         current_phase,
         actor_role,
         false,
-    ) {
+    )
+    .and_then(|()| {
+        validate_reviewer_not_author(actor_role, target_phase, &actor_id, &assignment.actor_id)
+    });
+    if let Err(err) = combined {
         emit_illegal_transition_warning(
             tx,
             github_event_id,

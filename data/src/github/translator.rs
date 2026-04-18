@@ -132,15 +132,14 @@ fn translate_pull_request(body: &Value) -> Result<CanonicalGitHubEvent, Translat
                 // GitHub may omit merge_commit_sha momentarily for
                 // squash/rebase merges between the close event firing
                 // and the merge commit's SHA being published. Fall
-                // back to an empty string only if absolutely absent
-                // — callers should treat that as "SHA not yet known"
-                // but the event is still terminal.
+                // back to an empty string when the field is absent or
+                // null — callers should treat that as "SHA not yet
+                // known" but the event is still terminal so the
+                // Assignment can advance to Merged.
                 let merge_commit_sha = pr
                     .get("merge_commit_sha")
                     .and_then(Value::as_str)
-                    .ok_or(TranslateError::MissingField(
-                        "pull_request.merge_commit_sha",
-                    ))?
+                    .unwrap_or("")
                     .to_string();
                 Ok(CanonicalGitHubEvent::PrMerged {
                     pr_number,
@@ -272,11 +271,14 @@ fn translate_check_run(body: &Value) -> Result<CanonicalGitHubEvent, TranslateEr
     // GitHub fills in `conclusion` only once the run has finished —
     // which is guaranteed under action="completed" but we still
     // treat a null conclusion as Unsupported rather than fabricating
-    // a status the applier would misinterpret.
+    // a status the applier would misinterpret. Unsupported lets the
+    // caller log-and-drop; MissingField would surface as schema drift.
     let status = check_run
         .get("conclusion")
         .and_then(Value::as_str)
-        .ok_or(TranslateError::MissingField("check_run.conclusion"))?
+        .ok_or_else(|| {
+            TranslateError::Unsupported("check_run.conclusion is null (run not finished)".into())
+        })?
         .to_string();
 
     // A check_run may be associated with zero or more PRs; we emit one

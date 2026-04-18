@@ -115,8 +115,9 @@ fn orphan_reportable_phases() -> Vec<&'static str> {
 /// doesn't keep a cursor open across outbox writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OrphanRow {
-    /// Internal integer id — used as the outbox `assignment_id` for
-    /// consistency with the rest of the mirror.
+    /// External text id from `assignments.assignment_id` — the same
+    /// identifier the rest of the mirror (and outbox consumers) carry.
+    /// Note this is NOT the internal integer PK `assignments.id`.
     assignment_id: String,
     spark_id: String,
     phase: AssignmentPhase,

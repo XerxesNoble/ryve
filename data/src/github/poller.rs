@@ -330,7 +330,18 @@ impl Poller {
                 self.consecutive_failures = 0;
                 self.throttled_until_epoch = None;
                 let applied = apply_events(pool, &response.events, &self.seen).await?;
-                let new_cursor = response.observed_cursor.unwrap_or(self.cursor);
+                // When the fetcher reports no observed_cursor (e.g. an
+                // empty repo with zero events on this tick), advance to
+                // the tick start time. Without this fallback the cursor
+                // would never advance on a successful empty fetch and
+                // every subsequent tick would re-query the same `since`,
+                // wasting rate-limit budget and never narrowing the
+                // window. The documented contract on
+                // `FetchResponse.observed_cursor` is "None means use the
+                // tick start time".
+                let tick_start_cursor =
+                    DateTime::<Utc>::from_timestamp(now_epoch as i64, 0).unwrap_or(self.cursor);
+                let new_cursor = response.observed_cursor.unwrap_or(tick_start_cursor);
                 if new_cursor > self.cursor {
                     self.cursor = new_cursor;
                 }
