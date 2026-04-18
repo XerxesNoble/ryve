@@ -154,8 +154,7 @@ pub async fn run_orphan_scan_with(
     let bucket = now.timestamp().div_euclid(debounce) * debounce;
 
     let phases = orphan_reportable_phases();
-    let placeholders = std::iter::repeat("?")
-        .take(phases.len())
+    let placeholders = std::iter::repeat_n("?", phases.len())
         .collect::<Vec<_>>()
         .join(", ");
     let query = format!(
