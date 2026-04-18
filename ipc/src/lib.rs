@@ -13,6 +13,8 @@
 //! `Acquired::First` with no listener — multiple instances are still
 //! allowed there until a named-pipe implementation lands.
 
+pub mod irc_command_parser;
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
