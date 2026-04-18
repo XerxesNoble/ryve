@@ -2606,6 +2606,97 @@ async fn handle_hand(
             }
             Err(e) => die(&format!("{e}")),
         },
+        // Durable heartbeat loop for a spawned Hand (spark ryve-85034c27).
+        // This subcommand is the sidecar body: each active-assignment tick
+        // emits a `HeartbeatReceived` event into `event_outbox` and advances
+        // `assignments.last_heartbeat_at`. The loop exits cleanly the first
+        // time the assignment stops being active (Hand closed its spark,
+        // Head override, sweep-reaper, etc.).
+        "heartbeat-loop" => {
+            if args.len() < 3 {
+                die("hand heartbeat-loop requires <session_id> <spark_id> \
+                     [--interval-secs N] [--max-ticks N]");
+            }
+            let session_id = args[1].clone();
+            let spark_id = args[2].clone();
+            let mut interval_secs: Option<u64> = None;
+            let mut max_ticks: Option<u64> = None;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--interval-secs" => {
+                        i += 1;
+                        if i < args.len() {
+                            interval_secs = Some(args[i].parse().unwrap_or_else(|_| {
+                                die(&format!("--interval-secs '{}' must be u64", args[i]))
+                            }));
+                        }
+                    }
+                    "--max-ticks" => {
+                        i += 1;
+                        if i < args.len() {
+                            max_ticks = Some(args[i].parse().unwrap_or_else(|_| {
+                                die(&format!("--max-ticks '{}' must be u64", args[i]))
+                            }));
+                        }
+                    }
+                    other => die(&format!("unknown hand heartbeat-loop flag '{other}'")),
+                }
+                i += 1;
+            }
+
+            // Resolve the per-workshop interval override; fall back to the
+            // default so CLI callers don't have to know it. CLI `--interval-secs`
+            // beats config so tests can pick a short cadence.
+            let ryve_dir = data::ryve_dir::RyveDir::new(workshop_root);
+            let config = data::ryve_dir::load_config(&ryve_dir).await;
+            let interval = std::time::Duration::from_secs(
+                interval_secs.unwrap_or(config.heartbeat_interval_secs),
+            );
+
+            let mut ticks: u64 = 0;
+            loop {
+                match data::sparks::heartbeat::emit_heartbeat(pool, &session_id, &spark_id).await {
+                    Ok(data::sparks::heartbeat::HeartbeatOutcome::Emitted) => {
+                        ticks += 1;
+                        if let Some(cap) = max_ticks
+                            && ticks >= cap
+                        {
+                            break;
+                        }
+                    }
+                    Ok(data::sparks::heartbeat::HeartbeatOutcome::AssignmentInactive) => {
+                        break;
+                    }
+                    Err(e) => {
+                        // Log and keep trying — a transient DB lock shouldn't
+                        // kill the loop. If the pool is permanently gone the
+                        // next sleep + retry will exit via connection error
+                        // cascade; we don't want a single hiccup to silence
+                        // the Hand's liveness signal.
+                        eprintln!(
+                            "hand heartbeat-loop: emit failed ({e}); retrying after interval"
+                        );
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+            if json_mode {
+                let payload = serde_json::json!({
+                    "session_id": session_id,
+                    "spark_id": spark_id,
+                    "ticks": ticks,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "hand heartbeat-loop exited: session={session_id} spark={spark_id} ticks={ticks}"
+                );
+            }
+        }
         other => die(&format!(
             "unknown hand subcommand '{other}'. Try `ryve hand --help`."
         )),

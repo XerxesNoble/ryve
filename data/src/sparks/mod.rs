@@ -19,6 +19,7 @@ pub mod error;
 pub mod event_repo;
 pub mod file_link_repo;
 pub mod graph;
+pub mod heartbeat;
 pub mod heartbeat_watchdog;
 pub mod id;
 pub mod irc_repo;
