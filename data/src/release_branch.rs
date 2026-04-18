@@ -26,6 +26,17 @@ pub fn release_branch_name(version: &str) -> String {
     format!("{RELEASE_BRANCH_PREFIX}{version}")
 }
 
+/// Paths the Ryve UI rewrites during normal operation. The dirty-tree gate
+/// on `cut_release_branch` / `tag_release` skips these so a user can close a
+/// release while the workshop is still live: a chevron click that updates
+/// `.ryve/ui_state.json`, or a sidebar-width tweak persisted to
+/// `.ryve/config.toml`, must not be able to break the release ceremony.
+///
+/// Keep this list narrow. Every entry here is a surface where the file's
+/// current contents are *not* reflected in the tagged commit; widening it
+/// risks shipping a release that doesn't match what's on disk.
+pub const LIVE_WORKSPACE_FILES: &[&str] = &[".ryve/config.toml", ".ryve/ui_state.json"];
+
 /// Errors raised by the release-branch module.
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseBranchError {
@@ -178,7 +189,7 @@ impl ReleaseBranch {
 
     async fn is_dirty(&self) -> Result<bool, ReleaseBranchError> {
         let output = Command::new("git")
-            .args(["status", "--porcelain"])
+            .args(["status", "--porcelain=v1", "-z"])
             .current_dir(&self.repo.path)
             .output()
             .await?;
@@ -187,8 +198,56 @@ impl ReleaseBranch {
                 String::from_utf8_lossy(&output.stderr).to_string(),
             ));
         }
-        Ok(!output.stdout.is_empty())
+        Ok(porcelain_has_non_allowlisted_entry(
+            &output.stdout,
+            LIVE_WORKSPACE_FILES,
+        ))
     }
+}
+
+/// Parse NUL-delimited `git status --porcelain=v1 -z` output and return
+/// `true` if any entry references a path *not* in `allowlist`.
+///
+/// Uses `-z` so paths are emitted verbatim (no octal escaping, no surrounding
+/// quotes) and entries are NUL-separated. Rename/copy entries include the
+/// old path as a second NUL-terminated field; we treat that old-path field
+/// as a second dirty entry and require it to be allowlisted too.
+pub(crate) fn porcelain_has_non_allowlisted_entry(stdout: &[u8], allowlist: &[&str]) -> bool {
+    let mut iter = stdout.split(|&b| b == 0).peekable();
+    while let Some(entry) = iter.next() {
+        if entry.is_empty() {
+            // Trailing NUL (or blank line) — ignore.
+            continue;
+        }
+        // Each entry is `XY<space>path` (2 status bytes, space, path).
+        if entry.len() < 4 {
+            return true;
+        }
+        let status = &entry[..2];
+        let path_bytes = &entry[3..];
+        let path = match std::str::from_utf8(path_bytes) {
+            Ok(p) => p,
+            // Non-UTF-8 path — can't match the allowlist, treat as dirty.
+            Err(_) => return true,
+        };
+        if !allowlist.contains(&path) {
+            return true;
+        }
+        // Rename (`R`) and copy (`C`) entries have the old path following in
+        // the next NUL-terminated field. Consume and check it too.
+        let is_rename_or_copy =
+            status[0] == b'R' || status[0] == b'C' || status[1] == b'R' || status[1] == b'C';
+        if is_rename_or_copy {
+            match iter.next() {
+                Some(old) if !old.is_empty() => match std::str::from_utf8(old) {
+                    Ok(old_path) if allowlist.contains(&old_path) => continue,
+                    _ => return true,
+                },
+                _ => return true,
+            }
+        }
+    }
+    false
 }
 
 async fn run_git(repo: &Path, args: &[&str]) -> Result<(), ReleaseBranchError> {
@@ -260,6 +319,44 @@ mod tests {
     fn validate_version_accepts_strict_semver() {
         assert!(validate_version("0.0.1").is_ok());
         assert!(validate_version("10.20.30").is_ok());
+    }
+
+    #[test]
+    fn porcelain_clean_tree_is_not_dirty() {
+        assert!(!porcelain_has_non_allowlisted_entry(
+            b"",
+            LIVE_WORKSPACE_FILES
+        ));
+    }
+
+    #[test]
+    fn porcelain_allowlisted_only_is_not_dirty() {
+        // Two entries: modified config.toml, untracked ui_state.json.
+        let stdout = b" M .ryve/config.toml\0?? .ryve/ui_state.json\0";
+        assert!(!porcelain_has_non_allowlisted_entry(
+            stdout,
+            LIVE_WORKSPACE_FILES
+        ));
+    }
+
+    #[test]
+    fn porcelain_non_allowlisted_is_dirty() {
+        // One allowlisted entry alongside one non-allowlisted entry.
+        let stdout = b" M .ryve/config.toml\0 M src/main.rs\0";
+        assert!(porcelain_has_non_allowlisted_entry(
+            stdout,
+            LIVE_WORKSPACE_FILES
+        ));
+    }
+
+    #[test]
+    fn porcelain_rename_old_path_must_also_be_allowlisted() {
+        // Rename from an allowlisted path to a non-allowlisted path is dirty.
+        let stdout = b"R  src/other.rs\0.ryve/config.toml\0";
+        assert!(porcelain_has_non_allowlisted_entry(
+            stdout,
+            LIVE_WORKSPACE_FILES
+        ));
     }
 
     #[test]
