@@ -261,6 +261,11 @@ mod tests {
             (AssignmentPhase::InRepair, true),
             (AssignmentPhase::ReadyForMerge, true),
             (AssignmentPhase::Merged, true),
+            // Stuck (added by the Heartbeat epic) is a liveness/repair-
+            // cycle escalation, not a workflow gate where we expect a
+            // GitHub artifact — Head/Director intervention is the
+            // recovery path, so leave it out of the orphan predicate.
+            (AssignmentPhase::Stuck, false),
         ];
         for (phase, expected) in cases {
             assert_eq!(
