@@ -69,13 +69,15 @@ jobs:
       # new-session).
       - name: Build vendored tmux
         run: ./scripts/build-vendored-tmux.sh
-      # --test-threads=2 keeps concurrent resource use in budget on the
-      # default GitHub Actions runner. Several heavier tests (hand_spawn
-      # lifecycle, assign_e2e, watchdog) each fork subprocesses; running
-      # the full workspace at the default parallelism exhausts
-      # pthread/ulimit and the step hangs (or exits 143). Keep this in
-      # sync with any future ignored tests.
-      - run: cargo test --workspace -- --test-threads=2
+      # --test-threads=1 is the stable setting on the default GitHub
+      # Actions runner. Several hand_spawn tests share global state
+      # (tmux sockets, env vars, filesystem paths) and race under any
+      # parallelism; --test-threads=2 produced non-deterministic
+      # failures across multiple runs. Default parallelism additionally
+      # exhausted the runner's pthread/ulimit budget. Trades wall time
+      # for reliability; tech debt: instrument the shared state and
+      # restore parallelism via #[serial] on the offenders.
+      - run: cargo test --workspace -- --test-threads=1
 
   bundled-tmux:
     name: Bundled tmux builds and runs
