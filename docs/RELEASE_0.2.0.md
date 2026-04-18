@@ -79,53 +79,56 @@ Together these three epics make 0.2.0 the release that turns a "group of agents 
 
 10. **`ryve release close` refused on Ryve's own workspace.** `.ryve/config.toml` and `.ryve/ui_state.json` are mutated continuously by the Ryve UI. The close ritual's dirty-tree check flags them and refuses to tag + build. 0.2.0 was left at `cut` without a `v0.2.0` git tag or a built binary. Either the close ritual needs an allowlist for Ryve-internal mutable files, or those files need to not be tracked after init.
 
-## How to manually test this release
+## How to try out this release
 
-Prerequisites: Rust toolchain, SQLite, git. The release-manager paths are gated on tmux availability — some tests skip cleanly if `vendor/tmux/bin/tmux` isn't built.
-
-```bash
-git checkout main
-cargo build --release
-```
-
-### 1. IRC backbone (member epic `ryve-ddf6fd7f`)
+You just need a Ryve workshop running and a terminal. No Rust toolchain needed to exercise these features.
 
 ```bash
-cargo test --test outbox_relay
-cargo test --test irc_golden_rule
-cargo test --test irc_client
-cargo test --test lifecycle
+ryve init                # if this directory isn't already a workshop
+ryve                     # open the workshop UI
 ```
 
-**Expected:** the outbox relay drains pending events, respects signal discipline, retries on failure up to `max_attempts`, and emits a flare ember when the retry budget exhausts. The golden-rule lint passes (every allow-listed `event_type` has an `event_to_irc` mapping).
+### 1. IRC backbone — your epics now have live channels
 
-### 2. GitHub artifact mirror (member epic `ryve-73e42cac`)
+**What you should see:**
 
-```bash
-cargo test -p data --lib github::
-cargo test -p data --test github_poller_rate_limit
-```
+- Point your workshop at an IRC server. In the workshop settings (or `.ryve/config.toml`), set `irc.server_address = "irc.libera.chat:6697"` (or any other IRC server you have credentials for) and toggle `irc.enabled = true`. Restart the workshop.
+- Create a new epic from the Sparks panel: `ryve spark create --type epic "My first IRC epic"`.
+- **Expected:** within a few seconds a channel named `#epic-<id>-my-first-irc-epic` appears on the IRC server. The workshop auto-joins it.
+- Change the spark's status from the UI (`open` → `in_progress`). **Expected:** a one-line message appears in the IRC channel describing the transition (not a wall of reasoning — signal discipline strips that).
+- Open an IRC client, join the channel, and send `/ryve block sp-<some-spark> "waiting on API spec"`. **Expected:** the referenced spark transitions to `blocked` status in the workshop.
+- **What should NOT appear on IRC:** tool-call logs, retry chatter, agent reasoning, or your Hand's full output. Only state transitions, review signals, blockers, merge signals, and GitHub events.
 
-**Expected:** 51+ tests under `github::` pass (translator determinism, applier idempotency + validator routing, orphan-scan exhaustiveness, poller rate-limit classification). The rate-limit test scripts a 403 + Retry-After sequence without touching the network.
+### 2. GitHub artifact mirror — PRs and sparks stay in sync
 
-### 3. Heartbeat + stuck detection (member epic `ryve-cf05fd85`)
+**What you should see:**
 
-```bash
-cargo test --test hand_heartbeat_loop
-cargo test --test stuck_override
-cargo test -p data --lib sparks::transition::tests::escalate_to_stuck
-cargo test -p data --lib sparks::watchdog
-```
+- Configure GitHub credentials in the workshop settings (`github.webhook_secret` for webhook mode, or `github.poll_token` for polling fallback).
+- Spawn a Hand on any spark (`ryve hand spawn <spark-id>`). Let it do its work and open a PR against `main`.
+- **Expected:** within one poll cycle (default 60 s) or one webhook delivery, the spark's `github_artifact` field shows the PR number and branch. Check with `ryve spark show <spark-id>`.
+- In GitHub, request a review on the PR and have a different actor approve it. **Expected:** the spark's assignment phase transitions to `Approved` automatically (or `Rejected` if changes were requested).
+- Merge the PR on GitHub. **Expected:** the spark's assignment phase transitions to `Merged`.
+- Open a PR but then close it without merging. **Expected:** the mirror emits a warning event visible in the workshop's event log or on the Epic's IRC channel.
+- **What should NOT happen:** the spark state going out of sync with GitHub, duplicate phase transitions, or phantom PRs (the mirror refuses to invent PR numbers).
 
-**Expected:** the heartbeat loop emits ≥ 2 events and advances `last_heartbeat_at` within a bounded run. The watchdog transitions Healthy → AtRisk → Stuck at the configured thresholds and blocks Epic merges via the pre-merge validator. A Head/Director override recovers a Stuck Assignment with a logged reason.
+### 3. Heartbeat + stuck detection — silent failures become visible
 
-### 4. Full release-branch suite
+**What you should see:**
 
-```bash
-cargo test --workspace -- --test-threads=1
-```
+- Spawn a Hand (`ryve hand spawn <spark-id>`). Let it run. Check `ryve spark show <spark-id>` — you should see `last_heartbeat_at` update every 30 s (default interval).
+- **Crash the Hand deliberately:** find its process (`ryve hand list`, then `ps` on the session id) and `kill -9` it. Don't tell the workshop.
+- **Expected:** within roughly 2× the heartbeat interval (~1 min), the spark's `liveness` flips to `at_risk`. Within the configured `stuck_threshold` (default a few minutes), it flips to `stuck`. A flare ember appears on the workshop's Embers bar with a recovery command.
+- Try to merge the Epic containing that stuck assignment. **Expected:** the merge is refused with a clear message pointing at the stuck assignment.
+- Run the suggested recovery: `ryve assign override <head-session> <spark-id> --to in_progress --reason "restarted manually"`. **Expected:** the spark returns to `in_progress`, the reason appears in the event log, and the Epic merge path unblocks.
+- **What should NOT happen:** a stuck Hand staying invisible until someone manually notices; a workshop letting you merge an Epic with a stuck member; a recovery override going through without a reason.
 
-**Expected:** all non-ignored tests pass. The 12 `hand_spawn` tokio tests, 2 `release_artifact` tests, and 4 `archetype_language_agnostic` tests are `#[ignore]` on CI — run them locally with `--ignored` when touching their subsystems:
+### 4. End-to-end sanity check
+
+Spawn a Hand on a real spark, let it work until it opens a PR, watch IRC for the transition messages, merge the PR on GitHub, see the spark close on its own. If you can do that loop without touching the workshop UI, 0.2.0 is working as intended.
+
+### For maintainers
+
+The automated test suite backing the above is in `cargo test --workspace` (requires the Rust toolchain). Most flow is covered by library + integration tests; twelve `hand_spawn` tokio tests and six cargo-recursive tests are currently `#[ignore]` on CI pending the tech-debt fixes tracked in `ryve-96b7e59e`. Run them locally with:
 
 ```bash
 cargo test --workspace -- --ignored --test-threads=1
