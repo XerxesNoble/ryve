@@ -404,6 +404,19 @@ pub struct Workshop {
     /// here so `do_close_workshop` can await graceful shutdown.
     /// Spark ryve-6ab1980c [sp-ee3f5c74].
     pub watch_runner: Option<crate::watch_runner::WatchRunnerHandle>,
+    /// Handle to the workshop's IRC subsystem. Populated asynchronously
+    /// after connect + channel bootstrap succeed; `None` when IRC is
+    /// disabled (no `irc_server` configured) or while the boot task is
+    /// still running. Held inside a mutex so the async boot task can
+    /// install the runtime from another thread once it's ready.
+    /// Spark ryve-5a0e1d97 [sp-ddf6fd7f].
+    pub irc_runtime: Arc<Mutex<Option<ipc::lifecycle::IrcRuntime>>>,
+    /// IDs of epics we've already called `ensure_epic_channel` for since
+    /// IRC came up. Used to avoid re-joining on every sparks-poll tick
+    /// while still catching newly-created epics without a dedicated
+    /// signal. Cleared whenever the IRC runtime is torn down.
+    /// Spark ryve-5a0e1d97.
+    pub irc_known_epic_ids: HashSet<String>,
 }
 
 impl Workshop {
@@ -479,6 +492,8 @@ impl Workshop {
             cached_active_hands: 0,
             cached_total_hands: 0,
             watch_runner: None,
+            irc_runtime: Arc::new(Mutex::new(None)),
+            irc_known_epic_ids: HashSet::new(),
         }
     }
 

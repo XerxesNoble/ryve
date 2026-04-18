@@ -23,6 +23,7 @@ use thiserror::Error;
 pub mod channel_manager;
 pub mod irc_client;
 pub mod irc_renderer;
+pub mod lifecycle;
 pub mod outbox_relay;
 pub mod signal_discipline;
 
