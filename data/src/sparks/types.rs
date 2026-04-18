@@ -1339,6 +1339,7 @@ pub struct UpdateRelease {
     pub version: Option<String>,
     pub problem: Option<Option<String>>,
     pub notes: Option<Option<String>>,
+    pub branch_name: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
