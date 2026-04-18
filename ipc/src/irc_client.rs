@@ -12,7 +12,7 @@
 //! speaks raw IRC only. The caller receives parsed [`IrcMessage`]s through a
 //! user-supplied callback.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -303,6 +303,10 @@ async fn session_loop(
 
     let mut session: Option<Session> = Some(initial);
     let mut backoff = INITIAL_BACKOFF;
+    // Commands consumed from cmd_rx but not yet confirmed written to a live
+    // connection. Survives across session losses so the drain-after-reconnect
+    // invariant holds even when a write races a socket close.
+    let mut pending: VecDeque<Command> = VecDeque::new();
 
     loop {
         let active = match session.take() {
@@ -315,7 +319,7 @@ async fn session_loop(
         };
         backoff = INITIAL_BACKOFF;
 
-        match run_session(active, &mut cmd_rx, &on_message).await {
+        match run_session(active, &mut cmd_rx, &on_message, &mut pending).await {
             SessionOutcome::Disconnect => return,
             SessionOutcome::ConnectionLost => {
                 // Fall through: session is None → next iteration reconnects.
@@ -354,6 +358,7 @@ async fn run_session(
     mut session: Session,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
     on_message: &MessageCallback,
+    pending: &mut VecDeque<Command>,
 ) -> SessionOutcome {
     // Self-originated PING keeps idle connections alive through NAT and lets
     // us detect half-open sockets when the server stops responding.
@@ -361,10 +366,80 @@ async fn run_session(
     let mut next_ping = Instant::now() + ping_interval;
     let mut line = String::new();
 
+    // Flush any commands that outlived the previous connection. If a write
+    // fails mid-drain, put the offender back at the front so the next
+    // reconnect retries in order.
+    while let Some(cmd) = pending.pop_front() {
+        match cmd {
+            Command::Disconnect => {
+                let _ = write_irc(&mut session.writer, "QUIT :bye").await;
+                let _ = session.writer.shutdown().await;
+                return SessionOutcome::Disconnect;
+            }
+            other => {
+                let wire = render_command(&other);
+                if write_irc(&mut session.writer, &wire).await.is_err() {
+                    pending.push_front(other);
+                    return SessionOutcome::ConnectionLost;
+                }
+            }
+        }
+    }
+
+    // The most recent command we wrote out on *this* session. TCP write_all
+    // returning Ok means the bytes landed in the kernel buffer, not that the
+    // peer received them — if the connection then drops, the bytes are lost
+    // silently. Any server activity (Ok(n>0) on read) clears this, since it
+    // proves prior writes made it past the kernel. If the session dies
+    // without such proof, the still-pending command is requeued so the
+    // next reconnect redelivers it, preserving drain-after-reconnect.
+    let mut last_unconfirmed: Option<Command> = None;
+
     loop {
         line.clear();
         tokio::select! {
+            // Poll the reader first so an already-ready EOF is seen before we
+            // consume a fresh command from cmd_rx. Without this, both arms can
+            // be ready at the same time (peer closed + API push) and the
+            // command would be "written" into a dead TCP buffer and silently
+            // lost, violating the drain-after-reconnect invariant.
             biased;
+
+            read = session.reader.read_line(&mut line) => {
+                match read {
+                    Ok(0) => {
+                        if let Some(c) = last_unconfirmed.take() {
+                            pending.push_front(c);
+                        }
+                        return SessionOutcome::ConnectionLost;
+                    }
+                    Ok(_) => {
+                        // Any inbound byte from the server proves the socket
+                        // round-trip is healthy: prior writes reached the
+                        // peer, so the in-flight command is confirmed.
+                        last_unconfirmed = None;
+                        if let Some(msg) = IrcMessage::parse(&line) {
+                            if msg.command == "PING" {
+                                let token = msg.params.first().cloned().unwrap_or_default();
+                                if write_irc(&mut session.writer, &format!("PONG :{token}"))
+                                    .await
+                                    .is_err()
+                                {
+                                    return SessionOutcome::ConnectionLost;
+                                }
+                            } else {
+                                (on_message)(msg);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(c) = last_unconfirmed.take() {
+                            pending.push_front(c);
+                        }
+                        return SessionOutcome::ConnectionLost;
+                    }
+                }
+            }
 
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
@@ -380,37 +455,26 @@ async fn run_session(
                         return SessionOutcome::Disconnect;
                     }
                     other => {
-                        let wire = render_command(&other);
-                        if write_irc(&mut session.writer, &wire).await.is_err() {
-                            // Requeue? The cmd has already been consumed. We
-                            // treat the connection as lost so the user's next
-                            // send will again queue up. The dropped cmd is an
-                            // acceptable worst case for a torn connection.
+                        // Fast-path requeue if the peer has already closed;
+                        // avoids an unnecessary at-least-once retry on the
+                        // common race where cmd_rx and reader are both ready.
+                        if reader_has_eof(&mut session.reader).await {
+                            if let Some(c) = last_unconfirmed.take() {
+                                pending.push_front(c);
+                            }
+                            pending.push_back(other);
                             return SessionOutcome::ConnectionLost;
                         }
-                    }
-                }
-            }
-
-            read = session.reader.read_line(&mut line) => {
-                match read {
-                    Ok(0) => return SessionOutcome::ConnectionLost,
-                    Ok(_) => {
-                        if let Some(msg) = IrcMessage::parse(&line) {
-                            if msg.command == "PING" {
-                                let token = msg.params.first().cloned().unwrap_or_default();
-                                if write_irc(&mut session.writer, &format!("PONG :{token}"))
-                                    .await
-                                    .is_err()
-                                {
-                                    return SessionOutcome::ConnectionLost;
-                                }
-                            } else {
-                                (on_message)(msg);
+                        let wire = render_command(&other);
+                        if write_irc(&mut session.writer, &wire).await.is_err() {
+                            if let Some(c) = last_unconfirmed.take() {
+                                pending.push_front(c);
                             }
+                            pending.push_back(other);
+                            return SessionOutcome::ConnectionLost;
                         }
+                        last_unconfirmed = Some(other);
                     }
-                    Err(_) => return SessionOutcome::ConnectionLost,
                 }
             }
 
@@ -419,6 +483,9 @@ async fn run_session(
                     .await
                     .is_err()
                 {
+                    if let Some(c) = last_unconfirmed.take() {
+                        pending.push_front(c);
+                    }
                     return SessionOutcome::ConnectionLost;
                 }
                 next_ping = Instant::now() + ping_interval;
@@ -446,6 +513,31 @@ async fn write_irc<W: AsyncWrite + Unpin + ?Sized>(
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\r\n").await?;
     writer.flush().await
+}
+
+/// Poll the reader for an already-delivered EOF (or error) without consuming
+/// buffered data. Returns `true` when the peer has hung up and the caller
+/// should treat the connection as dead before issuing further writes.
+///
+/// `fill_buf` only drives the underlying `poll_read` when the internal buffer
+/// is empty; if the peer has already sent FIN, the next poll yields an empty
+/// slice (or an error) synchronously. We race that against `yield_now` so a
+/// connection with no EOF and no buffered data returns `false` immediately
+/// instead of blocking.
+async fn reader_has_eof(reader: &mut Reader) -> bool {
+    tokio::select! {
+        biased;
+
+        filled = reader.fill_buf() => {
+            match filled {
+                Ok([]) => true,
+                Ok(_) => false,
+                Err(_) => true,
+            }
+        }
+
+        _ = tokio::task::yield_now() => false,
+    }
 }
 
 async fn establish_and_register(config: &ConnectConfig) -> Result<Session, IrcError> {
