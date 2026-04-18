@@ -703,6 +703,49 @@ impl AssignmentStatus {
     }
 }
 
+/// Derived health of an active assignment. The watchdog transitions an
+/// assignment through these states based on heartbeat age and repair-cycle
+/// count; the value is persisted in `assignments.liveness` so the
+/// state machine stays authoritative across restarts.
+///
+/// The `HeartbeatReceived` event variant that feeds this state lives on
+/// the outbox `Event` enum in [`super::projector::Event`] — the projector
+/// is the authoritative consumer, so the variant stays next to its
+/// reducer. See parent epic `ryve-cf05fd85`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentLiveness {
+    /// Heartbeats are arriving within the healthy window.
+    Healthy,
+    /// Heartbeat age has exceeded 2x the heartbeat interval but not yet
+    /// the stuck threshold. Observability-only: no merge gating yet.
+    AtRisk,
+    /// Heartbeat age or repair-cycle count exceeded the configured
+    /// thresholds. Blocks merge until a Head/Director override recovers
+    /// the assignment.
+    Stuck,
+}
+
+impl AssignmentLiveness {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::AtRisk => "at_risk",
+            Self::Stuck => "stuck",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "healthy" => Some(Self::Healthy),
+            "at_risk" => Some(Self::AtRisk),
+            "stuck" => Some(Self::Stuck),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssignmentRole {
@@ -788,6 +831,8 @@ pub struct Assignment {
     pub phase_changed_by: Option<String>,
     pub phase_actor_role: Option<String>,
     pub phase_event_id: Option<i64>,
+    pub repair_cycle_count: i64,
+    pub liveness: String,
 }
 
 pub struct NewAssignment {

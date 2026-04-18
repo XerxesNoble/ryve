@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::types::AssignmentPhase;
+use super::types::{AssignmentLiveness, AssignmentPhase};
 
 /// Schema version of the current event payload format. Events written at
 /// older versions must be migrated before they reach the projector; the
@@ -64,6 +64,20 @@ pub enum Event {
         timestamp: String,
         assignment_id: String,
         actor_id: String,
+    },
+    /// The watchdog observed a liveness change on an active assignment.
+    /// Emitted once per transition (Healthy→AtRisk→Stuck, and back) so the
+    /// outbox relay surfaces the Stuck edge on IRC and the projector can
+    /// keep `AssignmentView::liveness` in sync without re-reading the DB.
+    /// Parent epic `ryve-cf05fd85`.
+    LivenessTransitioned {
+        event_id: String,
+        schema_version: u32,
+        timestamp: String,
+        assignment_id: String,
+        actor_id: String,
+        from_liveness: AssignmentLiveness,
+        to_liveness: AssignmentLiveness,
     },
     ReviewRequested {
         event_id: String,
@@ -103,6 +117,7 @@ impl Event {
             Event::AssignmentCreated { event_id, .. }
             | Event::PhaseTransitioned { event_id, .. }
             | Event::HeartbeatReceived { event_id, .. }
+            | Event::LivenessTransitioned { event_id, .. }
             | Event::ReviewRequested { event_id, .. }
             | Event::ReviewCompleted { event_id, .. }
             | Event::MergePreconditionFailed { event_id, .. }
@@ -115,6 +130,7 @@ impl Event {
             Event::AssignmentCreated { schema_version, .. }
             | Event::PhaseTransitioned { schema_version, .. }
             | Event::HeartbeatReceived { schema_version, .. }
+            | Event::LivenessTransitioned { schema_version, .. }
             | Event::ReviewRequested { schema_version, .. }
             | Event::ReviewCompleted { schema_version, .. }
             | Event::MergePreconditionFailed { schema_version, .. }
@@ -127,6 +143,7 @@ impl Event {
             Event::AssignmentCreated { assignment_id, .. }
             | Event::PhaseTransitioned { assignment_id, .. }
             | Event::HeartbeatReceived { assignment_id, .. }
+            | Event::LivenessTransitioned { assignment_id, .. }
             | Event::ReviewRequested { assignment_id, .. }
             | Event::ReviewCompleted { assignment_id, .. }
             | Event::MergePreconditionFailed { assignment_id, .. }
@@ -139,6 +156,7 @@ impl Event {
             Event::AssignmentCreated { timestamp, .. }
             | Event::PhaseTransitioned { timestamp, .. }
             | Event::HeartbeatReceived { timestamp, .. }
+            | Event::LivenessTransitioned { timestamp, .. }
             | Event::ReviewRequested { timestamp, .. }
             | Event::ReviewCompleted { timestamp, .. }
             | Event::MergePreconditionFailed { timestamp, .. }
@@ -168,6 +186,10 @@ pub struct AssignmentView {
     pub created_at: String,
     pub updated_at: String,
     pub last_heartbeat_at: Option<String>,
+    /// Derived liveness per the watchdog. Starts `Healthy` on creation and
+    /// advances via [`Event::LivenessTransitioned`]. Parent epic
+    /// `ryve-cf05fd85`.
+    pub liveness: AssignmentLiveness,
     pub last_review_outcome: Option<ReviewOutcome>,
     pub last_review_at: Option<String>,
     pub last_merge_precondition_failure: Option<String>,
@@ -231,6 +253,7 @@ fn apply_event(state: &mut WorldState, event: &Event) {
                     created_at: timestamp.clone(),
                     updated_at: timestamp.clone(),
                     last_heartbeat_at: None,
+                    liveness: AssignmentLiveness::Healthy,
                     last_review_outcome: None,
                     last_review_at: None,
                     last_merge_precondition_failure: None,
@@ -256,6 +279,18 @@ fn apply_event(state: &mut WorldState, event: &Event) {
         } => {
             if let Some(view) = state.assignments.get_mut(assignment_id) {
                 view.last_heartbeat_at = Some(timestamp.clone());
+                view.event_version += 1;
+                view.updated_at = timestamp.clone();
+            }
+        }
+        Event::LivenessTransitioned {
+            timestamp,
+            assignment_id,
+            to_liveness,
+            ..
+        } => {
+            if let Some(view) = state.assignments.get_mut(assignment_id) {
+                view.liveness = *to_liveness;
                 view.event_version += 1;
                 view.updated_at = timestamp.clone();
             }
@@ -446,6 +481,40 @@ mod tests {
             state.assignments["asgn-1"].last_heartbeat_at.as_deref(),
             Some("2026-04-16T00:05:00Z"),
         );
+    }
+
+    #[test]
+    fn liveness_transitioned_updates_assignment_liveness() {
+        // Parent epic ryve-cf05fd85 / watchdog spark ryve-fe4e03d3: the
+        // projector must replay the watchdog's liveness edges so the
+        // derived view stays in sync with the DB-persisted `liveness`
+        // column. Starts Healthy, walks to AtRisk then Stuck.
+        let events = vec![
+            created("e1", "2026-04-16T00:00:00Z", "asgn-1"),
+            Event::LivenessTransitioned {
+                event_id: "e2".to_string(),
+                schema_version: CURRENT_SCHEMA_VERSION,
+                timestamp: "2026-04-16T00:01:00Z".to_string(),
+                assignment_id: "asgn-1".to_string(),
+                actor_id: "watchdog".to_string(),
+                from_liveness: AssignmentLiveness::Healthy,
+                to_liveness: AssignmentLiveness::AtRisk,
+            },
+            Event::LivenessTransitioned {
+                event_id: "e3".to_string(),
+                schema_version: CURRENT_SCHEMA_VERSION,
+                timestamp: "2026-04-16T00:02:00Z".to_string(),
+                assignment_id: "asgn-1".to_string(),
+                actor_id: "watchdog".to_string(),
+                from_liveness: AssignmentLiveness::AtRisk,
+                to_liveness: AssignmentLiveness::Stuck,
+            },
+        ];
+        let state = project(&events);
+        let view = &state.assignments["asgn-1"];
+        assert_eq!(view.liveness, AssignmentLiveness::Stuck);
+        assert_eq!(view.event_version, 3);
+        assert_eq!(view.updated_at, "2026-04-16T00:02:00Z");
     }
 
     #[test]
