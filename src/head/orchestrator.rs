@@ -350,12 +350,15 @@ pub async fn poll_crew(
                         .map(|p| p == AssignmentPhase::Stuck.as_str())
                         .unwrap_or(false);
                     if is_stuck {
+                        // When is_stuck is true, `phase` must be Some — the
+                        // phase row is what declared Stuck in the first place.
+                        // Use expect so a logic drift that decouples the two
+                        // surfaces loudly instead of silently emitting an
+                        // empty assignment_id to stuck notifications.
+                        let stuck_phase = phase.as_ref().expect("is_stuck implies phase is Some");
                         MemberState::Stuck {
                             session_id: owner.session_id.clone(),
-                            assignment_id: phase
-                                .as_ref()
-                                .map(|a| a.assignment_id.clone())
-                                .unwrap_or_default(),
+                            assignment_id: stuck_phase.assignment_id.clone(),
                         }
                     } else {
                         classify_owner(&owner, now, stall_after)
@@ -523,7 +526,28 @@ pub async fn notify_stuck(
         return Ok(0);
     }
 
+    let mut notified = 0usize;
     for (spark_id, assignment_id) in &stuck {
+        // Dedup: the notify path is called on every poll tick; without a
+        // guard we would spam a fresh flare ember + Epic comment every
+        // 60–90s while an assignment stayed Stuck. Use a per-assignment
+        // marker in an existing Epic comment to decide whether to
+        // notify at all. First poll after a spark becomes Stuck emits;
+        // subsequent polls are no-ops until recovery.
+        let marker = format!("stuck-notify:{assignment_id}");
+        let already_posted = match &crew.parent_spark_id {
+            Some(parent_id) => {
+                let existing = comment_repo::list_for_spark(pool, parent_id).await?;
+                existing
+                    .iter()
+                    .any(|c| c.author == "head-orchestrator" && c.body.contains(&marker))
+            }
+            None => false,
+        };
+        if already_posted {
+            continue;
+        }
+
         let content = format!(
             "Hand assignment `{assignment_id}` on child spark `{spark_id}` \
              is stuck. Run `ryve assign override <head-session> {spark_id} \
@@ -548,16 +572,18 @@ pub async fn notify_stuck(
                     spark_id: parent_id.clone(),
                     author: "head-orchestrator".to_string(),
                     body: format!(
-                        "Stuck assignment detected: `{assignment_id}` on child \
-                         spark `{spark_id}`. Head/Director action required \
-                         via `ryve assign override`."
+                        "[{marker}] Stuck assignment detected: \
+                         `{assignment_id}` on child spark `{spark_id}`. \
+                         Head/Director action required via `ryve assign \
+                         override`."
                     ),
                 },
             )
             .await?;
         }
+        notified += 1;
     }
-    Ok(stuck.len())
+    Ok(notified)
 }
 
 // ─── Primitive 4: finalize_with_merger ────────────────────────────────────

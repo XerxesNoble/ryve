@@ -126,9 +126,12 @@ pub async fn latest_assignment_for_spark(
 ///    more specific "only Head/Director may override Stuck" error here
 ///    so the CLI can report it cleanly before the transition runs.
 /// 2. A dedicated `assignment_phase_override` audit event carrying the
-///    human-supplied `reason`, written in the same transaction as the
-///    phase change so the override reason is always coupled to the
-///    transition it authorised.
+///    human-supplied `reason`, recorded immediately after the phase
+///    transition so the override reason is coupled to the transition
+///    it authorised. Note: the transition and the audit-event write
+///    are currently two separate writes (not one transaction); a
+///    failure between them would leave the assignment recovered with
+///    no recorded reason. Atomicity is tracked as tech debt.
 pub async fn override_stuck_to_in_progress(
     pool: &SqlitePool,
     assignment_id: &str,

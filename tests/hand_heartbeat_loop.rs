@@ -146,6 +146,25 @@ fn heartbeat_loop_emits_multiple_heartbeat_received_events_before_assignment_com
     let rt = tokio::runtime::Runtime::new().expect("rt");
     let (session_id, spark_id) = rt.block_on(seed_active_assignment(&ws));
 
+    // Capture the pre-loop heartbeat. `seed_active_assignment` stamps
+    // an initial value, so a loop that never advanced the timestamp
+    // would still leave `last_heartbeat_at` non-null — asserting "is
+    // some" alone is too weak.
+    let pre_loop_heartbeat: Option<String> = rt.block_on(async {
+        let pool = data::db::open_sparks_db(&ws).await.expect("reopen db");
+        let v: Option<String> = sqlx::query_scalar(
+            "SELECT last_heartbeat_at FROM assignments \
+             WHERE session_id = ? AND spark_id = ?",
+        )
+        .bind(&session_id)
+        .bind(&spark_id)
+        .fetch_one(&pool)
+        .await
+        .expect("pre-loop heartbeat query");
+        pool.close().await;
+        v
+    });
+
     // Run the sidecar body directly. `--interval-secs 0` makes the test
     // deterministic (no wall-clock sleep gap needed); `--max-ticks 3`
     // gives us a bounded run even if nothing else terminates the loop.
@@ -210,6 +229,14 @@ fn heartbeat_loop_emits_multiple_heartbeat_received_events_before_assignment_com
     assert!(
         last_heartbeat.is_some(),
         "last_heartbeat_at must be stamped after the loop runs"
+    );
+    // Critical: the loop must have *advanced* the timestamp, not just
+    // left the seeded initial value in place. `--interval-secs 0` and
+    // `--max-ticks 3` guarantee the sidecar wrote at least one fresh
+    // heartbeat after seed time.
+    assert_ne!(
+        last_heartbeat, pre_loop_heartbeat,
+        "last_heartbeat_at must change after the loop runs (pre={pre_loop_heartbeat:?}, post={last_heartbeat:?})"
     );
 }
 

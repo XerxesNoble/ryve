@@ -721,8 +721,12 @@ pub enum AssignmentLiveness {
     /// the stuck threshold. Observability-only: no merge gating yet.
     AtRisk,
     /// Heartbeat age or repair-cycle count exceeded the configured
-    /// thresholds. Blocks merge until a Head/Director override recovers
-    /// the assignment.
+    /// thresholds. The companion `assignment_phase` is also flipped to
+    /// `Stuck`, and it is the **phase** check (in
+    /// `data/src/pre_merge_validator.rs`) that actually blocks merges —
+    /// not this liveness value. A Head/Director override
+    /// (`assign_repo::override_stuck_to_in_progress`) returns the phase
+    /// to `InProgress` and the assignment can re-enter the merge path.
     Stuck,
 }
 

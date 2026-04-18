@@ -2002,8 +2002,9 @@ async fn handle_assignment(pool: &sqlx::SqlitePool, args: &[String], json_mode: 
 /// `agent_sessions.session_label`), and drives the
 /// `Stuck → InProgress` override through
 /// [`data::sparks::assign_repo::override_stuck_to_in_progress`]. The
-/// override reason is audit-logged in the same transaction as the phase
-/// transition.
+/// override reason is audit-logged immediately after the phase
+/// transition (see the underlying function's docs for the current
+/// non-atomic guarantee and the tech debt to make it a single tx).
 async fn handle_assignment_override(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
     if args.len() < 2 {
         die("assign override requires <session_id> <spark_id> \
@@ -2738,19 +2739,21 @@ async fn handle_hand(
                 match args[i].as_str() {
                     "--interval-secs" => {
                         i += 1;
-                        if i < args.len() {
-                            interval_secs = Some(args[i].parse().unwrap_or_else(|_| {
-                                die(&format!("--interval-secs '{}' must be u64", args[i]))
-                            }));
+                        if i >= args.len() {
+                            die("hand heartbeat-loop --interval-secs requires a value");
                         }
+                        interval_secs = Some(args[i].parse().unwrap_or_else(|_| {
+                            die(&format!("--interval-secs '{}' must be u64", args[i]))
+                        }));
                     }
                     "--max-ticks" => {
                         i += 1;
-                        if i < args.len() {
-                            max_ticks = Some(args[i].parse().unwrap_or_else(|_| {
-                                die(&format!("--max-ticks '{}' must be u64", args[i]))
-                            }));
+                        if i >= args.len() {
+                            die("hand heartbeat-loop --max-ticks requires a value");
                         }
+                        max_ticks = Some(args[i].parse().unwrap_or_else(|_| {
+                            die(&format!("--max-ticks '{}' must be u64", args[i]))
+                        }));
                     }
                     other => die(&format!("unknown hand heartbeat-loop flag '{other}'")),
                 }

@@ -507,6 +507,27 @@ async fn escalate_to_stuck_in_tx(
     observed_at: &str,
     repair_cycle_count: i64,
 ) -> Result<(), TransitionError> {
+    // Capture the pre-update liveness so the emitted event's
+    // `from_liveness` reflects reality. The assignment may already be
+    // `AtRisk` when the repair-cycle counter escalates (e.g. heartbeat
+    // has aged between the last check and this call); pinning
+    // `from_liveness = Healthy` would mislead downstream auditors that
+    // replay the outbox.
+    let pre_row = sqlx::query_as::<_, (String,)>(
+        "SELECT liveness FROM assignments \
+         WHERE id = ? AND status = 'active' AND liveness != ?",
+    )
+    .bind(assignment_id)
+    .bind(AssignmentLiveness::Stuck.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some((prev_liveness_str,)) = pre_row else {
+        return Ok(());
+    };
+    let from_liveness =
+        AssignmentLiveness::from_str(&prev_liveness_str).unwrap_or(AssignmentLiveness::Healthy);
+
     let row = sqlx::query_as::<_, (String, String, Option<String>)>(
         "UPDATE assignments SET liveness = ? \
          WHERE id = ? AND status = 'active' AND liveness != ? \
@@ -525,13 +546,7 @@ async fn escalate_to_stuck_in_tx(
     let payload = LivenessTransitionedPayload {
         assignment_id: assignment_id_str.clone(),
         spark_id: spark_id.to_string(),
-        // `from_liveness` is pinned to Healthy rather than re-reading the
-        // pre-update row because this escalation is driven by the
-        // repair-cycle counter, not by heartbeat age — the subscriber cares
-        // that the assignment is now Stuck and why (age_secs = 0, actor =
-        // REPAIR_CYCLE_ESCALATION_ACTOR), not which AtRisk window it passed
-        // through. The watchdog continues to report the actual edge.
-        from_liveness: AssignmentLiveness::Healthy,
+        from_liveness,
         to_liveness: AssignmentLiveness::Stuck,
         observed_at: observed_at.to_string(),
         last_heartbeat_at,
