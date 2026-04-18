@@ -286,7 +286,29 @@ pub fn compose_head_prompt(
              reviewable PR. Decompose the epic into 2–8 implementer sparks, spawn \
              one Hand per spark in parallel git worktrees, monitor progress, \
              reassign on failure, and finally spawn exactly one Merger Hand that \
-             integrates every member branch into one PR for human review.\n\n",
+             integrates every member branch into one PR for human review.\n\n\
+             DISPATCH DISCIPLINE — after decomposition, DISPATCH. Do NOT exit \
+             after creating child sparks to ask the user 'which should I do \
+             first, A / B / C?' or to present decomposition options for \
+             approval. That pattern is the single most common build-Head \
+             failure mode and has burned multiple release cycles already. \
+             Once the children exist and `blocks` bonds are set, walk the \
+             graph, identify every child whose blocking predecessors are all \
+             closed (the upstream-most unblocked wave), and immediately spawn \
+             one Hand per child in that wave via \
+             `ryve hand spawn <child_id> --agent claude --crew <crew_id>`, \
+             then move on to polling. Decomposition shape, child ordering, \
+             scope boundaries, and which concrete agent to spawn are YOUR \
+             decisions — they are not user-facing questions.\n\n\
+             Only pause to ask the user — by posting a comment on the \
+             parent epic with `ryve comment add <epic_id> '<question>'` and \
+             waiting one poll cycle — when the epic's goal itself is \
+             genuinely ambiguous: the acceptance criteria contradict each \
+             other, cannot be verified, or leave a product decision that \
+             only the user owns. In that case post the comment BEFORE \
+             spawning Hands; never decompose, present options, and exit. If \
+             you already have a valid decomposition in front of you, \
+             dispatch.\n\n",
         ),
         HeadArchetype::Research => prompt.push_str(
             "CHARTER — RESEARCH. Reduce uncertainty before any code is written. \
@@ -1807,6 +1829,58 @@ mod tests {
         assert!(review.contains("**review Head**"));
         assert!(review.contains("CHARTER — REVIEW"));
         assert!(review.contains("Blocking"));
+    }
+
+    /// sp-ryve-36591aa6: Build Heads have been exiting after decomposing
+    /// to ask the user A/B/C style questions instead of dispatching. The
+    /// prompt must name the anti-pattern explicitly, require immediate
+    /// dispatch on the upstream-most unblocked wave, and only leave a
+    /// narrow clarifying-comment escape hatch for genuinely ambiguous
+    /// goals. These asserts are behavioural so a future edit cannot
+    /// quietly soften the directive.
+    #[test]
+    fn build_head_prompt_forbids_ab_c_exit_and_requires_dispatch() {
+        let p = compose_head_prompt(HeadArchetype::Build, Some("sp-1"), None);
+
+        // The anti-pattern is named so the Head cannot plausibly deny it.
+        assert!(
+            p.contains("DISPATCH DISCIPLINE"),
+            "build charter must include DISPATCH DISCIPLINE block"
+        );
+        assert!(
+            p.contains("A / B / C") || p.contains("A/B/C"),
+            "build charter must call out the A/B/C ask-the-user anti-pattern"
+        );
+
+        // The positive directive: dispatch Hands on the upstream-most
+        // unblocked wave immediately after decomposition.
+        assert!(
+            p.contains("upstream-most unblocked"),
+            "build charter must direct dispatch on the upstream-most unblocked wave"
+        );
+        assert!(
+            p.contains("ryve hand spawn"),
+            "build charter must reference the hand spawn CLI in the dispatch rule"
+        );
+
+        // The narrow escape hatch: comment+wait only for genuine goal
+        // ambiguity, via ryve comment add.
+        assert!(
+            p.contains("ryve comment add"),
+            "build charter must point to ryve comment add as the clarification channel"
+        );
+        assert!(
+            p.contains("genuinely ambiguous"),
+            "build charter must restrict clarifying comments to genuinely ambiguous goals"
+        );
+
+        // DISPATCH DISCIPLINE is archetype-specific: Research / Review
+        // have their own charters and must not inherit build-dispatch
+        // rhetoric.
+        let research = compose_head_prompt(HeadArchetype::Research, Some("sp-2"), None);
+        let review = compose_head_prompt(HeadArchetype::Review, Some("sp-3"), None);
+        assert!(!research.contains("DISPATCH DISCIPLINE"));
+        assert!(!review.contains("DISPATCH DISCIPLINE"));
     }
 
     #[test]
