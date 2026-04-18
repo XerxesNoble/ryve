@@ -4,6 +4,8 @@
 
 pub mod applier;
 pub mod orphan_scan;
+pub mod poller;
+pub mod rate_limit;
 pub mod sync;
 pub mod translator;
 pub mod types;
@@ -17,6 +19,14 @@ pub use orphan_scan::{
     DEFAULT_DEBOUNCE_SECONDS, EVT_ORPHAN_ASSIGNMENT_WARNING, ORPHAN_SCAN_ACTOR,
     ORPHAN_SCAN_EVENT_TYPE, OrphanScanOutcome, is_orphan_candidate, run_orphan_scan,
     run_orphan_scan_with,
+};
+pub use poller::{
+    DEFAULT_POLL_CADENCE, FetchResponse, FetchedEvent, PollError, Poller, PollerConfig,
+    TickOutcome, current_epoch, default_jitter, run_forever,
+};
+pub use rate_limit::{
+    BackoffReason, DEFAULT_BACKOFF_BASE, DEFAULT_BACKOFF_CAP, ExponentialBackoff, RateLimitInfo,
+    ResponseOutcome, classify,
 };
 pub use sync::GitHubSync;
 pub use translator::{GitHubPayload, TranslateError, translate};
