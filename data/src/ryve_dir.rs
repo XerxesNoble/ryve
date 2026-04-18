@@ -159,6 +159,51 @@ pub struct WorkshopConfig {
     /// resolution follows Claude Code → Codex → OpenCode order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atlas_agent: Option<String>,
+
+    /// IRC coordination settings. When `irc_server` is unset the whole
+    /// subsystem stays dormant — the client does not connect, the relay
+    /// does not drain, the inbound listener does not start. Spark
+    /// ryve-5a0e1d97 [sp-ddf6fd7f]: IRC is opt-in per workshop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irc_server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irc_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irc_tls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irc_nick: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irc_password: Option<String>,
+}
+
+impl WorkshopConfig {
+    /// Whether the IRC subsystem should start for this workshop. A missing
+    /// `irc_server` is the single switch: without a server address the
+    /// client has nothing to connect to and the relay has no destination.
+    pub fn irc_enabled(&self) -> bool {
+        self.irc_server
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Effective IRC port: falls back to 6697 when TLS is on and 6667
+    /// otherwise. Call sites must not hand-roll this default so every
+    /// subsystem agrees on which port to dial.
+    pub fn effective_irc_port(&self) -> u16 {
+        self.irc_port.unwrap_or(if self.irc_tls.unwrap_or(false) {
+            6697
+        } else {
+            6667
+        })
+    }
+
+    /// Effective IRC nick: falls back to `"ryve"` when unset.
+    pub fn effective_irc_nick(&self) -> String {
+        self.irc_nick
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "ryve".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -581,6 +626,104 @@ mod tests {
         let state = load_ui_state(&ryve_dir).await;
         assert!(state.collapsed_epics.contains("ep-1"));
         assert_eq!(state.sparks_filter, SparksFilterState::default());
+    }
+
+    // Spark ryve-5a0e1d97: IRC lifecycle integration.
+
+    #[test]
+    fn irc_disabled_by_default() {
+        let cfg = WorkshopConfig::default();
+        assert!(!cfg.irc_enabled());
+        assert!(cfg.irc_server.is_none());
+        assert!(cfg.irc_port.is_none());
+        assert!(cfg.irc_tls.is_none());
+        assert!(cfg.irc_nick.is_none());
+        assert!(cfg.irc_password.is_none());
+    }
+
+    #[test]
+    fn irc_enabled_requires_non_empty_server() {
+        let cfg = WorkshopConfig {
+            irc_server: Some("  ".into()),
+            ..Default::default()
+        };
+        assert!(!cfg.irc_enabled());
+
+        let cfg = WorkshopConfig {
+            irc_server: Some("irc.example.com".into()),
+            ..Default::default()
+        };
+        assert!(cfg.irc_enabled());
+    }
+
+    #[test]
+    fn irc_port_defaults_depend_on_tls() {
+        let cfg_plain = WorkshopConfig {
+            irc_server: Some("irc.example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg_plain.effective_irc_port(), 6667);
+
+        let cfg_tls = WorkshopConfig {
+            irc_server: Some("irc.example.com".into()),
+            irc_tls: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(cfg_tls.effective_irc_port(), 6697);
+
+        let cfg_custom = WorkshopConfig {
+            irc_server: Some("irc.example.com".into()),
+            irc_port: Some(9999),
+            ..Default::default()
+        };
+        assert_eq!(cfg_custom.effective_irc_port(), 9999);
+    }
+
+    #[test]
+    fn irc_nick_falls_back_to_ryve() {
+        let cfg = WorkshopConfig::default();
+        assert_eq!(cfg.effective_irc_nick(), "ryve");
+
+        let cfg = WorkshopConfig {
+            irc_nick: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_irc_nick(), "ryve");
+
+        let cfg = WorkshopConfig {
+            irc_nick: Some("bot".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_irc_nick(), "bot");
+    }
+
+    #[test]
+    fn irc_config_round_trips_through_toml() {
+        let cfg = WorkshopConfig {
+            irc_server: Some("irc.example.com".into()),
+            irc_port: Some(6697),
+            irc_tls: Some(true),
+            irc_nick: Some("ryvebot".into()),
+            irc_password: Some("secret".into()),
+            ..Default::default()
+        };
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let restored: WorkshopConfig = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(restored.irc_server.as_deref(), Some("irc.example.com"));
+        assert_eq!(restored.irc_port, Some(6697));
+        assert_eq!(restored.irc_tls, Some(true));
+        assert_eq!(restored.irc_nick.as_deref(), Some("ryvebot"));
+        assert_eq!(restored.irc_password.as_deref(), Some("secret"));
+        assert!(restored.irc_enabled());
+    }
+
+    #[test]
+    fn irc_config_missing_fields_stay_disabled() {
+        let legacy = r#"
+            workshop_schema_version = 1
+        "#;
+        let cfg: WorkshopConfig = toml::from_str(legacy).expect("legacy parse");
+        assert!(!cfg.irc_enabled());
     }
 
     #[tokio::test]
