@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod irc_client;
+pub mod irc_renderer;
 pub mod signal_discipline;
 
 /// Returns the path for the IPC socket. We prefer `$XDG_RUNTIME_DIR`
