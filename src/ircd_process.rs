@@ -103,7 +103,17 @@ impl SpawnSpec {
     /// cleanly skip the supervisor on a pre-`ryve init` workshop, on a
     /// platform without the bundled binary, or before
     /// `scripts/build-vendored-ircd.sh` has run.
+    ///
+    /// PR #50 Copilot c2: also returns `None` when the user has
+    /// explicitly disabled IRC via `config.irc_enabled() == false`.
+    /// Previously a workshop that had a bundled port + ircd.conf from
+    /// a prior `ryve init` would still spawn / reconcile ngIRCd on
+    /// startup even after the user flipped the opt-out, leaving a
+    /// background daemon running unexpectedly.
     pub fn for_workshop(ryve_dir: &RyveDir, config: &WorkshopConfig) -> Option<Self> {
+        if !config.irc_enabled() {
+            return None;
+        }
         let binary = bundled_ircd_path()?;
         let port = config.irc_bundled_port?;
         let config_path = ircd_config_path(ryve_dir);
@@ -301,7 +311,19 @@ fn pid_is_alive(pid: u32) -> bool {
     // produces a pid that almost certainly isn't ours, and the call
     // just returns ESRCH — still a safe no-op.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0
+    if rc == 0 {
+        return true;
+    }
+    // PR #50 Copilot c3: `kill(pid, 0)` returns -1 for both "process
+    // does not exist" (ESRCH) and "process exists but we can't signal
+    // it" (EPERM). Only ESRCH means the PID is dead; treating EPERM
+    // as dead would misclassify a live daemon owned by another user
+    // (or running under a different uid after a privilege drop) and
+    // spawn a duplicate. Any other errno is conservatively treated
+    // as "unknown → dead" because the reconcile path is cheap and a
+    // false-negative just means one extra spawn attempt.
+    let err = std::io::Error::last_os_error().raw_os_error();
+    matches!(err, Some(libc::EPERM))
 }
 
 #[cfg(not(unix))]

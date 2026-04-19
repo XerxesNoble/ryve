@@ -131,10 +131,29 @@ pub fn irc_health_from(
     } else {
         IrcStatus::Configured
     };
+    // PR #50 Copilot c4: derive server + port from the effective
+    // server address so the bundled-daemon case (irc_server unset,
+    // irc_bundled_port set) shows "127.0.0.1:<bundled_port>" instead
+    // of rendering "(unset):6667" (or 6697) with the raw override
+    // fields. Parse the "host:port" form produced by
+    // `effective_irc_server_address()`; fall back to the explicit
+    // override fields when we can't resolve an effective address.
+    let (display_server, display_port) = match config.effective_irc_server_address() {
+        Some(addr) => {
+            if let Some((host, port_str)) = addr.rsplit_once(':')
+                && let Ok(port) = port_str.parse::<u16>()
+            {
+                (Some(host.to_string()), port)
+            } else {
+                (config.irc_server.clone(), config.effective_irc_port())
+            }
+        }
+        None => (config.irc_server.clone(), config.effective_irc_port()),
+    };
     IrcHealth {
         status,
-        server: config.irc_server.clone(),
-        port: config.effective_irc_port(),
+        server: display_server,
+        port: display_port,
         tls: config.irc_tls.unwrap_or(false),
         nick: config.effective_irc_nick(),
     }

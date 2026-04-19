@@ -179,68 +179,103 @@ impl StreamHeartbeat {
         let mut heartbeats: u64 = 0;
         let mut child_status: Option<ExitStatus> = None;
         let mut last_output = Instant::now();
-        let mut wait_fut = Box::pin(child.wait());
 
-        // On any early-return Err the child's `kill_on_drop(true)`
-        // setting takes care of cleanup: `wait_fut` is dropped first
-        // (block-scope LIFO), releasing the &mut borrow on `child`,
-        // then `child` itself drops and tokio sends SIGKILL. We
-        // therefore do not need explicit `start_kill()` calls in the
-        // error arms below — but the contract is that the wrapper must
-        // not return Err and leave a long-running child alive, and the
-        // module-level invariants document that guarantee.
-        loop {
-            let deadline = last_output + self.interval;
-            let sleep = tokio::time::sleep_until(deadline);
-            tokio::pin!(sleep);
+        // Drive the child, readers, and heartbeat timer from a single
+        // select loop. On any error we break out to the cleanup
+        // epilogue below so we can explicitly `start_kill()` + `wait()`
+        // the child — `kill_on_drop(true)` (set on `command` above)
+        // is a belt-and-braces safety net, but reaping is the right
+        // contract so the wrapper never returns Err into a parent
+        // that's about to do its own `waitpid` book-keeping and find
+        // a zombie.  (PR #50 Copilot c1.)
+        //
+        // `LoopOutcome` is the exit value of the inner block:
+        //   Ok(Some(status)) — child finished cleanly, success path
+        //   Ok(None)         — keep looping (no early exit)
+        //   Err(e)           — bail with io::Error and kill the child
+        let wait_result: std::io::Result<StreamOutcome> = 'run: {
+            let mut wait_fut = Box::pin(child.wait());
+            loop {
+                let deadline = last_output + self.interval;
+                let sleep = tokio::time::sleep_until(deadline);
+                tokio::pin!(sleep);
 
-            tokio::select! {
-                biased;
-                maybe_chunk = rx.recv() => {
-                    match maybe_chunk {
-                        Some(Ok(chunk)) => {
-                            // A sink-write failure here returns Err;
-                            // child is killed via kill_on_drop on the
-                            // way out (see comment above).
-                            out.write_all(&chunk).await?;
-                            out.flush().await?;
-                            last_output = Instant::now();
+                tokio::select! {
+                    biased;
+                    maybe_chunk = rx.recv() => {
+                        match maybe_chunk {
+                            Some(Ok(chunk)) => {
+                                if let Err(e) = out.write_all(&chunk).await {
+                                    break 'run Err(e);
+                                }
+                                if let Err(e) = out.flush().await {
+                                    break 'run Err(e);
+                                }
+                                last_output = Instant::now();
+                            }
+                            Some(Err(e)) => {
+                                // Reader failed mid-stream. Truncated
+                                // output is a contract violation —
+                                // surface the error rather than
+                                // returning Ok with partial bytes.
+                                break 'run Err(e);
+                            }
+                            None => {
+                                // Both forwarders have closed the
+                                // channel: stdout + stderr at EOF.
+                                // Resolve the exit status (may already
+                                // be captured) and finish successfully.
+                                let status = match child_status {
+                                    Some(s) => s,
+                                    None => match (&mut wait_fut).await {
+                                        Ok(s) => s,
+                                        Err(e) => break 'run Err(e),
+                                    },
+                                };
+                                break 'run Ok(StreamOutcome {
+                                    status,
+                                    heartbeats_emitted: heartbeats,
+                                });
+                            }
                         }
-                        Some(Err(e)) => {
-                            // Reader failed mid-stream. Truncated
-                            // output is a contract violation — surface
-                            // the error rather than returning Ok with
-                            // partial bytes. kill_on_drop reaps the
-                            // child as we unwind.
-                            return Err(e);
+                    }
+                    _ = &mut sleep, if child_status.is_none() => {
+                        if let Err(e) = out.write_all(&heartbeat_bytes).await {
+                            break 'run Err(e);
                         }
-                        None => {
-                            // Both forwarders have closed the channel,
-                            // meaning stdout + stderr have hit EOF.
-                            // Resolve the exit status (may already be
-                            // captured) and finish.
-                            let status = match child_status {
-                                Some(s) => s,
-                                None => (&mut wait_fut).await?,
-                            };
-                            return Ok(StreamOutcome {
-                                status,
-                                heartbeats_emitted: heartbeats,
-                            });
+                        if let Err(e) = out.flush().await {
+                            break 'run Err(e);
+                        }
+                        heartbeats += 1;
+                        last_output = Instant::now();
+                    }
+                    status = &mut wait_fut, if child_status.is_none() => {
+                        match status {
+                            Ok(s) => {
+                                child_status = Some(s);
+                                // Keep looping so any pending
+                                // stdout/stderr bytes still drain
+                                // through `rx.recv()` before we return.
+                            }
+                            Err(e) => break 'run Err(e),
                         }
                     }
                 }
-                _ = &mut sleep, if child_status.is_none() => {
-                    out.write_all(&heartbeat_bytes).await?;
-                    out.flush().await?;
-                    heartbeats += 1;
-                    last_output = Instant::now();
-                }
-                status = &mut wait_fut, if child_status.is_none() => {
-                    child_status = Some(status?);
-                    // Keep looping so any pending stdout/stderr bytes
-                    // still drain through `rx.recv()` before we return.
-                }
+            }
+            // wait_fut is dropped here when the `'run` block ends,
+            // releasing the &mut borrow on `child` so the epilogue
+            // below can call `start_kill()` + `wait()`.
+        };
+
+        match wait_result {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                // Kill and reap so the parent doesn't leak a zombie
+                // ngircd / cargo / etc. even if kill_on_drop already
+                // fired the SIGKILL. start_kill is idempotent.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                Err(e)
             }
         }
     }

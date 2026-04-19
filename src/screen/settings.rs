@@ -145,9 +145,15 @@ pub fn view<'a>(
 
     // ── IRC section ───────────────────────────────────
     let irc_heading = text("IRC server").size(FONT_BODY).color(pal.text_primary);
+    // PR #50 Copilot c5: with bundled IRC, a blank field no longer
+    // means "disabled" — it falls back to the workshop-local
+    // daemon at 127.0.0.1:<bundled_port> that `ryve init` provisions.
+    // Users who really want to disable IRC flip `irc_enabled = false`
+    // in `.ryve/config.toml` (see house rules / integrations docs).
     let irc_hint = text(
-        "Address of the coordination server (e.g. irc.libera.chat). \
-         Leaving this blank disables the IRC subsystem.",
+        "Override for the coordination server (e.g. irc.libera.chat:6697). \
+         Leave blank to use the bundled workshop-local daemon. To disable \
+         IRC entirely, set irc_enabled = false in .ryve/config.toml.",
     )
     .size(FONT_SMALL)
     .color(pal.text_secondary);

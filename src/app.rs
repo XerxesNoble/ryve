@@ -6853,7 +6853,17 @@ impl App {
                 .lock()
                 .map(|guard| guard.is_some())
                 .unwrap_or(false);
-            screen::status_bar::IrcStatus::from_runtime(ws.config.irc_enabled(), runtime_present)
+            // PR #50 Copilot c6: "enabled" on the status bar means
+            // "the flag is true AND there is an effective server to
+            // dial". Without the address check, a pre-`ryve init`
+            // workshop (irc_enabled default true, no irc_server, no
+            // irc_bundled_port) would render as "Disconnected" in the
+            // status bar even though the lifecycle correctly skipped
+            // IRC boot. Treating a workshop with no dial target as
+            // `Disabled` keeps the pill honest.
+            let has_dial_target = ws.config.effective_irc_server_address().is_some();
+            let enabled_effective = ws.config.irc_enabled() && has_dial_target;
+            screen::status_bar::IrcStatus::from_runtime(enabled_effective, runtime_present)
         };
         let github_status = screen::status_bar::GitHubStatus::from_config(
             ws.config.github.is_configured(),
