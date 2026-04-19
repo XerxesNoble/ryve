@@ -14,7 +14,11 @@ pub const ATLAS_ROLE_ANNOTATION: &str = "(Director)";
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    OpenSettings,
+    /// Gear-icon press. Opens the Integrations health overlay, which
+    /// cross-links into the Settings credentials form. PR #49 Copilot
+    /// c10: renamed from `OpenSettings` so the message name matches
+    /// where it actually routes.
+    OpenIntegrations,
     RequestBranchSwitch,
 }
 
@@ -55,6 +59,77 @@ pub struct FileViewerInfo<'a> {
     pub language: &'a str,
 }
 
+/// IRC subsystem state as seen by the status bar.
+///
+/// Spark ryve-0daa8262: a single read-only enum so the bar can render an
+/// always-present indicator without crashing when IRC is disabled or the
+/// boot task has not yet installed a runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrcStatus {
+    /// `irc_server` is configured and an `IrcRuntime` is currently held.
+    Connected,
+    /// `irc_server` is configured but no runtime is installed (boot in
+    /// progress, boot failed, or shutdown). Renders as a non-fatal warning.
+    Disconnected,
+    /// `irc_server` is unset — the subsystem is dormant by design.
+    Disabled,
+}
+
+impl IrcStatus {
+    /// Project the workshop's IRC state into a status-bar indicator.
+    /// `enabled` mirrors `WorkshopConfig::irc_enabled` and `runtime_present`
+    /// is `true` when `Workshop::irc_runtime` currently holds a runtime.
+    pub fn from_runtime(enabled: bool, runtime_present: bool) -> Self {
+        if !enabled {
+            Self::Disabled
+        } else if runtime_present {
+            Self::Connected
+        } else {
+            Self::Disconnected
+        }
+    }
+}
+
+/// GitHub integration state as seen by the status bar.
+///
+/// Spark ryve-0daa8262: token + repo are the two switches the rest of the
+/// app reads to decide whether GitHub sync is wired up. Both must be set
+/// for `Configured`; neither set is the default `Unconfigured` state; a
+/// half-configured pair (token without repo or vice versa) is `Error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubStatus {
+    /// Both `github.token` and `github.repo` are non-empty.
+    Configured,
+    /// Neither `github.token` nor `github.repo` is set.
+    Unconfigured,
+    /// One of `github.token` / `github.repo` is set without the other.
+    Error,
+}
+
+impl GitHubStatus {
+    /// Project `GitHubConfig` into a status-bar indicator.
+    ///
+    /// `is_configured` comes from the full `GitHubConfig::is_configured()`
+    /// so the newer Settings/Integrations flows that configure GitHub
+    /// via `webhook_secret` + `poll_token` are reflected correctly
+    /// (PR #49 Copilot c4). The legacy `token` + `repo` pair is still
+    /// inspected so a partial legacy setup surfaces as `Error`.
+    /// Trimmed-empty strings count as unset so stray empty TOML values
+    /// do not silently pose as a partial configuration.
+    pub fn from_config(is_configured: bool, token: Option<&str>, repo: Option<&str>) -> Self {
+        if is_configured {
+            return Self::Configured;
+        }
+        let token_set = token.map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let repo_set = repo.map(|s| !s.trim().is_empty()).unwrap_or(false);
+        match (token_set, repo_set) {
+            (true, true) => Self::Configured,
+            (false, false) => Self::Unconfigured,
+            _ => Self::Error,
+        }
+    }
+}
+
 /// Render the status bar for a workshop.
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
@@ -66,6 +141,8 @@ pub fn view<'a>(
     total_hands: usize,
     failing_contracts: usize,
     file_info: Option<FileViewerInfo<'a>>,
+    irc_status: IrcStatus,
+    github_status: GitHubStatus,
     pal: &Palette,
     has_bg: bool,
 ) -> Element<'a, Message> {
@@ -235,6 +312,17 @@ pub fn view<'a>(
         right = right.push(separator(&pal));
     }
 
+    // Integration indicators — IRC + GitHub. Always rendered so users can
+    // glance at the bar and see whether the backbone is wired up. Spark
+    // ryve-0daa8262.
+    right = right.push(integration_pill("IRC", irc_glyph(irc_status, &pal), &pal));
+    right = right.push(integration_pill(
+        "GitHub",
+        github_glyph(github_status, &pal),
+        &pal,
+    ));
+    right = right.push(separator(&pal));
+
     // Atlas (Director) indicator — anchors the agent hierarchy in the status
     // bar so users always see who is in charge, whether or not Hands are
     // currently running. Sits immediately before the Hand count.
@@ -289,7 +377,7 @@ pub fn view<'a>(
         button(text("\u{2699}").size(FONT_ICON).color(pal.text_secondary))
             .style(button::text)
             .padding([2, 6])
-            .on_press(Message::OpenSettings),
+            .on_press(Message::OpenIntegrations),
     );
 
     // ── Assemble the bar ─────────────────────────────────
@@ -327,6 +415,44 @@ fn separator<'a>(pal: &Palette) -> Element<'a, Message> {
         .into()
 }
 
+/// Glyph + color for the IRC indicator. Filled circle for live states
+/// (connected = success, disconnected = danger) and an empty circle for
+/// the dormant `Disabled` state so a glance distinguishes "off by design"
+/// from "should be on but isn't".
+fn irc_glyph(status: IrcStatus, pal: &Palette) -> (&'static str, iced::Color) {
+    match status {
+        IrcStatus::Connected => ("\u{25CF}", pal.success), // ●
+        IrcStatus::Disconnected => ("\u{25CF}", pal.danger),
+        IrcStatus::Disabled => ("\u{25CB}", pal.text_tertiary), // ○
+    }
+}
+
+/// Glyph + color for the GitHub indicator. Mirrors [`irc_glyph`] so the
+/// two integrations read consistently in the bar.
+fn github_glyph(status: GitHubStatus, pal: &Palette) -> (&'static str, iced::Color) {
+    match status {
+        GitHubStatus::Configured => ("\u{25CF}", pal.success),
+        GitHubStatus::Error => ("\u{25CF}", pal.danger),
+        GitHubStatus::Unconfigured => ("\u{25CB}", pal.text_tertiary),
+    }
+}
+
+/// Shared two-part pill (glyph + label) used by the integration indicators.
+fn integration_pill<'a>(
+    label: &'a str,
+    glyph_with_color: (&'static str, iced::Color),
+    pal: &Palette,
+) -> Element<'a, Message> {
+    let (glyph, color) = glyph_with_color;
+    row![
+        text(glyph).size(FONT_LABEL).color(color),
+        text(label).size(FONT_LABEL).color(pal.text_secondary),
+    ]
+    .spacing(4)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +483,79 @@ mod tests {
     fn spark_summary_default_is_zero() {
         let s = SparkSummary::default();
         assert_eq!(s.total_active(), 0);
+    }
+
+    #[test]
+    fn irc_status_disabled_when_not_enabled() {
+        assert_eq!(IrcStatus::from_runtime(false, false), IrcStatus::Disabled);
+        // `runtime_present=true` while `enabled=false` is not a state the
+        // workshop can reach in practice, but the projection still reports
+        // `Disabled` to keep the contract simple: enabled drives the switch.
+        assert_eq!(IrcStatus::from_runtime(false, true), IrcStatus::Disabled);
+    }
+
+    #[test]
+    fn irc_status_connected_when_runtime_present() {
+        assert_eq!(IrcStatus::from_runtime(true, true), IrcStatus::Connected);
+    }
+
+    #[test]
+    fn irc_status_disconnected_when_enabled_without_runtime() {
+        assert_eq!(
+            IrcStatus::from_runtime(true, false),
+            IrcStatus::Disconnected,
+        );
+    }
+
+    #[test]
+    fn github_status_configured_requires_token_and_repo() {
+        // Legacy path: token+repo both set but is_configured=false
+        // (older callers that don't consult the full GitHubConfig).
+        assert_eq!(
+            GitHubStatus::from_config(false, Some("ghp_token"), Some("owner/repo")),
+            GitHubStatus::Configured,
+        );
+    }
+
+    #[test]
+    fn github_status_configured_via_is_configured_flag() {
+        // PR #49 Copilot c4: the modern Settings/Integrations flow
+        // configures GitHub via `webhook_secret` + `poll_token`, not
+        // legacy `token` + `repo`. `GitHubConfig::is_configured()`
+        // returns true for that case; the status bar must honour it
+        // even if the legacy pair is empty.
+        assert_eq!(
+            GitHubStatus::from_config(true, None, None),
+            GitHubStatus::Configured,
+        );
+    }
+
+    #[test]
+    fn github_status_unconfigured_when_both_missing() {
+        assert_eq!(
+            GitHubStatus::from_config(false, None, None),
+            GitHubStatus::Unconfigured,
+        );
+    }
+
+    #[test]
+    fn github_status_unconfigured_when_both_blank() {
+        assert_eq!(
+            GitHubStatus::from_config(false, Some("   "), Some("")),
+            GitHubStatus::Unconfigured,
+        );
+    }
+
+    #[test]
+    fn github_status_error_when_only_one_set() {
+        assert_eq!(
+            GitHubStatus::from_config(false, Some("ghp_token"), None),
+            GitHubStatus::Error,
+        );
+        assert_eq!(
+            GitHubStatus::from_config(false, None, Some("owner/repo")),
+            GitHubStatus::Error,
+        );
     }
 
     #[test]

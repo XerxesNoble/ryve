@@ -160,10 +160,24 @@ pub struct WorkshopConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atlas_agent: Option<String>,
 
-    /// IRC coordination settings. When `irc_server` is unset the whole
-    /// subsystem stays dormant — the client does not connect, the relay
-    /// does not drain, the inbound listener does not start. Spark
-    /// ryve-5a0e1d97 [sp-ddf6fd7f]: IRC is opt-in per workshop.
+    /// IRC coordination settings. Under the bundled-IRC model (spark
+    /// ryve-300f661c [sp-31659bbb]) IRC defaults on: the workshop runs
+    /// a local daemon on `127.0.0.1:<irc_bundled_port>` and
+    /// [`WorkshopConfig::effective_irc_server_address`] resolves to that
+    /// address unless `irc_server` explicitly overrides it (e.g.
+    /// `irc_server = "irc.libera.chat"` for a mesh setup).
+    ///
+    /// `irc_enabled` is the master opt-out switch; set it to `false` to
+    /// keep the whole subsystem dormant.
+    #[serde(default = "default_true")]
+    pub irc_enabled: bool,
+    /// Workshop-local IRC daemon port, allocated and recorded by
+    /// `ryve init` (spark ryve-4d5881c2). Read by
+    /// [`WorkshopConfig::effective_irc_server_address`] to form the
+    /// default `127.0.0.1:<port>` address when no explicit `irc_server`
+    /// override is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irc_bundled_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub irc_server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,13 +205,39 @@ pub struct WorkshopConfig {
 }
 
 impl WorkshopConfig {
-    /// Whether the IRC subsystem should start for this workshop. A missing
-    /// `irc_server` is the single switch: without a server address the
-    /// client has nothing to connect to and the relay has no destination.
+    /// Whether the IRC subsystem should start for this workshop. Defaults
+    /// to `true` — Ryve ships a bundled daemon and IRC is the backbone of
+    /// agent coordination. Set the `irc_enabled` field to `false` to keep
+    /// the client, relay, and inbound listener dormant.
     pub fn irc_enabled(&self) -> bool {
-        self.irc_server
-            .as_ref()
-            .is_some_and(|s| !s.trim().is_empty())
+        self.irc_enabled
+    }
+
+    /// Effective IRC server address the runtime should dial. Resolution
+    /// order:
+    ///
+    /// 1. Explicit `irc_server` override combined with
+    ///    [`effective_irc_port`] — e.g. `"irc.libera.chat:6697"` for a
+    ///    mesh/cross-workshop setup.
+    /// 2. Bundled workshop-local daemon at
+    ///    `127.0.0.1:<irc_bundled_port>` (the port allocated by
+    ///    `ryve init`).
+    ///
+    /// Returns `None` only when neither source yields an address — i.e.
+    /// the workshop has not yet been initialised and no override is set.
+    /// Callers (IPC lifecycle, supervisor) treat that as "skip IRC for
+    /// this boot".
+    pub fn effective_irc_server_address(&self) -> Option<String> {
+        if let Some(host) = self
+            .irc_server
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(format!("{host}:{}", self.effective_irc_port()));
+        }
+        self.irc_bundled_port
+            .map(|port| format!("127.0.0.1:{port}"))
     }
 
     /// Effective IRC port: falls back to 6697 when TLS is on and 6667
@@ -233,6 +273,8 @@ impl Default for WorkshopConfig {
             background: BackgroundConfig::default(),
             agents: AgentsConfig::default(),
             atlas_agent: None,
+            irc_enabled: true,
+            irc_bundled_port: None,
             irc_server: None,
             irc_port: None,
             irc_tls: None,
@@ -255,6 +297,10 @@ fn default_heartbeat_interval_secs() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_stuck_threshold_secs() -> u64 {
     DEFAULT_STUCK_THRESHOLD_SECS
 }
@@ -272,6 +318,50 @@ pub struct GitHubConfig {
     /// Auto-sync sparks to GitHub issues on every change.
     #[serde(default)]
     pub auto_sync: bool,
+
+    /// Shared secret for verifying inbound webhook deliveries. When set,
+    /// the artifact mirror flips to webhook ingestion mode and disables
+    /// the REST polling fallback (`PollerConfig::webhook_secret_configured`).
+    /// Spark ryve-c3de335e: surfaced through the integrations settings form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
+
+    /// PAT used by the REST polling fallback when no webhook is wired up.
+    /// `None` leaves the poller authenticated with whatever `token` is set
+    /// to, or unauthenticated for public repos. Surfaced through the
+    /// integrations settings form. Spark ryve-c3de335e.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_token: Option<String>,
+}
+
+impl GitHubConfig {
+    /// Whether webhook ingestion is configured for this workshop. Drives
+    /// the gate flag in the artifact mirror poller and the integrations
+    /// detail screen's mode badge. A whitespace-only secret counts as
+    /// unconfigured so the user can clear the field by blanking it out.
+    pub fn webhook_configured(&self) -> bool {
+        self.webhook_secret
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Whether REST polling has a credential available. Considers either
+    /// `poll_token` (the explicit field) or the legacy `token` field.
+    pub fn poll_token_configured(&self) -> bool {
+        self.poll_token
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || self.token.as_ref().is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Whether the workshop has any GitHub integration configured at all.
+    /// Used by the status bar / integrations screen to render an
+    /// "unconfigured" state without a hard error.
+    pub fn is_configured(&self) -> bool {
+        self.repo.as_ref().is_some_and(|s| !s.trim().is_empty())
+            || self.webhook_configured()
+            || self.poll_token_configured()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -682,31 +772,116 @@ mod tests {
     }
 
     // Spark ryve-5a0e1d97: IRC lifecycle integration.
+    // Spark ryve-300f661c [sp-31659bbb]: default-on IRC + bundled-port resolution.
 
     #[test]
-    fn irc_disabled_by_default() {
+    fn irc_enabled_by_default() {
+        // A fresh WorkshopConfig represents a workshop that has passed
+        // through `ryve init`; IRC is the coordination backbone and must
+        // default on. The non-IRC fields stay None/unset — the bundled
+        // port is written by `ryve init` (spark ryve-4d5881c2).
         let cfg = WorkshopConfig::default();
-        assert!(!cfg.irc_enabled());
+        assert!(cfg.irc_enabled());
         assert!(cfg.irc_server.is_none());
         assert!(cfg.irc_port.is_none());
         assert!(cfg.irc_tls.is_none());
         assert!(cfg.irc_nick.is_none());
         assert!(cfg.irc_password.is_none());
+        assert!(cfg.irc_bundled_port.is_none());
     }
 
     #[test]
-    fn irc_enabled_requires_non_empty_server() {
+    fn irc_enabled_honours_explicit_opt_out() {
+        // Users can still disable the whole subsystem by flipping the
+        // master switch in `.ryve/config.toml`.
         let cfg = WorkshopConfig {
-            irc_server: Some("  ".into()),
+            irc_enabled: false,
             ..Default::default()
         };
         assert!(!cfg.irc_enabled());
+    }
 
+    #[test]
+    fn effective_irc_server_address_uses_bundled_port_on_fresh_config() {
+        // Freshly-inited workshop: `ryve init` has recorded a bundled
+        // port but no explicit override. The helper resolves to the
+        // workshop-local daemon.
         let cfg = WorkshopConfig {
-            irc_server: Some("irc.example.com".into()),
+            irc_bundled_port: Some(6971),
             ..Default::default()
         };
-        assert!(cfg.irc_enabled());
+        assert_eq!(
+            cfg.effective_irc_server_address().as_deref(),
+            Some("127.0.0.1:6971"),
+        );
+    }
+
+    #[test]
+    fn effective_irc_server_address_honours_explicit_override() {
+        // Mesh / cross-workshop setup: an explicit `irc_server` wins
+        // over the bundled port, and the helper composes host:port via
+        // `effective_irc_port`.
+        let cfg = WorkshopConfig {
+            irc_server: Some("irc.libera.chat".into()),
+            irc_port: Some(6697),
+            irc_tls: Some(true),
+            irc_bundled_port: Some(6971),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_irc_server_address().as_deref(),
+            Some("irc.libera.chat:6697"),
+        );
+    }
+
+    #[test]
+    fn effective_irc_server_address_override_defaults_port() {
+        // Override with no explicit port falls back to 6667 for plain
+        // and 6697 for TLS — the same logic as `effective_irc_port`.
+        let plain = WorkshopConfig {
+            irc_server: Some("irc.example.com".into()),
+            irc_bundled_port: Some(6971),
+            ..Default::default()
+        };
+        assert_eq!(
+            plain.effective_irc_server_address().as_deref(),
+            Some("irc.example.com:6667"),
+        );
+
+        let tls = WorkshopConfig {
+            irc_server: Some("irc.example.com".into()),
+            irc_tls: Some(true),
+            irc_bundled_port: Some(6971),
+            ..Default::default()
+        };
+        assert_eq!(
+            tls.effective_irc_server_address().as_deref(),
+            Some("irc.example.com:6697"),
+        );
+    }
+
+    #[test]
+    fn effective_irc_server_address_none_without_override_or_bundled() {
+        // Pre-init state (no override, no bundled port allocated yet):
+        // the lifecycle treats `None` as "skip IRC this boot".
+        let cfg = WorkshopConfig::default();
+        assert!(cfg.effective_irc_server_address().is_none());
+    }
+
+    #[test]
+    fn effective_irc_server_address_blank_override_falls_back_to_bundled() {
+        // A whitespace-only `irc_server` is treated as no override so a
+        // stray blank line in config.toml doesn't brick IRC for the
+        // workshop.
+        let cfg = WorkshopConfig {
+            irc_server: Some("   ".into()),
+            irc_bundled_port: Some(6971),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_irc_server_address().as_deref(),
+            Some("127.0.0.1:6971"),
+        );
     }
 
     #[test]
@@ -753,6 +928,8 @@ mod tests {
     #[test]
     fn irc_config_round_trips_through_toml() {
         let cfg = WorkshopConfig {
+            irc_enabled: true,
+            irc_bundled_port: Some(6971),
             irc_server: Some("irc.example.com".into()),
             irc_port: Some(6697),
             irc_tls: Some(true),
@@ -762,21 +939,107 @@ mod tests {
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         let restored: WorkshopConfig = toml::from_str(&serialized).expect("deserialize");
+        assert!(restored.irc_enabled());
+        assert_eq!(restored.irc_bundled_port, Some(6971));
         assert_eq!(restored.irc_server.as_deref(), Some("irc.example.com"));
         assert_eq!(restored.irc_port, Some(6697));
         assert_eq!(restored.irc_tls, Some(true));
         assert_eq!(restored.irc_nick.as_deref(), Some("ryvebot"));
         assert_eq!(restored.irc_password.as_deref(), Some("secret"));
-        assert!(restored.irc_enabled());
     }
 
     #[test]
-    fn irc_config_missing_fields_stay_disabled() {
+    fn irc_config_missing_fields_default_to_enabled() {
+        // Legacy config files written before ryve-300f661c won't have
+        // `irc_enabled` or `irc_bundled_port`. They must load cleanly
+        // and inherit the new default-on behaviour — the supervisor
+        // (spark ryve-242252b0) re-runs `ryve init` semantics if the
+        // bundled port is missing.
         let legacy = r#"
             workshop_schema_version = 1
         "#;
         let cfg: WorkshopConfig = toml::from_str(legacy).expect("legacy parse");
-        assert!(!cfg.irc_enabled());
+        assert!(cfg.irc_enabled());
+        assert!(cfg.irc_bundled_port.is_none());
+        assert!(cfg.effective_irc_server_address().is_none());
+    }
+
+    // Spark ryve-c3de335e: GitHub credential surfacing.
+
+    #[test]
+    fn github_config_default_is_unconfigured() {
+        let cfg = GitHubConfig::default();
+        assert!(!cfg.is_configured());
+        assert!(!cfg.webhook_configured());
+        assert!(!cfg.poll_token_configured());
+    }
+
+    #[test]
+    fn github_webhook_secret_requires_non_empty_value() {
+        let cfg = GitHubConfig {
+            webhook_secret: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(!cfg.webhook_configured());
+
+        let cfg = GitHubConfig {
+            webhook_secret: Some("shh".into()),
+            ..Default::default()
+        };
+        assert!(cfg.webhook_configured());
+        assert!(cfg.is_configured());
+    }
+
+    #[test]
+    fn github_poll_token_falls_back_to_legacy_token_field() {
+        let only_legacy = GitHubConfig {
+            token: Some("ghp_legacy".into()),
+            ..Default::default()
+        };
+        assert!(only_legacy.poll_token_configured());
+
+        let only_new = GitHubConfig {
+            poll_token: Some("ghp_new".into()),
+            ..Default::default()
+        };
+        assert!(only_new.poll_token_configured());
+
+        let blank_new = GitHubConfig {
+            poll_token: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(!blank_new.poll_token_configured());
+    }
+
+    #[test]
+    fn github_config_round_trips_through_toml() {
+        let cfg = GitHubConfig {
+            repo: Some("octo/cat".into()),
+            webhook_secret: Some("shh".into()),
+            poll_token: Some("ghp_xxx".into()),
+            ..Default::default()
+        };
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let restored: GitHubConfig = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(restored.repo.as_deref(), Some("octo/cat"));
+        assert_eq!(restored.webhook_secret.as_deref(), Some("shh"));
+        assert_eq!(restored.poll_token.as_deref(), Some("ghp_xxx"));
+        assert!(restored.is_configured());
+    }
+
+    #[test]
+    fn github_config_legacy_toml_without_new_fields_loads() {
+        // Pre-c3de335e configs only had token/repo/auto_sync. They must
+        // still parse and report the legacy token via poll_token_configured.
+        let legacy = r#"
+            token = "ghp_old"
+            repo = "octo/cat"
+            auto_sync = true
+        "#;
+        let cfg: GitHubConfig = toml::from_str(legacy).expect("legacy parse");
+        assert_eq!(cfg.token.as_deref(), Some("ghp_old"));
+        assert!(cfg.poll_token_configured());
+        assert!(!cfg.webhook_configured());
     }
 
     #[tokio::test]

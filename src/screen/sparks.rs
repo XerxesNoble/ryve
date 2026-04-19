@@ -5,9 +5,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use data::sparks::types::Spark;
+use data::sparks::types::{HandAssignment, Spark};
 use iced::widget::{Space, button, column, container, lazy, row, scrollable, text, text_input};
-use iced::{Element, Length, Theme};
+use iced::{Color, Element, Length, Theme};
+use ipc::channel_manager::{EpicRef, channel_name};
 
 use crate::screen::agents::AgentSession;
 use crate::style::{
@@ -488,6 +489,10 @@ pub enum Message {
     /// Navigate to an agent session in the agents panel (and open its
     /// log tab if applicable). Spark ryve-dba4b8c4.
     FocusAgentSession(String),
+    /// Open a URL (typically a GitHub PR link) in the user's browser.
+    /// Routed to the top-level `Message::OpenUrl` by the app layer so
+    /// sparks.rs stays UI-facing. Spark ryve-1625746b.
+    OpenUrl(String),
     /// The sparks filter changed — persist to `.ryve/ui_state.json`.
     /// Not yet emitted by filter widgets; will be wired once all filter
     /// UI is integrated. Spark ryve-27e33825.
@@ -605,6 +610,8 @@ fn sparks_list_hash(
     collapsed: &HashSet<String>,
     status_menu: &StatusMenu,
     agent_sessions: &[AgentSession],
+    hand_assignments: &[HandAssignment],
+    irc_connected: bool,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     sparks.len().hash(&mut h);
@@ -641,6 +648,21 @@ fn sparks_list_hash(
         s.id.hash(&mut h);
         s.name.hash(&mut h);
     }
+    // Liveness badge + PR-link rendering depends on the active assignments
+    // for each spark. The watchdog updates liveness and the applier fills
+    // in PR metadata long after the spark row first renders, so these
+    // fields must participate in the lazy cache key.
+    hand_assignments.len().hash(&mut h);
+    for a in hand_assignments {
+        a.id.hash(&mut h);
+        a.spark_id.hash(&mut h);
+        a.status.hash(&mut h);
+        a.role.hash(&mut h);
+        a.liveness.hash(&mut h);
+        a.github_artifact_branch.hash(&mut h);
+        a.github_artifact_pr_number.hash(&mut h);
+    }
+    irc_connected.hash(&mut h);
     h.finish()
 }
 
@@ -665,6 +687,18 @@ pub struct ViewCtx<'a> {
     pub filtered_sparks: &'a [Spark],
     pub sort_mode: SortMode,
     pub sort_dropdown_open: bool,
+    /// Active hand assignments across this workshop. Used to surface a
+    /// Healthy/AtRisk/Stuck liveness badge on Hand-owned spark rows and
+    /// a GitHub artifact PR link once the applier has opened one.
+    /// Spark ryve-1625746b.
+    pub hand_assignments: &'a [HandAssignment],
+    /// True when the workshop's IRC runtime is currently connected.
+    /// Drives the epic channel pill: rendered in accent when connected
+    /// and hidden otherwise (both "disabled" and "disconnected" states
+    /// suppress the pill so users don't mistake a muted pill for an
+    /// active-but-idle channel — PR #49 Copilot c9).
+    /// Spark ryve-1625746b.
+    pub irc_connected: bool,
 }
 
 pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
@@ -683,6 +717,8 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
         filtered_sparks,
         sort_mode,
         sort_dropdown_open,
+        hand_assignments,
+        irc_connected,
     } = ctx;
 
     // Refresh button: dim the glyph and swap it for an ellipsis while a
@@ -772,6 +808,8 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
             collapsed,
             status_menu,
             agent_sessions,
+            hand_assignments,
+            irc_connected,
         );
         let cf_vis = create_form.visible;
         let f_empty = filter.is_empty();
@@ -780,6 +818,8 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
         let asess = agent_sessions.to_vec();
         let smenu = status_menu.clone();
         let coll = collapsed.clone();
+        let hasn = hand_assignments.to_vec();
+        let irc_on = irc_connected;
 
         list = list.push(lazy(key, move |_| {
             let mut inner = column![].spacing(2);
@@ -804,7 +844,7 @@ pub fn view(ctx: ViewCtx<'_>) -> Element<'_, Message> {
                         continue;
                     }
                     inner = inner.push(view_epic_group(
-                        g, &groups, 0, &bi, &asess, &pal, &smenu, &coll,
+                        g, &groups, 0, &bi, &asess, &pal, &smenu, &coll, &hasn, irc_on,
                     ));
                 }
             }
@@ -1241,6 +1281,8 @@ fn view_epic_group(
     pal: &Palette,
     status_menu: &StatusMenu,
     collapsed: &HashSet<String>,
+    hand_assignments: &[HandAssignment],
+    irc_connected: bool,
 ) -> Element<'static, Message> {
     let pal = *pal;
     let epic = group.epic;
@@ -1252,7 +1294,9 @@ fn view_epic_group(
         is_collapsed,
         is_blocked,
         depth,
-        &pal
+        irc_connected,
+        hand_assignments,
+        &pal,
     )]
     .spacing(2);
 
@@ -1271,6 +1315,8 @@ fn view_epic_group(
                     &pal,
                     status_menu,
                     collapsed,
+                    hand_assignments,
+                    irc_connected,
                 ));
                 continue;
             }
@@ -1282,6 +1328,7 @@ fn view_epic_group(
                 agent_sessions,
                 &pal,
                 status_menu,
+                hand_assignments,
             ));
         }
     }
@@ -1297,6 +1344,8 @@ fn view_epic_header(
     is_collapsed: bool,
     is_blocked: bool,
     depth: usize,
+    irc_connected: bool,
+    hand_assignments: &[HandAssignment],
     pal: &Palette,
 ) -> Element<'static, Message> {
     let pal = *pal;
@@ -1333,6 +1382,23 @@ fn view_epic_header(
         row_inner = row_inner.push(text("\u{1F512}").size(FONT_LABEL).color(pal.text_tertiary));
     }
 
+    // Liveness badge on the epic owner's row. Epics rarely carry an
+    // owner assignment today, but the plumbing is symmetric with Hand
+    // rows so a Head session that claims its own epic still surfaces.
+    if let Some(asn) = owner_assignment_for_spark(&epic.id, hand_assignments) {
+        row_inner = row_inner.push(liveness_badge(&asn.liveness, &pal));
+    }
+
+    // IRC channel pill: derived from the epic id + title via the shared
+    // `channel_name` helper so the rendered name is identical to what
+    // the runtime joins. PR #49 Copilot c9: hide the pill entirely
+    // when IRC isn't connected rather than rendering a muted pill for
+    // both "disabled" and "disconnected" states — users conflated the
+    // two and thought IRC was always dormant.
+    if irc_connected {
+        row_inner = row_inner.push(epic_channel_pill(epic, irc_connected, &pal));
+    }
+
     let indent = Space::new().width(Length::Fixed(16.0 * depth as f32));
 
     row![
@@ -1359,11 +1425,19 @@ fn view_spark_row_indented(
     agent_sessions: &[AgentSession],
     pal: &Palette,
     status_menu: &StatusMenu,
+    hand_assignments: &[HandAssignment],
 ) -> Element<'static, Message> {
     let indent = Space::new().width(Length::Fixed(16.0 * depth as f32));
     row![
         indent,
-        view_spark_row(spark, is_blocked, agent_sessions, pal, status_menu)
+        view_spark_row(
+            spark,
+            is_blocked,
+            agent_sessions,
+            pal,
+            status_menu,
+            hand_assignments,
+        )
     ]
     .spacing(0)
     .align_y(iced::Alignment::Center)
@@ -1377,6 +1451,7 @@ fn view_spark_row(
     agent_sessions: &[AgentSession],
     pal: &Palette,
     status_menu: &StatusMenu,
+    hand_assignments: &[HandAssignment],
 ) -> Element<'static, Message> {
     let pal = *pal;
     let status_indicator = status_symbol(&spark.status);
@@ -1432,6 +1507,15 @@ fn view_spark_row(
                     .into()
             };
         row_inner = row_inner.push(assignee_el);
+    }
+
+    // Hand liveness badge + GitHub artifact link — both derived from the
+    // active owner assignment (if any). Spark ryve-1625746b.
+    if let Some(asn) = owner_assignment_for_spark(&spark.id, hand_assignments) {
+        row_inner = row_inner.push(liveness_badge(&asn.liveness, &pal));
+        if let Some(el) = github_artifact_chip(asn, spark.github_repo.as_deref(), &pal) {
+            row_inner = row_inner.push(el);
+        }
     }
 
     let main_row = row![
@@ -1570,6 +1654,157 @@ pub(crate) fn resolve_agent_session<'a>(
     sessions
         .iter()
         .find(|s| s.name == assignee || s.id == assignee)
+}
+
+// ── Liveness + GitHub artifact + IRC channel rendering ──
+// Spark ryve-1625746b.
+
+/// Return the active owner assignment for `spark_id`, if any. "Active"
+/// matches `status == "active"` and "owner" matches `role == "owner"`
+/// — the only assignment category that surfaces a liveness badge on a
+/// Hand card. Returns `None` for observer / assistant / merger claims
+/// and for completed or handed-off rows.
+pub(crate) fn owner_assignment_for_spark<'a>(
+    spark_id: &str,
+    assignments: &'a [HandAssignment],
+) -> Option<&'a HandAssignment> {
+    assignments
+        .iter()
+        .find(|a| a.spark_id == spark_id && a.role == "owner" && a.status == "active")
+}
+
+/// Display label for a liveness string — used by the badge renderer and
+/// exposed for tests.
+pub(crate) fn liveness_label(liveness: &str) -> &'static str {
+    match liveness {
+        "healthy" => "Healthy",
+        "at_risk" => "At Risk",
+        "stuck" => "Stuck",
+        // PR #49 Copilot c5: unknown values now render as "Unknown"
+        // so the label matches `liveness_color`'s neutral/muted
+        // fallback. Previously a badge could say "Healthy" with a
+        // muted disabled colour, which misled users.
+        _ => "Unknown",
+    }
+}
+
+/// Colour pick for the liveness badge. `healthy` reuses the palette's
+/// success green; `stuck` reuses `danger`; `at_risk` uses an inlined
+/// amber because the palette has no warning slot (keeping the change
+/// local to sparks.rs per the spark's additive-only constraint).
+pub(crate) fn liveness_color(liveness: &str, pal: &Palette) -> Color {
+    match liveness {
+        "healthy" => pal.success,
+        "at_risk" => Color {
+            r: 0.95,
+            g: 0.70,
+            b: 0.20,
+            a: 1.0,
+        },
+        "stuck" => pal.danger,
+        _ => pal.text_tertiary,
+    }
+}
+
+/// Build the Healthy / AtRisk / Stuck liveness pill. A compact chip with
+/// a filled-background accent coloured by [`liveness_color`].
+fn liveness_badge(liveness: &str, pal: &Palette) -> Element<'static, Message> {
+    let pal = *pal;
+    let color = liveness_color(liveness, &pal);
+    let label = liveness_label(liveness);
+    container(text(label).size(FONT_SMALL).color(pal.window_bg))
+        .padding([1, 6])
+        .style(move |_t: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(color)),
+            border: iced::Border {
+                color,
+                width: 1.0,
+                radius: iced::border::Radius::from(8.0),
+            },
+            text_color: Some(pal.window_bg),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Construct a GitHub PR URL for a (repo, pr_number) pair. Accepts the
+/// `github_repo` string as `owner/repo`; callers must guard against
+/// `None` before composing a URL.
+pub(crate) fn github_pr_url(repo: &str, pr_number: i64) -> String {
+    format!("https://github.com/{repo}/pull/{pr_number}")
+}
+
+/// GitHub artifact chip shown next to an assignee: a clickable PR link
+/// when both `github_artifact_pr_number` and the spark's `github_repo`
+/// are populated; an un-clickable `PR #N` label when the PR number is
+/// set but the repo is missing; and the raw branch name when only the
+/// branch is populated. Returns `None` when no artifact metadata exists.
+fn github_artifact_chip(
+    asn: &HandAssignment,
+    spark_repo: Option<&str>,
+    pal: &Palette,
+) -> Option<Element<'static, Message>> {
+    let pal = *pal;
+    match (
+        asn.github_artifact_pr_number,
+        asn.github_artifact_branch.as_deref(),
+    ) {
+        (Some(pr), _) => {
+            let label = format!("PR #{pr}");
+            if let Some(repo) = spark_repo.filter(|r| !r.is_empty()) {
+                let url = github_pr_url(repo, pr);
+                Some(
+                    button(text(label).size(FONT_LABEL).color(pal.accent))
+                        .style(button::text)
+                        .padding([0, 4])
+                        .on_press(Message::OpenUrl(url))
+                        .into(),
+                )
+            } else {
+                Some(text(label).size(FONT_LABEL).color(pal.accent).into())
+            }
+        }
+        (None, Some(branch)) if !branch.is_empty() => Some(
+            text(branch.to_string())
+                .size(FONT_LABEL)
+                .color(pal.text_tertiary)
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
+/// Build the IRC channel pill shown on epic headers. The channel name
+/// is computed via the shared `ipc::channel_manager::channel_name` so
+/// the rendered label matches what the runtime actually joins.
+fn epic_channel_pill(
+    epic: &Spark,
+    irc_connected: bool,
+    pal: &Palette,
+) -> Element<'static, Message> {
+    let pal = *pal;
+    let channel = channel_name(&EpicRef {
+        id: epic.id.clone(),
+        name: epic.title.clone(),
+    });
+    let (text_color, border_color) = if irc_connected {
+        (pal.accent, pal.accent)
+    } else {
+        (pal.text_tertiary, pal.border)
+    };
+    container(text(channel).size(FONT_SMALL).color(text_color))
+        .padding([1, 6])
+        .style(move |_t: &Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(pal.surface)),
+            border: iced::Border {
+                color: border_color,
+                width: 1.0,
+                radius: iced::border::Radius::from(8.0),
+            },
+            text_color: Some(text_color),
+            ..Default::default()
+        })
+        .into()
 }
 
 #[cfg(test)]
@@ -2441,6 +2676,254 @@ mod tests {
         assert!(resolve_agent_session("anything", &sessions).is_none());
     }
 
+    // ── Liveness / GitHub artifact / IRC pill tests (spark ryve-1625746b) ──
+
+    fn mk_assignment(
+        spark_id: &str,
+        role: &str,
+        status: &str,
+        liveness: &str,
+        pr_number: Option<i64>,
+        branch: Option<&str>,
+    ) -> HandAssignment {
+        HandAssignment {
+            id: 1,
+            session_id: "sess".to_string(),
+            spark_id: spark_id.to_string(),
+            status: status.to_string(),
+            role: role.to_string(),
+            assigned_at: "2026-04-19T00:00:00Z".to_string(),
+            last_heartbeat_at: None,
+            lease_expires_at: None,
+            completed_at: None,
+            handoff_to: None,
+            handoff_reason: None,
+            liveness: liveness.to_string(),
+            github_artifact_branch: branch.map(String::from),
+            github_artifact_pr_number: pr_number,
+        }
+    }
+
+    #[test]
+    fn liveness_label_covers_documented_states() {
+        assert_eq!(liveness_label("healthy"), "Healthy");
+        assert_eq!(liveness_label("at_risk"), "At Risk");
+        assert_eq!(liveness_label("stuck"), "Stuck");
+        // PR #49 Copilot c5: unknown values now surface as "Unknown"
+        // so the label matches `liveness_color`'s muted fallback
+        // instead of painting "Healthy" in disabled grey.
+        assert_eq!(liveness_label("wat"), "Unknown");
+    }
+
+    #[test]
+    fn liveness_color_is_distinct_per_state() {
+        let pal = crate::style::Palette::dark();
+        let healthy = liveness_color("healthy", &pal);
+        let at_risk = liveness_color("at_risk", &pal);
+        let stuck = liveness_color("stuck", &pal);
+        assert_ne!(healthy, at_risk);
+        assert_ne!(at_risk, stuck);
+        assert_ne!(healthy, stuck);
+    }
+
+    #[test]
+    fn owner_assignment_matches_active_owner_only() {
+        let assignments = vec![
+            mk_assignment("sp-a", "owner", "active", "healthy", None, None),
+            mk_assignment("sp-b", "owner", "completed", "healthy", None, None),
+            mk_assignment("sp-c", "observer", "active", "healthy", None, None),
+        ];
+        assert!(owner_assignment_for_spark("sp-a", &assignments).is_some());
+        // Completed owner: no active badge — the Hand is done.
+        assert!(owner_assignment_for_spark("sp-b", &assignments).is_none());
+        // Active observer: not the owner, no badge.
+        assert!(owner_assignment_for_spark("sp-c", &assignments).is_none());
+        // Unknown spark id.
+        assert!(owner_assignment_for_spark("sp-ghost", &assignments).is_none());
+    }
+
+    #[test]
+    fn github_pr_url_is_well_formed() {
+        assert_eq!(
+            github_pr_url("owner/repo", 42),
+            "https://github.com/owner/repo/pull/42"
+        );
+    }
+
+    #[test]
+    fn github_artifact_chip_prefers_pr_over_branch() {
+        // When both are populated the PR is the useful thing to click.
+        let asn = mk_assignment(
+            "sp-1",
+            "owner",
+            "active",
+            "healthy",
+            Some(42),
+            Some("hand/abc123"),
+        );
+        let pal = crate::style::Palette::dark();
+        let el = github_artifact_chip(&asn, Some("owner/repo"), &pal);
+        assert!(
+            el.is_some(),
+            "a PR number must produce a chip whether or not a repo is known"
+        );
+    }
+
+    #[test]
+    fn github_artifact_chip_falls_back_to_branch_only() {
+        // Applier hasn't opened a PR yet — branch exists, PR number doesn't.
+        let asn = mk_assignment(
+            "sp-1",
+            "owner",
+            "active",
+            "healthy",
+            None,
+            Some("hand/abc123"),
+        );
+        let pal = crate::style::Palette::dark();
+        assert!(github_artifact_chip(&asn, Some("owner/repo"), &pal).is_some());
+    }
+
+    #[test]
+    fn github_artifact_chip_is_none_when_no_metadata() {
+        let asn = mk_assignment("sp-1", "owner", "active", "healthy", None, None);
+        let pal = crate::style::Palette::dark();
+        assert!(github_artifact_chip(&asn, Some("owner/repo"), &pal).is_none());
+    }
+
+    #[test]
+    fn github_artifact_chip_is_none_when_branch_is_empty_string() {
+        // Empty branch strings behave the same as None (belt-and-braces
+        // since the DB allows NULL but a client could insert an empty).
+        let asn = mk_assignment("sp-1", "owner", "active", "healthy", None, Some(""));
+        let pal = crate::style::Palette::dark();
+        assert!(github_artifact_chip(&asn, Some("owner/repo"), &pal).is_none());
+    }
+
+    #[test]
+    fn github_artifact_chip_renders_without_repo_when_pr_is_known() {
+        // Even if the spark has no github_repo, a PR number is still
+        // useful — we just can't produce a URL, so the chip is plain text.
+        let asn = mk_assignment("sp-1", "owner", "active", "healthy", Some(9), None);
+        let pal = crate::style::Palette::dark();
+        assert!(github_artifact_chip(&asn, None, &pal).is_some());
+    }
+
+    #[test]
+    fn liveness_badge_hash_invalidates_on_liveness_change() {
+        // Spark ryve-1625746b: the lazy cache key must include liveness
+        // so the watchdog's Healthy→AtRisk→Stuck transitions force a
+        // re-render without relying on spark updated_at bumps.
+        let sparks = vec![mk_sort_spark("sp-1", 0, "task", "in_progress")];
+        let blocked = HashSet::new();
+        let collapsed = HashSet::new();
+        let menu = StatusMenu::default();
+        let sessions: Vec<AgentSession> = Vec::new();
+        let healthy = vec![mk_assignment(
+            "sp-1", "owner", "active", "healthy", None, None,
+        )];
+        let at_risk = vec![mk_assignment(
+            "sp-1", "owner", "active", "at_risk", None, None,
+        )];
+
+        let h1 = sparks_list_hash(
+            &sparks, &blocked, &collapsed, &menu, &sessions, &healthy, false,
+        );
+        let h2 = sparks_list_hash(
+            &sparks, &blocked, &collapsed, &menu, &sessions, &at_risk, false,
+        );
+        assert_ne!(h1, h2, "liveness transitions must bust the lazy cache");
+    }
+
+    #[test]
+    fn pr_number_change_invalidates_lazy_hash() {
+        let sparks = vec![mk_sort_spark("sp-1", 0, "task", "in_progress")];
+        let blocked = HashSet::new();
+        let collapsed = HashSet::new();
+        let menu = StatusMenu::default();
+        let sessions: Vec<AgentSession> = Vec::new();
+        let before = vec![mk_assignment(
+            "sp-1",
+            "owner",
+            "active",
+            "healthy",
+            None,
+            Some("b"),
+        )];
+        let after = vec![mk_assignment(
+            "sp-1",
+            "owner",
+            "active",
+            "healthy",
+            Some(7),
+            Some("b"),
+        )];
+
+        let h1 = sparks_list_hash(
+            &sparks, &blocked, &collapsed, &menu, &sessions, &before, false,
+        );
+        let h2 = sparks_list_hash(
+            &sparks, &blocked, &collapsed, &menu, &sessions, &after, false,
+        );
+        assert_ne!(
+            h1, h2,
+            "PR number appearing on an assignment must bust the cache"
+        );
+    }
+
+    #[test]
+    fn irc_connected_flip_invalidates_lazy_hash() {
+        let sparks = vec![mk_sort_spark("sp-1", 0, "epic", "open")];
+        let blocked = HashSet::new();
+        let collapsed = HashSet::new();
+        let menu = StatusMenu::default();
+        let sessions: Vec<AgentSession> = Vec::new();
+        let assignments: Vec<HandAssignment> = Vec::new();
+
+        let h_off = sparks_list_hash(
+            &sparks,
+            &blocked,
+            &collapsed,
+            &menu,
+            &sessions,
+            &assignments,
+            false,
+        );
+        let h_on = sparks_list_hash(
+            &sparks,
+            &blocked,
+            &collapsed,
+            &menu,
+            &sessions,
+            &assignments,
+            true,
+        );
+        assert_ne!(
+            h_off, h_on,
+            "IRC connect state must bust the cache so the pill styling refreshes"
+        );
+    }
+
+    #[test]
+    fn epic_channel_name_matches_ipc_contract() {
+        // The pill's label must match the runtime's channel_name exactly
+        // so the UI and the IRC client agree on which room is which.
+        let spark = mk_spark("ep-42", "epic", None);
+        let expected = ipc::channel_manager::channel_name(&ipc::channel_manager::EpicRef {
+            id: spark.id.clone(),
+            name: spark.title.clone(),
+        });
+        // Sanity: derive via the same helper the view uses. This is a
+        // regression guard — if we ever move channel-name derivation out
+        // of ipc, both the view and the test will fail together.
+        let actual = ipc::channel_manager::channel_name(&ipc::channel_manager::EpicRef {
+            id: spark.id.clone(),
+            name: spark.title.clone(),
+        });
+        assert_eq!(actual, expected);
+        assert!(expected.starts_with("#epic-ep-42"));
+    }
+
     /// Benchmark the sparks panel lazy key: with 150 sparks the hash
     /// computation (run every frame) is cheap, while group_by_epic +
     /// widget tree construction (only on cache miss) is relatively
@@ -2484,12 +2967,22 @@ mod tests {
         let collapsed: HashSet<String> = HashSet::new();
         let status_menu = StatusMenu::default();
         let sessions: Vec<AgentSession> = Vec::new();
+        let assignments: Vec<HandAssignment> = Vec::new();
+        let irc_connected = false;
 
         // Measure hash computation (per-frame cost with lazy).
         let iters = 500;
         let start = std::time::Instant::now();
         for _ in 0..iters {
-            let h = sparks_list_hash(&sparks, &blocked_ids, &collapsed, &status_menu, &sessions);
+            let h = sparks_list_hash(
+                &sparks,
+                &blocked_ids,
+                &collapsed,
+                &status_menu,
+                &sessions,
+                &assignments,
+                irc_connected,
+            );
             std::hint::black_box(h);
         }
         let hash_elapsed = start.elapsed();
@@ -2526,8 +3019,24 @@ mod tests {
         // only covers the functional properties asserted below.
 
         // Verify hash stability: same input → same output.
-        let h1 = sparks_list_hash(&sparks, &blocked_ids, &collapsed, &status_menu, &sessions);
-        let h2 = sparks_list_hash(&sparks, &blocked_ids, &collapsed, &status_menu, &sessions);
+        let h1 = sparks_list_hash(
+            &sparks,
+            &blocked_ids,
+            &collapsed,
+            &status_menu,
+            &sessions,
+            &assignments,
+            irc_connected,
+        );
+        let h2 = sparks_list_hash(
+            &sparks,
+            &blocked_ids,
+            &collapsed,
+            &status_menu,
+            &sessions,
+            &assignments,
+            irc_connected,
+        );
         assert_eq!(h1, h2, "hash must be deterministic for same input");
 
         // Verify hash sensitivity: mutating a spark changes the hash.
@@ -2535,7 +3044,15 @@ mod tests {
         // so we simulate a data change by touching that field.
         let mut sparks2 = sparks.clone();
         sparks2[50].updated_at = "2026-04-09T12:00:00Z".to_string();
-        let h3 = sparks_list_hash(&sparks2, &blocked_ids, &collapsed, &status_menu, &sessions);
+        let h3 = sparks_list_hash(
+            &sparks2,
+            &blocked_ids,
+            &collapsed,
+            &status_menu,
+            &sessions,
+            &assignments,
+            irc_connected,
+        );
         assert_ne!(h1, h3, "hash must change when spark data changes");
     }
 }
