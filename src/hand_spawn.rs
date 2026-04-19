@@ -31,7 +31,9 @@ use data::ryve_dir::RyveDir;
 use data::sparks::types::{
     AssignmentRole, NewAgentSession, NewCrew, NewHandAssignment, Spark, SparkFilter,
 };
-use data::sparks::{agent_session_repo, assignment_repo, crew_repo, spark_repo};
+use data::sparks::{
+    agent_session_repo, assign_repo, assignment_repo, bond_repo, crew_repo, spark_repo,
+};
 use sqlx::SqlitePool;
 use tokio::io::AsyncWrite;
 use tokio::process::Command;
@@ -361,6 +363,127 @@ fn validate_actor(actor: &str) -> Result<(), HandSpawnError> {
     Ok(())
 }
 
+/// Branch-name convention used by [`workshop::create_hand_worktree`].
+/// The new Hand's branch is cut as `<actor>/<short>` where `<short>` is
+/// the first eight characters of the session id. Kept here so the
+/// base-ref resolver computes the exact same ref the production spawn
+/// path creates. Private because no cross-module call site needs it —
+/// the integration test keeps its own synced copy and asserts it
+/// matches this convention via the resolver's end-to-end behaviour.
+fn hand_branch_name(actor: &str, session_id: &str) -> String {
+    let short = &session_id[..8.min(session_id.len())];
+    format!("{actor}/{short}")
+}
+
+/// Resolve the `base_ref` a new Hand dispatched on `spark_id` should cut
+/// its worktree from. Spark [sp-b7633430] / epic ryve-b7633430:
+///
+/// When `spark_id` has at least one `blocks` predecessor, the Merger
+/// must integrate the predecessor's diff before (or as part of) ours.
+/// Cutting every Hand from the release tip forces the Merger to do an
+/// N-way same-file integration that mechanical merge cannot resolve —
+/// the exact failure mode that caused the three migration-019 collisions
+/// in 0.2.0. Cutting the new Hand's worktree from the predecessor's
+/// branch tip moves that integration to dispatch time and makes the
+/// subsequent merger a no-op.
+///
+/// Contract:
+///   (a) query [`bond_repo::list_blocks_predecessors`] for `spark_id`;
+///   (b) for each predecessor spark id, consult `assign_repo` for the
+///       owner assignment row (active or completed) — the row carries
+///       both the `actor_id` (git branch namespace) and `session_id`
+///       (branch short), which together name the Hand's branch under
+///       the [`hand_branch_name`] convention;
+///   (c) `git rev-parse` each candidate branch and return the first
+///       SHA that resolves. Most-recent assignments come first because
+///       `assign_repo::list_assignments_for_spark` orders by
+///       `created_at DESC`.
+///
+/// Returns `None` when the spark has no `blocks` predecessors, or when
+/// none of the predecessor branches resolves (e.g. predecessor was
+/// spawned under a foreign actor and its branch doesn't exist locally
+/// yet). In that case the spawn path falls back to the historical
+/// behaviour of cutting from the current HEAD.
+pub(crate) async fn resolve_hand_base_ref(
+    pool: &SqlitePool,
+    workshop_dir: &Path,
+    spark_id: &str,
+) -> Option<String> {
+    let predecessors = bond_repo::list_blocks_predecessors(pool, spark_id)
+        .await
+        .ok()?;
+    if predecessors.is_empty() {
+        return None;
+    }
+
+    // Gather every owner assignment across every predecessor so the
+    // resolver can fall back to an older row whose branch still exists.
+    // Previous revision broke after the newest-per-predecessor row,
+    // which silently skipped stacking whenever that row's actor-scoped
+    // branch had been pruned (foreign-actor respawn, worktree cleanup).
+    // `list_assignments_for_spark` orders rows newest-first;
+    // sorting all candidates by `assigned_at DESC` after collecting
+    // them preserves that ordering globally.
+    let mut candidates: Vec<(String, String, String)> = Vec::new(); // (assigned_at, actor_id, session_id)
+    for pred_id in &predecessors {
+        let Ok(asgns) = assign_repo::list_assignments_for_spark(pool, pred_id).await else {
+            continue;
+        };
+        for a in asgns {
+            if a.role != "owner" {
+                continue;
+            }
+            let Some(sid) = a.session_id.clone() else {
+                continue;
+            };
+            let ts = a
+                .assigned_at
+                .clone()
+                .unwrap_or_else(|| a.created_at.clone());
+            candidates.push((ts, a.actor_id, sid));
+            // Keep going: older owner assignments on the same
+            // predecessor are valid fall-backs if the newest row's
+            // branch has been pruned locally.
+        }
+    }
+    // Sort newest-first globally. Ties are broken deterministically by
+    // (actor, session) so the resolver is stable across reruns.
+    candidates.sort_by(|x, y| {
+        y.0.cmp(&x.0)
+            .then_with(|| y.1.cmp(&x.1))
+            .then_with(|| y.2.cmp(&x.2))
+    });
+
+    for (_, actor_id, session_id) in candidates {
+        let branch = hand_branch_name(&actor_id, &session_id);
+        if let Some(sha) = resolve_branch_tip(workshop_dir, &branch).await {
+            return Some(sha);
+        }
+    }
+    None
+}
+
+/// Run `git rev-parse --verify refs/heads/<branch>` in `workshop_dir` and
+/// return the SHA on success. Returns `None` when the branch does not
+/// exist (common case when the predecessor Hand was spawned under a
+/// different actor / a branch was renamed / pruned). Callers treat a
+/// `None` here as "no usable base ref" and fall back to HEAD.
+async fn resolve_branch_tip(workshop_dir: &Path, branch: &str) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg(format!("refs/heads/{branch}"))
+        .current_dir(workshop_dir)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
 /// Optional context bundle for [`spawn_hand`] and [`spawn_head`]. Bundled
 /// to keep the function signature under clippy's too-many-arguments
 /// threshold while still letting callers pass only the hints they have.
@@ -444,11 +567,28 @@ pub async fn spawn_hand(
     ryve_dir.ensure_exists().await.map_err(HandSpawnError::Io)?;
 
     // 1. New session id + worktree — branch is `<actor>/<short>`.
+    //    Base-branch stacking for serial children (spark [sp-b7633430]):
+    //    when this spark has `blocks` predecessors, cut the new Hand's
+    //    branch from the predecessor Hand's tip so the Merger integrates
+    //    pre-serialized diffs with zero conflicts instead of an N-way
+    //    same-file reconcile. For Mergers, the crew merge branch is
+    //    always cut from the crew's target — never a sibling Hand's
+    //    tip — so this lookup is skipped.
     let session_id = Uuid::new_v4().to_string();
-    let worktree_path =
-        workshop::create_hand_worktree(workshop_dir, &ryve_dir, &session_id, &actor)
-            .await
-            .map_err(HandSpawnError::Worktree)?;
+    let base_ref = if matches!(kind, HandKind::Merger) {
+        None
+    } else {
+        resolve_hand_base_ref(pool, workshop_dir, spark_id).await
+    };
+    let worktree_path = workshop::create_hand_worktree(
+        workshop_dir,
+        &ryve_dir,
+        &session_id,
+        &actor,
+        base_ref.as_deref(),
+    )
+    .await
+    .map_err(HandSpawnError::Worktree)?;
 
     // Pre-compute the log path so it can be persisted alongside the
     // session row. The UI uses this path to drive the read-only spy view
@@ -742,7 +882,7 @@ pub async fn spawn_head(
     //    agent-local state stay out of the main checkout.
     let session_id = Uuid::new_v4().to_string();
     let worktree_path =
-        workshop::create_hand_worktree(workshop_dir, &ryve_dir, &session_id, &actor)
+        workshop::create_hand_worktree(workshop_dir, &ryve_dir, &session_id, &actor, None)
             .await
             .map_err(HandSpawnError::Worktree)?;
 
@@ -2998,6 +3138,183 @@ mod tests {
 
         let tmux_name = format!("reviewer-{}", hand.session_id);
         cleanup_tmux(&workshop_dir, &tmux_name);
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+
+    /// Direct coverage of `resolve_hand_base_ref` on the very path
+    /// `spawn_hand` invokes — no tmux, no subprocess agents, just the
+    /// DB + git rev-parse pair. Guards against a refactor that drops
+    /// the lookup from the spawn path or drifts the branch-name
+    /// convention from `<actor>/<short>` (spark [sp-b7633430]).
+    #[tokio::test]
+    async fn resolve_hand_base_ref_returns_predecessor_tip() {
+        use data::sparks::types::{
+            AssignmentRole, BondType, NewAgentSession, NewHandAssignment, NewSpark, SparkType,
+        };
+        use data::sparks::{agent_session_repo, assignment_repo, bond_repo, spark_repo};
+
+        let (workshop_dir, pool, _out_path) = setup_workshop().await;
+        let workshop_id = workshop_id_for(&workshop_dir);
+
+        let parent = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "resolver test epic".into(),
+                description: String::new(),
+                spark_type: SparkType::Epic,
+                priority: 2,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let spark_a = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "child A".into(),
+                description: String::new(),
+                spark_type: SparkType::Task,
+                priority: 2,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: Some(parent.id.clone()),
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: Some("sentinel.txt".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let spark_b = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "child B (blocked by A)".into(),
+                description: String::new(),
+                spark_type: SparkType::Task,
+                priority: 2,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: Some(parent.id.clone()),
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: Some("sentinel.txt".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        bond_repo::create(&pool, &spark_a.id, &spark_b.id, BondType::Blocks)
+            .await
+            .unwrap();
+
+        // With no assignment yet, the resolver returns None even with a
+        // predecessor bond — there is no Hand owning A, so there is no
+        // branch to stack on.
+        assert!(
+            super::resolve_hand_base_ref(&pool, &workshop_dir, &spark_b.id)
+                .await
+                .is_none(),
+            "no owning Hand on the predecessor means no base ref"
+        );
+
+        // Seed an owner assignment + branch for Hand A. Use `resolve_actor_from_env`
+        // indirectly via a fixed actor so the branch-naming convention
+        // is exercised exactly as the CLI spawn path does it.
+        let actor = "testhand";
+        let session_a = Uuid::new_v4().to_string();
+        agent_session_repo::create(
+            &pool,
+            &NewAgentSession {
+                id: session_a.clone(),
+                workshop_id: workshop_id.clone(),
+                agent_name: "stub".into(),
+                agent_command: "true".into(),
+                agent_args: vec![],
+                session_label: Some("hand".into()),
+                child_pid: None,
+                resume_id: None,
+                log_path: None,
+                parent_session_id: None,
+                archetype_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assignment_repo::assign(
+            &pool,
+            NewHandAssignment {
+                session_id: session_a.clone(),
+                spark_id: spark_a.id.clone(),
+                role: AssignmentRole::Owner,
+                actor_id: Some(actor.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Hand A's worktree — actually create the branch so rev-parse
+        // resolves. We don't need to commit; the point is that
+        // `<actor>/<short_a>` exists at a known SHA.
+        let branch_a = super::hand_branch_name(actor, &session_a);
+        let wt_a = workshop_dir
+            .join(".ryve")
+            .join("worktrees")
+            .join(&session_a[..8]);
+        let out = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", &branch_a, wt_a.to_str().unwrap()])
+            .current_dir(&workshop_dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let expected_sha = {
+            let o = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", &format!("refs/heads/{branch_a}")])
+                .current_dir(&workshop_dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        assert!(!expected_sha.is_empty(), "branch_a must resolve");
+
+        // Now the resolver sees: predecessor is spark_a → owner session
+        // is `session_a` with actor `testhand` → branch `<actor>/<short>`
+        // resolves to `expected_sha` → return Some(expected_sha).
+        let resolved = super::resolve_hand_base_ref(&pool, &workshop_dir, &spark_b.id)
+            .await
+            .expect("resolver must return predecessor tip SHA");
+        assert_eq!(
+            resolved, expected_sha,
+            "resolver must return exactly Hand A's branch tip"
+        );
+
+        // Control: a spark with no predecessors still returns None.
+        assert!(
+            super::resolve_hand_base_ref(&pool, &workshop_dir, &spark_a.id)
+                .await
+                .is_none(),
+            "spark with no blocks predecessors returns None (unchanged behavior)"
+        );
+
         let _ = std::fs::remove_dir_all(&workshop_dir);
     }
 }
