@@ -412,6 +412,20 @@ async fn handle_init(ryve_dir: &RyveDir, cwd: &Path) {
     if let Err(e) = data::db::open_sparks_db(cwd).await {
         die(&format!("failed to create database: {e}"));
     }
+
+    // Spark ryve-4d5881c2: provision the workshop-scoped IRC daemon
+    // (port + `.ryve/ircd/ircd.conf`) so the supervisor (spark
+    // ryve-242252b0) finds everything it needs on next launch.
+    // Idempotent — re-running init against an already-provisioned
+    // workshop is a no-op on both the recorded port and the conf file.
+    let mut config = data::ryve_dir::load_config(ryve_dir).await;
+    if let Err(e) = crate::workshop::provision_workshop_ircd(ryve_dir, &mut config).await {
+        die(&format!("failed to provision workshop IRC daemon: {e}"));
+    }
+    if let Err(e) = data::ryve_dir::save_config(ryve_dir, &config).await {
+        die(&format!("failed to save workshop config: {e}"));
+    }
+
     println!("initialized .ryve/ in {}", cwd.display());
 }
 
