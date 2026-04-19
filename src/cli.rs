@@ -2812,6 +2812,87 @@ async fn handle_hand(
                 );
             }
         }
+        // Run a subprocess under the StreamHeartbeat wrapper so long-silent
+        // Hand-side subcommands (notably the full-workspace `cargo test`)
+        // do not trip Claude's ~5-minute stream-idle timeout and kill the
+        // Hand session. Opt-in per invocation: a Hand calls this
+        // explicitly for commands it knows will be silent for minutes at
+        // a time, and stays on the plain shell for short commands so
+        // their output is not polluted with heartbeat lines. Parent epic
+        // ryve-32e95c28 / [sp-b7f7f1fa].
+        "exec-heartbeat" => {
+            let mut interval_secs: Option<u64> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--interval-secs" => {
+                        i += 1;
+                        if i >= args.len() {
+                            die("hand exec-heartbeat --interval-secs requires a value");
+                        }
+                        interval_secs = Some(args[i].parse().unwrap_or_else(|_| {
+                            die(&format!(
+                                "--interval-secs '{}' must be a non-negative integer",
+                                args[i]
+                            ))
+                        }));
+                        i += 1;
+                    }
+                    "--" => {
+                        i += 1;
+                        break;
+                    }
+                    "--help" | "-h" => {
+                        println!(
+                            "ryve hand exec-heartbeat — run a subprocess under the \
+                             stream-heartbeat wrapper\n\n\
+                             USAGE:\n  \
+                             ryve hand exec-heartbeat [--interval-secs N] -- <cmd> [args...]\n\n\
+                             Forwards the child's stdout and stderr to this process's \
+                             stdout byte-for-byte while injecting a heartbeat line \
+                             (default every 30 s) whenever the child is silent. Exits \
+                             with the child's exit code. Use it when a Hand runs \
+                             a command that may stay silent past Claude's \
+                             ~5-minute stream-idle threshold (e.g. the full \
+                             workspace `cargo test`)."
+                        );
+                        return;
+                    }
+                    other if other.starts_with("--") => {
+                        die(&format!("unknown hand exec-heartbeat flag '{other}'"));
+                    }
+                    _ => break,
+                }
+            }
+            if i >= args.len() {
+                die("hand exec-heartbeat requires a command: \
+                     `ryve hand exec-heartbeat [--interval-secs N] -- <cmd> [args...]`");
+            }
+            let cmd = args[i].clone();
+            let cmd_args: Vec<&str> = args[(i + 1)..].iter().map(String::as_str).collect();
+            let interval = interval_secs.map(std::time::Duration::from_secs);
+
+            let mut stdout = tokio::io::stdout();
+            match hand_spawn::run_with_stream_heartbeat(
+                &cmd,
+                &cmd_args,
+                None,
+                &[],
+                interval,
+                &mut stdout,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    // Propagate the child's exit code so the caller
+                    // (typically a Hand's shell) sees a failed
+                    // `cargo test` as a non-zero exit. Signal-killed
+                    // children (no exit code) surface as 1.
+                    std::process::exit(outcome.status.code().unwrap_or(1));
+                }
+                Err(e) => die(&format!("hand exec-heartbeat: {e}")),
+            }
+        }
         other => die(&format!(
             "unknown hand subcommand '{other}'. Try `ryve hand --help`."
         )),
@@ -2836,8 +2917,12 @@ USAGE:
   ryve hand spawn --help
 
 SUBCOMMANDS:
-  spawn    Launch a detached Hand subprocess on a spark.
-  list     Show active hand assignments (ownership + role + heartbeat).
+  spawn           Launch a detached Hand subprocess on a spark.
+  list            Show active hand assignments (ownership + role + heartbeat).
+  exec-heartbeat  Run a subprocess under the stream-heartbeat wrapper so long
+                  silent commands (e.g. full-workspace `cargo test`) do not
+                  trip Claude's ~5-minute stream-idle timeout.
+                  See `ryve hand exec-heartbeat --help`.
 
 ROLES:
   owner             (default) Standard worker. Claims the spark, works in its

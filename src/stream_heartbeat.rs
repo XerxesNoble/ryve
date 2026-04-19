@@ -25,9 +25,9 @@
 //!   heartbeats are emitted. The wrapper drains any remaining buffered
 //!   output before returning.
 //!
-//! The sibling spark ryve-b7f7f1fa wires this wrapper into
-//! `src/hand_spawn.rs`; until then the module is unreferenced from the
-//! binary entry-point, mirroring the `sparks_filter` staging pattern.
+//! Wired into `src/hand_spawn::run_with_stream_heartbeat` by sibling
+//! spark ryve-b7f7f1fa as the opt-in spawn path for long-silent
+//! subcommands run from a Hand.
 
 use std::process::{ExitStatus, Stdio};
 
