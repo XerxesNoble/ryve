@@ -17,10 +17,13 @@
 //! in 0.2.0.
 //!
 //! After the fix: Hand B's branch is cut from Hand A's tip SHA, so
-//! Hand A's commit is already an ancestor of Hand B's branch. Merging
-//! Hand A to `main` is a fast-forward; merging Hand B to `main` is
-//! also a fast-forward (because Hand A is an ancestor of Hand B).
-//! Zero conflicts.
+//! Hand A's commit is already an ancestor of Hand B's branch. The two
+//! Hand branches are stacked linearly, which is what the test
+//! asserts. The merge step below uses `git merge --no-ff` to produce
+//! explicit merge commits (matching the Merger's real behaviour), and
+//! the invariant under test is conflict-free integration — both
+//! merges must succeed without touching the same hunk twice, not a
+//! particular fast-forward shape.
 //!
 //! # What this test exercises
 //!

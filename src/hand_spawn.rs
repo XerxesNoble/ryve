@@ -320,9 +320,10 @@ fn validate_actor(actor: &str) -> Result<(), HandSpawnError> {
 /// The new Hand's branch is cut as `<actor>/<short>` where `<short>` is
 /// the first eight characters of the session id. Kept here so the
 /// base-ref resolver computes the exact same ref the production spawn
-/// path creates. Shared with tests so regression coverage doesn't drift
-/// from the real convention.
-pub fn hand_branch_name(actor: &str, session_id: &str) -> String {
+/// path creates. Private because no cross-module call site needs it —
+/// the integration test keeps its own synced copy and asserts it
+/// matches this convention via the resolver's end-to-end behaviour.
+fn hand_branch_name(actor: &str, session_id: &str) -> String {
     let short = &session_id[..8.min(session_id.len())];
     format!("{actor}/{short}")
 }
@@ -368,10 +369,14 @@ pub(crate) async fn resolve_hand_base_ref(
         return None;
     }
 
-    // Gather every candidate owner assignment across all predecessors
-    // so we can pick the most recent one globally. `list_assignments_for_spark`
-    // orders by created_at DESC, so the first owner row per predecessor
-    // is already that predecessor's newest.
+    // Gather every owner assignment across every predecessor so the
+    // resolver can fall back to an older row whose branch still exists.
+    // Previous revision broke after the newest-per-predecessor row,
+    // which silently skipped stacking whenever that row's actor-scoped
+    // branch had been pruned (foreign-actor respawn, worktree cleanup).
+    // `list_assignments_for_spark` orders rows newest-first;
+    // sorting all candidates by `assigned_at DESC` after collecting
+    // them preserves that ordering globally.
     let mut candidates: Vec<(String, String, String)> = Vec::new(); // (assigned_at, actor_id, session_id)
     for pred_id in &predecessors {
         let Ok(asgns) = assign_repo::list_assignments_for_spark(pool, pred_id).await else {
@@ -389,7 +394,9 @@ pub(crate) async fn resolve_hand_base_ref(
                 .clone()
                 .unwrap_or_else(|| a.created_at.clone());
             candidates.push((ts, a.actor_id, sid));
-            break; // newest assignment for this predecessor is enough
+            // Keep going: older owner assignments on the same
+            // predecessor are valid fall-backs if the newest row's
+            // branch has been pruned locally.
         }
     }
     // Sort newest-first globally. Ties are broken deterministically by
