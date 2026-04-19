@@ -6576,6 +6576,23 @@ impl App {
             })
         });
 
+        // Spark ryve-0daa8262: project workshop integration state into
+        // status-bar enums. IRC reads `irc_runtime` under its mutex without
+        // holding the guard across the view call; GitHub reads the cached
+        // config the rest of the app already uses.
+        let irc_status = {
+            let runtime_present = ws
+                .irc_runtime
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false);
+            screen::status_bar::IrcStatus::from_runtime(ws.config.irc_enabled(), runtime_present)
+        };
+        let github_status = screen::status_bar::GitHubStatus::from_config(
+            ws.config.github.token.as_deref(),
+            ws.config.github.repo.as_deref(),
+        );
+
         let status_bar = screen::status_bar::view(
             ws.file_explorer.branch.as_deref(),
             &ws.directory,
@@ -6585,6 +6602,8 @@ impl App {
             total_hands,
             ws.failing_contracts,
             file_info,
+            irc_status,
+            github_status,
             &pal,
             has_bg,
         )
