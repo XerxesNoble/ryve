@@ -83,6 +83,21 @@ pub async fn list_blockers(pool: &SqlitePool, spark_id: &str) -> Result<Vec<Bond
     .await?)
 }
 
+/// Return the `from_id` of every bond where `to_id = spark_id` and the bond
+/// type is exactly `"blocks"`. Other bond types (`conditional_blocks`,
+/// `related`, `parent_child`, …) are intentionally excluded.
+pub async fn list_blocks_predecessors(
+    pool: &SqlitePool,
+    spark_id: &str,
+) -> Result<Vec<String>, SparksError> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT from_id FROM bonds WHERE to_id = ? AND bond_type = 'blocks'")
+            .bind(spark_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 /// Return the set of spark IDs in the workshop that have at least one
 /// open (non-closed) blocking bond pointing at them. Used by the UI to
 /// surface a "blocked" indicator on the sparks panel and to remind agents
@@ -104,4 +119,115 @@ pub async fn list_blocked_spark_ids(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+#[cfg(test)]
+mod list_blocks_predecessors_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    async fn fresh_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    async fn insert_spark(pool: &SqlitePool, id: &str) {
+        sqlx::query(
+            "INSERT INTO sparks (id, title, description, status, priority, spark_type, workshop_id, metadata, created_at, updated_at)
+             VALUES (?, ?, '', 'open', 2, 'task', 'ws', '{}', '2026-04-19T00:00:00+00:00', '2026-04-19T00:00:00+00:00')",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("insert spark");
+    }
+
+    async fn insert_bond(pool: &SqlitePool, from: &str, to: &str, bond_type: &str) {
+        sqlx::query("INSERT INTO bonds (from_id, to_id, bond_type) VALUES (?, ?, ?)")
+            .bind(from)
+            .bind(to)
+            .bind(bond_type)
+            .execute(pool)
+            .await
+            .expect("insert bond");
+    }
+
+    #[tokio::test]
+    async fn returns_empty_when_no_predecessors() {
+        let pool = fresh_pool().await;
+        insert_spark(&pool, "target").await;
+
+        let preds = list_blocks_predecessors(&pool, "target")
+            .await
+            .expect("query succeeds");
+
+        assert!(preds.is_empty(), "expected no predecessors, got {preds:?}");
+    }
+
+    #[tokio::test]
+    async fn returns_single_predecessor() {
+        let pool = fresh_pool().await;
+        insert_spark(&pool, "target").await;
+        insert_spark(&pool, "blocker").await;
+        insert_bond(&pool, "blocker", "target", "blocks").await;
+
+        let preds = list_blocks_predecessors(&pool, "target")
+            .await
+            .expect("query succeeds");
+
+        assert_eq!(preds, vec!["blocker".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn returns_two_predecessors() {
+        let pool = fresh_pool().await;
+        insert_spark(&pool, "target").await;
+        insert_spark(&pool, "blocker_a").await;
+        insert_spark(&pool, "blocker_b").await;
+        insert_bond(&pool, "blocker_a", "target", "blocks").await;
+        insert_bond(&pool, "blocker_b", "target", "blocks").await;
+
+        let mut preds = list_blocks_predecessors(&pool, "target")
+            .await
+            .expect("query succeeds");
+        preds.sort();
+
+        assert_eq!(
+            preds,
+            vec!["blocker_a".to_string(), "blocker_b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_non_blocks_bond_types() {
+        let pool = fresh_pool().await;
+        insert_spark(&pool, "target").await;
+        insert_spark(&pool, "related_src").await;
+        insert_spark(&pool, "parent_src").await;
+        insert_spark(&pool, "cond_src").await;
+        insert_spark(&pool, "waits_src").await;
+        insert_bond(&pool, "related_src", "target", "related").await;
+        insert_bond(&pool, "parent_src", "target", "parent_child").await;
+        insert_bond(&pool, "cond_src", "target", "conditional_blocks").await;
+        insert_bond(&pool, "waits_src", "target", "waits_for").await;
+
+        let preds = list_blocks_predecessors(&pool, "target")
+            .await
+            .expect("query succeeds");
+
+        assert!(
+            preds.is_empty(),
+            "only `blocks` bonds should be returned, got {preds:?}"
+        );
+    }
 }
