@@ -24,11 +24,47 @@ fn ryve_bin() -> PathBuf {
 ///   - tiny `ryve` cargo fixture so `cargo build --release` (invoked by
 ///     `ryve release close` via [`crate::release_artifact`]) produces a
 ///     binary called `ryve`,
-///   - `.gitignore` excludes `/.ryve/` and `/target/` so the working tree
-///     stays clean after `ryve init` and after the artifact build —
-///     `release_branch::cut_release_branch` and `tag_release` both refuse
-///     to operate on a dirty tree.
+///   - `.gitignore` is whatever `fresh_workshop_with` is told to write under
+///     the `[ryve_ignore]` slot — by default `".ryve"` (the broad exclusion
+///     used by most release-flow tests so the working tree stays clean
+///     after `ryve init`). The companion `fresh_workshop_tracked_ryve`
+///     variant uses a narrower pattern that mirrors the real ryve repo,
+///     leaving `.ryve/config.toml` + `.ryve/ui_state.json` tracked so the
+///     dirty-tree allowlist gets exercised end-to-end. Either way,
+///     `release_branch::cut_release_branch` and `tag_release` continue to
+///     refuse on a dirty tree (now modulo the live-workspace allowlist).
 fn fresh_workshop() -> PathBuf {
+    fresh_workshop_with(".ryve")
+}
+
+/// Variant of [`fresh_workshop`] that leaves `.ryve/config.toml` and
+/// `.ryve/ui_state.json` tracked in git (mirroring the real ryve repo).
+/// Only `.ryve/sparks.db*` and runtime subdirs are ignored, so any live UI
+/// rewrite of those two files shows up as a dirty diff — which is exactly
+/// the scenario the dirty-tree allowlist is meant to handle.
+fn fresh_workshop_tracked_ryve() -> PathBuf {
+    let root = fresh_workshop_with(
+        // Ignore only the runtime bits that can't be versioned; leave
+        // config.toml and ui_state.json tracked.
+        ".ryve/sparks.db\n.ryve/sparks.db-*\n.ryve/prompts/\n.ryve/logs/\n.ryve/worktrees/\n.ryve/backups/\n.ryve/releases/",
+    );
+    // Seed both live-workshop files with committed contents so the later
+    // test can modify them and observe the diff.
+    fs::write(root.join(".ryve").join("config.toml"), "# initial\n").unwrap();
+    fs::write(
+        root.join(".ryve").join("ui_state.json"),
+        "{\"collapsed_epics\":[]}\n",
+    )
+    .unwrap();
+    git(&root, &["add", ".ryve/config.toml", ".ryve/ui_state.json"]);
+    git(&root, &["commit", "-m", "seed live ryve workspace files"]);
+    root
+}
+
+/// Core workshop builder — `ryve_ignore` is the literal `.gitignore` snippet
+/// used for `.ryve/` entries. The caller controls how much of `.ryve/` is
+/// tracked vs. ignored.
+fn fresh_workshop_with(ryve_ignore: &str) -> PathBuf {
     let mut root = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -56,7 +92,11 @@ fn fresh_workshop() -> PathBuf {
         "fn main() { println!(\"ryve fixture\"); }\n",
     )
     .unwrap();
-    fs::write(root.join(".gitignore"), "/.ryve/\n/target/\nCargo.lock\n").unwrap();
+    fs::write(
+        root.join(".gitignore"),
+        format!("{ryve_ignore}\n/target/\nCargo.lock\n"),
+    )
+    .unwrap();
 
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "init"]);
@@ -243,4 +283,80 @@ fn release_e2e_create_through_close() {
         Some(artifact_path.as_str()),
         "release row must persist the artifact path"
     );
+}
+
+/// Regression for spark ryve-b3d4547d: `ryve release close` must succeed
+/// when the only unstaged diffs are the Ryve-internal workspace files that
+/// the live UI rewrites (`.ryve/config.toml`, `.ryve/ui_state.json`). Those
+/// paths are allowlisted in the `release_branch` dirty-tree gate so a user
+/// can close a release from the running UI without having to quit it first.
+#[test]
+fn release_e2e_close_tolerates_dirty_live_ryve_workspace_files() {
+    let ws = fresh_workshop_tracked_ryve();
+
+    // Create and populate the release exactly like the happy-path test.
+    let out = run_assert(&ws, &["--json", "release", "create", "patch"]);
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("release create stdout JSON");
+    let release_id = v["release"]["id"].as_str().unwrap().to_string();
+    let version = v["release"]["version"].as_str().unwrap().to_string();
+
+    let epic = create_epic(&ws, "dirty-workspace toy epic");
+    run_assert(&ws, &["release", "add-epic", &release_id, &epic]);
+    run_assert(&ws, &["spark", "close", &epic, "completed"]);
+
+    // Simulate the live UI mid-session: rewrite both allowlisted files on
+    // disk without committing. Before our fix this would have made
+    // `tag_release` error with `DirtyWorkingTree`, aborting the close.
+    fs::write(
+        ws.join(".ryve").join("config.toml"),
+        "# rewritten by live UI during close\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join(".ryve").join("ui_state.json"),
+        "{\"collapsed_epics\":[\"ep-live\"]}\n",
+    )
+    .unwrap();
+
+    // Sanity: git reports the tree as dirty (the scenario we're covering).
+    let porcelain = git_output(&ws, &["status", "--porcelain"]);
+    assert!(
+        porcelain.contains(".ryve/config.toml"),
+        "precondition: config.toml should appear dirty, got: {porcelain:?}"
+    );
+    assert!(
+        porcelain.contains(".ryve/ui_state.json"),
+        "precondition: ui_state.json should appear dirty, got: {porcelain:?}"
+    );
+
+    // Close the release — this must succeed despite the dirty allowlisted
+    // files. Any other dirty file would still abort; we don't introduce
+    // one here because that case is covered at the release_branch level.
+    let out = run_assert(&ws, &["--json", "release", "close", &release_id]);
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("release close stdout JSON");
+    let tag = v["tag"].as_str().unwrap().to_string();
+    assert_eq!(tag, format!("v{version}"));
+
+    // The tag and artifact must be in place, and the row must be closed.
+    let tag_exists = Command::new("git")
+        .args(["tag", "--list", &tag])
+        .current_dir(&ws)
+        .output()
+        .expect("git tag list");
+    assert_eq!(
+        String::from_utf8_lossy(&tag_exists.stdout).trim(),
+        tag,
+        "release tag must exist after close"
+    );
+    let artifact_path = v["artifact_path"].as_str().unwrap();
+    assert!(
+        Path::new(artifact_path).exists(),
+        "artifact {artifact_path} must exist after close"
+    );
+
+    let show = run_assert(&ws, &["--json", "release", "show", &release_id]);
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).expect("release show JSON");
+    assert_eq!(v["release"]["status"].as_str(), Some("closed"));
 }

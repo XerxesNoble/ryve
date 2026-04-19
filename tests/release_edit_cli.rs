@@ -112,3 +112,60 @@ fn release_edit_invalid_version_fails() {
         "expected semver error, got: {stderr}"
     );
 }
+
+#[test]
+fn release_edit_branch_round_trip() {
+    let ws = fresh_workshop();
+    let id = create_release(&ws);
+
+    let out = run(&ws, &["release", "edit", &id, "--branch", "release/9.9.9"]);
+    assert!(
+        out.status.success(),
+        "release edit --branch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let show = run(&ws, &["--json", "release", "show", &id]);
+    assert!(
+        show.status.success(),
+        "release show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        stdout.contains("release/9.9.9"),
+        "expected branch_name to round-trip via release show, got: {stdout}"
+    );
+
+    let clear = run(&ws, &["release", "edit", &id, "--clear-branch"]);
+    assert!(
+        clear.status.success(),
+        "release edit --clear-branch failed: {}",
+        String::from_utf8_lossy(&clear.stderr)
+    );
+
+    let show2 = run(&ws, &["--json", "release", "show", &id]);
+    assert!(show2.status.success());
+    let stdout2 = String::from_utf8_lossy(&show2.stdout);
+    assert!(
+        stdout2.contains("\"branch_name\": null"),
+        "expected branch_name to be null after --clear-branch, got: {stdout2}"
+    );
+}
+
+#[test]
+fn release_edit_branch_requires_value() {
+    let ws = fresh_workshop();
+    let id = create_release(&ws);
+
+    let out = run(&ws, &["release", "edit", &id, "--branch"]);
+    assert!(
+        !out.status.success(),
+        "expected --branch without value to fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--branch"),
+        "expected stderr to mention --branch, got: {stderr}"
+    );
+}

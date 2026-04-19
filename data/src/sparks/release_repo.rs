@@ -115,6 +115,7 @@ pub async fn update(
         version: existing_version,
         problem: existing_problem,
         notes: existing_notes,
+        branch_name: existing_branch_name,
         ..
     } = get(pool, id).await?;
 
@@ -134,14 +135,21 @@ pub async fn update(
         Some(opt) => opt,
         None => existing_notes,
     };
+    let branch_name = match patch.branch_name {
+        Some(opt) => opt,
+        None => existing_branch_name,
+    };
 
-    sqlx::query("UPDATE releases SET version = ?, problem = ?, notes = ? WHERE id = ?")
-        .bind(&version)
-        .bind(&problem)
-        .bind(&notes)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE releases SET version = ?, problem = ?, notes = ?, branch_name = ? WHERE id = ?",
+    )
+    .bind(&version)
+    .bind(&problem)
+    .bind(&notes)
+    .bind(&branch_name)
+    .bind(id)
+    .execute(pool)
+    .await?;
 
     get(pool, id).await
 }
