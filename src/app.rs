@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use data::sparks::types::{
     Bond, Contract, Ember, EmberType, HandAssignment, NewEmber, PersistedAgentSession, Spark,
@@ -152,6 +152,15 @@ pub(crate) struct App {
     /// If set, a "close workshop" confirmation dialog is open for the
     /// workshop at this index. Spark sp-ux0021.
     pending_close_workshop: Option<usize>,
+    /// Per-workshop ngIRCd supervisor handles. Populated asynchronously
+    /// once the bundled daemon has been spawned (or reconciled to a
+    /// daemon from a prior launch), drained by `do_close_workshop` so
+    /// the supervisor can drive SIGTERM-then-SIGKILL cleanup before the
+    /// workshop's rows are removed. Entries stay wrapped in
+    /// `Arc<StdMutex<Option<_>>>` so the async boot task can install the
+    /// supervisor from another thread once `start()` completes.
+    /// Spark ryve-242252b0 [sp-31659bbb].
+    ircd_supervisors: HashMap<Uuid, Arc<StdMutex<Option<crate::ircd_process::IrcdSupervisor>>>>,
 }
 
 #[derive(Clone)]
@@ -247,6 +256,12 @@ pub(crate) enum Message {
     /// state mutation — it just gives the batched-close `Task::batch` a
     /// terminal message for the IRC arm. Spark ryve-5a0e1d97 [sp-ddf6fd7f].
     IrcRuntimeStopped,
+    /// The ngIRCd supervisor's graceful shutdown (SIGTERM then SIGKILL)
+    /// finished. Emitted from `do_close_workshop` so the batched-close
+    /// `Task::batch` has a terminal message for the daemon arm. Carries
+    /// no payload — the supervisor removes its own pidfile on clean
+    /// exit. Spark ryve-242252b0 [sp-31659bbb].
+    IrcdSupervisorStopped,
     /// Dead-session reconciliation completed. Carries the session IDs whose
     /// `agent_sessions` rows were ended and `hand_assignments` were
     /// abandoned. Spark `ryve-a677498c`.
@@ -490,6 +505,7 @@ impl std::fmt::Debug for Message {
             Self::AgentSessionSaved => write!(f, "AgentSessionSaved"),
             Self::WatchRunnerStopped => write!(f, "WatchRunnerStopped"),
             Self::IrcRuntimeStopped => write!(f, "IrcRuntimeStopped"),
+            Self::IrcdSupervisorStopped => write!(f, "IrcdSupervisorStopped"),
             Self::DeadSessionsReconciled(ids) => {
                 write!(f, "DeadSessionsReconciled({} sessions)", ids.len())
             }
@@ -605,6 +621,7 @@ impl App {
             toasts: Vec::new(),
             next_toast_id: 1,
             pending_close_workshop: None,
+            ircd_supervisors: HashMap::new(),
         };
 
         // Surface an upgrade toast for any detected CLI whose version is
@@ -760,6 +777,24 @@ impl App {
                 )
             })
             .unwrap_or(Task::none());
+        // Spark ryve-242252b0 [sp-31659bbb]: tear down the ngIRCd
+        // supervisor. Runs after the IRC runtime disconnects so the
+        // client's QUIT reaches the daemon before we SIGTERM it;
+        // reconciled supervisors leave the daemon alive so the next
+        // launch can re-adopt it.
+        let workshop_uuid = self.workshops.get(idx).map(|ws| ws.id);
+        let stop_ircd_supervisor = workshop_uuid
+            .and_then(|id| self.ircd_supervisors.remove(&id))
+            .and_then(|slot| slot.lock().ok().and_then(|mut s| s.take()))
+            .map(|sup| {
+                Task::perform(
+                    async move {
+                        sup.shutdown().await;
+                    },
+                    |_| Message::IrcdSupervisorStopped,
+                )
+            })
+            .unwrap_or(Task::none());
         self.workshops.remove(idx);
         if self.workshops.is_empty() {
             self.active_workshop = None;
@@ -770,7 +805,13 @@ impl App {
                 self.active_workshop = Some(idx.min(self.workshops.len() - 1));
             }
         }
-        Task::batch([snapshot, kill_agents, stop_watch_runner, stop_irc_runtime])
+        Task::batch([
+            snapshot,
+            kill_agents,
+            stop_watch_runner,
+            stop_irc_runtime,
+            stop_ircd_supervisor,
+        ])
     }
 
     /// Push a new toast onto the stack and return a `Task` that will
@@ -1028,6 +1069,7 @@ impl App {
             Message::WatchRunnerStopped => Task::none(),
 
             Message::IrcRuntimeStopped => Task::none(),
+            Message::IrcdSupervisorStopped => Task::none(),
 
             Message::DeadSessionsReconciled(session_ids) => {
                 // The DB rows are already updated — the next poll cycle's
@@ -3252,6 +3294,44 @@ impl App {
                     pool.clone(),
                     crate::watch_runner::tick_interval_from_env(),
                 ));
+            }
+            // Spark ryve-242252b0 [sp-31659bbb]: bring up the workshop-
+            // scoped ngIRCd daemon (or reconcile to one from a prior
+            // launch) BEFORE the IRC client attempts to connect. The
+            // supervisor skips cleanly when there's nothing to do —
+            // pre-`ryve init` workshops, missing bundled binary — so
+            // the client path stays responsible for flares when the
+            // actual connect fails.
+            if let Some(spec) =
+                crate::ircd_process::SpawnSpec::for_workshop(ws.ryve_dir.as_ref(), &config)
+            {
+                let supervisor_slot: Arc<StdMutex<Option<crate::ircd_process::IrcdSupervisor>>> =
+                    Arc::new(StdMutex::new(None));
+                self.ircd_supervisors
+                    .insert(ws.id, Arc::clone(&supervisor_slot));
+                let workshop_uuid_for_log = ws.id;
+                tokio::spawn(async move {
+                    match crate::ircd_process::IrcdSupervisor::start(spec).await {
+                        Ok(sup) => {
+                            let port = sup.port();
+                            let pid = sup.pid();
+                            let owned = sup.owns_child();
+                            if let Ok(mut slot) = supervisor_slot.lock() {
+                                *slot = Some(sup);
+                            }
+                            log::info!(
+                                "ircd: workshop {workshop_uuid_for_log} supervisor {} pid={pid} port={port}",
+                                if owned { "spawned" } else { "reconciled" }
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "ircd: workshop {workshop_uuid_for_log} supervisor start failed: {e}; \
+                                 continuing without bundled daemon"
+                            );
+                        }
+                    }
+                });
             }
             // Spark ryve-5a0e1d97 [sp-ddf6fd7f]: start the IRC subsystem
             // if the workshop has `irc_server` configured. Opt-in per
