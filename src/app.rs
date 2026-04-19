@@ -785,7 +785,19 @@ impl App {
         let workshop_uuid = self.workshops.get(idx).map(|ws| ws.id);
         let stop_ircd_supervisor = workshop_uuid
             .and_then(|id| self.ircd_supervisors.remove(&id))
-            .and_then(|slot| slot.lock().ok().and_then(|mut s| s.take()))
+            .and_then(|slot| {
+                // Recover-on-poison so a panic in the async `start`
+                // task cannot leak the daemon. `lock().ok()` used to
+                // silently drop shutdown on a poisoned mutex, which
+                // would keep ngIRCd running after workshop close.
+                // PoisonError carries the guard, so we can still take
+                // the supervisor out and run its graceful shutdown.
+                let mut guard = match slot.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.take()
+            })
             .map(|sup| {
                 Task::perform(
                     async move {
@@ -3316,9 +3328,34 @@ impl App {
                             let port = sup.port();
                             let pid = sup.pid();
                             let owned = sup.owns_child();
-                            if let Ok(mut slot) = supervisor_slot.lock() {
-                                *slot = Some(sup);
+                            // Race: if do_close_workshop ran between the
+                            // `.insert(...)` above and `start().await`
+                            // resolving here, the map's Arc clone has
+                            // already been dropped. The supervisor we
+                            // just started would never be reachable for
+                            // graceful shutdown. Detect that via
+                            // `Arc::strong_count` — when it is 1 the map
+                            // is no longer holding this slot, so we own
+                            // the only reference and must drive
+                            // shutdown ourselves instead of installing
+                            // into an orphan slot.
+                            if Arc::strong_count(&supervisor_slot) == 1 {
+                                log::warn!(
+                                    "ircd: workshop {workshop_uuid_for_log} closed during \
+                                     supervisor start; driving graceful shutdown on the \
+                                     supervisor we just spawned to avoid leaking ngIRCd"
+                                );
+                                sup.shutdown().await;
+                                return;
                             }
+                            // Recover-on-poison so a panicked holder of
+                            // the lock cannot silently orphan the
+                            // supervisor.
+                            let mut slot = match supervisor_slot.lock() {
+                                Ok(g) => g,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            *slot = Some(sup);
                             log::info!(
                                 "ircd: workshop {workshop_uuid_for_log} supervisor {} pid={pid} port={port}",
                                 if owned { "spawned" } else { "reconciled" }

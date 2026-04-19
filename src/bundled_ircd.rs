@@ -19,7 +19,7 @@
 //! The pinned ngIRCd version is recorded in `vendor/ircd/VERSION`. The shared
 //! vendor / auto-build pattern is documented in `docs/VENDORED_TMUX.md`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The pinned ngIRCd version, embedded at compile time from `vendor/ircd/VERSION`.
 #[allow(dead_code)] // consumed by a follow-up spark that wires the ngIRCd supervisor
@@ -37,11 +37,26 @@ pub const PINNED_IRCD_VERSION: &str = env!("RYVE_IRCD_VERSION");
 #[cfg(unix)]
 #[allow(dead_code)] // consumed by a follow-up spark that wires the ngIRCd supervisor
 pub fn bundled_ircd_path() -> Option<PathBuf> {
+    resolve_bundled_ircd_path_from(
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .as_deref(),
+    )
+}
+
+/// Resolve the bundled ngIRCd binary given an explicit exe directory,
+/// so tests can drive the resolution logic against a controlled layout
+/// instead of the real `std::env::current_exe()`. Production callers
+/// use [`bundled_ircd_path`], which threads in the real exe dir.
+#[cfg(unix)]
+fn resolve_bundled_ircd_path_from(exe_dir: Option<&Path>) -> Option<PathBuf> {
     // 1. Installed layout: <exe_dir>/bin/ngircd
-    if let Some(path) = exe_relative_path()
-        && path.exists()
-    {
-        return Some(path);
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join("bin").join("ngircd");
+        if candidate.exists() {
+            return Some(candidate);
+        }
     }
 
     // 2. Development layout: <repo_root>/vendor/ircd/bin/ngircd
@@ -58,13 +73,6 @@ pub fn bundled_ircd_path() -> Option<PathBuf> {
 #[allow(dead_code)] // consumed by a follow-up spark that wires the ngIRCd supervisor
 pub fn bundled_ircd_path() -> Option<PathBuf> {
     None
-}
-
-/// Returns the expected installed-layout path: `<exe_dir>/bin/ngircd`.
-fn exe_relative_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_dir = exe.parent()?;
-    Some(exe_dir.join("bin").join("ngircd"))
 }
 
 /// Returns the development-layout path, set at compile time by `build.rs`.
@@ -101,55 +109,78 @@ mod tests {
     }
 
     #[test]
-    fn exe_relative_path_returns_bin_ngircd() {
-        // We can't control where the test binary lives, but the function
-        // should always produce a path ending in bin/ngircd.
-        if let Some(path) = exe_relative_path() {
-            assert!(
-                path.ends_with("bin/ngircd"),
-                "expected bin/ngircd, got: {path:?}"
-            );
-        }
-    }
-
-    #[test]
     fn dev_ircd_path_is_under_vendor() {
         let path = dev_ircd_path();
+        // Assert on Path components rather than the string form so the
+        // test is path-separator portable (Windows renders with `\`,
+        // and while the `unix`-cfg resolver has a stub on non-unix the
+        // build.rs sets RYVE_IRCD_DEV_PATH unconditionally).
+        let expected_tail = Path::new("vendor").join("ircd").join("bin").join("ngircd");
         assert!(
-            path.to_string_lossy().contains("vendor/ircd/bin/ngircd"),
-            "dev path should be under vendor/ircd/bin/ngircd, got: {path:?}"
+            path.ends_with(&expected_tail),
+            "dev path should end in <vendor>/ircd/bin/ngircd (platform-native \
+             separator); expected tail={expected_tail:?}, got path={path:?}"
         );
     }
 
-    /// When an ngIRCd binary exists at the exe-relative path, that path wins.
+    /// Exercises `bundled_ircd_path()` against a synthesised "installed
+    /// layout" temp dir: `<tmp>/bin/ngircd`. Because the real resolver
+    /// keys off `current_exe()`, we drive it via the private
+    /// [`resolve_bundled_ircd_path_from`] helper to pass the fake exe
+    /// directory. Replaces the prior two tests that asserted on
+    /// resolver shape (`exe_relative_path().is_some()` /
+    /// `installed_layout_path_structure`) without actually invoking
+    /// the resolution logic — those passed regardless of resolver
+    /// regressions, which is exactly what Copilot called out.
     #[test]
-    fn resolution_prefers_exe_relative() {
-        // This test validates the resolution *logic* by checking that
-        // exe_relative_path() is tried first. We can't easily fake the exe
-        // dir in a unit test, so we just verify the function shape: if the
-        // exe-relative path existed, it would be returned before dev_path.
-        //
-        // Full end-to-end coverage is in CI where a real bundled ngIRCd is
-        // placed at the correct path.
-        let exe_path = exe_relative_path();
-        assert!(
-            exe_path.is_some(),
-            "exe_relative_path should not return None"
-        );
-    }
-
-    /// Simulates the installed layout by creating a temp dir with bin/ngircd
-    /// and verifying the resolution logic would pick it up.
-    #[test]
-    fn installed_layout_path_structure() {
+    fn bundled_ircd_path_prefers_installed_layout_when_present() {
         let tmp = TempDir::new().unwrap();
         let bin_dir = tmp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let ngircd_path = bin_dir.join("ngircd");
         fs::write(&ngircd_path, "#!/bin/sh\necho fake-ngircd").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&ngircd_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&ngircd_path, perms).unwrap();
+        }
 
-        // Verify the path exists and is correct
-        assert!(ngircd_path.exists());
-        assert!(ngircd_path.ends_with("bin/ngircd"));
+        // When the exe-relative path exists, the resolver must return
+        // it in preference to the dev path.
+        let resolved = resolve_bundled_ircd_path_from(Some(tmp.path()));
+        assert_eq!(
+            resolved.as_deref(),
+            Some(ngircd_path.as_path()),
+            "resolver must pick up <exe_dir>/bin/ngircd when it exists",
+        );
+    }
+
+    /// When nothing is installed at the exe-relative path, the resolver
+    /// falls through to the dev path. We can't reliably create the
+    /// compile-time `RYVE_IRCD_DEV_PATH` under a TempDir, so we only
+    /// assert the fall-through returns the dev path (or None if the
+    /// dev path also does not exist in this checkout).
+    #[test]
+    fn bundled_ircd_path_falls_through_to_dev_when_no_installed_layout() {
+        let tmp = TempDir::new().unwrap();
+        // Empty tmp dir -> no bin/ngircd -> should fall through to the
+        // dev path without ever considering the exe-relative path.
+        let resolved = resolve_bundled_ircd_path_from(Some(tmp.path()));
+        let dev = dev_ircd_path();
+        if dev.exists() {
+            assert_eq!(
+                resolved.as_deref(),
+                Some(dev.as_path()),
+                "resolver must fall through to the dev path when installed layout missing",
+            );
+        } else {
+            assert!(
+                resolved.is_none(),
+                "resolver must return None when neither installed nor dev path exists; \
+                 got {resolved:?}",
+            );
+        }
     }
 }

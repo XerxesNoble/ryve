@@ -198,14 +198,31 @@ impl IrcdSupervisor {
 
         let mut cmd = Command::new(&binary);
         cmd.args(&args);
-        let child = cmd.spawn()?;
+        // Belt-and-braces for the post-spawn error paths below: if this
+        // function returns `Err` between `spawn()` and the final `Ok`,
+        // the child is dropped and tokio sends SIGKILL instead of
+        // leaving an orphan ngIRCd on the supervised port. Without this
+        // a `tokio::fs::write(&pidfile, …)` failure (e.g. ENOSPC, EIO,
+        // readonly fs) would leak a running daemon with no pidfile,
+        // and the next launch would reconcile via port probe only —
+        // or spawn a duplicate if the port probe raced.
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn()?;
         let pid = child.id().ok_or_else(|| {
             SupervisorError::Io(std::io::Error::other(
                 "spawned ngircd child did not expose a pid",
             ))
         })?;
 
-        tokio::fs::write(&pidfile, format!("{pid}\n")).await?;
+        // Any `?` between here and the final `Ok` must not leak the
+        // child. Capture every fallible step, kill on failure, then
+        // propagate the original error so the caller sees the real
+        // cause (not a shutdown error masking it).
+        if let Err(e) = tokio::fs::write(&pidfile, format!("{pid}\n")).await {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(SupervisorError::Io(e));
+        }
 
         let _ = wait_for_port(port, PORT_READY_TIMEOUT).await;
 
