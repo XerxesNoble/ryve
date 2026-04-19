@@ -127,6 +127,21 @@ pub async fn run(args: Vec<String>) {
         return;
     }
 
+    // Special: `hand exec-heartbeat` is a stateless subprocess wrapper —
+    // it forwards a child's stdout/stderr through the stream-heartbeat
+    // wrapper and does not touch the workgraph at all. Dispatching it
+    // after workshop discovery (below) means the Hand's shell must sit
+    // inside a Ryve workshop to use the wrapper, which both breaks the
+    // e2e test (no workshop in the test tempdir / CI checkout) and
+    // contradicts the wrapper's design as a general-purpose shim.
+    // Handle it up front without opening a DB.
+    if args_clean.get(1).map(|s| s.as_str()) == Some("hand")
+        && args_clean.get(2).map(|s| s.as_str()) == Some("exec-heartbeat")
+    {
+        handle_hand_exec_heartbeat(&args_clean[3..]).await;
+        return;
+    }
+
     // Find the workshop root by walking up the directory tree, or honor
     // $RYVE_WORKSHOP_ROOT if set. This lets Hands run `ryve` from inside
     // a worktree without needing to cd to the workshop root first.
@@ -2438,6 +2453,90 @@ async fn handle_crew(pool: &sqlx::SqlitePool, args: &[String], ws_id: &str, json
 
 // ── Hand ─────────────────────────────────────────────
 
+/// Run a subprocess under the [`stream_heartbeat::StreamHeartbeat`]
+/// wrapper so long-silent Hand-side subcommands (notably the
+/// full-workspace `cargo test`) do not trip Claude's ~5-minute
+/// stream-idle timeout and kill the Hand session.
+///
+/// This handler is intentionally stateless: it takes no pool, no
+/// workshop root, and does not touch the workgraph. It is dispatched
+/// from `run_cli` before the workshop-discovery step so a Hand (or
+/// anyone) can invoke `ryve hand exec-heartbeat -- <cmd>` from any
+/// directory, including a fresh CI checkout that has never run
+/// `ryve init`.
+///
+/// Parent epic: ryve-32e95c28 / [sp-b7f7f1fa].
+async fn handle_hand_exec_heartbeat(args: &[String]) {
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("help" | "--help" | "-h")
+    ) {
+        println!(
+            "ryve hand exec-heartbeat — run a subprocess under the \
+             stream-heartbeat wrapper\n\n\
+             USAGE:\n  \
+             ryve hand exec-heartbeat [--interval-secs N] -- <cmd> [args...]\n\n\
+             Forwards the child's stdout and stderr to this process's \
+             stdout byte-for-byte while injecting a heartbeat line \
+             (default every 30 s) whenever the child is silent. Exits \
+             with the child's exit code. Use it when a Hand runs \
+             a command that may stay silent past Claude's \
+             ~5-minute stream-idle threshold (e.g. the full \
+             workspace `cargo test`)."
+        );
+        return;
+    }
+
+    let mut interval_secs: Option<u64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval-secs" => {
+                i += 1;
+                if i >= args.len() {
+                    die("hand exec-heartbeat --interval-secs requires a value");
+                }
+                interval_secs = Some(args[i].parse().unwrap_or_else(|_| {
+                    die(&format!(
+                        "--interval-secs '{}' must be a non-negative integer",
+                        args[i]
+                    ))
+                }));
+                i += 1;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            other if other.starts_with("--") => {
+                die(&format!("unknown hand exec-heartbeat flag '{other}'"));
+            }
+            _ => break,
+        }
+    }
+    if i >= args.len() {
+        die("hand exec-heartbeat requires a command: \
+             `ryve hand exec-heartbeat [--interval-secs N] -- <cmd> [args...]`");
+    }
+    let cmd = args[i].clone();
+    let cmd_args: Vec<&str> = args[(i + 1)..].iter().map(String::as_str).collect();
+    let interval = interval_secs.map(std::time::Duration::from_secs);
+
+    let mut stdout = tokio::io::stdout();
+    match hand_spawn::run_with_stream_heartbeat(&cmd, &cmd_args, None, &[], interval, &mut stdout)
+        .await
+    {
+        Ok(outcome) => {
+            // Propagate the child's exit code so the caller
+            // (typically a Hand's shell) sees a failed
+            // `cargo test` as a non-zero exit. Signal-killed
+            // children (no exit code) surface as 1.
+            std::process::exit(outcome.status.code().unwrap_or(1));
+        }
+        Err(e) => die(&format!("hand exec-heartbeat: {e}")),
+    }
+}
+
 async fn handle_hand(
     pool: &sqlx::SqlitePool,
     workshop_root: &Path,
@@ -2812,6 +2911,10 @@ async fn handle_hand(
                 );
             }
         }
+        // `exec-heartbeat` is dispatched early in `run_cli` (before
+        // workshop discovery) via `handle_hand_exec_heartbeat`. It is a
+        // stateless subprocess wrapper and intentionally does not touch
+        // the workgraph.
         other => die(&format!(
             "unknown hand subcommand '{other}'. Try `ryve hand --help`."
         )),
@@ -2836,8 +2939,12 @@ USAGE:
   ryve hand spawn --help
 
 SUBCOMMANDS:
-  spawn    Launch a detached Hand subprocess on a spark.
-  list     Show active hand assignments (ownership + role + heartbeat).
+  spawn           Launch a detached Hand subprocess on a spark.
+  list            Show active hand assignments (ownership + role + heartbeat).
+  exec-heartbeat  Run a subprocess under the stream-heartbeat wrapper so long
+                  silent commands (e.g. full-workspace `cargo test`) do not
+                  trip Claude's ~5-minute stream-idle timeout.
+                  See `ryve hand exec-heartbeat --help`.
 
 ROLES:
   owner             (default) Standard worker. Claims the spark, works in its

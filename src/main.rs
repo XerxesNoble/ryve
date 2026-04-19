@@ -19,6 +19,12 @@ mod release_artifact;
 mod screen;
 #[allow(dead_code)]
 mod sparks_filter;
+// Some wrapper API surface (builder getters, custom-heartbeat-line
+// setter) is intentionally kept for future callers / integration tests
+// under `tests/heavy_test_stream_survival.rs` (spark ryve-9350365a),
+// even though the binary entry-point only uses a subset today.
+#[allow(dead_code)]
+mod stream_heartbeat;
 mod style;
 mod tmux;
 mod watch_runner;

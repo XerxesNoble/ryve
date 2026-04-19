@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use data::ryve_dir::RyveDir;
 use data::sparks::types::{
@@ -32,6 +33,8 @@ use data::sparks::types::{
 };
 use data::sparks::{agent_session_repo, assignment_repo, crew_repo, spark_repo};
 use sqlx::SqlitePool;
+use tokio::io::AsyncWrite;
+use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::agent_prompts::{
@@ -40,6 +43,7 @@ use crate::agent_prompts::{
     compose_performance_engineer_prompt, compose_release_manager_prompt, compose_reviewer_prompt,
 };
 use crate::coding_agents::CodingAgent;
+use crate::stream_heartbeat::{StreamHeartbeat, StreamOutcome};
 use crate::tmux::{self, TmuxClient, TmuxError};
 use crate::{hand_archetypes, workshop};
 
@@ -266,6 +270,49 @@ pub enum HandSpawnError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Run a subprocess under a streaming-heartbeat wrapper so long silent
+/// runs (notably the full-workspace `cargo test`) do not trip Claude's
+/// ~5-minute stream-idle timeout and kill the Hand session. Parent epic
+/// ryve-32e95c28 / [sp-b7f7f1fa].
+///
+/// Opt-in per invocation: short or noisy commands should stay on the
+/// plain `Command` path so their output is not polluted with heartbeat
+/// lines. This helper is intended for commands whose silent windows
+/// routinely exceed the stream-idle threshold.
+///
+/// The child's stdout and stderr are multiplexed onto `out` byte-for-byte,
+/// in arrival order; heartbeat lines are the only additions and no child
+/// bytes are rewritten or dropped (see [`StreamHeartbeat`]).
+///
+/// `cwd = None` inherits the caller's current directory; `interval = None`
+/// uses [`crate::stream_heartbeat::DEFAULT_HEARTBEAT_INTERVAL`] (30 s,
+/// comfortably under the ~5-minute Claude threshold).
+pub async fn run_with_stream_heartbeat<W>(
+    command: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    envs: &[(String, String)],
+    interval: Option<Duration>,
+    out: W,
+) -> std::io::Result<StreamOutcome>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut wrapper = StreamHeartbeat::new();
+    if let Some(d) = interval {
+        wrapper = wrapper.with_interval(d);
+    }
+    wrapper.run(cmd, out).await
 }
 
 /// Resolve the actor_id a UI-driven Hand spawn should use when no explicit
@@ -2952,5 +2999,149 @@ mod tests {
         let tmux_name = format!("reviewer-{}", hand.session_id);
         cleanup_tmux(&workshop_dir, &tmux_name);
         let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+}
+
+// ── run_with_stream_heartbeat ── [sp-b7f7f1fa] ─────────────────────────
+//
+// These tests exercise the opt-in heartbeat-wrapped spawn path from a
+// Hand's perspective: silent children must be kept alive with injected
+// heartbeat lines while noisy children must reach `out` verbatim, and
+// the child's exit code must propagate unchanged so the caller can fail
+// the Hand's work on a real `cargo test` failure.
+
+#[cfg(all(test, unix))]
+mod run_with_stream_heartbeat_tests {
+    use tokio::time::Duration;
+
+    use super::run_with_stream_heartbeat;
+
+    #[tokio::test]
+    async fn silent_child_gets_heartbeats_injected_for_hand_stream() {
+        let mut captured = Vec::<u8>::new();
+        let outcome = run_with_stream_heartbeat(
+            "sh",
+            &["-c", "sleep 0.4"],
+            None,
+            &[],
+            Some(Duration::from_millis(100)),
+            &mut captured,
+        )
+        .await
+        .expect("heartbeat-wrapped sleep should run");
+
+        assert!(outcome.status.success(), "sleep 0.4 exits 0");
+        assert!(
+            outcome.heartbeats_emitted >= 2,
+            "expected >=2 heartbeats across a 400 ms silent window with a 100 ms \
+             interval, got {}",
+            outcome.heartbeats_emitted,
+        );
+        let text = String::from_utf8(captured).expect("utf8 output");
+        let observed = text.matches("[stream-heartbeat] still running\n").count();
+        assert_eq!(
+            observed as u64, outcome.heartbeats_emitted,
+            "heartbeat lines in the sink must match the reported count; sink={text:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn noisy_child_output_is_forwarded_verbatim_without_heartbeats() {
+        let mut captured = Vec::<u8>::new();
+        let outcome = run_with_stream_heartbeat(
+            "sh",
+            &["-c", "echo hello && echo world 1>&2"],
+            None,
+            &[],
+            Some(Duration::from_secs(10)),
+            &mut captured,
+        )
+        .await
+        .expect("heartbeat-wrapped echo should run");
+
+        assert!(outcome.status.success());
+        assert_eq!(
+            outcome.heartbeats_emitted, 0,
+            "fast, non-silent child must not emit any heartbeat",
+        );
+        let text = String::from_utf8(captured).expect("utf8 output");
+        assert!(
+            text.contains("hello"),
+            "child stdout must reach the sink unrewritten; sink={text:?}",
+        );
+        assert!(
+            text.contains("world"),
+            "child stderr must also reach the sink unrewritten; sink={text:?}",
+        );
+        assert!(
+            !text.contains("stream-heartbeat"),
+            "no heartbeat noise should pollute a noisy child's output; sink={text:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_code_propagates_so_hand_can_detect_cargo_test_failure() {
+        let mut captured = Vec::<u8>::new();
+        let outcome = run_with_stream_heartbeat(
+            "sh",
+            &["-c", "exit 11"],
+            None,
+            &[],
+            Some(Duration::from_secs(10)),
+            &mut captured,
+        )
+        .await
+        .expect("heartbeat-wrapped exit-11 should run");
+
+        assert_eq!(
+            outcome.status.code(),
+            Some(11),
+            "wrapper must propagate the child's exit code unchanged so a \
+             failed cargo test returns non-zero to the Hand",
+        );
+        assert_eq!(outcome.heartbeats_emitted, 0);
+    }
+
+    #[tokio::test]
+    async fn cwd_and_env_overrides_reach_the_child() {
+        let tmp = std::env::temp_dir().join(format!("ryve-heartbeat-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp cwd");
+        let tail = tmp
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .expect("tmp dir must have a utf8 file name");
+
+        let mut captured = Vec::<u8>::new();
+        let outcome = run_with_stream_heartbeat(
+            "sh",
+            &["-c", "printf '%s\\n%s\\n' \"$PWD\" \"$HEARTBEAT_TEST\""],
+            Some(&tmp),
+            &[("HEARTBEAT_TEST".to_string(), "marker-ok".to_string())],
+            Some(Duration::from_secs(10)),
+            &mut captured,
+        )
+        .await
+        .expect("pwd under override cwd should run");
+
+        assert!(outcome.status.success());
+        assert_eq!(
+            outcome.heartbeats_emitted, 0,
+            "fast child should not emit heartbeats",
+        );
+        let text = String::from_utf8(captured).expect("utf8 output");
+        let pwd_line = text
+            .lines()
+            .next()
+            .expect("child must print at least one line");
+        assert!(
+            pwd_line.ends_with(tail.as_str()),
+            "child $PWD must reflect caller cwd; got {pwd_line:?}, expected tail {tail:?}",
+        );
+        assert!(
+            text.contains("marker-ok"),
+            "child env must carry caller-supplied vars; got {text:?}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
