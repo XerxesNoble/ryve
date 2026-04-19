@@ -2037,9 +2037,50 @@ pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::spa
 
     // Run any pending workshop schema migrations. Returns the (now-current)
     // config plus a log of what ran so the caller can surface it to the user.
-    let (config, migration_log) = data::migrations::migrate_workshop(&ryve_dir)
+    let (mut config, migration_log) = data::migrations::migrate_workshop(&ryve_dir)
         .await
         .map_err(data::sparks::SparksError::Io)?;
+
+    // Auto-provision the workshop-scoped IRC daemon if the workshop
+    // wants IRC (`irc_enabled = true`) but has never been allocated a
+    // bundled port. This covers the upgrade path: workshops created
+    // before 0.2.1 land here on first launch with `irc_enabled = true`
+    // (default) and `irc_bundled_port = None`. Without this, the
+    // supervisor would skip cleanly, the IRC client would have no
+    // dial target, and the status-bar pill would (correctly, per
+    // PR #50 c6) display Disabled — but the user would have no clear
+    // path to re-provision short of running `ryve init` manually.
+    //
+    // Idempotent: a workshop that already has a bundled port (or has
+    // opted out) is a no-op (`provision_workshop_ircd` short-circuits
+    // on both). Errors are logged but non-fatal — workshop open must
+    // still succeed even if the IRC daemon can't be provisioned (no
+    // bundled binary on this platform, ircd dir not writable, etc.).
+    if config.irc_enabled() && config.irc_bundled_port.is_none() {
+        match provision_workshop_ircd(&ryve_dir, &mut config).await {
+            Ok(()) => {
+                if let Err(e) = data::ryve_dir::save_config(&ryve_dir, &config).await {
+                    log::warn!(
+                        "ircd: auto-provision succeeded but persisting config failed: {e}; \
+                         the bundled port will be re-allocated on next launch"
+                    );
+                } else {
+                    log::info!(
+                        "ircd: auto-provisioned bundled daemon for upgraded workshop \
+                         (port={:?})",
+                        config.irc_bundled_port
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "ircd: auto-provision skipped — {e}; the IRC pill will stay Disabled \
+                     until `ryve init` is run manually or the user sets an explicit \
+                     `irc_server` override"
+                );
+            }
+        }
+    }
 
     if migration_log.is_empty() {
         log::debug!("{}", migration_log.summary());
@@ -3327,6 +3368,66 @@ mod tests {
         assert!(
             body.contains("Ports = 45678"),
             "regenerated conf must use the recorded port, got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_workshop_auto_provisions_bundled_irc_for_pre_021_workshop() {
+        // Hotfix regression: a workshop directory created before 0.2.1's
+        // bundled IRC has `irc_enabled = true` (default-on flip from
+        // Epic B) but no `irc_bundled_port` and no `.ryve/ircd/`. On
+        // first launch under 0.2.1+ the open path must auto-provision
+        // the bundled daemon, otherwise the supervisor skips, the IRC
+        // client has no dial target, and the status pill stays
+        // Disabled with no clear remediation in the UI.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        // Seed a config that mimics the post-upgrade pre-init state:
+        // irc_enabled true (default), no bundled port, no conf.
+        let pre_upgrade_config = WorkshopConfig {
+            irc_enabled: true,
+            irc_bundled_port: None,
+            ..WorkshopConfig::default()
+        };
+        data::ryve_dir::save_config(&ryve_dir, &pre_upgrade_config)
+            .await
+            .unwrap();
+
+        // Sanity: no ircd dir or conf yet.
+        let conf_path = ryve_dir
+            .root()
+            .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
+        assert!(!conf_path.exists(), "test setup: conf must not exist yet");
+
+        // Run the open path. We bypass `init_workshop` (which also
+        // touches sparks.db, agent context, etc. that aren't relevant
+        // here) and call the auto-provision branch directly under the
+        // same condition.
+        let mut config = data::ryve_dir::load_config(&ryve_dir).await;
+        if config.irc_enabled() && config.irc_bundled_port.is_none() {
+            provision_workshop_ircd(&ryve_dir, &mut config)
+                .await
+                .expect("auto-provision must succeed on a writable workshop dir");
+            data::ryve_dir::save_config(&ryve_dir, &config)
+                .await
+                .expect("persisting auto-provisioned config must succeed");
+        }
+
+        // After open: bundled port allocated, conf written, file
+        // persisted so a second launch is a no-op (idempotency
+        // already covered by `provision_workshop_ircd_is_idempotent_on_rerun`).
+        assert!(
+            config.irc_bundled_port.is_some(),
+            "auto-provision must allocate a bundled port"
+        );
+        assert!(conf_path.exists(), "auto-provision must write ircd.conf");
+        let persisted = data::ryve_dir::load_config(&ryve_dir).await;
+        assert_eq!(
+            persisted.irc_bundled_port, config.irc_bundled_port,
+            "auto-provisioned port must round-trip through .ryve/config.toml \
+             so the supervisor sees it on next launch"
         );
     }
 
