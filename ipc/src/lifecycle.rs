@@ -20,9 +20,14 @@
 //!    any) back on the same client. The listener runs inside the client —
 //!    no separate task required.
 //!
-//! The runtime is opt-in per workshop. When `WorkshopConfig::irc_enabled`
-//! returns `false` the app never constructs an [`IrcRuntime`] in the first
-//! place; the rest of the app remains functional.
+//! The runtime is default-on per workshop (spark ryve-300f661c
+//! [sp-31659bbb]): `WorkshopConfig::irc_enabled` returns `true` by
+//! default and [`WorkshopConfig::effective_irc_server_address`] resolves
+//! to the bundled `127.0.0.1:<irc_bundled_port>` daemon unless the user
+//! sets an explicit `irc_server` override (e.g. `irc.libera.chat` for a
+//! mesh setup). The app never constructs an [`IrcRuntime`] when
+//! `irc_enabled` is explicitly disabled or when neither a bundled port
+//! nor an override is configured (pre-`ryve init` workshops).
 //!
 //! Shutdown via [`IrcRuntime::shutdown`] is clean:
 //! 1. Signal the relay task via oneshot so it stops sleeping.
@@ -54,7 +59,9 @@ use crate::outbox_relay::{RelayConfig, RelayHandle};
 /// and continue running the rest of the workshop without IRC.
 #[derive(Debug, Error)]
 pub enum LifecycleError {
-    #[error("IRC is not enabled for this workshop (irc_server is unset)")]
+    #[error(
+        "IRC is not enabled for this workshop (irc_enabled = false or no server_address resolvable)"
+    )]
     Disabled,
 
     #[error("IRC connect failed: {0}")]
@@ -82,22 +89,47 @@ pub struct IrcLifecycleConfig {
 }
 
 impl IrcLifecycleConfig {
-    /// Extract IRC settings from a [`WorkshopConfig`]. Returns `None` when
-    /// the workshop has IRC disabled — the caller should simply skip the
-    /// IRC boot path.
+    /// Extract IRC settings from a [`WorkshopConfig`]. Returns `None`
+    /// when the workshop has IRC explicitly disabled (`irc_enabled =
+    /// false`) or when no server address resolves — i.e. the workshop
+    /// has not yet been inited (no bundled port recorded) and no
+    /// explicit `irc_server` override is set. In either case the caller
+    /// should skip the IRC boot path.
+    ///
+    /// Spark ryve-300f661c [sp-31659bbb]: the earlier `irc_server.clone()?`
+    /// short-circuit is gone — the runtime now dials the bundled
+    /// `127.0.0.1:<irc_bundled_port>` daemon whenever an override isn't
+    /// set, via [`WorkshopConfig::effective_irc_server_address`].
     pub fn from_workshop(config: &WorkshopConfig, workshop_id: impl Into<String>) -> Option<Self> {
         if !config.irc_enabled() {
             return None;
         }
+        let address = config.effective_irc_server_address()?;
+        let (server, port) = split_host_port(&address)?;
         Some(Self {
-            server: config.irc_server.clone()?,
-            port: config.effective_irc_port(),
+            server,
+            port,
             tls: config.irc_tls.unwrap_or(false),
             nick: config.effective_irc_nick(),
             password: config.irc_password.clone(),
             workshop_id: workshop_id.into(),
         })
     }
+}
+
+/// Parse a `host:port` pair produced by
+/// [`WorkshopConfig::effective_irc_server_address`]. Uses `rsplit_once`
+/// so IPv6 literals without an explicit port degrade predictably — the
+/// helper only emits `host:port` today but future overrides may include
+/// more exotic forms, and callers should treat an unparseable address
+/// the same as "no address".
+fn split_host_port(addr: &str) -> Option<(String, u16)> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port))
 }
 
 /// Owner of the per-workshop IRC subsystem. Holds the client, the relay
@@ -426,9 +458,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_workshop_returns_none_when_disabled() {
-        let cfg = WorkshopConfig::default();
+    fn from_workshop_returns_none_when_explicitly_disabled() {
+        // Spark ryve-300f661c: the master switch still opts the
+        // workshop out entirely.
+        let cfg = WorkshopConfig {
+            irc_enabled: false,
+            irc_bundled_port: Some(6971),
+            ..Default::default()
+        };
         assert!(IrcLifecycleConfig::from_workshop(&cfg, "ws").is_none());
+    }
+
+    #[test]
+    fn from_workshop_returns_none_without_override_or_bundled_port() {
+        // Pre-`ryve init` workshop: nothing to dial. Enabled but no
+        // address resolves, so the runtime is skipped cleanly.
+        let cfg = WorkshopConfig::default();
+        assert!(cfg.irc_enabled());
+        assert!(IrcLifecycleConfig::from_workshop(&cfg, "ws").is_none());
+    }
+
+    #[test]
+    fn from_workshop_uses_bundled_port_when_no_override() {
+        // Default-on path: `ryve init` has recorded a bundled port and
+        // the user has no `irc_server` override. The lifecycle dials
+        // the workshop-local daemon on 127.0.0.1:<bundled_port>.
+        let cfg = WorkshopConfig {
+            irc_bundled_port: Some(6971),
+            ..Default::default()
+        };
+        let lc = IrcLifecycleConfig::from_workshop(&cfg, "ws")
+            .expect("bundled port resolves to a dialable address");
+        assert_eq!(lc.server, "127.0.0.1");
+        assert_eq!(lc.port, 6971);
+        assert!(!lc.tls);
+        assert_eq!(lc.nick, "ryve");
+        assert!(lc.password.is_none());
+        assert_eq!(lc.workshop_id, "ws");
+    }
+
+    #[test]
+    fn from_workshop_explicit_override_wins_over_bundled() {
+        // Mesh/cross-workshop setup: an explicit `irc_server` plus port
+        // trumps the bundled daemon even if a bundled port is set.
+        let cfg = WorkshopConfig {
+            irc_server: Some("irc.libera.chat".into()),
+            irc_port: Some(6697),
+            irc_tls: Some(true),
+            irc_bundled_port: Some(6971),
+            ..Default::default()
+        };
+        let lc = IrcLifecycleConfig::from_workshop(&cfg, "ws").expect("explicit override resolves");
+        assert_eq!(lc.server, "irc.libera.chat");
+        assert_eq!(lc.port, 6697);
+        assert!(lc.tls);
     }
 
     #[test]
@@ -460,5 +543,19 @@ mod tests {
         assert!(lc.tls);
         assert_eq!(lc.nick, "bot");
         assert_eq!(lc.password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn split_host_port_parses_basic_ipv4() {
+        let (host, port) = split_host_port("127.0.0.1:6971").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 6971);
+    }
+
+    #[test]
+    fn split_host_port_rejects_unparseable() {
+        assert!(split_host_port("no-colon").is_none());
+        assert!(split_host_port(":6971").is_none());
+        assert!(split_host_port("host:notaport").is_none());
     }
 }
