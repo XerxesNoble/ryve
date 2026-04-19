@@ -2,21 +2,24 @@
 
 //! Workshop integrations settings form.
 //!
-//! Spark ryve-c3de335e: lets the user set `irc.server_address` and the
-//! GitHub credentials (`webhook_secret`, `poll_token`) without hand-editing
-//! `.ryve/config.toml`. Persistence is dispatched by the parent app
-//! (`Message::Settings(_)` → `WorkshopConfig` write) once the user commits
-//! a field.
+//! Spark ryve-c3de335e: lets the user set `irc_server` (serialised as
+//! the `irc_server` key in `.ryve/config.toml`) and the GitHub
+//! credentials (`webhook_secret`, `poll_token`) without hand-editing
+//! the TOML. Persistence is dispatched by the parent app
+//! (`Message::Settings(_)` → `WorkshopConfig` write) once the user
+//! commits a field. (PR #49 Copilot c3: earlier revisions called the
+//! field `irc.server_address` which does not exist on
+//! [`WorkshopConfig`].)
 //!
-//! The screen is rendered as a modal overlay; navigation is wired by
-//! [`crate::workshop::Workshop`] so the gear icon in the status bar opens
-//! it via the existing `OpenSettings` message and the Integrations
-//! detail screen can route through it as well.
-
-use iced::widget::{Space, button, column, container, row, rule, text, text_input};
-use iced::{Element, Length, Theme};
+//! The screen is rendered as a modal overlay. Navigation comes via
+//! [`crate::workshop::Workshop`] for workshop/integrations flows,
+//! including the cross-link from the Integrations detail screen
+//! (PR #49 Copilot c11: the status-bar gear icon itself opens the
+//! Integrations health overlay first, not this screen directly).
 
 use data::ryve_dir::{GitHubConfig, WorkshopConfig};
+use iced::widget::{Space, button, column, container, row, rule, text, text_input};
+use iced::{Element, Length, Theme};
 
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_LABEL, FONT_SMALL, Palette};
 
@@ -108,10 +111,12 @@ fn trim_to_optional(s: &str) -> Option<String> {
 
 // ── View ──────────────────────────────────────────────
 
-/// Render the settings form as a modal overlay. `github` is taken from
-/// `config.github` for displaying the "currently configured" hint
-/// alongside each input. `_config` is reserved for callers that want to
-/// render the unsaved draft against the persisted value.
+/// Render the settings form as a modal overlay. `state` holds the
+/// editable draft values shown in each input, `github` provides the
+/// persisted GitHub settings used for the "currently configured" hint
+/// alongside each field, and `pal` is the active palette.
+/// (PR #49 Copilot c6: earlier revisions mentioned a `_config`
+/// parameter which was never part of the signature.)
 pub fn view<'a>(
     state: &'a SettingsFormState,
     github: &'a GitHubConfig,
@@ -174,7 +179,9 @@ pub fn view<'a>(
     .size(FONT_SMALL)
     .color(pal.text_secondary);
 
-    let webhook_label = text("Webhook secret").size(FONT_LABEL).color(pal.text_secondary);
+    let webhook_label = text("Webhook secret")
+        .size(FONT_LABEL)
+        .color(pal.text_secondary);
     let webhook_input = text_input(
         "shared secret used to verify webhook payloads",
         &state.webhook_secret_draft,
@@ -192,7 +199,9 @@ pub fn view<'a>(
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-    let poll_label = text("Poll token").size(FONT_LABEL).color(pal.text_secondary);
+    let poll_label = text("Poll token")
+        .size(FONT_LABEL)
+        .color(pal.text_secondary);
     let poll_input = text_input(
         "PAT used by the REST polling fallback",
         &state.poll_token_draft,
@@ -220,8 +229,8 @@ pub fn view<'a>(
     .padding([4, 0])
     .on_press(Message::ShowIntegrations);
 
-    let footer = row![Space::new().width(Length::Fill), see_health]
-        .align_y(iced::Alignment::Center);
+    let footer =
+        row![Space::new().width(Length::Fill), see_health].align_y(iced::Alignment::Center);
 
     let body = column![
         header,

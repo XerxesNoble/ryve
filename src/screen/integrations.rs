@@ -2,10 +2,13 @@
 
 //! IRC + GitHub detail / health view.
 //!
-//! Spark ryve-c3de335e: reachable from the status bar IRC and GitHub
-//! indicators, this screen surfaces the live state of both subsystems
+//! Spark ryve-c3de335e: reachable via the status-bar gear icon (which
+//! routes [`crate::screen::status_bar::Message::OpenIntegrations`]),
+//! this screen surfaces the live state of both subsystems
 //! (server/port/nick/connected for IRC; repo/mode/configured for GitHub)
-//! plus a button to open the [`crate::screen::settings`] form.
+//! plus a button to open the [`crate::screen::settings`] form. The
+//! IRC/GitHub pills in the status bar are read-only indicators today
+//! and do not themselves emit navigation messages (PR #49 Copilot c1).
 //!
 //! The view is rendered as a modal overlay. It reads only existing
 //! [`data::ryve_dir::WorkshopConfig`] fields and a small connection
@@ -15,10 +18,9 @@
 //! row with a link to the settings form rather than crashing or
 //! hiding the section entirely.
 
+use data::ryve_dir::{GitHubConfig, WorkshopConfig};
 use iced::widget::{Space, button, column, container, row, rule, text};
 use iced::{Element, Length, Theme};
-
-use data::ryve_dir::{GitHubConfig, WorkshopConfig};
 
 use crate::style::{self, FONT_BODY, FONT_HEADER, FONT_LABEL, FONT_SMALL, Palette};
 
@@ -35,8 +37,10 @@ pub enum Message {
 // ── Health snapshots ──────────────────────────────────
 
 /// Live IRC runtime status sampled by the workshop. Keeps the screen
-/// view function pure — the real `IrcRuntime` lives behind a tokio
-/// `Mutex` and we don't want the renderer to acquire it.
+/// view function pure — the real `IrcRuntime` lives behind a
+/// `std::sync::Mutex` inside the workshop, and we don't want the
+/// renderer to acquire it. (PR #49 Copilot c2: was previously
+/// described as a tokio `Mutex` which implied async-aware locking.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrcStatus {
     /// `irc_server` is unset — subsystem dormant.
@@ -141,11 +145,7 @@ pub fn github_health_from(config: &WorkshopConfig) -> GitHubHealth {
 
 // ── View ──────────────────────────────────────────────
 
-pub fn view(
-    irc: &IrcHealth,
-    github: &GitHubHealth,
-    pal: &Palette,
-) -> Element<'static, Message> {
+pub fn view(irc: &IrcHealth, github: &GitHubHealth, pal: &Palette) -> Element<'static, Message> {
     let pal = *pal;
 
     let title = text("Integrations")
@@ -176,7 +176,9 @@ pub fn view(
     let irc_heading = row![
         text("IRC").size(FONT_BODY).color(pal.text_primary),
         Space::new().width(Length::Fill),
-        text(irc_status_label).size(FONT_LABEL).color(irc_status_color),
+        text(irc_status_label)
+            .size(FONT_LABEL)
+            .color(irc_status_color),
     ]
     .align_y(iced::Alignment::Center);
 
@@ -259,7 +261,11 @@ pub fn view(
     ));
     gh_body = gh_body.push(detail_row(
         "Auto-sync",
-        if github.auto_sync { "Enabled" } else { "Disabled" },
+        if github.auto_sync {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
         &pal,
     ));
     if !github.configured {
@@ -271,10 +277,14 @@ pub fn view(
     }
 
     // ── Footer ────────────────────────────────────────
-    let edit_btn = button(text("Edit settings…").size(FONT_LABEL).color(pal.text_primary))
-        .style(button::secondary)
-        .padding([6, 14])
-        .on_press(Message::OpenSettings);
+    let edit_btn = button(
+        text("Edit settings…")
+            .size(FONT_LABEL)
+            .color(pal.text_primary),
+    )
+    .style(button::secondary)
+    .padding([6, 14])
+    .on_press(Message::OpenSettings);
     let footer = row![Space::new().width(Length::Fill), edit_btn].align_y(iced::Alignment::Center);
 
     let body = column![
@@ -303,9 +313,15 @@ pub fn view(
 
 fn detail_row<'a>(label: &str, value: &str, pal: &Palette) -> Element<'a, Message> {
     row![
-        container(text(label.to_string()).size(FONT_SMALL).color(pal.text_secondary))
-            .width(Length::Fixed(140.0)),
-        text(value.to_string()).size(FONT_LABEL).color(pal.text_primary),
+        container(
+            text(label.to_string())
+                .size(FONT_SMALL)
+                .color(pal.text_secondary)
+        )
+        .width(Length::Fixed(140.0)),
+        text(value.to_string())
+            .size(FONT_LABEL)
+            .color(pal.text_primary),
     ]
     .align_y(iced::Alignment::Center)
     .into()

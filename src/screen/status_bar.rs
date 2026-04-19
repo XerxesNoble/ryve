@@ -14,7 +14,11 @@ pub const ATLAS_ROLE_ANNOTATION: &str = "(Director)";
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    OpenSettings,
+    /// Gear-icon press. Opens the Integrations health overlay, which
+    /// cross-links into the Settings credentials form. PR #49 Copilot
+    /// c10: renamed from `OpenSettings` so the message name matches
+    /// where it actually routes.
+    OpenIntegrations,
     RequestBranchSwitch,
 }
 
@@ -103,10 +107,19 @@ pub enum GitHubStatus {
 }
 
 impl GitHubStatus {
-    /// Project `GitHubConfig` into a status-bar indicator. Trimmed-empty
-    /// strings count as unset so a stray `token = ""` in the TOML does
-    /// not silently pose as `Configured`.
-    pub fn from_config(token: Option<&str>, repo: Option<&str>) -> Self {
+    /// Project `GitHubConfig` into a status-bar indicator.
+    ///
+    /// `is_configured` comes from the full `GitHubConfig::is_configured()`
+    /// so the newer Settings/Integrations flows that configure GitHub
+    /// via `webhook_secret` + `poll_token` are reflected correctly
+    /// (PR #49 Copilot c4). The legacy `token` + `repo` pair is still
+    /// inspected so a partial legacy setup surfaces as `Error`.
+    /// Trimmed-empty strings count as unset so stray empty TOML values
+    /// do not silently pose as a partial configuration.
+    pub fn from_config(is_configured: bool, token: Option<&str>, repo: Option<&str>) -> Self {
+        if is_configured {
+            return Self::Configured;
+        }
         let token_set = token.map(|s| !s.trim().is_empty()).unwrap_or(false);
         let repo_set = repo.map(|s| !s.trim().is_empty()).unwrap_or(false);
         match (token_set, repo_set) {
@@ -364,7 +377,7 @@ pub fn view<'a>(
         button(text("\u{2699}").size(FONT_ICON).color(pal.text_secondary))
             .style(button::text)
             .padding([2, 6])
-            .on_press(Message::OpenSettings),
+            .on_press(Message::OpenIntegrations),
     );
 
     // ── Assemble the bar ─────────────────────────────────
@@ -496,8 +509,23 @@ mod tests {
 
     #[test]
     fn github_status_configured_requires_token_and_repo() {
+        // Legacy path: token+repo both set but is_configured=false
+        // (older callers that don't consult the full GitHubConfig).
         assert_eq!(
-            GitHubStatus::from_config(Some("ghp_token"), Some("owner/repo")),
+            GitHubStatus::from_config(false, Some("ghp_token"), Some("owner/repo")),
+            GitHubStatus::Configured,
+        );
+    }
+
+    #[test]
+    fn github_status_configured_via_is_configured_flag() {
+        // PR #49 Copilot c4: the modern Settings/Integrations flow
+        // configures GitHub via `webhook_secret` + `poll_token`, not
+        // legacy `token` + `repo`. `GitHubConfig::is_configured()`
+        // returns true for that case; the status bar must honour it
+        // even if the legacy pair is empty.
+        assert_eq!(
+            GitHubStatus::from_config(true, None, None),
             GitHubStatus::Configured,
         );
     }
@@ -505,7 +533,7 @@ mod tests {
     #[test]
     fn github_status_unconfigured_when_both_missing() {
         assert_eq!(
-            GitHubStatus::from_config(None, None),
+            GitHubStatus::from_config(false, None, None),
             GitHubStatus::Unconfigured,
         );
     }
@@ -513,7 +541,7 @@ mod tests {
     #[test]
     fn github_status_unconfigured_when_both_blank() {
         assert_eq!(
-            GitHubStatus::from_config(Some("   "), Some("")),
+            GitHubStatus::from_config(false, Some("   "), Some("")),
             GitHubStatus::Unconfigured,
         );
     }
@@ -521,11 +549,11 @@ mod tests {
     #[test]
     fn github_status_error_when_only_one_set() {
         assert_eq!(
-            GitHubStatus::from_config(Some("ghp_token"), None),
+            GitHubStatus::from_config(false, Some("ghp_token"), None),
             GitHubStatus::Error,
         );
         assert_eq!(
-            GitHubStatus::from_config(None, Some("owner/repo")),
+            GitHubStatus::from_config(false, None, Some("owner/repo")),
             GitHubStatus::Error,
         );
     }

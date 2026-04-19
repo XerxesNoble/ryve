@@ -547,7 +547,10 @@ impl Workshop {
 
     /// Snapshot the IRC health for the integrations view. The
     /// `runtime_active` flag must be polled by the caller from the
-    /// async-locked `irc_runtime` mutex, since the renderer cannot block.
+    /// mutex-protected `irc_runtime` slot, since the renderer cannot
+    /// block. (PR #49 Copilot c7: the mutex is a `std::sync::Mutex`,
+    /// not a tokio async one — earlier wording implied async-aware
+    /// locking semantics that do not apply here.)
     pub fn integrations_irc_health(
         &self,
         runtime_active: bool,
@@ -1779,11 +1782,16 @@ pub(crate) fn validate_git_branch_name(name: &str) -> Result<(), String> {
 ///
 /// Visible to the rest of the crate so the `hand_spawn` CLI helper can call
 /// it without re-implementing the worktree convention.
+///
+/// When `base_ref` is `Some`, the new Hand branch is cut from that ref
+/// (`git worktree add -b <branch> <path> <ref>`). When `None`, the branch
+/// is cut from the current HEAD — the historical behavior. Spark ryve-a64b3a06.
 pub(crate) async fn create_hand_worktree(
     workshop_dir: &Path,
     ryve_dir: &RyveDir,
     session_id: &str,
     actor: &str,
+    base_ref: Option<&str>,
 ) -> Result<PathBuf, String> {
     // Only create worktrees for git repos
     let git_dir = workshop_dir.join(".git");
@@ -1817,8 +1825,17 @@ pub(crate) async fn create_hand_worktree(
         .await
         .map_err(|e| e.to_string())?;
 
-    let output = tokio::process::Command::new("git")
-        .args(["worktree", "add", "-b", &branch, &wt_dir.to_string_lossy()])
+    let wt_dir_str = wt_dir.to_string_lossy();
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("worktree")
+        .arg("add")
+        .arg("-b")
+        .arg(&branch)
+        .arg(wt_dir_str.as_ref());
+    if let Some(base) = base_ref {
+        cmd.arg(base);
+    }
+    let output = cmd
         .current_dir(workshop_dir)
         .output()
         .await
@@ -1926,6 +1943,91 @@ pub struct WorkshopInit {
     /// Persisted per-workshop UI state (collapsed epics, ...). Loaded on
     /// workshop open and applied to the initial render. Spark ryve-926870a9.
     pub ui_state: UiState,
+}
+
+/// Provision the workshop-scoped ngIRCd daemon: allocate a free
+/// `127.0.0.1` port, record it in the workshop config, write
+/// `.ryve/ircd/ircd.conf`, and explicitly flip `irc_enabled` on so the
+/// supervisor (spark ryve-242252b0) picks it up on next launch.
+///
+/// Idempotent — re-running against a workshop that already has an
+/// allocated port keeps the same port and leaves an existing
+/// `ircd.conf` untouched. Callers are expected to persist the mutated
+/// `config` to disk themselves (via [`data::ryve_dir::save_config`]).
+///
+/// Spark ryve-4d5881c2 [sp-31659bbb].
+pub async fn provision_workshop_ircd(
+    ryve_dir: &RyveDir,
+    config: &mut WorkshopConfig,
+) -> std::io::Result<()> {
+    // Re-init preserves an explicit opt-out: if the workshop already
+    // has a bundled port, we've been here before, so leave
+    // `irc_enabled` alone. Users who set `irc_enabled = false` after
+    // their first init keep that setting across every subsequent
+    // `ryve init`. Only a *fresh* workshop (no bundled port yet) gets
+    // the default-on flip below, which also round-trips through
+    // config.toml so downstream serde code doesn't fall back to an
+    // inferred default.
+    let is_fresh = config.irc_bundled_port.is_none();
+    if is_fresh {
+        config.irc_enabled = true;
+    }
+
+    let ircd_dir = ryve_dir.root().join("ircd");
+    tokio::fs::create_dir_all(&ircd_dir).await?;
+
+    let port = match config.irc_bundled_port {
+        Some(p) => p,
+        None => {
+            // Bind to port 0 to let the kernel pick a free ephemeral
+            // port, then drop the listener so ngIRCd can rebind. There
+            // is a TOCTOU window between this and the first supervisor
+            // spawn but it's acceptable for init — the supervisor
+            // retries on failure and the chance of collision on a
+            // freshly-picked ephemeral is negligible.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let allocated = listener.local_addr()?.port();
+            drop(listener);
+            config.irc_bundled_port = Some(allocated);
+            allocated
+        }
+    };
+
+    let conf_path = ryve_dir
+        .root()
+        .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
+    if !conf_path.exists() {
+        let body = render_ircd_conf(port);
+        tokio::fs::write(&conf_path, body).await?;
+    }
+
+    Ok(())
+}
+
+/// Minimal ngIRCd config bound to `127.0.0.1:<port>` suitable for a
+/// workshop-local agent coordination daemon. No PAM, no ident, no
+/// TLS — the daemon only ever sees loopback traffic from Ryve-spawned
+/// clients.
+fn render_ircd_conf(port: u16) -> String {
+    format!(
+        "# ngIRCd config for the Ryve workshop-local daemon.\n\
+         # Auto-generated by `ryve init` (spark ryve-4d5881c2).\n\
+         # Safe to edit by hand; ryve init will not overwrite an\n\
+         # existing file on re-init.\n\
+         \n\
+         [Global]\n\
+         \tName = ryve.local\n\
+         \tAdminInfo1 = Ryve workshop\n\
+         \tAdminInfo2 = workshop-local\n\
+         \tAdminEMail = noreply@ryve.local\n\
+         \tInfo = Ryve workshop IRC\n\
+         \tListen = 127.0.0.1\n\
+         \tPorts = {port}\n\
+         \tMotdPhrase = \"Ryve workshop\"\n\
+         \n\
+         [Options]\n\
+         \tPAM = no\n"
+    )
 }
 
 /// Initialize a workshop's `.ryve/` directory, DB, and load config.
@@ -3031,5 +3133,325 @@ mod tests {
             irc.status,
             crate::screen::integrations::IrcStatus::Connected { known_channels: 2 }
         );
+    }
+    // Spark ryve-4d5881c2: ryve init provisions the workshop IRC daemon.
+
+    #[tokio::test]
+    async fn provision_workshop_ircd_writes_conf_and_records_port_on_fresh_workshop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        let mut config = WorkshopConfig::default();
+        // Invariant check: a fresh config has no bundled port recorded.
+        assert!(config.irc_bundled_port.is_none());
+
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("provision succeeds on fresh workshop");
+
+        // Workshop config now carries an explicit port + enabled flag.
+        let port = config
+            .irc_bundled_port
+            .expect("provision must record a bundled port");
+        assert!(port >= 1024, "ephemeral port should be unprivileged");
+        assert!(config.irc_enabled, "irc_enabled must be recorded as true");
+
+        // `.ryve/ircd/ircd.conf` exists with the allocated port and binds
+        // only to loopback — the supervisor can cleanly dial it.
+        let conf_path = ryve_dir
+            .root()
+            .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
+        assert!(conf_path.exists(), "ircd.conf must be written");
+        let body = tokio::fs::read_to_string(&conf_path).await.unwrap();
+        assert!(
+            body.contains(&format!("Ports = {port}")),
+            "ircd.conf must record the allocated port, got:\n{body}"
+        );
+        assert!(
+            body.contains("Listen = 127.0.0.1"),
+            "ircd.conf must bind loopback only, got:\n{body}"
+        );
+
+        // And the address the supervisor resolves matches the allocated port.
+        assert_eq!(
+            config.effective_irc_server_address().as_deref(),
+            Some(format!("127.0.0.1:{port}").as_str()),
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_workshop_ircd_is_idempotent_on_rerun() {
+        // Acceptance: "Running ryve init a second time in the same
+        // workshop is idempotent (same port, same config contents)."
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        let mut config = WorkshopConfig::default();
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("first provision");
+        let first_port = config.irc_bundled_port.unwrap();
+
+        let conf_path = ryve_dir
+            .root()
+            .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
+        let first_body = tokio::fs::read_to_string(&conf_path).await.unwrap();
+
+        // Re-run provision against the same (already-provisioned)
+        // workshop. Idempotency is asserted below by byte-equality of
+        // the conf file — a rewrite that happens to produce identical
+        // bytes is still "idempotent" on disk, which is the contract
+        // this test locks down. If the real concern is "did the file
+        // get rewritten at all", a separate mtime-based test would be
+        // needed; the acceptance criterion only calls for identical
+        // config contents.
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("second provision");
+
+        assert_eq!(
+            config.irc_bundled_port,
+            Some(first_port),
+            "re-init must not reallocate the port"
+        );
+        assert!(config.irc_enabled, "re-init must keep irc_enabled = true");
+
+        let second_body = tokio::fs::read_to_string(&conf_path).await.unwrap();
+        assert_eq!(
+            first_body, second_body,
+            "re-init must not rewrite ircd.conf"
+        );
+    }
+
+    /// Regression for PR #48 Copilot c1: `provision_workshop_ircd`
+    /// used to flip `config.irc_enabled = true` on every call, which
+    /// clobbered a user who had explicitly set `false` between inits.
+    /// The fix is to only set the default on a *fresh* workshop (no
+    /// bundled port yet); re-init must preserve the user's opt-out.
+    #[tokio::test]
+    async fn provision_workshop_ircd_preserves_user_opt_out_on_rerun() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        let mut config = WorkshopConfig::default();
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("first provision");
+        let first_port = config.irc_bundled_port.unwrap();
+        assert!(
+            config.irc_enabled,
+            "fresh provision should default irc_enabled = true"
+        );
+
+        // Simulate the user explicitly disabling IRC after first init.
+        config.irc_enabled = false;
+
+        // Re-run provision. Port stays, conf stays, irc_enabled must
+        // NOT be flipped back to true.
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("second provision");
+        assert_eq!(
+            config.irc_bundled_port,
+            Some(first_port),
+            "re-init must not reallocate the port"
+        );
+        assert!(
+            !config.irc_enabled,
+            "re-init must preserve an explicit irc_enabled = false opt-out",
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_workshop_ircd_preserves_user_edited_conf() {
+        // If a user hand-edits `.ryve/ircd/ircd.conf` between inits
+        // (e.g. to add a PASS directive), re-running `ryve init` must
+        // not clobber their edits.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        let mut config = WorkshopConfig::default();
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("first provision");
+
+        let conf_path = ryve_dir
+            .root()
+            .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
+        let marker = "# RYVE-USER-EDIT: hand-tweaked config\n";
+        let doctored = format!(
+            "{marker}{}",
+            tokio::fs::read_to_string(&conf_path).await.unwrap()
+        );
+        tokio::fs::write(&conf_path, &doctored).await.unwrap();
+
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("second provision");
+
+        let after = tokio::fs::read_to_string(&conf_path).await.unwrap();
+        assert!(
+            after.contains(marker),
+            "re-init must preserve user edits to ircd.conf, got:\n{after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_workshop_ircd_regenerates_missing_conf_against_recorded_port() {
+        // If the conf file is deleted but the bundled port is still in
+        // the config, re-init must regenerate the conf against the
+        // already-allocated port (no port churn, no missing daemon
+        // config).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        let mut config = WorkshopConfig {
+            irc_bundled_port: Some(45678),
+            ..WorkshopConfig::default()
+        };
+
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("provision with pre-recorded port");
+
+        assert_eq!(config.irc_bundled_port, Some(45678));
+        let conf_path = ryve_dir
+            .root()
+            .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
+        let body = tokio::fs::read_to_string(&conf_path).await.unwrap();
+        assert!(
+            body.contains("Ports = 45678"),
+            "regenerated conf must use the recorded port, got:\n{body}"
+        );
+    }
+
+    /// Spark ryve-a64b3a06: when `base_ref` is `Some`, the new Hand branch
+    /// must be cut from that ref rather than the current HEAD.
+    ///
+    /// Strategy: init a repo, seed two commits on `main` (`seed`, then
+    /// `tip`). Checkout a throwaway branch so HEAD != main. Call
+    /// create_hand_worktree twice:
+    ///   1. `base_ref = None` — branch must sit on HEAD (the throwaway's
+    ///      commit).
+    ///   2. `base_ref = Some("main~1")` — branch must sit on the `seed`
+    ///      commit, proving the ref flag was honoured.
+    #[tokio::test]
+    async fn create_hand_worktree_respects_base_ref() {
+        let base = std::env::temp_dir().join(format!("ryve-test-br-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+
+        let run_git = |args: Vec<String>| {
+            let base = base.clone();
+            async move {
+                let out = tokio::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&base)
+                    .env("GIT_AUTHOR_NAME", "ryve-test")
+                    .env("GIT_AUTHOR_EMAIL", "test@ryve.local")
+                    .env("GIT_COMMITTER_NAME", "ryve-test")
+                    .env("GIT_COMMITTER_EMAIL", "test@ryve.local")
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "git {args:?} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                out
+            }
+        };
+
+        run_git(vec!["init".into(), "-q".into(), "-b".into(), "main".into()]).await;
+        run_git(vec![
+            "config".into(),
+            "commit.gpgsign".into(),
+            "false".into(),
+        ])
+        .await;
+        run_git(vec![
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "seed".into(),
+        ])
+        .await;
+        run_git(vec![
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "tip".into(),
+        ])
+        .await;
+        // HEAD is on a throwaway branch so we can tell "HEAD" and "main~1"
+        // apart when we read the resulting worktree's commit.
+        run_git(vec![
+            "checkout".into(),
+            "-q".into(),
+            "-b".into(),
+            "throwaway".into(),
+        ])
+        .await;
+        run_git(vec![
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "throwaway-tip".into(),
+        ])
+        .await;
+
+        let ryve_dir = RyveDir::new(&base);
+
+        // Case 1: base_ref = None -> branch sits on current HEAD.
+        let session_none = "none00000aaaaaaaaaaaaaaaaaaaaaaa";
+        let wt_none = create_hand_worktree(&base, &ryve_dir, session_none, "hand", None)
+            .await
+            .expect("None base_ref should succeed");
+        let head_msg = run_git(vec![
+            "log".into(),
+            "-1".into(),
+            "--format=%s".into(),
+            "HEAD".into(),
+        ])
+        .await;
+        let workshop_head = String::from_utf8_lossy(&head_msg.stdout).trim().to_string();
+        let wt_none_msg = tokio::process::Command::new("git")
+            .args(["log", "-1", "--format=%s", "HEAD"])
+            .current_dir(&wt_none)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&wt_none_msg.stdout).trim(),
+            workshop_head,
+            "worktree with base_ref=None must match the workshop's current HEAD"
+        );
+
+        // Case 2: base_ref = Some("main~1") -> branch sits on `seed`.
+        let session_ref = "withref00bbbbbbbbbbbbbbbbbbbbbbb";
+        let wt_ref = create_hand_worktree(&base, &ryve_dir, session_ref, "hand", Some("main~1"))
+            .await
+            .expect("Some base_ref should succeed");
+        let wt_ref_msg = tokio::process::Command::new("git")
+            .args(["log", "-1", "--format=%s", "HEAD"])
+            .current_dir(&wt_ref)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&wt_ref_msg.stdout).trim(),
+            "seed",
+            "worktree with base_ref=Some(main~1) must be cut from that ref"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

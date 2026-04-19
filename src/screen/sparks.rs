@@ -692,9 +692,11 @@ pub struct ViewCtx<'a> {
     /// a GitHub artifact PR link once the applier has opened one.
     /// Spark ryve-1625746b.
     pub hand_assignments: &'a [HandAssignment],
-    /// True when the workshop's IRC runtime is currently connected. Drives
-    /// the epic channel pill: rendered in accent when connected, muted when
-    /// disconnected, hidden when IRC has never been configured.
+    /// True when the workshop's IRC runtime is currently connected.
+    /// Drives the epic channel pill: rendered in accent when connected
+    /// and hidden otherwise (both "disabled" and "disconnected" states
+    /// suppress the pill so users don't mistake a muted pill for an
+    /// active-but-idle channel — PR #49 Copilot c9).
     /// Spark ryve-1625746b.
     pub irc_connected: bool,
 }
@@ -1389,8 +1391,13 @@ fn view_epic_header(
 
     // IRC channel pill: derived from the epic id + title via the shared
     // `channel_name` helper so the rendered name is identical to what
-    // the runtime joins. Muted when IRC is disabled / not connected.
-    row_inner = row_inner.push(epic_channel_pill(epic, irc_connected, &pal));
+    // the runtime joins. PR #49 Copilot c9: hide the pill entirely
+    // when IRC isn't connected rather than rendering a muted pill for
+    // both "disabled" and "disconnected" states — users conflated the
+    // two and thought IRC was always dormant.
+    if irc_connected {
+        row_inner = row_inner.push(epic_channel_pill(epic, irc_connected, &pal));
+    }
 
     let indent = Space::new().width(Length::Fixed(16.0 * depth as f32));
 
@@ -1673,7 +1680,11 @@ pub(crate) fn liveness_label(liveness: &str) -> &'static str {
         "healthy" => "Healthy",
         "at_risk" => "At Risk",
         "stuck" => "Stuck",
-        _ => "Healthy",
+        // PR #49 Copilot c5: unknown values now render as "Unknown"
+        // so the label matches `liveness_color`'s neutral/muted
+        // fallback. Previously a badge could say "Healthy" with a
+        // muted disabled colour, which misled users.
+        _ => "Unknown",
     }
 }
 
