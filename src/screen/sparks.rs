@@ -2709,9 +2709,10 @@ mod tests {
         assert_eq!(liveness_label("healthy"), "Healthy");
         assert_eq!(liveness_label("at_risk"), "At Risk");
         assert_eq!(liveness_label("stuck"), "Stuck");
-        // Unknown values default to the healthy label so a malformed row
-        // never crashes the renderer.
-        assert_eq!(liveness_label("wat"), "Healthy");
+        // PR #49 Copilot c5: unknown values now surface as "Unknown"
+        // so the label matches `liveness_color`'s muted fallback
+        // instead of painting "Healthy" in disabled grey.
+        assert_eq!(liveness_label("wat"), "Unknown");
     }
 
     #[test]

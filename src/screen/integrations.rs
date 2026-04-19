@@ -116,7 +116,15 @@ pub fn irc_health_from(
     runtime_active: bool,
     known_channels: usize,
 ) -> IrcHealth {
-    let status = if !config.irc_enabled() {
+    // Disabled = "no effective way to dial any IRC server": either the
+    // `irc_enabled` switch is off, or the config doesn't resolve to a
+    // server address (no `irc_server` override AND no
+    // `irc_bundled_port` allocated by `ryve init`). Epic B's
+    // default-on flip turned `irc_enabled` true for every new
+    // WorkshopConfig, so checking the flag alone would wrongly report
+    // "Configured" for a workshop that has never been `ryve init`ed.
+    let has_dial_target = config.effective_irc_server_address().is_some();
+    let status = if !config.irc_enabled() || !has_dial_target {
         IrcStatus::Disabled
     } else if runtime_active {
         IrcStatus::Connected { known_channels }
