@@ -448,8 +448,8 @@ mod tests {
     async fn sink_write_error_kills_child_and_propagates() {
         use std::pin::Pin;
         use std::task::{Context, Poll};
-        use tokio::io::Error as IoError;
-        use tokio::io::ErrorKind as IoErrorKind;
+
+        use tokio::io::{Error as IoError, ErrorKind as IoErrorKind};
 
         struct BrokenSink;
         impl AsyncWrite for BrokenSink {
