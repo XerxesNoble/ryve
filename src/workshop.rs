@@ -417,6 +417,31 @@ pub struct Workshop {
     /// signal. Cleared whenever the IRC runtime is torn down.
     /// Spark ryve-5a0e1d97.
     pub irc_known_epic_ids: HashSet<String>,
+    /// Which secondary screen, if any, is currently rendered as a modal
+    /// overlay. `None` is the steady state — the workshop just shows the
+    /// sparks/bench layout. Switching between screens is mutually
+    /// exclusive: opening Settings closes Integrations and vice versa,
+    /// so the user is never staring at two stacked modals. Spark
+    /// ryve-c3de335e.
+    pub active_overlay: WorkshopOverlay,
+    /// Form drafts for the integrations settings screen. Persisted on
+    /// the workshop (rather than rebuilt every view) so the inputs
+    /// don't lose state between renders. Spark ryve-c3de335e.
+    pub settings_form: crate::screen::settings::SettingsFormState,
+}
+
+/// Which secondary screen the workshop is currently showing as an
+/// overlay. The variants stay flat so the UI can dispatch a single
+/// match in [`crate::app::App::view_workshop`]. Spark ryve-c3de335e.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkshopOverlay {
+    /// No secondary screen is open — the default state.
+    #[default]
+    None,
+    /// Settings form for IRC server + GitHub credentials.
+    Settings,
+    /// IRC + GitHub health / detail view.
+    Integrations,
 }
 
 impl Workshop {
@@ -494,7 +519,49 @@ impl Workshop {
             watch_runner: None,
             irc_runtime: Arc::new(Mutex::new(None)),
             irc_known_epic_ids: HashSet::new(),
+            active_overlay: WorkshopOverlay::None,
+            settings_form: crate::screen::settings::SettingsFormState::default(),
         }
+    }
+
+    // ── Settings / Integrations overlays (spark ryve-c3de335e) ────
+
+    /// Open the integrations settings form. Seeds the form drafts from
+    /// the current config so the inputs reflect the persisted values.
+    /// Idempotent — re-opening just refreshes the drafts.
+    pub fn open_settings(&mut self) {
+        self.settings_form.seed_from(&self.config);
+        self.active_overlay = WorkshopOverlay::Settings;
+    }
+
+    /// Open the integrations detail / health view. Closes any other
+    /// overlay (the two are mutually exclusive).
+    pub fn open_integrations(&mut self) {
+        self.active_overlay = WorkshopOverlay::Integrations;
+    }
+
+    /// Close any open overlay and return to the main workshop view.
+    pub fn close_overlay(&mut self) {
+        self.active_overlay = WorkshopOverlay::None;
+    }
+
+    /// Snapshot the IRC health for the integrations view. The
+    /// `runtime_active` flag must be polled by the caller from the
+    /// async-locked `irc_runtime` mutex, since the renderer cannot block.
+    pub fn integrations_irc_health(
+        &self,
+        runtime_active: bool,
+    ) -> crate::screen::integrations::IrcHealth {
+        crate::screen::integrations::irc_health_from(
+            &self.config,
+            runtime_active,
+            self.irc_known_epic_ids.len(),
+        )
+    }
+
+    /// Snapshot the GitHub health for the integrations view.
+    pub fn integrations_github_health(&self) -> crate::screen::integrations::GitHubHealth {
+        crate::screen::integrations::github_health_from(&self.config)
     }
 
     // ── Cached aggregations (spark ryve-252c5b6e) ──────────
@@ -2889,5 +2956,80 @@ mod tests {
         );
         assert!(validate_git_branch_name("foo\nbar/abc").is_err());
         assert!(validate_git_branch_name("foo\x7fbar/abc").is_err());
+    }
+
+    // ── Settings / Integrations overlay (spark ryve-c3de335e) ────
+
+    #[test]
+    fn workshop_default_overlay_is_none() {
+        let ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        assert_eq!(ws.active_overlay, WorkshopOverlay::None);
+    }
+
+    #[test]
+    fn open_settings_seeds_form_from_config() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        Arc::make_mut(&mut ws.config).irc_server = Some("irc.example.com".into());
+        Arc::make_mut(&mut ws.config).github.webhook_secret = Some("shh".into());
+        Arc::make_mut(&mut ws.config).github.poll_token = Some("ghp_xxx".into());
+
+        ws.open_settings();
+
+        assert_eq!(ws.active_overlay, WorkshopOverlay::Settings);
+        assert_eq!(ws.settings_form.irc_server_draft, "irc.example.com");
+        assert_eq!(ws.settings_form.webhook_secret_draft, "shh");
+        assert_eq!(ws.settings_form.poll_token_draft, "ghp_xxx");
+    }
+
+    #[test]
+    fn open_integrations_replaces_settings() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.open_settings();
+        assert_eq!(ws.active_overlay, WorkshopOverlay::Settings);
+
+        ws.open_integrations();
+        assert_eq!(ws.active_overlay, WorkshopOverlay::Integrations);
+    }
+
+    #[test]
+    fn close_overlay_returns_to_default_state() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        ws.open_integrations();
+        assert_eq!(ws.active_overlay, WorkshopOverlay::Integrations);
+
+        ws.close_overlay();
+        assert_eq!(ws.active_overlay, WorkshopOverlay::None);
+    }
+
+    #[test]
+    fn integrations_health_snapshot_matches_config() {
+        // UI degradation: when IRC + GitHub are both unconfigured the
+        // workshop must still produce a health snapshot rather than
+        // panic. The `Disabled` / `Unconfigured` states drive the
+        // graceful-degradation rendering in screen::integrations.
+        let ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        let irc = ws.integrations_irc_health(false);
+        assert_eq!(irc.status, crate::screen::integrations::IrcStatus::Disabled);
+
+        let gh = ws.integrations_github_health();
+        assert_eq!(
+            gh.mode,
+            crate::screen::integrations::GitHubMode::Unconfigured
+        );
+        assert!(!gh.configured);
+    }
+
+    #[test]
+    fn integrations_health_reflects_runtime_active() {
+        let mut ws = Workshop::new(PathBuf::from("/tmp/ryve"));
+        Arc::make_mut(&mut ws.config).irc_server = Some("irc.example.com".into());
+        ws.irc_known_epic_ids.insert("ep-1".into());
+        ws.irc_known_epic_ids.insert("ep-2".into());
+
+        let irc = ws.integrations_irc_health(true);
+        assert_eq!(
+            irc.status,
+            crate::screen::integrations::IrcStatus::Connected { known_channels: 2 }
+        );
     }
 }
