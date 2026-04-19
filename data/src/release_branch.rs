@@ -35,7 +35,7 @@ pub fn release_branch_name(version: &str) -> String {
 /// Keep this list narrow. Every entry here is a surface where the file's
 /// current contents are *not* reflected in the tagged commit; widening it
 /// risks shipping a release that doesn't match what's on disk.
-pub const LIVE_WORKSPACE_FILES: &[&str] = &[".ryve/config.toml", ".ryve/ui_state.json"];
+pub(crate) const LIVE_WORKSPACE_FILES: &[&str] = &[".ryve/config.toml", ".ryve/ui_state.json"];
 
 /// Errors raised by the release-branch module.
 #[derive(Debug, thiserror::Error)]

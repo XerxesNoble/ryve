@@ -24,10 +24,15 @@ fn ryve_bin() -> PathBuf {
 ///   - tiny `ryve` cargo fixture so `cargo build --release` (invoked by
 ///     `ryve release close` via [`crate::release_artifact`]) produces a
 ///     binary called `ryve`,
-///   - `.gitignore` excludes `/.ryve/` and `/target/` so the working tree
-///     stays clean after `ryve init` and after the artifact build —
-///     `release_branch::cut_release_branch` and `tag_release` both refuse
-///     to operate on a dirty tree.
+///   - `.gitignore` is whatever `fresh_workshop_with` is told to write under
+///     the `[ryve_ignore]` slot — by default `".ryve"` (the broad exclusion
+///     used by most release-flow tests so the working tree stays clean
+///     after `ryve init`). The companion `fresh_workshop_tracked_ryve`
+///     variant uses a narrower pattern that mirrors the real ryve repo,
+///     leaving `.ryve/config.toml` + `.ryve/ui_state.json` tracked so the
+///     dirty-tree allowlist gets exercised end-to-end. Either way,
+///     `release_branch::cut_release_branch` and `tag_release` continue to
+///     refuse on a dirty tree (now modulo the live-workspace allowlist).
 fn fresh_workshop() -> PathBuf {
     fresh_workshop_with(".ryve")
 }

@@ -4220,6 +4220,17 @@ async fn handle_release(
                         if i >= args.len() {
                             die("--branch requires a value");
                         }
+                        // Reject values that aren't valid git branch names up
+                        // front (whitespace, "..", "@{", control chars, lock
+                        // suffixes, etc). The release row's branch_name is
+                        // surfaced everywhere as a real git ref; persisting
+                        // garbage here just defers the failure to the next
+                        // git operation that consumes it. Reuses the
+                        // workshop-side validator so the rule lives in one
+                        // place.
+                        if let Err(err) = crate::workshop::validate_git_branch_name(&args[i]) {
+                            die(&format!("--branch '{}' rejected: {err}", args[i]));
+                        }
                         patch.branch_name = Some(Some(args[i].clone()));
                     }
                     "--clear-branch" => {
