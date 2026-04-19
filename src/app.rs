@@ -4737,6 +4737,9 @@ impl App {
                     session_id,
                 )));
             }
+            screen::sparks::Message::OpenUrl(url) => {
+                return self.update(Message::OpenUrl(url));
+            }
             // Remaining variants are handled by screen::sparks::update.
             _ => {}
         }
@@ -6505,6 +6508,13 @@ impl App {
                     filtered_sparks: &ws.filtered_sparks,
                     sort_mode: ws.sort_mode,
                     sort_dropdown_open: ws.sort_dropdown_open,
+                    hand_assignments: &ws.hand_assignments,
+                    irc_connected: ws
+                        .irc_runtime
+                        .lock()
+                        .ok()
+                        .map(|s| s.is_some())
+                        .unwrap_or(false),
                 })
                 .map(Message::Sparks)
             }
@@ -6524,6 +6534,13 @@ impl App {
                 filtered_sparks: &ws.filtered_sparks,
                 sort_mode: ws.sort_mode,
                 sort_dropdown_open: ws.sort_dropdown_open,
+                hand_assignments: &ws.hand_assignments,
+                irc_connected: ws
+                    .irc_runtime
+                    .lock()
+                    .ok()
+                    .map(|s| s.is_some())
+                    .unwrap_or(false),
             })
             .map(Message::Sparks)
         };

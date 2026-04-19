@@ -797,6 +797,19 @@ pub struct HandAssignment {
     pub completed_at: Option<String>,
     pub handoff_to: Option<String>,
     pub handoff_reason: Option<String>,
+    /// Derived health of the assignment. Values: `healthy`, `at_risk`,
+    /// `stuck`. Defaults to `healthy` when the row predates the watchdog
+    /// column. Surfaced in the sparks panel via a liveness badge on Hand
+    /// cards (spark ryve-1625746b).
+    pub liveness: String,
+    /// Head branch of the pushed GitHub artifact mirroring this assignment.
+    /// `None` until the applier has opened (or adopted) a PR. Paired with
+    /// `github_artifact_pr_number` so the UI can render a PR link with a
+    /// graceful branch-only fallback (spark ryve-1625746b).
+    pub github_artifact_branch: Option<String>,
+    /// PR number of the GitHub artifact mirroring this assignment.
+    /// See [`github_artifact_branch`](Self::github_artifact_branch).
+    pub github_artifact_pr_number: Option<i64>,
 }
 
 pub struct NewHandAssignment {

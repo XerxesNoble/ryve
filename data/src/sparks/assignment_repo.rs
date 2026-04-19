@@ -10,7 +10,8 @@ use super::id::generate_id;
 use super::types::*;
 
 const HA_SELECT_COLS: &str = "id, session_id, spark_id, status, role, assigned_at, last_heartbeat_at, \
-     lease_expires_at, completed_at, handoff_to, handoff_reason";
+     lease_expires_at, completed_at, handoff_to, handoff_reason, liveness, \
+     github_artifact_branch, github_artifact_pr_number";
 
 /// Assign a Hand to a Spark. Fails if an active owner already exists.
 /// The check and INSERT are wrapped in a transaction to prevent TOCTOU races.
@@ -274,7 +275,8 @@ pub async fn list_active_for_workshop(
 ) -> Result<Vec<HandAssignment>, SparksError> {
     Ok(sqlx::query_as::<_, HandAssignment>(
         "SELECT a.id, a.session_id, a.spark_id, a.status, a.role, a.assigned_at, \
-         a.last_heartbeat_at, a.lease_expires_at, a.completed_at, a.handoff_to, a.handoff_reason \
+         a.last_heartbeat_at, a.lease_expires_at, a.completed_at, a.handoff_to, a.handoff_reason, \
+         a.liveness, a.github_artifact_branch, a.github_artifact_pr_number \
          FROM assignments a \
          INNER JOIN sparks s ON s.id = a.spark_id \
          WHERE a.status = 'active' AND s.workshop_id = ?",
