@@ -3410,21 +3410,126 @@ impl App {
                 tokio::spawn(async move {
                     let executor: Arc<dyn ipc::irc_command_parser::CommandExecutor> =
                         Arc::new(ipc::lifecycle::LoggingExecutor);
-                    match ipc::lifecycle::IrcRuntime::start(pool_for_irc.clone(), irc_cfg, executor)
+
+                    // Boot-race defence: the supervisor task (spawned
+                    // above at the `SpawnSpec::for_workshop` site)
+                    // fork-spawns ngIRCd concurrently with this task.
+                    // For the bundled-loopback case ngIRCd typically
+                    // binds in <200 ms, but if this `start` lands
+                    // first the client gets ECONNREFUSED and we used
+                    // to immediately emit a flare + give up — leaving
+                    // the user with a red pill even though the daemon
+                    // was about to be up. Retry with a short backoff
+                    // so the 99%+ case heals itself. Remote/user-
+                    // supplied `irc_server` overrides go through the
+                    // same path; for those the retry just absorbs the
+                    // normal variance in remote DNS/TCP establishment.
+                    //
+                    // Bounded: up to MAX_ATTEMPTS (= RETRY_DELAYS_MS +
+                    // the initial attempt) with sleeps from
+                    // RETRY_DELAYS_MS between attempts. With the
+                    // current schedule (200, 200, 400, 400, 600 ms)
+                    // that's ~1.8 s of cumulative sleep on top of the
+                    // actual `IrcRuntime::start` wall time. Enough to
+                    // cover a cold ngIRCd spawn on a busy laptop
+                    // without making a real outage feel frozen.
+                    //
+                    // PR #52 Copilot c2: only retry on
+                    // `LifecycleError::Connect`. Channel-level errors
+                    // (JOIN failures) are not the boot race we're
+                    // guarding against; retrying them just creates
+                    // connect churn and delays surfacing real
+                    // configuration issues to the user.
+                    const RETRY_DELAYS_MS: [u64; 5] = [200, 200, 400, 400, 600];
+                    const MAX_ATTEMPTS: usize = RETRY_DELAYS_MS.len() + 1;
+                    let mut attempt: usize = 0;
+                    let runtime_result = loop {
+                        attempt += 1;
+                        match ipc::lifecycle::IrcRuntime::start(
+                            pool_for_irc.clone(),
+                            irc_cfg.clone(),
+                            Arc::clone(&executor),
+                        )
                         .await
-                    {
-                        Ok(runtime) => {
-                            if let Ok(mut slot) = runtime_slot.lock() {
-                                *slot = Some(runtime);
+                        {
+                            Ok(r) => break Ok(r),
+                            Err(e) => {
+                                let is_connect_error =
+                                    matches!(e, ipc::lifecycle::LifecycleError::Connect(_));
+                                if !is_connect_error {
+                                    // Channel/other errors: surface
+                                    // immediately rather than hiding
+                                    // them behind retries.
+                                    break Err(e);
+                                }
+                                let idx = attempt.saturating_sub(1);
+                                if idx >= RETRY_DELAYS_MS.len() {
+                                    break Err(e);
+                                }
+                                let delay = RETRY_DELAYS_MS[idx];
+                                log::debug!(
+                                    "irc: workshop {workshop_id_for_irc} connect attempt \
+                                     {attempt}/{MAX_ATTEMPTS} failed: {e}; retrying in {delay}ms"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                             }
-                            log::info!(
-                                "irc: workshop {workshop_id_for_irc} connected + relay running"
-                            );
+                        }
+                    };
+
+                    match runtime_result {
+                        Ok(runtime) => {
+                            // PR #52 Copilot c1: if `do_close_workshop`
+                            // ran during the retry window, the slot's
+                            // Arc was dropped from the workshop's
+                            // `irc_runtime` field and the only strong
+                            // reference left is the clone we captured
+                            // before spawn. Installing here would
+                            // orphan the runtime — tokio's `JoinHandle`
+                            // drop detaches the relay task, so the
+                            // connection would linger without
+                            // `shutdown()` ever being called.
+                            // Detect that via `Arc::strong_count` and
+                            // drive shutdown directly, mirroring the
+                            // supervisor-slot race handling above.
+                            if Arc::strong_count(&runtime_slot) == 1 {
+                                log::warn!(
+                                    "irc: workshop {workshop_id_for_irc} closed during \
+                                     connect; driving graceful shutdown on the runtime \
+                                     we just established (attempt {attempt}) to avoid \
+                                     leaking the relay task"
+                                );
+                                runtime.shutdown().await;
+                            } else {
+                                match runtime_slot.lock() {
+                                    Ok(mut slot) => {
+                                        *slot = Some(runtime);
+                                        log::info!(
+                                            "irc: workshop {workshop_id_for_irc} connected + \
+                                             relay running (attempt {attempt})"
+                                        );
+                                    }
+                                    Err(poisoned) => {
+                                        // Lock poisoned. Recover via
+                                        // `into_inner` rather than
+                                        // silently dropping the runtime
+                                        // (which would orphan the
+                                        // relay task, same as the
+                                        // close-race path above).
+                                        let mut slot = poisoned.into_inner();
+                                        *slot = Some(runtime);
+                                        log::warn!(
+                                            "irc: workshop {workshop_id_for_irc} runtime slot \
+                                             recovered from poisoned lock; connected + relay \
+                                             running (attempt {attempt})"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             log::warn!(
-                                "irc: workshop {workshop_id_for_irc} boot failed: {e}; \
-                                 continuing without IRC"
+                                "irc: workshop {workshop_id_for_irc} boot failed after \
+                                 {attempt} attempts: {e}; continuing without IRC"
                             );
                             ipc::lifecycle::IrcRuntime::emit_connect_flare(
                                 &pool_for_irc,
