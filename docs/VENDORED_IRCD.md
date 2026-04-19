@@ -4,9 +4,9 @@ Ryve ships its own ngIRCd binary so the workshop-local IRC backbone —
 the coordination channel between Hands, Heads, and Atlas — works on
 every install with zero configuration and no outbound network. Every
 daemon invocation Ryve makes goes through
-`src/bundled_ircd::bundled_ircd_path()`, which resolves to the bundled
-binary at a fixed, layout-dependent location (see *Runtime resolution*
-below).
+`crate::bundled_ircd::bundled_ircd_path()` (source: [`src/bundled_ircd.rs`](../src/bundled_ircd.rs)),
+which resolves to the bundled binary at a fixed, layout-dependent
+location (see *Runtime resolution* below).
 
 ## Provenance
 

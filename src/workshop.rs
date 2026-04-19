@@ -1890,13 +1890,18 @@ pub async fn provision_workshop_ircd(
     ryve_dir: &RyveDir,
     config: &mut WorkshopConfig,
 ) -> std::io::Result<()> {
-    // Under the bundled-IRC model the master opt-out is record-once:
-    // `ryve init` always writes `irc_enabled = true` explicitly so the
-    // flag round-trips through config.toml rather than relying on the
-    // serde default. Users who want to disable IRC flip this to
-    // `false` after init; we never overwrite that decision on
-    // re-init either — see the allocated-port branch below.
-    config.irc_enabled = true;
+    // Re-init preserves an explicit opt-out: if the workshop already
+    // has a bundled port, we've been here before, so leave
+    // `irc_enabled` alone. Users who set `irc_enabled = false` after
+    // their first init keep that setting across every subsequent
+    // `ryve init`. Only a *fresh* workshop (no bundled port yet) gets
+    // the default-on flip below, which also round-trips through
+    // config.toml so downstream serde code doesn't fall back to an
+    // inferred default.
+    let is_fresh = config.irc_bundled_port.is_none();
+    if is_fresh {
+        config.irc_enabled = true;
+    }
 
     let ircd_dir = ryve_dir.root().join("ircd");
     tokio::fs::create_dir_all(&ircd_dir).await?;
@@ -3050,12 +3055,14 @@ mod tests {
             .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
         let first_body = tokio::fs::read_to_string(&conf_path).await.unwrap();
 
-        // Touch the file's mtime into the past (and rewrite with the
-        // same bytes) so we can detect any subsequent rewrite by the
-        // second provision call — but only if the content actually
-        // changes. A byte-for-byte equal rewrite would still be
-        // "idempotent" on disk; the comment in the conf body would
-        // disagree.
+        // Re-run provision against the same (already-provisioned)
+        // workshop. Idempotency is asserted below by byte-equality of
+        // the conf file — a rewrite that happens to produce identical
+        // bytes is still "idempotent" on disk, which is the contract
+        // this test locks down. If the real concern is "did the file
+        // get rewritten at all", a separate mtime-based test would be
+        // needed; the acceptance criterion only calls for identical
+        // config contents.
         provision_workshop_ircd(&ryve_dir, &mut config)
             .await
             .expect("second provision");
@@ -3071,6 +3078,46 @@ mod tests {
         assert_eq!(
             first_body, second_body,
             "re-init must not rewrite ircd.conf"
+        );
+    }
+
+    /// Regression for PR #48 Copilot c1: `provision_workshop_ircd`
+    /// used to flip `config.irc_enabled = true` on every call, which
+    /// clobbered a user who had explicitly set `false` between inits.
+    /// The fix is to only set the default on a *fresh* workshop (no
+    /// bundled port yet); re-init must preserve the user's opt-out.
+    #[tokio::test]
+    async fn provision_workshop_ircd_preserves_user_opt_out_on_rerun() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        let mut config = WorkshopConfig::default();
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("first provision");
+        let first_port = config.irc_bundled_port.unwrap();
+        assert!(
+            config.irc_enabled,
+            "fresh provision should default irc_enabled = true"
+        );
+
+        // Simulate the user explicitly disabling IRC after first init.
+        config.irc_enabled = false;
+
+        // Re-run provision. Port stays, conf stays, irc_enabled must
+        // NOT be flipped back to true.
+        provision_workshop_ircd(&ryve_dir, &mut config)
+            .await
+            .expect("second provision");
+        assert_eq!(
+            config.irc_bundled_port,
+            Some(first_port),
+            "re-init must not reallocate the port"
+        );
+        assert!(
+            !config.irc_enabled,
+            "re-init must preserve an explicit irc_enabled = false opt-out",
         );
     }
 
