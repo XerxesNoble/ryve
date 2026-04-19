@@ -2,6 +2,7 @@
 
 mod agent_prompts;
 mod app;
+mod bundled_ircd;
 mod bundled_tmux;
 mod cli;
 mod coding_agents;
