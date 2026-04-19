@@ -288,6 +288,18 @@ pub(crate) enum Message {
     Releases(screen::releases::Message),
     Background(screen::background_picker::Message),
     StatusBar(screen::status_bar::Message),
+    /// Forwarded to the active workshop's settings form overlay.
+    /// Spark ryve-c3de335e.
+    Settings(screen::settings::Message),
+    /// Forwarded to the active workshop's integrations detail overlay.
+    /// Spark ryve-c3de335e.
+    Integrations(screen::integrations::Message),
+    /// The async config save dispatched after a settings-form commit
+    /// finished. The arm exists so the runtime can drive the future to
+    /// completion; the body is a no-op because the optimistic write to
+    /// `ws.config` has already updated the in-memory state.
+    /// Spark ryve-c3de335e.
+    SettingsSaved,
 
     /// Release data loaded from DB (all releases + member epic IDs).
     ReleasesLoaded(
@@ -596,6 +608,9 @@ impl std::fmt::Debug for Message {
             }
             Self::Releases(m) => write!(f, "Releases({m:?})"),
             Self::ReleasesLoaded(id, _, _) => write!(f, "ReleasesLoaded({id})"),
+            Self::Settings(m) => write!(f, "Settings({m:?})"),
+            Self::Integrations(m) => write!(f, "Integrations({m:?})"),
+            Self::SettingsSaved => write!(f, "SettingsSaved"),
         }
     }
 }
@@ -1253,9 +1268,14 @@ impl App {
             }
 
             // ── Background ───────────────────────────────
-            Message::StatusBar(screen::status_bar::Message::OpenSettings) => {
+            Message::StatusBar(screen::status_bar::Message::OpenIntegrations) => {
+                // Spark ryve-c3de335e: the gear icon opens the
+                // integrations health view (which links over to the
+                // credentials form). The "appearance & terminal font"
+                // modal is still reachable via its existing entry
+                // points (`background_picker.open = true`).
                 if let Some(idx) = self.active_workshop {
-                    self.workshops[idx].background_picker.open = true;
+                    self.workshops[idx].open_integrations();
                 }
                 Task::none()
             }
@@ -1263,6 +1283,10 @@ impl App {
                 // TODO: open branch picker modal
                 Task::none()
             }
+            // ── Integrations + settings overlays (spark ryve-c3de335e) ──
+            Message::Integrations(msg) => self.handle_integrations_message(msg),
+            Message::Settings(msg) => self.handle_settings_message(msg),
+            Message::SettingsSaved => Task::none(),
             Message::Background(msg) => self.handle_background_message(msg),
             Message::BackgroundLoaded(id, Some(bytes)) => {
                 let ws_idx = self.workshops.iter().position(|ws| ws.id == id);
@@ -4854,6 +4878,9 @@ impl App {
                     session_id,
                 )));
             }
+            screen::sparks::Message::OpenUrl(url) => {
+                return self.update(Message::OpenUrl(url));
+            }
             // Remaining variants are handled by screen::sparks::update.
             _ => {}
         }
@@ -6032,6 +6059,109 @@ impl App {
         }
     }
 
+    /// Persist the active workshop's config to `.ryve/config.toml` after
+    /// a settings-form commit. Wraps the existing
+    /// [`data::ryve_dir::save_config`] in a `Task` that emits
+    /// [`Message::SettingsSaved`]. Spark ryve-c3de335e.
+    ///
+    /// PR #49 Copilot c8: captures `ws.config.as_ref().clone()` rather
+    /// than `ws.config.clone()` so the spawned task owns an independent
+    /// `WorkshopConfig` instead of bumping the `Arc`'s strong count.
+    /// With the Arc clone, the next `Arc::make_mut(&mut ws.config)`
+    /// would COW the underlying config and in-flight save tasks could
+    /// write a stale snapshot out of order. Taking an owned value up
+    /// front pins each task to the snapshot that was current when the
+    /// user committed the form.
+    fn save_workshop_config_task(ws: &Workshop) -> Task<Message> {
+        let ryve_dir = ws.ryve_dir.clone();
+        let config = ws.config.as_ref().clone();
+        Task::perform(
+            async move {
+                if let Err(e) = data::ryve_dir::save_config(&ryve_dir, &config).await {
+                    log::warn!("settings: save_config failed: {e}");
+                }
+            },
+            |_| Message::SettingsSaved,
+        )
+    }
+
+    /// Spark ryve-c3de335e: handle messages from the integrations
+    /// detail / health overlay. Currently the screen only emits Close
+    /// and OpenSettings (cross-link into the credentials form).
+    fn handle_integrations_message(&mut self, msg: screen::integrations::Message) -> Task<Message> {
+        let Some(idx) = self.active_workshop else {
+            return Task::none();
+        };
+        let ws = &mut self.workshops[idx];
+        match msg {
+            screen::integrations::Message::Close => {
+                ws.close_overlay();
+                Task::none()
+            }
+            screen::integrations::Message::OpenSettings => {
+                ws.open_settings();
+                Task::none()
+            }
+        }
+    }
+
+    /// Spark ryve-c3de335e: handle messages from the integrations
+    /// settings form overlay. Form submissions write the relevant
+    /// config field through `Arc::make_mut(&mut ws.config)` and then
+    /// dispatch an async `save_config` so the change is durable. The
+    /// optimistic write is the source of truth for any subsequent
+    /// `IrcLifecycleConfig::from_workshop` / `GitHubConfig::is_configured`
+    /// checks until the save completes.
+    fn handle_settings_message(&mut self, msg: screen::settings::Message) -> Task<Message> {
+        let Some(idx) = self.active_workshop else {
+            return Task::none();
+        };
+        let ws = &mut self.workshops[idx];
+        match msg {
+            screen::settings::Message::Close => {
+                ws.close_overlay();
+                Task::none()
+            }
+            screen::settings::Message::ShowIntegrations => {
+                ws.open_integrations();
+                Task::none()
+            }
+            screen::settings::Message::IrcServerChanged(value) => {
+                ws.settings_form.irc_server_draft = value;
+                Task::none()
+            }
+            screen::settings::Message::WebhookSecretChanged(value) => {
+                ws.settings_form.webhook_secret_draft = value;
+                Task::none()
+            }
+            screen::settings::Message::PollTokenChanged(value) => {
+                ws.settings_form.poll_token_draft = value;
+                Task::none()
+            }
+            screen::settings::Message::IrcServerSubmitted => {
+                let cfg_mut = Arc::make_mut(&mut ws.config);
+                if !ws.settings_form.apply_irc_server(cfg_mut) {
+                    return Task::none();
+                }
+                Self::save_workshop_config_task(ws)
+            }
+            screen::settings::Message::WebhookSecretSubmitted => {
+                let cfg_mut = Arc::make_mut(&mut ws.config);
+                if !ws.settings_form.apply_webhook_secret(cfg_mut) {
+                    return Task::none();
+                }
+                Self::save_workshop_config_task(ws)
+            }
+            screen::settings::Message::PollTokenSubmitted => {
+                let cfg_mut = Arc::make_mut(&mut ws.config);
+                if !ws.settings_form.apply_poll_token(cfg_mut) {
+                    return Task::none();
+                }
+                Self::save_workshop_config_task(ws)
+            }
+        }
+    }
+
     pub(crate) fn subscription(&self) -> Subscription<Message> {
         let term_subs: Vec<_> = self
             .workshops
@@ -6628,6 +6758,13 @@ impl App {
                     filtered_sparks: &ws.filtered_sparks,
                     sort_mode: ws.sort_mode,
                     sort_dropdown_open: ws.sort_dropdown_open,
+                    hand_assignments: &ws.hand_assignments,
+                    irc_connected: ws
+                        .irc_runtime
+                        .lock()
+                        .ok()
+                        .map(|s| s.is_some())
+                        .unwrap_or(false),
                 })
                 .map(Message::Sparks)
             }
@@ -6647,6 +6784,13 @@ impl App {
                 filtered_sparks: &ws.filtered_sparks,
                 sort_mode: ws.sort_mode,
                 sort_dropdown_open: ws.sort_dropdown_open,
+                hand_assignments: &ws.hand_assignments,
+                irc_connected: ws
+                    .irc_runtime
+                    .lock()
+                    .ok()
+                    .map(|s| s.is_some())
+                    .unwrap_or(false),
             })
             .map(Message::Sparks)
         };
@@ -6699,6 +6843,24 @@ impl App {
             })
         });
 
+        // Spark ryve-0daa8262: project workshop integration state into
+        // status-bar enums. IRC reads `irc_runtime` under its mutex without
+        // holding the guard across the view call; GitHub reads the cached
+        // config the rest of the app already uses.
+        let irc_status = {
+            let runtime_present = ws
+                .irc_runtime
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false);
+            screen::status_bar::IrcStatus::from_runtime(ws.config.irc_enabled(), runtime_present)
+        };
+        let github_status = screen::status_bar::GitHubStatus::from_config(
+            ws.config.github.is_configured(),
+            ws.config.github.token.as_deref(),
+            ws.config.github.repo.as_deref(),
+        );
+
         let status_bar = screen::status_bar::view(
             ws.file_explorer.branch.as_deref(),
             &ws.directory,
@@ -6708,6 +6870,8 @@ impl App {
             total_hands,
             ws.failing_contracts,
             file_info,
+            irc_status,
+            github_status,
             &pal,
             has_bg,
         )
@@ -6833,6 +6997,31 @@ impl App {
                 screen::head_picker::view(state, &ws.sparks, &self.available_agents, &pal)
                     .map(Message::HeadPicker),
             );
+        }
+
+        // Spark ryve-c3de335e: integrations + settings overlays. The
+        // two are mutually exclusive — `WorkshopOverlay` enforces that
+        // — so at most one of these branches runs per frame.
+        match ws.active_overlay {
+            workshop::WorkshopOverlay::Integrations => {
+                let runtime_active = ws
+                    .irc_runtime
+                    .lock()
+                    .ok()
+                    .is_some_and(|guard| guard.is_some());
+                let irc = ws.integrations_irc_health(runtime_active);
+                let github = ws.integrations_github_health();
+                layers.push(
+                    screen::integrations::view(&irc, &github, &pal).map(Message::Integrations),
+                );
+            }
+            workshop::WorkshopOverlay::Settings => {
+                layers.push(
+                    screen::settings::view(&ws.settings_form, &ws.config.github, &pal)
+                        .map(Message::Settings),
+                );
+            }
+            workshop::WorkshopOverlay::None => {}
         }
 
         stack(layers)

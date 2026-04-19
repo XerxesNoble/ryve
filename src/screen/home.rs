@@ -445,6 +445,9 @@ mod tests {
             completed_at: None,
             handoff_to: None,
             handoff_reason: None,
+            liveness: "healthy".to_string(),
+            github_artifact_branch: None,
+            github_artifact_pr_number: None,
         }
     }
 

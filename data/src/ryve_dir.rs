@@ -318,6 +318,50 @@ pub struct GitHubConfig {
     /// Auto-sync sparks to GitHub issues on every change.
     #[serde(default)]
     pub auto_sync: bool,
+
+    /// Shared secret for verifying inbound webhook deliveries. When set,
+    /// the artifact mirror flips to webhook ingestion mode and disables
+    /// the REST polling fallback (`PollerConfig::webhook_secret_configured`).
+    /// Spark ryve-c3de335e: surfaced through the integrations settings form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
+
+    /// PAT used by the REST polling fallback when no webhook is wired up.
+    /// `None` leaves the poller authenticated with whatever `token` is set
+    /// to, or unauthenticated for public repos. Surfaced through the
+    /// integrations settings form. Spark ryve-c3de335e.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_token: Option<String>,
+}
+
+impl GitHubConfig {
+    /// Whether webhook ingestion is configured for this workshop. Drives
+    /// the gate flag in the artifact mirror poller and the integrations
+    /// detail screen's mode badge. A whitespace-only secret counts as
+    /// unconfigured so the user can clear the field by blanking it out.
+    pub fn webhook_configured(&self) -> bool {
+        self.webhook_secret
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Whether REST polling has a credential available. Considers either
+    /// `poll_token` (the explicit field) or the legacy `token` field.
+    pub fn poll_token_configured(&self) -> bool {
+        self.poll_token
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || self.token.as_ref().is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Whether the workshop has any GitHub integration configured at all.
+    /// Used by the status bar / integrations screen to render an
+    /// "unconfigured" state without a hard error.
+    pub fn is_configured(&self) -> bool {
+        self.repo.as_ref().is_some_and(|s| !s.trim().is_empty())
+            || self.webhook_configured()
+            || self.poll_token_configured()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -918,6 +962,84 @@ mod tests {
         assert!(cfg.irc_enabled());
         assert!(cfg.irc_bundled_port.is_none());
         assert!(cfg.effective_irc_server_address().is_none());
+    }
+
+    // Spark ryve-c3de335e: GitHub credential surfacing.
+
+    #[test]
+    fn github_config_default_is_unconfigured() {
+        let cfg = GitHubConfig::default();
+        assert!(!cfg.is_configured());
+        assert!(!cfg.webhook_configured());
+        assert!(!cfg.poll_token_configured());
+    }
+
+    #[test]
+    fn github_webhook_secret_requires_non_empty_value() {
+        let cfg = GitHubConfig {
+            webhook_secret: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(!cfg.webhook_configured());
+
+        let cfg = GitHubConfig {
+            webhook_secret: Some("shh".into()),
+            ..Default::default()
+        };
+        assert!(cfg.webhook_configured());
+        assert!(cfg.is_configured());
+    }
+
+    #[test]
+    fn github_poll_token_falls_back_to_legacy_token_field() {
+        let only_legacy = GitHubConfig {
+            token: Some("ghp_legacy".into()),
+            ..Default::default()
+        };
+        assert!(only_legacy.poll_token_configured());
+
+        let only_new = GitHubConfig {
+            poll_token: Some("ghp_new".into()),
+            ..Default::default()
+        };
+        assert!(only_new.poll_token_configured());
+
+        let blank_new = GitHubConfig {
+            poll_token: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(!blank_new.poll_token_configured());
+    }
+
+    #[test]
+    fn github_config_round_trips_through_toml() {
+        let cfg = GitHubConfig {
+            repo: Some("octo/cat".into()),
+            webhook_secret: Some("shh".into()),
+            poll_token: Some("ghp_xxx".into()),
+            ..Default::default()
+        };
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let restored: GitHubConfig = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(restored.repo.as_deref(), Some("octo/cat"));
+        assert_eq!(restored.webhook_secret.as_deref(), Some("shh"));
+        assert_eq!(restored.poll_token.as_deref(), Some("ghp_xxx"));
+        assert!(restored.is_configured());
+    }
+
+    #[test]
+    fn github_config_legacy_toml_without_new_fields_loads() {
+        // Pre-c3de335e configs only had token/repo/auto_sync. They must
+        // still parse and report the legacy token via poll_token_configured.
+        let legacy = r#"
+            token = "ghp_old"
+            repo = "octo/cat"
+            auto_sync = true
+        "#;
+        let cfg: GitHubConfig = toml::from_str(legacy).expect("legacy parse");
+        assert_eq!(cfg.token.as_deref(), Some("ghp_old"));
+        assert!(cfg.poll_token_configured());
+        assert!(!cfg.webhook_configured());
     }
 
     #[tokio::test]
