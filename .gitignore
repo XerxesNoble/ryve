@@ -31,6 +31,9 @@ Cargo.lock
 # Vendored tmux build output (built locally via scripts/build-vendored-tmux.sh)
 vendor/tmux/bin/
 
+# Vendored ngIRCd build output (built locally via scripts/build-vendored-ircd.sh)
+vendor/ircd/bin/
+
 # Ryve runtime artifacts (per-Hand prompts and logs)
 .ryve/prompts/
 .ryve/logs/
