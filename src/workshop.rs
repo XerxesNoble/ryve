@@ -1630,7 +1630,7 @@ pub fn compute_image_luminance(bytes: &[u8]) -> Option<f32> {
 /// obviously bad names (whitespace, `..`, `~`, `^`, `:`, `@{`, trailing
 /// `.lock`, …) before shelling out to `git worktree add`. Pure Rust so
 /// unit tests don't need a git binary. Spark ryve-7aa05933.
-fn validate_git_branch_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_git_branch_name(name: &str) -> Result<(), String> {
     let reject = |reason: &str| Err(format!("invalid branch name '{name}': {reason}"));
 
     if name.is_empty() {

@@ -178,6 +178,118 @@ async fn tag_release_refuses_when_head_drifted_from_branch_tip() {
 }
 
 #[tokio::test]
+async fn tag_release_allows_live_ryve_workspace_files_dirty() {
+    // Simulates the live-workshop case: Ryve has rewritten
+    // `.ryve/config.toml` and `.ryve/ui_state.json` since the commit that
+    // HEAD points at. `release close` must still succeed — those files are
+    // deliberately allowlisted in the dirty-tree gate.
+    let dir = init_repo();
+
+    // Commit both allowlisted paths so they're tracked. Untracked-but-
+    // allowlisted is also supported (see below), but modified-tracked is
+    // the path the close-time bug actually hits.
+    std::fs::create_dir_all(dir.path().join(".ryve")).unwrap();
+    std::fs::write(
+        dir.path().join(".ryve").join("config.toml"),
+        "# committed\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".ryve").join("ui_state.json"),
+        "{\"collapsed_epics\":[]}\n",
+    )
+    .unwrap();
+    run(
+        dir.path(),
+        &["add", ".ryve/config.toml", ".ryve/ui_state.json"],
+    );
+    run(
+        dir.path(),
+        &["commit", "-q", "-m", "add ryve workspace files"],
+    );
+
+    let rb = release_branch_for(&dir);
+    rb.cut_release_branch("0.1.0").await.expect("cut");
+
+    // Live modifications — the kind the UI makes on every chevron click or
+    // sidebar-width drag.
+    std::fs::write(
+        dir.path().join(".ryve").join("config.toml"),
+        "# rewritten by live UI\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".ryve").join("ui_state.json"),
+        "{\"collapsed_epics\":[\"ep-1\"]}\n",
+    )
+    .unwrap();
+
+    // Sanity: git sees the tree as dirty via its normal porcelain output.
+    let porcelain = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        !porcelain.stdout.is_empty(),
+        "precondition: porcelain should report the allowlisted paths as modified"
+    );
+
+    // Despite that, tag_release must succeed.
+    rb.tag_release("0.1.0", Path::new("/tmp/x"))
+        .await
+        .expect("tag_release must succeed when only allowlisted files are dirty");
+
+    let tags = Command::new("git")
+        .args(["tag", "--list", "v0.1.0"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git tag list");
+    assert_eq!(
+        String::from_utf8_lossy(&tags.stdout).trim(),
+        "v0.1.0",
+        "v0.1.0 tag should have been created"
+    );
+}
+
+#[tokio::test]
+async fn tag_release_still_refuses_non_allowlisted_dirty_alongside_live_files() {
+    // A non-allowlisted dirty file is always fatal, even when the
+    // allowlisted ones are also dirty — the guard must not be bypassable
+    // by sneaking a scratch file in with the live-workshop paths.
+    let dir = init_repo();
+
+    std::fs::create_dir_all(dir.path().join(".ryve")).unwrap();
+    std::fs::write(
+        dir.path().join(".ryve").join("config.toml"),
+        "# committed\n",
+    )
+    .unwrap();
+    run(dir.path(), &["add", ".ryve/config.toml"]);
+    run(dir.path(), &["commit", "-q", "-m", "add ryve config"]);
+
+    let rb = release_branch_for(&dir);
+    rb.cut_release_branch("0.2.0").await.expect("cut");
+
+    std::fs::write(
+        dir.path().join(".ryve").join("config.toml"),
+        "# live rewrite\n",
+    )
+    .unwrap();
+    // Plus a non-allowlisted dirty file.
+    dirty_the_tree(dir.path());
+
+    let err = rb
+        .tag_release("0.2.0", Path::new("/tmp/x"))
+        .await
+        .expect_err("must still refuse when a non-allowlisted file is dirty");
+    assert!(
+        matches!(err, ReleaseBranchError::DirtyWorkingTree),
+        "got unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn tag_release_refuses_dirty_tree() {
     let dir = init_repo();
     let rb = release_branch_for(&dir);

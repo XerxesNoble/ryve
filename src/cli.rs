@@ -367,7 +367,7 @@ fn print_usage() {
     eprintln!("  release list                         List releases");
     eprintln!("  release show <id>                    Show release details + member epics");
     eprintln!(
-        "  release edit <id> [--version <semver>] [--notes <text>] [--clear-notes] [--problem <text>] [--clear-problem]"
+        "  release edit <id> [--version <semver>] [--notes <text>] [--clear-notes] [--problem <text>] [--clear-problem] [--branch <name>] [--clear-branch]"
     );
     eprintln!("      Update release fields in place (pass --clear-* to null a field)");
     eprintln!("  release add-epic <id> <epic_id>      Add an epic to a release");
@@ -4287,7 +4287,7 @@ async fn handle_release(
         "edit" => {
             if args.len() < 2 {
                 die(
-                    "release edit requires <id> [--version <ver>] [--notes <text>] [--clear-notes] [--problem <text>] [--clear-problem]",
+                    "release edit requires <id> [--version <ver>] [--notes <text>] [--clear-notes] [--problem <text>] [--clear-problem] [--branch <name>] [--clear-branch]",
                 );
             }
             let release_id = &args[1];
@@ -4321,6 +4321,27 @@ async fn handle_release(
                     }
                     "--clear-problem" => {
                         patch.problem = Some(None);
+                    }
+                    "--branch" => {
+                        i += 1;
+                        if i >= args.len() {
+                            die("--branch requires a value");
+                        }
+                        // Reject values that aren't valid git branch names up
+                        // front (whitespace, "..", "@{", control chars, lock
+                        // suffixes, etc). The release row's branch_name is
+                        // surfaced everywhere as a real git ref; persisting
+                        // garbage here just defers the failure to the next
+                        // git operation that consumes it. Reuses the
+                        // workshop-side validator so the rule lives in one
+                        // place.
+                        if let Err(err) = crate::workshop::validate_git_branch_name(&args[i]) {
+                            die(&format!("--branch '{}' rejected: {err}", args[i]));
+                        }
+                        patch.branch_name = Some(Some(args[i].clone()));
+                    }
+                    "--clear-branch" => {
+                        patch.branch_name = Some(None);
                     }
                     other => die(&format!("unknown flag '{other}' for release edit")),
                 }

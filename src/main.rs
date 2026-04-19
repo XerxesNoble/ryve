@@ -2,6 +2,7 @@
 
 mod agent_prompts;
 mod app;
+mod bundled_ircd;
 mod bundled_tmux;
 mod cli;
 mod coding_agents;
@@ -13,6 +14,7 @@ mod head;
 mod head_archetype;
 mod head_archetypes;
 mod icons;
+mod ircd_process;
 mod panel_state;
 mod process_snapshot;
 mod release_artifact;
