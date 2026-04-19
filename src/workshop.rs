@@ -1712,11 +1712,16 @@ pub(crate) fn validate_git_branch_name(name: &str) -> Result<(), String> {
 ///
 /// Visible to the rest of the crate so the `hand_spawn` CLI helper can call
 /// it without re-implementing the worktree convention.
+///
+/// When `base_ref` is `Some`, the new Hand branch is cut from that ref
+/// (`git worktree add -b <branch> <path> <ref>`). When `None`, the branch
+/// is cut from the current HEAD — the historical behavior. Spark ryve-a64b3a06.
 pub(crate) async fn create_hand_worktree(
     workshop_dir: &Path,
     ryve_dir: &RyveDir,
     session_id: &str,
     actor: &str,
+    base_ref: Option<&str>,
 ) -> Result<PathBuf, String> {
     // Only create worktrees for git repos
     let git_dir = workshop_dir.join(".git");
@@ -1750,8 +1755,17 @@ pub(crate) async fn create_hand_worktree(
         .await
         .map_err(|e| e.to_string())?;
 
-    let output = tokio::process::Command::new("git")
-        .args(["worktree", "add", "-b", &branch, &wt_dir.to_string_lossy()])
+    let wt_dir_str = wt_dir.to_string_lossy();
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("worktree")
+        .arg("add")
+        .arg("-b")
+        .arg(&branch)
+        .arg(wt_dir_str.as_ref());
+    if let Some(base) = base_ref {
+        cmd.arg(base);
+    }
+    let output = cmd
         .current_dir(workshop_dir)
         .output()
         .await
@@ -3123,5 +3137,130 @@ mod tests {
             body.contains("Ports = 45678"),
             "regenerated conf must use the recorded port, got:\n{body}"
         );
+    }
+
+    /// Spark ryve-a64b3a06: when `base_ref` is `Some`, the new Hand branch
+    /// must be cut from that ref rather than the current HEAD.
+    ///
+    /// Strategy: init a repo, seed two commits on `main` (`seed`, then
+    /// `tip`). Checkout a throwaway branch so HEAD != main. Call
+    /// create_hand_worktree twice:
+    ///   1. `base_ref = None` — branch must sit on HEAD (the throwaway's
+    ///      commit).
+    ///   2. `base_ref = Some("main~1")` — branch must sit on the `seed`
+    ///      commit, proving the ref flag was honoured.
+    #[tokio::test]
+    async fn create_hand_worktree_respects_base_ref() {
+        let base = std::env::temp_dir().join(format!("ryve-test-br-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+
+        let run_git = |args: Vec<String>| {
+            let base = base.clone();
+            async move {
+                let out = tokio::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&base)
+                    .env("GIT_AUTHOR_NAME", "ryve-test")
+                    .env("GIT_AUTHOR_EMAIL", "test@ryve.local")
+                    .env("GIT_COMMITTER_NAME", "ryve-test")
+                    .env("GIT_COMMITTER_EMAIL", "test@ryve.local")
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "git {args:?} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                out
+            }
+        };
+
+        run_git(vec!["init".into(), "-q".into(), "-b".into(), "main".into()]).await;
+        run_git(vec![
+            "config".into(),
+            "commit.gpgsign".into(),
+            "false".into(),
+        ])
+        .await;
+        run_git(vec![
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "seed".into(),
+        ])
+        .await;
+        run_git(vec![
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "tip".into(),
+        ])
+        .await;
+        // HEAD is on a throwaway branch so we can tell "HEAD" and "main~1"
+        // apart when we read the resulting worktree's commit.
+        run_git(vec![
+            "checkout".into(),
+            "-q".into(),
+            "-b".into(),
+            "throwaway".into(),
+        ])
+        .await;
+        run_git(vec![
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "throwaway-tip".into(),
+        ])
+        .await;
+
+        let ryve_dir = RyveDir::new(&base);
+
+        // Case 1: base_ref = None -> branch sits on current HEAD.
+        let session_none = "none00000aaaaaaaaaaaaaaaaaaaaaaa";
+        let wt_none = create_hand_worktree(&base, &ryve_dir, session_none, "hand", None)
+            .await
+            .expect("None base_ref should succeed");
+        let head_msg = run_git(vec![
+            "log".into(),
+            "-1".into(),
+            "--format=%s".into(),
+            "HEAD".into(),
+        ])
+        .await;
+        let workshop_head = String::from_utf8_lossy(&head_msg.stdout).trim().to_string();
+        let wt_none_msg = tokio::process::Command::new("git")
+            .args(["log", "-1", "--format=%s", "HEAD"])
+            .current_dir(&wt_none)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&wt_none_msg.stdout).trim(),
+            workshop_head,
+            "worktree with base_ref=None must match the workshop's current HEAD"
+        );
+
+        // Case 2: base_ref = Some("main~1") -> branch sits on `seed`.
+        let session_ref = "withref00bbbbbbbbbbbbbbbbbbbbbbb";
+        let wt_ref = create_hand_worktree(&base, &ryve_dir, session_ref, "hand", Some("main~1"))
+            .await
+            .expect("Some base_ref should succeed");
+        let wt_ref_msg = tokio::process::Command::new("git")
+            .args(["log", "-1", "--format=%s", "HEAD"])
+            .current_dir(&wt_ref)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&wt_ref_msg.stdout).trim(),
+            "seed",
+            "worktree with base_ref=Some(main~1) must be cut from that ref"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }
