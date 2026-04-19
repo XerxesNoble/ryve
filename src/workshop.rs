@@ -2037,9 +2037,75 @@ pub async fn init_workshop(directory: PathBuf) -> Result<WorkshopInit, data::spa
 
     // Run any pending workshop schema migrations. Returns the (now-current)
     // config plus a log of what ran so the caller can surface it to the user.
-    let (config, migration_log) = data::migrations::migrate_workshop(&ryve_dir)
+    let (mut config, migration_log) = data::migrations::migrate_workshop(&ryve_dir)
         .await
         .map_err(data::sparks::SparksError::Io)?;
+
+    // Auto-provision the workshop-scoped IRC daemon if the workshop
+    // wants IRC (`irc_enabled = true`) but has never been allocated a
+    // bundled port. This covers the upgrade path: workshops created
+    // before 0.2.1 land here on first launch with `irc_enabled = true`
+    // (default) and `irc_bundled_port = None`. Without this, the
+    // supervisor would skip cleanly, the IRC client would have no
+    // dial target, and the status-bar pill would (correctly, per
+    // PR #50 c6) display Disabled — but the user would have no clear
+    // path to re-provision short of running `ryve init` manually.
+    //
+    // This caller guards on `irc_enabled()` so a user who has opted
+    // out (`irc_enabled = false` in .ryve/config.toml) skips the
+    // auto-provision entirely. `provision_workshop_ircd` itself does
+    // not check `irc_enabled()` — it only short-circuits on the port
+    // being already allocated. Re-launching a workshop that already
+    // has `irc_bundled_port = Some(_)` is therefore a no-op (PR #51
+    // Copilot c2). Errors are logged but non-fatal — workshop open
+    // must still succeed if the IRC daemon can't be provisioned (no
+    // bundled binary on this platform, ircd dir not writable, etc.).
+    //
+    // PR #51 Copilot c3 — recovering from a save_config failure:
+    // provision_workshop_ircd allocates a new port and writes
+    // ircd.conf at that port. If save_config then fails, the on-disk
+    // config keeps `irc_bundled_port = None` while ircd.conf carries
+    // a now-orphaned port. On the next launch we'd allocate ANOTHER
+    // fresh port but leave the stale conf in place (the existence
+    // check at `provision_workshop_ircd` short-circuits the write),
+    // producing a conf↔config mismatch that breaks the supervisor.
+    // Defend by deleting ircd.conf on save-failure so the next launch
+    // regenerates it cleanly against whatever port we allocate then.
+    if config.irc_enabled() && config.irc_bundled_port.is_none() {
+        match provision_workshop_ircd(&ryve_dir, &mut config).await {
+            Ok(()) => {
+                if let Err(e) = data::ryve_dir::save_config(&ryve_dir, &config).await {
+                    let conf_path = ryve_dir
+                        .root()
+                        .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
+                    let cleanup = tokio::fs::remove_file(&conf_path).await;
+                    log::warn!(
+                        "ircd: auto-provision succeeded but persisting config failed: {e}; \
+                         removed ircd.conf to avoid a port mismatch on next launch \
+                         (cleanup result: {cleanup:?}); the bundled port will be re-allocated \
+                         on next launch"
+                    );
+                } else {
+                    log::info!(
+                        "ircd: auto-provisioned bundled daemon for upgraded workshop \
+                         (port={:?})",
+                        config.irc_bundled_port
+                    );
+                }
+            }
+            Err(e) => {
+                // PR #51 Copilot c4: this branch is reached only after
+                // the `irc_enabled && port is None` guard passed, so
+                // `provision_workshop_ircd` actually failed (I/O error,
+                // port allocation, etc.) — it wasn't a deliberate skip.
+                log::warn!(
+                    "ircd: auto-provision failed — {e}; the IRC pill will stay Disabled \
+                     until `ryve init` is run manually or the user sets an explicit \
+                     `irc_server` override"
+                );
+            }
+        }
+    }
 
     if migration_log.is_empty() {
         log::debug!("{}", migration_log.summary());
@@ -3327,6 +3393,88 @@ mod tests {
         assert!(
             body.contains("Ports = 45678"),
             "regenerated conf must use the recorded port, got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_workshop_auto_provisions_bundled_irc_for_pre_021_workshop() {
+        // Hotfix regression: a workshop directory created before 0.2.1's
+        // bundled IRC has `irc_enabled = true` (default-on flip from
+        // Epic B) but no `irc_bundled_port` and no `.ryve/ircd/`. On
+        // first launch under 0.2.1+ the open path must auto-provision
+        // the bundled daemon, otherwise the supervisor skips, the IRC
+        // client has no dial target, and the status pill stays
+        // Disabled with no clear remediation in the UI.
+        //
+        // PR #51 Copilot c1: drive this through `init_workshop` itself
+        // rather than re-implementing the auto-provision branch inline.
+        // The earlier revision could have silently regressed a
+        // refactor of `init_workshop` that dropped the provision call,
+        // because the test never called the function under test.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ryve_dir = RyveDir::new(tmp.path());
+        ryve_dir.ensure_exists().await.unwrap();
+
+        // Seed a config that mimics the post-upgrade pre-init state:
+        // irc_enabled true, no bundled port, no conf. agents.disable_sync
+        // is set so `init_workshop` skips the WORKSHOP.md generation
+        // step (which spawns external processes and isn't what this
+        // test is locking down).
+        let pre_upgrade_config = WorkshopConfig {
+            irc_enabled: true,
+            irc_bundled_port: None,
+            agents: data::ryve_dir::AgentsConfig {
+                disable_sync: true,
+                ..data::ryve_dir::AgentsConfig::default()
+            },
+            ..WorkshopConfig::default()
+        };
+        data::ryve_dir::save_config(&ryve_dir, &pre_upgrade_config)
+            .await
+            .unwrap();
+
+        // Sanity: no conf yet.
+        let conf_path = ryve_dir
+            .root()
+            .join(crate::ircd_process::IRCD_CONFIG_RELATIVE);
+        assert!(!conf_path.exists(), "test setup: conf must not exist yet");
+
+        // Drive the actual workshop-open path.
+        let init = init_workshop(tmp.path().to_path_buf())
+            .await
+            .expect("init_workshop must succeed on a writable workshop dir");
+
+        // After init_workshop: the returned config carries the
+        // freshly-allocated bundled port, and ircd.conf exists.
+        assert!(
+            init.config.irc_bundled_port.is_some(),
+            "init_workshop must auto-provision a bundled port for \
+             pre-0.2.1 workshops"
+        );
+        assert!(
+            conf_path.exists(),
+            "init_workshop must auto-write ircd.conf alongside the port"
+        );
+        // The port round-trips through .ryve/config.toml so the
+        // supervisor sees it on next launch.
+        let persisted = data::ryve_dir::load_config(&ryve_dir).await;
+        assert_eq!(
+            persisted.irc_bundled_port, init.config.irc_bundled_port,
+            "auto-provisioned port must persist through \
+             .ryve/config.toml, not just the returned in-memory config"
+        );
+
+        // Second launch is a no-op (idempotency already covered in
+        // isolation by `provision_workshop_ircd_is_idempotent_on_rerun`,
+        // here we just confirm init_workshop doesn't churn the port).
+        let first_port = init.config.irc_bundled_port;
+        let second = init_workshop(tmp.path().to_path_buf())
+            .await
+            .expect("second init_workshop must succeed");
+        assert_eq!(
+            second.config.irc_bundled_port, first_port,
+            "re-opening an already-provisioned workshop must not \
+             reallocate the bundled port"
         );
     }
 
