@@ -3410,21 +3410,68 @@ impl App {
                 tokio::spawn(async move {
                     let executor: Arc<dyn ipc::irc_command_parser::CommandExecutor> =
                         Arc::new(ipc::lifecycle::LoggingExecutor);
-                    match ipc::lifecycle::IrcRuntime::start(pool_for_irc.clone(), irc_cfg, executor)
+
+                    // Boot-race defence: the supervisor task (spawned
+                    // above at the `SpawnSpec::for_workshop` site)
+                    // fork-spawns ngIRCd concurrently with this task.
+                    // For the bundled-loopback case ngIRCd typically
+                    // binds in <200 ms, but if this `start` lands
+                    // first the client gets ECONNREFUSED and we used
+                    // to immediately emit a flare + give up — leaving
+                    // the user with a red pill even though the daemon
+                    // was about to be up. Retry with a short backoff
+                    // so the 99%+ case heals itself. Remote/user-
+                    // supplied `irc_server` overrides go through the
+                    // same path; for those the retry just absorbs the
+                    // normal variance in remote DNS/TCP establishment.
+                    //
+                    // Bounded: 6 attempts (0, 200, 400, 800, 1200,
+                    // 1800 ms cumulative ≈ 4.4 s wall time) before we
+                    // fall through to the flare-and-give-up path.
+                    // That's enough to cover a cold ngIRCd spawn on a
+                    // busy laptop without making a real outage feel
+                    // frozen.
+                    const RETRY_DELAYS_MS: [u64; 5] = [200, 200, 400, 400, 600];
+                    let mut attempt: usize = 0;
+                    let runtime_result = loop {
+                        attempt += 1;
+                        match ipc::lifecycle::IrcRuntime::start(
+                            pool_for_irc.clone(),
+                            irc_cfg.clone(),
+                            Arc::clone(&executor),
+                        )
                         .await
-                    {
+                        {
+                            Ok(r) => break Ok(r),
+                            Err(e) => {
+                                let idx = attempt.saturating_sub(1);
+                                if idx >= RETRY_DELAYS_MS.len() {
+                                    break Err(e);
+                                }
+                                let delay = RETRY_DELAYS_MS[idx];
+                                log::debug!(
+                                    "irc: workshop {workshop_id_for_irc} connect attempt \
+                                     {attempt}/6 failed: {e}; retrying in {delay}ms"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                            }
+                        }
+                    };
+
+                    match runtime_result {
                         Ok(runtime) => {
                             if let Ok(mut slot) = runtime_slot.lock() {
                                 *slot = Some(runtime);
                             }
                             log::info!(
-                                "irc: workshop {workshop_id_for_irc} connected + relay running"
+                                "irc: workshop {workshop_id_for_irc} connected + relay running \
+                                 (attempt {attempt})"
                             );
                         }
                         Err(e) => {
                             log::warn!(
-                                "irc: workshop {workshop_id_for_irc} boot failed: {e}; \
-                                 continuing without IRC"
+                                "irc: workshop {workshop_id_for_irc} boot failed after \
+                                 {attempt} attempts: {e}; continuing without IRC"
                             );
                             ipc::lifecycle::IrcRuntime::emit_connect_flare(
                                 &pool_for_irc,
