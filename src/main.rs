@@ -19,6 +19,8 @@ mod release_artifact;
 mod screen;
 #[allow(dead_code)]
 mod sparks_filter;
+#[allow(dead_code)]
+mod stream_heartbeat;
 mod style;
 mod tmux;
 mod watch_runner;
