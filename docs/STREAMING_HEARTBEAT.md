@@ -6,13 +6,11 @@ process. Future heavy subcommands must adopt it so Hand sessions do not
 die mid-task, and reviewers must hold new heavy-command additions to
 this standard.
 
-Parent epic: [`ryve-32e95c28`][epic] — *Heavy-test stream-timeout fix:
+Parent epic: `ryve-32e95c28` — *Heavy-test stream-timeout fix:
 streaming heartbeat during long cargo test invocations so Hand sessions
 do not die mid-test.* Wrapper module landed in sibling spark
-[`ryve-9660d5d2`][wrapper-spark].
-
-[epic]: #
-[wrapper-spark]: #
+`ryve-9660d5d2`. (Spark IDs are workgraph-local; query them with
+`ryve spark show <id>`.)
 
 ## 1. The stream-idle-timeout failure mode
 
@@ -31,14 +29,12 @@ The trap is triggered by any subcommand that stays silent longer than
 ~5 min. The empirical list so far:
 
 - `cargo test` over the full workspace — the dominant case. Two Hands
-  died on [`ryve-f8e9931c`][dead-1] (the `hand_spawn` `#[serial]` work)
-  because the heavy `hand_spawn` test suite takes well over five
-  minutes without printing anything.
+  died on `ryve-f8e9931c` (the `hand_spawn` `#[serial]` work) because
+  the heavy `hand_spawn` test suite takes well over five minutes
+  without printing anything.
 - Any `cargo build --release` on a cold target directory.
 - Long `sqlx migrate` runs against non-trivial databases.
 - Any compound command whose slowest stage prints nothing.
-
-[dead-1]: #
 
 The failure mode is *silent and unrelated to exit code*: the child
 would eventually succeed, but it never gets the chance because the
@@ -183,17 +179,14 @@ Current and planned uses inside this crate:
   wrapper itself. Start here for the public API and the invariant
   comments.
 - [`src/hand_spawn.rs`](../src/hand_spawn.rs) — Hand spawn path. The
-  wrapper is wired in by sibling spark
-  [`ryve-b7f7f1fa`][wire-spark] (*Wire stream-heartbeat into Hand
-  subprocess spawn*). The relevant call-sites are the subprocess
-  launches around
-  [`launch_in_tmux`](../src/hand_spawn.rs) and the
-  coding-agent spawns in
-  [`spawn_hand`](../src/hand_spawn.rs) / `spawn_head` — any Hand-driven
-  `cargo test` and equivalents must run inside `StreamHeartbeat::run`
-  so a silent >5 min test suite cannot kill the Hand mid-run.
-
-[wire-spark]: #
+  wrapper is wired in by sibling spark `ryve-b7f7f1fa` (*Wire
+  stream-heartbeat into Hand subprocess spawn*). The relevant
+  call-sites are the subprocess launches around
+  [`launch_in_tmux`](../src/hand_spawn.rs) and the coding-agent spawns
+  in [`spawn_hand`](../src/hand_spawn.rs) / `spawn_head` — any
+  Hand-driven `cargo test` and equivalents must run inside
+  `StreamHeartbeat::run` so a silent >5 min test suite cannot kill the
+  Hand mid-run.
 
 When adding a new heavy subcommand, land the call-site behind the
 wrapper in the same PR that introduces it. Do not stage the subcommand
