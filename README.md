@@ -262,11 +262,12 @@ Ryve is in active development. The core desktop shell, workgraph, multi-Hand coo
 - Hand spawning with per-session git worktrees, system-prompt injection of `.ryve/WORKSHOP.md`, and PID/log-path tracking
 - Head/Hand/Merger orchestration: `ryve hand spawn` lets a Head launch detached children that are auto-discovered by the running UI
 - 3-second sparks polling so external CLI mutations show up live in the UI
+- Workshop-local IRC backbone: `ryve init` provisions a bundled ngIRCd daemon on `127.0.0.1:<allocated port>` and the Ryve IPC runtime joins a channel per open epic, relays the lifecycle outbox onto the wire, and accepts inbound `/ryve` commands — no user-supplied server, no external network. See [docs/VENDORED_IRCD.md](docs/VENDORED_IRCD.md).
 
 ### In flight (near-term objectives)
 
 - **Execution Workflow Foundation** — append-only `lifecycle_events` table, `assignment_phase` axis, pure transition validator, projector, in-process broadcast bus, and `ryve lifecycle` CLI subcommand
-- **Adversarial Review Runtime + IRC Facade** — reviewer Hand role, auto-spawn review/repair loop with cycle caps, and a localhost IRC adapter over the lifecycle stream
+- **Adversarial Review Runtime** — reviewer Hand role and the auto-spawn review/repair loop with cycle caps, layered on top of the shipped lifecycle + IRC backbone
 - **Atlas as Primary Director Agent** — formalize a single user-facing Director that delegates through Heads to Hands; align UI copy and delegation traces
 - **Hand lifecycle ownership** — runtime reaps Hands on spark close (SIGTERM/SIGKILL), watchdog for stale processes, and a Hands panel that joins (spark_status, assignment.active, process_alive) for truthful state
 - **Build & test health** — restore `cargo test -p data` after `NewSpark` field additions
