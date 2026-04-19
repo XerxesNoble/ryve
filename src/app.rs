@@ -5332,8 +5332,14 @@ impl App {
                     // the real .ryve/sparks.db and the full git tree.
                     Ok(workshop_dir.clone())
                 } else {
-                    workshop::create_hand_worktree(&workshop_dir, &ryve_dir, &session_id, &actor)
-                        .await
+                    workshop::create_hand_worktree(
+                        &workshop_dir,
+                        &ryve_dir,
+                        &session_id,
+                        &actor,
+                        None,
+                    )
+                    .await
                 };
                 let system_prompt = match &prompt_flag {
                     Some((flag, is_file)) => {
