@@ -229,6 +229,20 @@ These hold for **every** Head, regardless of archetype:
   bond-discipline failure by the Head, not a merge-time problem.
   The canonical rule lives in `BOND_DISCIPLINE` in
   `src/agent_prompts.rs`.
+- **Chat-of-record.** Every Head (and the Hands it spawns) posts to
+  its epic's IRC channel (`#epic-<epic_id>-<slug>`) at five mandatory
+  boundaries: **claim**, **design-pick**, **block**, **commit**, and
+  **handoff**. Atlas mirrors the same discipline on the workshop-wide
+  `#atlas` channel (boot / route / design-pick / block / handoff).
+  Posts go through `ryve post --channel <name> <body>`; prior context
+  is read back with `ryve channel tail --channel <name>
+  [--since <rfc3339>] [--limit <N>] [--author <actor>]`. The on-close
+  path is **tool-gated**, not prompt-only: `ryve spark close` /
+  `ryve assign close` refuse an assignment with zero chat-of-record
+  posts since claim (epic `ryve-12f09190`). The canonical prompt
+  blocks live in `CHAT_OF_RECORD` and `ATLAS_CHAT_OF_RECORD` in
+  `src/agent_prompts.rs`; see `RYVE.md` § Chat-of-record for the
+  house-rules summary and example invocations.
 
 ---
 

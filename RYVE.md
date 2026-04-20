@@ -132,6 +132,14 @@ ryve ember send <type> <content>        # type: glow | flash | flare | blaze | a
 ryve ember sweep                        # clean up expired
 ```
 
+### Chat-of-record (post + channel tail)
+```sh
+ryve post --channel <name> <body>                                      # write one chat-of-record line
+ryve channel tail --channel <name> [--since <ts>] [--limit <N>] [--author <actor_id>]
+```
+
+The full contract — mandatory posting boundaries, channel naming, tool-gated on-close enforcement — lives in the **Chat-of-record** section below. Epic `ryve-12f09190`.
+
 ### Commits
 ```sh
 ryve commit link <spark-id> <hash>      # link a commit to a spark
@@ -186,6 +194,70 @@ The Merger integrates child branches sequentially onto the epic branch and canno
 ## Merger isolation
 
 The Merger NEVER changes the branch checked out in the workshop root. All merge work happens in a dedicated worktree created with `git worktree add .ryve/worktrees/merge-<crew-id> -b crew/<crew-id> origin/main`. Forbidden in the workshop root: `git checkout`, `git switch`, `git pull`, `git reset --hard`. Fetches are fine — they don't move HEAD.
+
+## Chat-of-record
+
+Every agent in a Ryve workshop writes its intent, plans, design picks, blocks, and hand-offs to an IRC channel that is durably recorded in `irc_messages`. This is the record layer that makes sudden-death recovery, cross-agent context, and Merger read-back possible without manual archaeology. Epic `ryve-12f09190`.
+
+**Channels.**
+- Hands and Heads working on an epic's children post to that epic's channel, `#epic-<epic_id>-<slug>`. Derive the channel from the parent epic id (the canonical form is produced by `ipc::channel_manager::channel_name`; the IRC 50-octet limit truncates long names).
+- Atlas posts to the workshop-wide `#atlas` channel (boot, routing decisions, shutdown).
+
+**Mandatory posting boundaries.** Every agent posts at each of these transitions:
+
+| Boundary    | When                                                             | Example post                                                          |
+|-------------|------------------------------------------------------------------|-----------------------------------------------------------------------|
+| claim       | right after claiming / entering in_progress                      | `claim: starting on <task>; plan is <outline> [sp-xxxx]`              |
+| design-pick | when selecting an approach, library, boundary, or scope split   | `design: chose <A> over <B> because <reason> [sp-xxxx]`               |
+| block       | when stuck on an obstacle, ambiguity, or bond-discipline clash   | `block: tests red on <file>; escalating as <question> [sp-xxxx]`      |
+| commit      | after each non-trivial commit                                    | `commit: wired <feature> into <module> [sp-xxxx]`                     |
+| handoff     | before `ryve spark close` / `ryve assign release`                | `handoff: shipped X/Y; next agent should do Z [sp-xxxx]`              |
+
+Atlas replaces `claim`/`commit` with `boot`/`route` since Atlas never claims sparks or commits code itself.
+
+**On-close enforcement is tool-gated.** `ryve spark close` and `ryve assign close` refuse to close an assignment with zero chat-of-record posts since its claim timestamp. This is not prompt-only rhetoric — the tool bounces the close if the record is empty. Fix it by posting, not by arguing with the prompt.
+
+### Writing: `ryve post`
+
+```sh
+ryve post --channel <name> <body>                            # returns the message id
+ryve post --channel <name> --author <actor_id> <body>         # override the default author
+ryve post --channel <name> --author "" <body>                 # anonymous (human CLI use)
+```
+
+The `--author` default is `$RYVE_HAND_SESSION_ID` when the caller is a spawned Hand, so posts are automatically attributable. The DB write is the durability contract — IRC wire delivery via the outbox relay is best-effort.
+
+Examples:
+
+```sh
+ryve post --channel '#epic-ryve-12f09190-chat-of-record-mandatory-agent' \
+    'claim: starting ryve-73fd1c5f — wiring CHAT_OF_RECORD into archetype prompts [sp-73fd1c5f]'
+
+ryve post --channel '#atlas' \
+    'route: user goal "stabilise release 0.3.0" → build head on ryve-d20d42cb'
+```
+
+### Reading: `ryve channel tail`
+
+```sh
+ryve channel tail --channel <name>                            # default limit=50, from channel start
+ryve channel tail --channel <name> --since <rfc3339-ts>       # incremental read
+ryve channel tail --channel <name> --limit <N>                # up to 1000
+ryve channel tail --channel <name> --author <actor_id>        # filter by author
+```
+
+Add `--json` for machine-readable output (e.g. `ryve --json channel tail --channel <name>`).
+
+Examples:
+
+```sh
+ryve channel tail --channel '#epic-ryve-12f09190-chat-of-record-mandatory-agent' --limit 20
+
+ryve channel tail --channel '#atlas' \
+    --since 2026-04-19T00:00:00Z --author atlas-<prior_session_id>
+```
+
+Post before acting, tail before handing off. Every agent reads the channel on claim to inherit prior context and posts on handoff so the next one can resume.
 
 ## Common workflows
 
