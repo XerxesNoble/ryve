@@ -11,9 +11,19 @@
 //! ## Contract
 //!
 //! - [`post_message`] writes a row to `irc_messages` and returns the row's
-//!   primary key. The database write is the durability contract; IRC wire
-//!   delivery via the outbox relay is best-effort and may no-op when no
-//!   relay is running.
+//!   primary key. The database write is the ENTIRE contract — this
+//!   module does not emit anything on the IRC wire. Agents read each
+//!   other's posts via [`tail`] (DB-backed), not via an IRC client
+//!   subscription.
+//!
+//!   PR #56 Copilot c3: earlier wording described IRC wire delivery as
+//!   "best-effort via the outbox relay". That was aspirational — no
+//!   call here enqueues an outbox row, and no code path in this
+//!   module forwards to an `IrcClient`. IRC-wire emission for
+//!   chat-of-record posts is tracked as a separate 0.4.0 candidate;
+//!   until it lands, channel subscribers on the actual IRC server
+//!   will NOT see chat-of-record posts in real time. Cross-agent
+//!   coordination happens through `ryve channel tail` reading the DB.
 //! - [`tail`] reads `irc_messages` scoped to a channel, optionally
 //!   filtered by `since` / `author`, and caps the result at `limit` rows.
 //!

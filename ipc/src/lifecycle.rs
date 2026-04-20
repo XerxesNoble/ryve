@@ -47,7 +47,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::channel_manager::{self, ATLAS_CHANNEL, ATLAS_SEAT_SPARK_ID, Epic};
-use crate::chat_of_record::{self, NewPost, TAIL_MAX_LIMIT, TailFilter};
+use crate::chat_of_record::{self, NewPost};
 use crate::irc_client::{ConnectConfig, IrcClient, IrcError, IrcMessage, MessageCallback};
 use crate::irc_command_parser::{
     self, CommandExecutor, DispatchOutcome, ExecError, ExecFuture, IrcReplyKind, ReviewDecision,
@@ -426,21 +426,35 @@ fn spawn_relay_loop(
 /// prior Atlas either still holds the seat or crashed without posting
 /// a release; either way the new Atlas must boot as a follower.
 async fn detect_active_seat_claim(pool: &SqlitePool) -> Result<bool, chat_of_record::ChatError> {
-    // Use the chat_of_record tail primitive so the seat scan stays on
-    // the same indexed path as every other #atlas reader. The
-    // chat-of-record epic caps sane windows at TAIL_MAX_LIMIT; for a
-    // single workshop's boot history that's more than enough headroom.
-    let rows = chat_of_record::tail(
-        pool,
-        TailFilter::for_channel(ATLAS_CHANNEL).with_limit(TAIL_MAX_LIMIT),
+    // PR #56 Copilot c1: the earlier implementation read the last
+    // TAIL_MAX_LIMIT (1000) rows of #atlas via chat_of_record::tail.
+    // On a long-running workshop #atlas will exceed 1000 rows of
+    // routing chatter; a still-unreleased seat-claim marker can scroll
+    // out of that window and a fresh Atlas boots as Primary while the
+    // prior seat-holder is still alive.
+    //
+    // Fix: filter the scan to rows whose body starts with
+    // `"atlas "` (the only shape the parsers recognise) via a
+    // dedicated SQL query. That skips all unrelated #atlas traffic so
+    // a 1000-row cap on the filtered slice really is "every seat
+    // event in history" for plausible workshop lifetimes. Still
+    // bounded in case something gets wedged.
+    let filtered: Vec<(String,)> = sqlx::query_as(
+        "SELECT raw_text FROM irc_messages \
+         WHERE channel = ? \
+           AND raw_text LIKE 'atlas %' \
+         ORDER BY id ASC \
+         LIMIT 5000",
     )
+    .bind(ATLAS_CHANNEL)
+    .fetch_all(pool)
     .await?;
 
     let mut outstanding: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for row in rows {
-        if let Some(id) = parse_atlas_online_instance_id(&row.raw_text) {
+    for (raw_text,) in filtered {
+        if let Some(id) = parse_atlas_online_instance_id(&raw_text) {
             outstanding.insert(id);
-        } else if let Some(id) = parse_atlas_offline_instance_id(&row.raw_text) {
+        } else if let Some(id) = parse_atlas_offline_instance_id(&raw_text) {
             outstanding.remove(&id);
         }
     }
