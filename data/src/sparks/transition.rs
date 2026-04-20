@@ -32,7 +32,7 @@
 //! | Rejected → InRepair             | Hand                          |
 //! | InRepair → AwaitingReview       | Hand                          |
 //! | Approved → ReadyForMerge        | MergeHand (auto)              |
-//! | ReadyForMerge → Merged          | MergeHand                     |
+//! | ReadyForMerge → Merged          | MergeHand (no override)       |
 //! | InProgress → Stuck              | Hand, Head, Director          |
 //! | AwaitingReview → Stuck          | Hand, Head, Director          |
 //! | InRepair → Stuck                | Hand, Head, Director          |
@@ -55,6 +55,15 @@
 //!    closed here. Conflict ownership belongs to the Merge Hand by
 //!    contract; letting an orchestrator bypass that ownership would
 //!    invalidate the hand-back protocol.
+//!
+//! The `ReadyForMerge → Merged` edge follows the same lockdown: the
+//! Merge-Hand contract ([spark ryve-476ef264]) names Merge Hand as the
+//! ONLY actor permitted to mark an Assignment merged, so that rule also
+//! carries `allows_override = false`. There is no Head/Director shortcut
+//! to "merged" — the only way an Assignment reaches [`AssignmentPhase::Merged`]
+//! is through a MergeHand-emitted transition (prefer the
+//! [`mark_assignment_merged`] wrapper below to avoid stamping a wrong
+//! actor role by accident).
 //! 2. **The reason must be `"conflict"`.** Callers go through
 //!    [`transition_assignment_phase_with_reason`] (or the convenience
 //!    wrapper [`reject_approved_for_conflict`]) which pins the reason
@@ -185,11 +194,17 @@ const LEGAL_TRANSITIONS: &[TransitionRule] = &[
         authorized_roles: &[TransitionActorRole::MergeHand],
         allows_override: true,
     },
+    // Merged transition: Merge-Hand contract ([spark ryve-476ef264 /
+    // sp-9f6b0c96]) names Merge Hand as the ONLY actor permitted to mark
+    // an Assignment merged. The rule pins the authorized role to
+    // MergeHand and disables the Head/Director override path (same
+    // lockdown as the Approved → Rejected conflict handoff) so the
+    // ownership invariant holds even against orchestrator-driven calls.
     TransitionRule {
         from: AssignmentPhase::ReadyForMerge,
         to: AssignmentPhase::Merged,
         authorized_roles: &[TransitionActorRole::MergeHand],
-        allows_override: true,
+        allows_override: false,
     },
     // Stuck entry paths: a Hand reports itself stuck from any active
     // working phase. Head/Director can also drive these transitions via
@@ -465,6 +480,39 @@ pub async fn reject_approved_for_conflict(
             event_version,
             reason: REASON_CONFLICT,
         },
+    )
+    .await
+}
+
+/// Drive the Merged transition `ReadyForMerge → Merged` on
+/// `assignment_id`, pinning the actor role to
+/// [`TransitionActorRole::MergeHand`]. Callers (the Merge-Hand
+/// Epic→main merge path today, and the spawn-path consumers in the
+/// sibling wrappers) should prefer this wrapper to the raw
+/// [`transition_assignment_phase`] so they cannot stamp a non-MergeHand
+/// role by accident: the legal-transition map already refuses a
+/// non-MergeHand call with
+/// `allows_override = false`, but this wrapper makes the invariant
+/// explicit at the call site and keeps Epic-merge callers symmetrical
+/// with [`reject_approved_for_conflict`].
+///
+/// Spark sp-9f6b0c96 / [sp-476ef264]: the Merge Hand is the ONLY actor
+/// permitted to transition an Assignment to
+/// [`AssignmentPhase::Merged`].
+pub async fn mark_assignment_merged(
+    pool: &SqlitePool,
+    assignment_id: i64,
+    actor_id: &str,
+    event_version: i64,
+) -> Result<Assignment, TransitionError> {
+    transition_assignment_phase(
+        pool,
+        assignment_id,
+        actor_id,
+        TransitionActorRole::MergeHand,
+        AssignmentPhase::Merged,
+        AssignmentPhase::ReadyForMerge,
+        event_version,
     )
     .await
 }
@@ -1377,6 +1425,74 @@ mod tests {
             None,
         )
         .expect("reviewer rejection takes no reason here");
+    }
+
+    // ── Merged transition lockdown [sp-9f6b0c96 / sp-476ef264] ─────
+
+    /// Acceptance criterion (3) of spark ryve-9f6b0c96: the Merged
+    /// phase transition is accepted only when emitted by merge_hand.
+    /// Mirror of the Approved→Rejected conflict-handoff role guard.
+    #[test]
+    fn merge_hand_may_drive_ready_for_merge_to_merged() {
+        validate_transition(
+            AssignmentPhase::ReadyForMerge,
+            AssignmentPhase::Merged,
+            AssignmentPhase::ReadyForMerge,
+            TransitionActorRole::MergeHand,
+            false,
+        )
+        .expect("merge_hand must be authorized for ReadyForMerge → Merged");
+    }
+
+    #[test]
+    fn hand_cannot_drive_ready_for_merge_to_merged() {
+        let err = validate_transition(
+            AssignmentPhase::ReadyForMerge,
+            AssignmentPhase::Merged,
+            AssignmentPhase::ReadyForMerge,
+            TransitionActorRole::Hand,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TransitionError::Unauthorized { .. }),
+            "Hand must not take the Merged transition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reviewer_hand_cannot_drive_ready_for_merge_to_merged() {
+        let err = validate_transition(
+            AssignmentPhase::ReadyForMerge,
+            AssignmentPhase::Merged,
+            AssignmentPhase::ReadyForMerge,
+            TransitionActorRole::ReviewerHand,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TransitionError::Unauthorized { .. }));
+    }
+
+    /// The Merged transition is merge-hand exclusive by contract — even
+    /// a Head/Director override MUST NOT bypass the role check. The
+    /// rule's `allows_override = false` flag is what enforces this.
+    #[test]
+    fn head_and_director_cannot_override_ready_for_merge_to_merged() {
+        for role in &[TransitionActorRole::Head, TransitionActorRole::Director] {
+            let err = validate_transition(
+                AssignmentPhase::ReadyForMerge,
+                AssignmentPhase::Merged,
+                AssignmentPhase::ReadyForMerge,
+                *role,
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TransitionError::Unauthorized { .. }),
+                "{role:?} override must not bypass ReadyForMerge → Merged, \
+                 got {err:?}"
+            );
+        }
     }
 
     // ── Stuck-origin validation ─────────────────────────
