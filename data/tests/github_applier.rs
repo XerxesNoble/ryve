@@ -210,14 +210,21 @@ async fn applier_drives_full_lifecycle(pool: sqlx::SqlitePool) {
         outcomes[3],
     );
 
-    // 5. CheckRunStatus on Approved → illegal transition Err.
+    // 5. CheckRunStatus on Approved → validator refuses.
+    // The `Approved → Rejected` edge exists (for the MergeHand conflict
+    // handoff, spark sp-086a4432) but is gated to MergeHand-only, so a
+    // ReviewerHand-driven CI-failure rejection is `Unauthorized`. Either
+    // refusal variant is acceptable — what matters is that the applier
+    // blocks the transition and emits the illegal-transition warning.
     let err = outcomes[4].as_ref().unwrap_err();
     assert!(
         matches!(
             err,
-            data::github::ApplyError::Transition(TransitionError::IllegalTransition { .. }),
+            data::github::ApplyError::Transition(
+                TransitionError::IllegalTransition { .. } | TransitionError::Unauthorized { .. }
+            ),
         ),
-        "step 5 should be IllegalTransition, got {err:?}",
+        "step 5 should be a refusal (IllegalTransition or Unauthorized), got {err:?}",
     );
 
     // 6. PrMerged → ReadyForMerge → Merged on the MergeHand.

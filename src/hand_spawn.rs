@@ -384,6 +384,24 @@ impl CriterionStatus {
     }
 }
 
+/// Per-sub-PR conflict record collected by [`check_merge_preconditions`].
+/// Populated only when the env probe reports `CriterionStatus::Fail` on a
+/// specific PR, so the Merge-Hand spawn path can drive the corresponding
+/// Assignment through the conflict-handoff transition
+/// (`Approved → Rejected`, reason=conflict) without re-running the probe.
+/// Spark sp-086a4432.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConflictingSubPr {
+    /// Child spark whose Assignment owns the conflicting sub-PR.
+    pub spark_id: String,
+    /// GitHub PR number — surfaced so the outbox payload and log lines
+    /// stay clickable.
+    pub pr_number: i64,
+    /// Free-form explanation the env probe returned. Fed verbatim into
+    /// the outbox so operators see the same text the probe reported.
+    pub reason: String,
+}
+
 /// Structured pass / fail report produced by [`check_merge_preconditions`].
 /// The four criterion fields map 1:1 to the Merge-Hand contract; the
 /// [`Self::is_pass`] predicate is the gate the spawn path consults.
@@ -410,6 +428,12 @@ pub struct MergePreconditionReport {
     /// A single stuck Assignment anywhere in the epic blocks the
     /// merge — no partial merges.
     pub stuck: CriterionStatus,
+    /// Per-spark breakdown of the conflicts found by the env probe.
+    /// Empty unless `conflicts.is_fail()`; populated in the same stable
+    /// order the probe walked the children so the handoff path is
+    /// deterministic. Spark sp-086a4432.
+    #[serde(default)]
+    pub conflicting_sparks: Vec<ConflictingSubPr>,
 }
 
 impl MergePreconditionReport {
@@ -676,6 +700,12 @@ pub async fn check_merge_preconditions(
     // configured" short-circuits on no PRs at all). Otherwise we iterate
     // each sub-PR and fold failures; the first env-level Fail wins the
     // criterion but its reason string enumerates every offending PR.
+    //
+    // `conflicting_sparks` accumulates per-spark detail from the env
+    // probe so the spawn path can drive the conflict-handoff transition
+    // (`Approved → Rejected`, reason=conflict) on each offending child
+    // without re-running the probe. Spark sp-086a4432.
+    let mut conflicting_sparks: Vec<ConflictingSubPr> = Vec::new();
     let (conflicts, ci) = if sub_pr_numbers.is_empty() {
         (
             CriterionStatus::NotApplicable {
@@ -698,6 +728,14 @@ pub async fn check_merge_preconditions(
                 CriterionStatus::Fail { reason } => {
                     conflict_all_na = false;
                     conflict_fails.push(format!("{spark_id} (PR #{pr}): {reason}"));
+                    // Capture per-spark detail so the spawn path can
+                    // drive the conflict-handoff transition without
+                    // having to re-run the env probe. Spark sp-086a4432.
+                    conflicting_sparks.push(ConflictingSubPr {
+                        spark_id: spark_id.clone(),
+                        pr_number: *pr,
+                        reason,
+                    });
                 }
             }
             match env.ci_status_for_pr(*pr).await {
@@ -745,6 +783,7 @@ pub async fn check_merge_preconditions(
         conflicts,
         ci,
         stuck: stuck_status,
+        conflicting_sparks,
     })
 }
 
@@ -811,6 +850,80 @@ pub(crate) async fn emit_merge_precondition_failure(
     .map_err(|e| HandSpawnError::Sparks(data::sparks::SparksError::Database(e)))?;
 
     Ok(event_id)
+}
+
+/// Actor id stamped on phase-change events the Merge-Hand preflight emits
+/// when driving the conflict-handoff transition. Stable so downstream
+/// replay / audit code can filter handoffs initiated by the spawn gate
+/// (as opposed to an in-flight Merge Hand that has already claimed the
+/// merge spark). Paired with the `merge_hand_preflight` actor id used by
+/// [`emit_merge_precondition_failure`] on the outbox row. Spark
+/// sp-086a4432.
+pub(crate) const MERGE_HAND_PRECONDITION_ACTOR: &str = "merge_hand_preflight";
+
+/// Drive the conflict-handoff transition on every conflicting sub-PR the
+/// precondition checker surfaced. Each child Assignment currently in the
+/// `Approved` phase is advanced to `Rejected` with reason=`conflict` via
+/// [`data::sparks::transition::reject_approved_for_conflict`], which
+/// records a phase-change event and bumps `assignment_phase` back to the
+/// repair loop.
+///
+/// Assignments not in `Approved` (already Rejected, still AwaitingReview,
+/// Stuck, …) are skipped. Idempotent in that sense: re-running a failed
+/// spawn attempt whose first run already handed the conflict back will
+/// find the Assignment in `Rejected` and take no action.
+///
+/// The helper is intentionally non-transactional across Assignments — a
+/// transient error on one spark's transition propagates immediately so
+/// the caller sees the failure and can retry; already-applied handoffs
+/// stay in place rather than being rolled back.
+///
+/// Spark sp-086a4432: enforces the Merge-Hand contract that conflict
+/// resolution is always delegated back to the originating Assignment
+/// rather than resolved in-place by the Merge Hand.
+pub(crate) async fn handoff_conflicts_to_assignments(
+    pool: &SqlitePool,
+    report: &MergePreconditionReport,
+) -> Result<(), HandSpawnError> {
+    use data::sparks::types::AssignmentPhase;
+    use data::sparks::{assign_repo, transition};
+
+    for conflict in &report.conflicting_sparks {
+        let assignment =
+            match assign_repo::latest_assignment_for_spark(pool, &conflict.spark_id).await {
+                Ok(a) => a,
+                // A conflict surfaced against a sub-PR whose owning
+                // Assignment has vanished is already handled elsewhere
+                // (the approvals criterion flags "missing assignment"
+                // paths). Nothing to hand back here.
+                Err(data::sparks::SparksError::NotFound(_)) => continue,
+                Err(e) => return Err(HandSpawnError::Sparks(e)),
+            };
+
+        // Only Assignments currently in Approved are eligible for the
+        // Approved → Rejected handoff. Anything else (already Rejected,
+        // InRepair, Stuck, …) is left alone so we don't double-emit or
+        // trip the validator's phase-mismatch guard.
+        let current_phase = assignment
+            .assignment_phase
+            .as_deref()
+            .and_then(AssignmentPhase::from_str);
+        if current_phase != Some(AssignmentPhase::Approved) {
+            continue;
+        }
+
+        let next_version = assignment.event_version.saturating_add(1);
+        transition::reject_approved_for_conflict(
+            pool,
+            assignment.id,
+            MERGE_HAND_PRECONDITION_ACTOR,
+            next_version,
+        )
+        .await
+        .map_err(|e| HandSpawnError::Sparks(data::sparks::SparksError::Transition(e)))?;
+    }
+
+    Ok(())
 }
 
 /// Run a subprocess under a streaming-heartbeat wrapper so long silent
@@ -1219,6 +1332,21 @@ pub async fn spawn_hand(
         let env = NoopMergePreconditionEnv;
         let report = check_merge_preconditions(pool, spark_id, &env).await?;
         if !report.is_pass() {
+            // Conflict handoff (spark sp-086a4432). For every sub-PR the
+            // env probe flagged with a conflict, drive the owning
+            // Assignment `Approved → Rejected` (reason=conflict) via the
+            // transition validator. The Merge Hand never resolves the
+            // conflict in-place — it hands the failure back so the
+            // originating Hand re-enters the repair loop. Driving the
+            // transition here (before the blocker-raised outbox row)
+            // means operators observing IRC see "assignment rejected
+            // for conflict" ahead of "merge-hand preflight failed".
+            //
+            // On a transition error (a race where the Assignment is no
+            // longer Approved, or a DB failure) we surface it to the
+            // caller instead of swallowing it so the outbox row doesn't
+            // lie about what the spawn path actually did.
+            handoff_conflicts_to_assignments(pool, &report).await?;
             emit_merge_precondition_failure(pool, &report).await?;
             return Err(HandSpawnError::MergePreconditionsFailed {
                 report: Box::new(report),
@@ -4582,6 +4710,7 @@ mod run_with_stream_heartbeat_tests {
                 conflicts: CriterionStatus::NotApplicable { reason: "_".into() },
                 ci: CriterionStatus::NotApplicable { reason: "_".into() },
                 stuck: CriterionStatus::Pass,
+                conflicting_sparks: Vec::new(),
             };
             assert!(r.is_pass(), "no failures → pass");
 
@@ -4605,6 +4734,7 @@ mod run_with_stream_heartbeat_tests {
                 stuck: CriterionStatus::Fail {
                     reason: "s-bad".into(),
                 },
+                conflicting_sparks: Vec::new(),
             };
             let fails = r.failing();
             assert_eq!(fails.len(), 3);
@@ -4977,6 +5107,252 @@ mod run_with_stream_heartbeat_tests {
             .await
             .unwrap();
             assert_eq!(outbox, 1, "exactly one outbox row per refused spawn");
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ── Conflict handoff [sp-086a4432] ──────────────────────
+
+        /// The merge-hand spawn path must drive the originating
+        /// Assignment back to `Rejected` with reason=conflict when a
+        /// sub-PR merge-conflict probe fails. The in-place conflict
+        /// ownership rule — "Merge Hand never resolves conflicts
+        /// in-place" — hinges on this transition firing.
+        #[tokio::test]
+        async fn conflicting_sub_pr_drives_handoff_transition_and_refuses_spawn() {
+            use crate::hand_spawn::MERGE_HAND_PRECONDITION_ACTOR;
+
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "conflict epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let child = seed_spark(&pool, &wid, "child", SparkType::Task, Some(&epic)).await;
+            seed_assignment(&pool, &child, "actor-author-1", AssignmentPhase::Approved).await;
+            sqlx::query(
+                "UPDATE assignments SET github_artifact_pr_number = 101, \
+                 github_artifact_branch = 'hand/author-1' WHERE spark_id = ?",
+            )
+            .bind(&child)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            // Wire a real (stubbed) env that reports a conflict for the
+            // child's PR. The merge-hand spawn path must observe the
+            // failure, hand the conflict back to the child's Assignment
+            // via the transition validator, and refuse the spawn. The
+            // production spawn path uses `NoopMergePreconditionEnv`, so
+            // we exercise the handoff helper directly from the report
+            // the stub env produced — matching the behaviour of
+            // `spawn_hand` once a real env probe is wired.
+            let env = FixedEnv {
+                conflicts: CriterionStatus::Fail {
+                    reason: "has conflict with epic branch".into(),
+                },
+                ci: CriterionStatus::Pass,
+            };
+            let report = check_merge_preconditions(&pool, &merge, &env)
+                .await
+                .unwrap();
+            assert!(!report.is_pass());
+            assert_eq!(
+                report.conflicting_sparks.len(),
+                1,
+                "checker must surface the offending sub-PR as structured data: {:?}",
+                report.conflicting_sparks,
+            );
+            assert_eq!(report.conflicting_sparks[0].spark_id, child);
+            assert_eq!(report.conflicting_sparks[0].pr_number, 101);
+
+            crate::hand_spawn::handoff_conflicts_to_assignments(&pool, &report)
+                .await
+                .expect("handoff must succeed for an Approved assignment");
+
+            // The originating Assignment is now Rejected — the Merge
+            // Hand is waiting for the repair loop to cycle it back
+            // through InRepair → AwaitingReview → Approved.
+            let phase: String =
+                sqlx::query_scalar("SELECT assignment_phase FROM assignments WHERE spark_id = ?")
+                    .bind(&child)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                phase, "rejected",
+                "conflict handoff must drive the Assignment back to Rejected"
+            );
+
+            // The phase-change event carries reason=conflict and the
+            // stable preflight actor id so the audit trail can tell a
+            // Merge-Hand conflict handoff apart from a Reviewer
+            // rejection and from an in-flight Merge Hand's transitions.
+            let (old_value, new_value, reason, actor): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+            ) = sqlx::query_as(
+                "SELECT old_value, new_value, reason, actor FROM events \
+                 WHERE spark_id = ? AND field_name = 'assignment_phase' \
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(&child)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(old_value.as_deref(), Some("approved"));
+            assert_eq!(new_value.as_deref(), Some("rejected"));
+            assert_eq!(
+                reason.as_deref(),
+                Some("conflict"),
+                "reason=conflict must be recorded on the transition event"
+            );
+            assert_eq!(actor, MERGE_HAND_PRECONDITION_ACTOR);
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Non-MergeHand roles are forbidden from driving the
+        /// Approved → Rejected conflict transition. Verified through
+        /// the same transition API the helper uses so a regression in
+        /// the validator blows up here, not just in transition.rs.
+        #[tokio::test]
+        async fn only_merge_hand_may_drive_approved_to_rejected_for_conflict() {
+            use data::sparks::error::TransitionError;
+            use data::sparks::transition;
+            use data::sparks::types::{AssignmentPhase as P, TransitionActorRole as R};
+
+            use crate::hand_spawn::MERGE_HAND_PRECONDITION_ACTOR;
+
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "role-gate epic", SparkType::Epic, None).await;
+            let child = seed_spark(&pool, &wid, "child", SparkType::Task, Some(&epic)).await;
+            seed_assignment(&pool, &child, "actor-author-1", AssignmentPhase::Approved).await;
+            let assignment_id: i64 =
+                sqlx::query_scalar("SELECT id FROM assignments WHERE spark_id = ?")
+                    .bind(&child)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+            // A plain Hand cannot drive the handoff.
+            let err = transition::transition_assignment_phase_with_reason(
+                &pool,
+                transition::PhaseTransitionWithReasonArgs {
+                    assignment_id,
+                    actor_id: "actor-hand-x",
+                    actor_role: R::Hand,
+                    target_phase: P::Rejected,
+                    expected_previous_phase: P::Approved,
+                    event_version: 1,
+                    reason: "conflict",
+                },
+            )
+            .await
+            .expect_err("Hand must be refused");
+            assert!(
+                matches!(err, TransitionError::Unauthorized { .. }),
+                "expected Unauthorized, got {err:?}"
+            );
+
+            // Reviewer cannot either.
+            let err = transition::transition_assignment_phase_with_reason(
+                &pool,
+                transition::PhaseTransitionWithReasonArgs {
+                    assignment_id,
+                    actor_id: "actor-reviewer-x",
+                    actor_role: R::ReviewerHand,
+                    target_phase: P::Rejected,
+                    expected_previous_phase: P::Approved,
+                    event_version: 1,
+                    reason: "conflict",
+                },
+            )
+            .await
+            .expect_err("Reviewer must be refused");
+            assert!(matches!(err, TransitionError::Unauthorized { .. }));
+
+            // MergeHand succeeds and stamps reason=conflict on the
+            // event row.
+            let updated = transition::reject_approved_for_conflict(
+                &pool,
+                assignment_id,
+                MERGE_HAND_PRECONDITION_ACTOR,
+                1,
+            )
+            .await
+            .expect("MergeHand conflict handoff must succeed");
+            assert_eq!(updated.assignment_phase.as_deref(), Some("rejected"));
+            assert_eq!(updated.phase_actor_role.as_deref(), Some("merge_hand"));
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// An Assignment already in Rejected must be left alone — the
+        /// handoff helper is idempotent so a re-run after the first
+        /// refused spawn doesn't try to re-transition an Assignment
+        /// that's no longer Approved.
+        #[tokio::test]
+        async fn handoff_skips_assignments_not_currently_approved() {
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "dedup epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let child = seed_spark(&pool, &wid, "child", SparkType::Task, Some(&epic)).await;
+            // Pre-seed the child's Assignment already in Rejected.
+            seed_assignment(&pool, &child, "actor-author-1", AssignmentPhase::Rejected).await;
+
+            let report = MergePreconditionReport {
+                merge_spark_id: merge.clone(),
+                epic_id: epic.clone(),
+                epic_title: "dedup epic".into(),
+                approvals: CriterionStatus::Fail {
+                    reason: "placeholder".into(),
+                },
+                conflicts: CriterionStatus::Fail {
+                    reason: "placeholder".into(),
+                },
+                ci: CriterionStatus::Pass,
+                stuck: CriterionStatus::Pass,
+                conflicting_sparks: vec![crate::hand_spawn::ConflictingSubPr {
+                    spark_id: child.clone(),
+                    pr_number: 777,
+                    reason: "probe reported a conflict".into(),
+                }],
+            };
+
+            crate::hand_spawn::handoff_conflicts_to_assignments(&pool, &report)
+                .await
+                .expect("handoff must no-op when the assignment is already rejected");
+
+            // Phase must remain Rejected — and no new events should
+            // have been recorded for this spark.
+            let phase: String =
+                sqlx::query_scalar("SELECT assignment_phase FROM assignments WHERE spark_id = ?")
+                    .bind(&child)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(phase, "rejected");
+
+            // Only the initial `create_assignment` event should exist —
+            // no subsequent transition was attempted. `seed_assignment`
+            // writes one event on creation (old_value=NULL,
+            // new_value=assigned) and then force-updates the phase via
+            // a direct UPDATE that skips the event log.
+            let extra_events: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM events WHERE spark_id = ? \
+                 AND field_name = 'assignment_phase' AND old_value IS NOT NULL",
+            )
+            .bind(&child)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                extra_events, 0,
+                "already-rejected assignment must not be re-transitioned"
+            );
 
             let _ = std::fs::remove_dir_all(&base);
         }

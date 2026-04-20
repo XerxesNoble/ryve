@@ -577,6 +577,162 @@ async fn hand_cannot_self_transition_to_stuck(pool: sqlx::SqlitePool) {
     assert_eq!(outbox_count, 0, "rejected request must not emit outbox row");
 }
 
+// ── Conflict handoff (Approved → Rejected) [sp-086a4432] ───────
+
+/// Walk the assignment into `Approved` so the conflict-handoff tests
+/// can drive the `Approved → Rejected` edge in isolation. Returns the
+/// assignment's integer primary key and the final `event_version` so
+/// callers know what to pass next.
+async fn walk_to_approved(pool: &sqlx::SqlitePool) -> (i64, i64) {
+    let assignment_id = seed_assignment(pool).await;
+    transition::transition_assignment_phase(
+        pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::InProgress,
+        AssignmentPhase::Assigned,
+        1,
+    )
+    .await
+    .expect("start work");
+    transition::transition_assignment_phase(
+        pool,
+        assignment_id,
+        "sess-trans-01",
+        TransitionActorRole::Hand,
+        AssignmentPhase::AwaitingReview,
+        AssignmentPhase::InProgress,
+        2,
+    )
+    .await
+    .expect("submit for review");
+    transition::transition_assignment_phase(
+        pool,
+        assignment_id,
+        "actor-reviewer-42",
+        TransitionActorRole::ReviewerHand,
+        AssignmentPhase::Approved,
+        AssignmentPhase::AwaitingReview,
+        3,
+    )
+    .await
+    .expect("reviewer approves");
+    (assignment_id, 3)
+}
+
+#[sqlx::test]
+async fn merge_hand_can_reject_approved_for_conflict(pool: sqlx::SqlitePool) {
+    let (assignment_id, version) = walk_to_approved(&pool).await;
+
+    let updated = transition::reject_approved_for_conflict(
+        &pool,
+        assignment_id,
+        "merge_hand_preflight",
+        version + 1,
+    )
+    .await
+    .expect("merge_hand conflict handoff must succeed");
+
+    assert_eq!(updated.assignment_phase.as_deref(), Some("rejected"));
+    assert_eq!(updated.phase_actor_role.as_deref(), Some("merge_hand"));
+    assert_eq!(
+        updated.phase_changed_by.as_deref(),
+        Some("merge_hand_preflight")
+    );
+
+    // The emitted phase-change event records reason=conflict so replay
+    // + audit consumers can tell a Merge-Hand handoff apart from a
+    // Reviewer rejection.
+    let event_id = updated.phase_event_id.expect("event id recorded");
+    let (old_value, new_value, reason): (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT old_value, new_value, reason FROM events WHERE id = ?")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(old_value.as_deref(), Some("approved"));
+    assert_eq!(new_value.as_deref(), Some("rejected"));
+    assert_eq!(reason.as_deref(), Some("conflict"));
+}
+
+#[sqlx::test]
+async fn hand_cannot_reject_approved_for_conflict(pool: sqlx::SqlitePool) {
+    let (assignment_id, version) = walk_to_approved(&pool).await;
+
+    // Using an actor distinct from the assignment author so we don't
+    // fall through to ReviewerIsAuthor before the role check fires.
+    let err = transition::transition_assignment_phase_with_reason(
+        &pool,
+        transition::PhaseTransitionWithReasonArgs {
+            assignment_id,
+            actor_id: "actor-rogue",
+            actor_role: TransitionActorRole::Hand,
+            target_phase: AssignmentPhase::Rejected,
+            expected_previous_phase: AssignmentPhase::Approved,
+            event_version: version + 1,
+            reason: "conflict",
+        },
+    )
+    .await
+    .expect_err("Hand must not drive the handoff");
+    match err {
+        data::sparks::error::TransitionError::Unauthorized { role, from, to, .. } => {
+            assert_eq!(role, "hand");
+            assert_eq!(from, "approved");
+            assert_eq!(to, "rejected");
+        }
+        other => panic!("expected Unauthorized, got {other:?}"),
+    }
+
+    let phase =
+        sqlx::query_scalar::<_, String>("SELECT assignment_phase FROM assignments WHERE id = ?")
+            .bind(assignment_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        phase, "approved",
+        "refused transition must not mutate state"
+    );
+}
+
+#[sqlx::test]
+async fn approved_to_rejected_requires_conflict_reason(pool: sqlx::SqlitePool) {
+    let (assignment_id, version) = walk_to_approved(&pool).await;
+
+    // A MergeHand passing the wrong reason must be refused — the
+    // reason=conflict tag is the semantic contract for this edge.
+    let err = transition::transition_assignment_phase_with_reason(
+        &pool,
+        transition::PhaseTransitionWithReasonArgs {
+            assignment_id,
+            actor_id: "merge_hand_preflight",
+            actor_role: TransitionActorRole::MergeHand,
+            target_phase: AssignmentPhase::Rejected,
+            expected_previous_phase: AssignmentPhase::Approved,
+            event_version: version + 1,
+            reason: "other-reason",
+        },
+    )
+    .await
+    .expect_err("wrong reason must be refused");
+    assert!(matches!(
+        err,
+        data::sparks::error::TransitionError::InvalidReason { .. }
+    ));
+
+    // Phase must remain Approved — the transition aborted before any
+    // UPDATE landed.
+    let phase =
+        sqlx::query_scalar::<_, String>("SELECT assignment_phase FROM assignments WHERE id = ?")
+            .bind(assignment_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "approved");
+}
+
 /// A Head/Director override is allowed to drive the Stuck transition
 /// directly. This covers the recovery/override path named in the parent
 /// epic without needing the watchdog or a repair-cycle breach.
