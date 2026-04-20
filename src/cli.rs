@@ -73,6 +73,10 @@ pub const CLI_COMMANDS: &[&str] = &[
     "backup",
     "backups",
     "restore",
+    "post",
+    "channel",
+    "channels",
+    "mcp",
     "help",
     "--help",
     "-h",
@@ -205,6 +209,9 @@ pub async fn run(args: Vec<String>) {
         "backup" | "backups" => {
             handle_backup(&pool, &workshop_root, &args_clean[2..], json_mode).await
         }
+        "post" => handle_post(&pool, &args_clean[2..], json_mode).await,
+        "channel" | "channels" => handle_channel(&pool, &args_clean[2..], json_mode).await,
+        "mcp" => handle_mcp(&pool, &args_clean[2..], json_mode).await,
         other => {
             eprintln!("error: unknown command '{other}'");
             print_usage();
@@ -323,11 +330,24 @@ fn print_usage() {
     eprintln!("  ember send <type> <content>         Send an ember (flash, flare, blaze)");
     eprintln!("  ember sweep                         Clean up expired embers");
     eprintln!();
+    eprintln!("  post --channel <name> <body>        Post to a channel (chat-of-record)");
+    eprintln!(
+        "  channel tail --channel <name> [--since <iso-ts>] [--limit <N>] [--author <session_id>]"
+    );
+    eprintln!("                                       Read recent channel posts");
+    eprintln!();
+    eprintln!("  mcp list                            List MCP tools registered with the server");
+    eprintln!("  mcp call <tool> <json-input>        Invoke an MCP tool (same paths as the CLI)");
+    eprintln!();
     eprintln!("  event list <spark_id>               List audit trail for a spark");
     eprintln!();
     eprintln!("  assign claim <session_id> <spark_id>  Claim a spark");
     eprintln!("  assign release <session_id> <spark_id>  Release a claim");
     eprintln!("  assign list <spark_id>              Show who owns a spark");
+    eprintln!(
+        "  assign close <session_id> <spark_id>  Complete the assignment; fails if the \
+         session posted no chat-of-record about <spark_id> since claim time"
+    );
     eprintln!(
         "  assign override <session_id> <spark_id> --to in_progress --reason <text>  \
          Recover a stuck assignment (Head/Director only)"
@@ -345,7 +365,7 @@ fn print_usage() {
     eprintln!("  crew status <crew_id> active|merging|completed|abandoned");
     eprintln!();
     eprintln!(
-        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]"
+        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger|merge_hand] [--crew <id>]"
     );
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
@@ -617,6 +637,235 @@ async fn handle_status(pool: &sqlx::SqlitePool, ws_id: &str) {
     );
     println!("Contracts: {} failing/pending", failing.len());
     println!("Constraints: {} defined", constraints.len());
+}
+
+// ── Chat of record (post + channel tail) ────────────
+//
+// Foundation primitives for agent chat-of-record (epic ryve-12f09190).
+// Thin CLI wrappers around `ipc::chat_of_record::post_message` and
+// `ipc::chat_of_record::tail`; the same module also backs the future
+// `chat.post` / `chat.tail` MCP tools.
+//
+// Authorship defaults to `RYVE_HAND_SESSION_ID` when set so Hands spawned
+// by Ryve are automatically attributed without each caller having to
+// remember the flag. Pass `--author <session_id>` to override or `--author
+// ""` for an intentionally anonymous human post.
+//
+// PR #54 Copilot c4: the `--author` value is a Ryve agent_sessions.id
+// (FK target of irc_messages.sender_actor_id). Despite the column name,
+// the field stores a session id (the actor namespace used elsewhere in
+// Ryve — git actor, etc. — is a different concept). User-facing copy
+// uses `<session_id>` to avoid the collision; the column name stays
+// for now to avoid a multi-call-site rename.
+
+async fn handle_post(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    let mut channel: Option<String> = None;
+    let mut author_override: Option<Option<String>> = None;
+    let mut body_parts: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--channel" => {
+                channel = Some(
+                    iter.next()
+                        .cloned()
+                        .unwrap_or_else(|| die("--channel requires a value")),
+                );
+            }
+            "--author" => {
+                let v = iter
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| die("--author requires a value (pass \"\" for anonymous)"));
+                author_override = Some(if v.is_empty() { None } else { Some(v) });
+            }
+            other => body_parts.push(other.to_string()),
+        }
+    }
+
+    let channel = channel.unwrap_or_else(|| die("post requires --channel <name>"));
+    if body_parts.is_empty() {
+        die("post requires a body (positional args after flags)");
+    }
+    let body = body_parts.join(" ");
+
+    // Default authorship: the spawned-Hand session id, so every Hand's
+    // posts are automatically attributable. `--author` overrides (either
+    // to a different session id or to anonymous with "").
+    let author_session_id = match author_override {
+        Some(v) => v,
+        None => std::env::var("RYVE_HAND_SESSION_ID").ok(),
+    };
+
+    match ipc::chat_of_record::post_message(
+        pool,
+        ipc::chat_of_record::NewPost {
+            channel: channel.clone(),
+            body,
+            author_session_id,
+            epic_id: None,
+        },
+    )
+    .await
+    {
+        Ok(id) => {
+            if json_mode {
+                println!("{}", serde_json::json!({ "id": id, "channel": channel }));
+            } else {
+                println!("{id}");
+            }
+        }
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+async fn handle_channel(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("channel subcommand required (tail)");
+    }
+    match args[0].as_str() {
+        "tail" => handle_channel_tail(pool, &args[1..], json_mode).await,
+        other => die(&format!(
+            "unknown channel subcommand '{other}' (expected: tail)"
+        )),
+    }
+}
+
+async fn handle_channel_tail(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    let mut channel: Option<String> = None;
+    let mut since: Option<String> = None;
+    let mut author: Option<String> = None;
+    let mut limit: i64 = ipc::chat_of_record::TAIL_DEFAULT_LIMIT;
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--channel" => {
+                channel = Some(
+                    iter.next()
+                        .cloned()
+                        .unwrap_or_else(|| die("--channel requires a value")),
+                );
+            }
+            "--since" => {
+                since = Some(
+                    iter.next()
+                        .cloned()
+                        .unwrap_or_else(|| die("--since requires an RFC-3339 timestamp")),
+                );
+            }
+            "--limit" => {
+                let v = iter
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| die("--limit requires a value"));
+                limit = v
+                    .parse::<i64>()
+                    .unwrap_or_else(|_| die(&format!("--limit must be an integer, got {v:?}")));
+            }
+            "--author" => {
+                author = Some(
+                    iter.next()
+                        .cloned()
+                        .unwrap_or_else(|| die("--author requires a value")),
+                );
+            }
+            other => die(&format!("unknown channel tail flag '{other}'")),
+        }
+    }
+
+    let channel = channel.unwrap_or_else(|| die("channel tail requires --channel <name>"));
+    let filter = ipc::chat_of_record::TailFilter::for_channel(channel)
+        .with_since(since)
+        .with_limit(limit)
+        .with_author(author);
+
+    match ipc::chat_of_record::tail(pool, filter).await {
+        Ok(rows) => {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rows).unwrap_or_default()
+                );
+            } else {
+                for m in &rows {
+                    println!(
+                        "[{}] {} {}: {}",
+                        m.created_at,
+                        m.channel,
+                        m.sender_actor_id.as_deref().unwrap_or("-"),
+                        m.raw_text
+                    );
+                }
+            }
+        }
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+// ── MCP tool server ─────────────────────────────────
+//
+// CLI bridge into the in-process MCP tool registry. `ryve mcp list`
+// prints the registered tools (name + description + schemas) and
+// `ryve mcp call <name> <json>` invokes one — giving humans and
+// scripts a shell-visible proof that the registry and dispatcher are
+// wired to the same code paths the MCP transport will use.
+
+async fn handle_mcp(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("mcp subcommand required (list | call)");
+    }
+    match args[0].as_str() {
+        "list" => handle_mcp_list(json_mode),
+        "call" => handle_mcp_call(pool, &args[1..], json_mode).await,
+        other => die(&format!(
+            "unknown mcp subcommand '{other}' (expected: list | call)"
+        )),
+    }
+}
+
+fn handle_mcp_list(json_mode: bool) {
+    let tools = crate::mcp::all_tools();
+    if json_mode {
+        let rendered: Vec<_> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                    "output_schema": t.output_schema,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rendered).unwrap_or_default()
+        );
+    } else {
+        for t in &tools {
+            println!("{}\t{}", t.name, t.description);
+        }
+    }
+}
+
+async fn handle_mcp_call(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.len() < 2 {
+        die("mcp call requires <tool-name> <json-input>");
+    }
+    let name = &args[0];
+    let input: serde_json::Value =
+        serde_json::from_str(&args[1]).unwrap_or_else(|e| die(&format!("invalid JSON input: {e}")));
+
+    match crate::mcp::call_tool(pool, name, input).await {
+        Ok(out) => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            } else {
+                println!("{out}");
+            }
+        }
+        Err(e) => die(&format!("{e}")),
+    }
 }
 
 // ── Hot ──────────────────────────────────────────────
@@ -1972,7 +2221,7 @@ async fn handle_event(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool)
 
 async fn handle_assignment(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
     if args.is_empty() {
-        die("assign subcommand required (claim, release, list, override)");
+        die("assign subcommand required (claim, release, close, list, override)");
     }
     match args[0].as_str() {
         "claim" => {
@@ -2000,6 +2249,12 @@ async fn handle_assignment(pool: &sqlx::SqlitePool, args: &[String], json_mode: 
                 Err(e) => die(&format!("{e}")),
             }
         }
+        "close" => {
+            if args.len() < 3 {
+                die("assign close requires <session_id> <spark_id>");
+            }
+            handle_assignment_close(pool, &args[1], &args[2], json_mode).await;
+        }
         "list" | "ls" => {
             if args.len() < 2 {
                 die("assign list requires <spark_id>");
@@ -2021,6 +2276,94 @@ async fn handle_assignment(pool: &sqlx::SqlitePool, args: &[String], json_mode: 
         }
         "override" => handle_assignment_override(pool, &args[1..], json_mode).await,
         other => die(&format!("unknown assign subcommand '{other}'")),
+    }
+}
+
+/// Handle `ryve assign close <session_id> <spark_id>`.
+///
+/// Completes the Hand's active assignment after enforcing the mandatory
+/// "on handoff" chat-of-record boundary defined on epic ryve-12f09190:
+/// the session must have posted at least one chat message tagged with
+/// this spark since its claim timestamp, or the close is refused with a
+/// non-zero exit. The gate is DB-gated — it counts `irc_messages` rows
+/// directly, not IRC wire acknowledgements, because a transient IRC
+/// outage must not block assignment closure.
+async fn handle_assignment_close(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    spark_id: &str,
+    json_mode: bool,
+) {
+    // Resolve the active assignment for this (session, spark) pair so we
+    // have an authoritative `assigned_at` cursor. Without it we can't
+    // distinguish "posted during this claim" from "posted on a previous
+    // claim then released". Completing without an active row would also
+    // be a silent no-op in `assignment_repo::complete`, so catch it here
+    // with a clearer message.
+    let assigned_at: Option<String> = match sqlx::query_scalar::<_, String>(
+        "SELECT assigned_at FROM assignments \
+         WHERE session_id = ? AND spark_id = ? AND status = 'active' \
+         ORDER BY assigned_at DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(spark_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => die(&format!("assign close: failed to look up assignment: {e}")),
+    };
+
+    let assigned_at = assigned_at.unwrap_or_else(|| {
+        die(&format!(
+            "assign close: no active assignment for session {session_id} on {spark_id}"
+        ))
+    });
+
+    let count = match ipc::chat_of_record::count_posts_since_claim(
+        pool,
+        session_id,
+        spark_id,
+        &assigned_at,
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => die(&format!("assign close: count query failed: {e}")),
+    };
+
+    if count == 0 {
+        // Non-zero exit with a one-liner pointing the agent at the
+        // exact command + the mandatory-post boundary it missed.
+        let hint = format!(
+            "assign close refused: session {session_id} has zero chat-of-record posts for \
+             {spark_id} since claim at {assigned_at}. Post the \"on handoff\" mandatory \
+             line before closing, e.g. `ryve post --channel <epic-channel> 'stopping at \
+             <state>, next step is <x>'` (epic ryve-12f09190 mandatory-post boundaries)."
+        );
+        die(&hint);
+    }
+
+    if let Err(e) = assignment_repo::complete(pool, session_id, spark_id).await {
+        die(&format!("assign close: failed to complete assignment: {e}"));
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "closed",
+                "session_id": session_id,
+                "spark_id": spark_id,
+                "posts_counted": count,
+                "since": assigned_at,
+            })
+        );
+    } else {
+        println!(
+            "assign closed: {spark_id} by {session_id} ({count} chat-of-record post{} since {assigned_at})",
+            if count == 1 { "" } else { "s" }
+        );
     }
 }
 
@@ -2580,7 +2923,7 @@ async fn handle_hand(
             }
             if args.len() < 2 {
                 die(
-                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
+                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger|merge_hand] [--crew <id>]. Try `ryve hand spawn --help`.",
                 );
             }
             let spark_id = args[1].clone();
@@ -2621,8 +2964,9 @@ async fn handle_hand(
                                 | "perf_engineer"
                                 | "perf-engineer" => HandKind::PerformanceEngineer,
                                 "merger" => HandKind::Merger,
+                                "merge_hand" | "merge-hand" => HandKind::MergeHand,
                                 other => die(&format!(
-                                    "invalid role '{other}' (owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger)"
+                                    "invalid role '{other}' (owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger|merge_hand)"
                                 )),
                             };
                         }
@@ -2947,7 +3291,7 @@ worktree under `.ryve/worktrees/<short>/` on branch `hand/<short>`. Hands
 are the only layer that edits code.
 
 USAGE:
-  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]
+  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger|merge_hand] [--crew <id>]
   ryve hand list
   ryve hand --help
   ryve hand spawn --help
@@ -2993,6 +3337,11 @@ ROLES:
   merger            Crew integrator. Collects sibling worktrees, merges them
                     into a single `crew/<id>` branch, and opens one PR.
                     Requires --crew.
+  merge_hand        Next-generation integrator role (skeleton — spark
+                    ryve-10c8baee [sp-476ef264]). Distinct from the existing
+                    Merger; sibling sparks build real behaviour on top of
+                    this plumbing. Requires --crew. The existing Merger role
+                    and its gradual-rollout semantics remain unchanged.
 
 See also:
   ryve head --help                    Head-specific documentation.
@@ -3018,7 +3367,7 @@ OPTIONS:
   --agent <name>           Coding agent to run (claude, codex, aider,
                            opencode, …). Defaults to the first detected
                            agent on your PATH.
-  --role <role>            owner | head | investigator | architect | reviewer | release_manager | bug_hunter | performance_engineer | merger.
+  --role <role>            owner | head | investigator | architect | reviewer | release_manager | bug_hunter | performance_engineer | merger | merge_hand.
                            Default: owner.
                              owner            — standard worker Hand.
                              head             — crew orchestrator (prefer `ryve head spawn`).
@@ -3032,8 +3381,11 @@ OPTIONS:
                              performance_engineer
                                               — Refactorer+Cartographer hybrid; baseline → profile → propose → verify.
                              merger           — crew integrator (requires --crew).
+                             merge_hand       — next-generation integrator skeleton (requires --crew).
+                                                Distinct from `merger`; sibling sparks build
+                                                real behaviour on top (spark ryve-10c8baee).
   --crew <crew_id>         Attach the new Hand to an existing crew as a
-                           member. Required when --role merger.
+                           member. Required when --role merger or --role merge_hand.
   --author-actor <id>      (--role reviewer) Actor of the Hand whose work is
                            under review. The reviewer is selected to be
                            different from this actor.
@@ -3054,7 +3406,7 @@ EFFECTS:
   1. Creates a git worktree at `.ryve/worktrees/<short>/` on branch
      `hand/<short>`.
   2. Persists an `agent_sessions` row (session_label = hand / head /
-     investigator / architect / release_manager / bug_hunter / performance_engineer / merger)
+     investigator / architect / release_manager / bug_hunter / performance_engineer / merger / merge_hand)
      and a `hand_assignments` row claiming the spark.
   3. If --crew is set, inserts a `crew_members` row.
   4. Writes a role-specific initial prompt under `.ryve/prompts/` and

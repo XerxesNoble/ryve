@@ -21,12 +21,33 @@
 //! channel is harmless). Setting the topic to the same value is a
 //! no-op at the semantic level.
 
+use chrono::Utc;
+use sqlx::SqlitePool;
+
 use crate::irc_client::{IrcClient, IrcError};
 
 /// IRC channel names are capped at 50 octets including the `#` prefix
 /// (RFC 2812 §1.3). Longer names are silently truncated by some servers
 /// and outright rejected by others, so [`channel_name`] clamps itself.
 pub const IRC_MAX_CHANNEL_LEN: usize = 50;
+
+/// Well-known workshop channel for the Atlas Director: boot / shutdown
+/// posts, seat hand-offs, and any future cross-instance coordination the
+/// Director needs a durable record of. Never rotates, never pruned.
+pub const ATLAS_CHANNEL: &str = "#atlas";
+
+/// Stable `sparks.id` used as the `irc_messages.epic_id` FK target for
+/// posts on [`ATLAS_CHANNEL`]. The `#atlas` channel is workshop-wide, not
+/// tied to any single epic, but `irc_messages.epic_id` is `NOT NULL` —
+/// we therefore anchor posts on a sentinel spark that every workshop
+/// creates on first IRC boot via [`ensure_atlas_seat_spark`].
+pub const ATLAS_SEAT_SPARK_ID: &str = "ryve-atlas-seat";
+
+/// Human-readable topic set on [`ATLAS_CHANNEL`]. A constant rather than
+/// a `format!` so repeated boots don't churn the topic with identical
+/// re-sets.
+pub const ATLAS_CHANNEL_TOPIC: &str =
+    "Atlas Director — workshop-wide boot/shutdown log and seat coordination";
 
 /// Identifying fields of an epic used for channel naming. Kept minimal
 /// so call sites that have only an id + name (the renderer, the UI)
@@ -154,6 +175,51 @@ pub async fn register_actor(
 ) -> Result<(), IrcError> {
     let channel = channel_name(epic);
     client.join(&channel).await?;
+    Ok(())
+}
+
+/// Idempotently insert the sentinel `sparks` row that anchors the
+/// `irc_messages.epic_id` FK for posts on [`ATLAS_CHANNEL`].
+///
+/// The row is a `milestone` (not an `epic`) so the lifecycle's
+/// `list_open_epics` call — which filters by `spark_type = 'epic'` — does
+/// not pick it up and try to create a `#epic-ryve-atlas-seat-*` channel
+/// for it. It carries `workshop_id` so the row lives inside the right
+/// workshop's sparks.db and is never confused with a real per-workshop
+/// spark (the id is a fixed string, not a generated one).
+///
+/// Call on every workshop open: the `ON CONFLICT DO NOTHING` keeps the
+/// row stable across launches so boot/shutdown posts accumulate in a
+/// single durable history.
+pub async fn ensure_atlas_seat_spark(
+    pool: &SqlitePool,
+    workshop_id: &str,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO sparks \
+           (id, title, description, status, priority, spark_type, workshop_id, \
+            metadata, created_at, updated_at) \
+         VALUES (?, ?, ?, 'open', 2, 'milestone', ?, '{}', ?, ?) \
+         ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(ATLAS_SEAT_SPARK_ID)
+    .bind("Atlas Director seat (well-known)")
+    .bind("Anchor row for the workshop-wide #atlas channel. Never closed.")
+    .bind(workshop_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Idempotently join [`ATLAS_CHANNEL`] and set its topic. Safe to call
+/// on every IRC connect; re-joining an already-joined channel and
+/// re-setting an identical topic are both no-ops at the semantic level.
+pub async fn ensure_atlas_channel(client: &IrcClient) -> Result<(), IrcError> {
+    client.join(ATLAS_CHANNEL).await?;
+    client.set_topic(ATLAS_CHANNEL, ATLAS_CHANNEL_TOPIC).await?;
     Ok(())
 }
 

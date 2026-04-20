@@ -12,6 +12,7 @@
 //! Assigned        → InProgress
 //! InProgress      → AwaitingReview | Stuck
 //! AwaitingReview  → Approved | Rejected | Stuck
+//! Approved        → Rejected   (reason=conflict, MergeHand only — no override)
 //! Rejected        → InRepair
 //! InRepair        → AwaitingReview | Stuck
 //! Approved        → ReadyForMerge
@@ -21,25 +22,55 @@
 //!
 //! # Role ownership
 //!
-//! | Transition                    | Authorized roles              |
-//! |-------------------------------|-------------------------------|
-//! | Assigned → InProgress         | Hand                          |
-//! | InProgress → AwaitingReview   | Hand                          |
-//! | AwaitingReview → Approved     | ReviewerHand                  |
-//! | AwaitingReview → Rejected     | ReviewerHand                  |
-//! | Rejected → InRepair           | Hand                          |
-//! | InRepair → AwaitingReview     | Hand                          |
-//! | Approved → ReadyForMerge      | MergeHand (auto)              |
-//! | ReadyForMerge → Merged        | MergeHand                     |
-//! | InProgress → Stuck            | Hand, Head, Director          |
-//! | AwaitingReview → Stuck        | Hand, Head, Director          |
-//! | InRepair → Stuck              | Hand, Head, Director          |
-//! | Stuck → InProgress            | Head, Director (override)     |
+//! | Transition                      | Authorized roles              |
+//! |---------------------------------|-------------------------------|
+//! | Assigned → InProgress           | Hand                          |
+//! | InProgress → AwaitingReview     | Hand                          |
+//! | AwaitingReview → Approved       | ReviewerHand                  |
+//! | AwaitingReview → Rejected       | ReviewerHand                  |
+//! | Approved → Rejected             | MergeHand (reason=conflict)   |
+//! | Rejected → InRepair             | Hand                          |
+//! | InRepair → AwaitingReview       | Hand                          |
+//! | Approved → ReadyForMerge        | MergeHand (auto)              |
+//! | ReadyForMerge → Merged          | MergeHand (no override)       |
+//! | InProgress → Stuck              | Hand, Head, Director          |
+//! | AwaitingReview → Stuck          | Hand, Head, Director          |
+//! | InRepair → Stuck                | Hand, Head, Director          |
+//! | Stuck → InProgress              | Head, Director (override)     |
 //!
 //! Head and Director may override any transition with the explicit
 //! `override_role_check` flag. The `Stuck → InProgress` recovery path is
 //! the only way out of `Stuck` and is authorized exclusively to
 //! Head/Director — there is no non-override entry for it in the map.
+//!
+//! # Conflict handoff (Approved → Rejected)
+//!
+//! The `Approved → Rejected` edge is the merge-conflict handoff path used
+//! by the Merge Hand when a sub-PR merge into the Epic branch conflicts.
+//! It is distinguished from the other transitions by two extra rules:
+//!
+//! 1. **MergeHand is the only emitter.** Even Head/Director overrides
+//!    are refused — the rule carries `allows_override = false` in the
+//!    transition map so the escape hatch that opens every other rule is
+//!    closed here. Conflict ownership belongs to the Merge Hand by
+//!    contract; letting an orchestrator bypass that ownership would
+//!    invalidate the hand-back protocol.
+//!
+//! The `ReadyForMerge → Merged` edge follows the same lockdown: the
+//! Merge-Hand contract ([spark ryve-476ef264]) names Merge Hand as the
+//! ONLY actor permitted to mark an Assignment merged, so that rule also
+//! carries `allows_override = false`. There is no Head/Director shortcut
+//! to "merged" — the only way an Assignment reaches [`AssignmentPhase::Merged`]
+//! is through a MergeHand-emitted transition (prefer the
+//! [`mark_assignment_merged`] wrapper below to avoid stamping a wrong
+//! actor role by accident).
+//! 2. **The reason must be `"conflict"`.** Callers go through
+//!    [`transition_assignment_phase_with_reason`] (or the convenience
+//!    wrapper [`reject_approved_for_conflict`]) which pins the reason
+//!    string to the stable value [`REASON_CONFLICT`]; a non-matching
+//!    reason is refused with [`TransitionError::InvalidReason`]. The
+//!    reason is persisted on the emitted phase-change event so replay
+//!    can distinguish a conflict handoff from a review rejection.
 //!
 //! # Reviewer identity invariant
 //!
@@ -86,11 +117,23 @@ pub const DEFAULT_REPAIR_CYCLE_LIMIT: i64 = 3;
 /// [`LIVENESS_TRANSITIONED_EVENT_TYPE`] event shape.
 pub const REPAIR_CYCLE_ESCALATION_ACTOR: &str = "repair-cycle-escalation";
 
-/// A transition rule: (from_phase, to_phase) → list of authorized roles.
+/// Stable reason string required on an `Approved → Rejected` transition.
+/// Exposed as a constant so callers, validators, and tests all compare
+/// against one canonical value.
+pub const REASON_CONFLICT: &str = "conflict";
+
+/// A transition rule: (from_phase, to_phase) → list of authorized roles,
+/// plus a flag recording whether Head/Director overrides apply.
 struct TransitionRule {
     from: AssignmentPhase,
     to: AssignmentPhase,
     authorized_roles: &'static [TransitionActorRole],
+    /// `true` for the common case where Head/Director may override the
+    /// role check via [`TransitionActorRole::can_override`]. `false`
+    /// locks the transition to its listed `authorized_roles` — used by
+    /// the conflict-handoff `Approved → Rejected` edge which is
+    /// MergeHand-exclusive by contract.
+    allows_override: bool,
 }
 
 /// The complete, exhaustive legal transition map.
@@ -99,41 +142,69 @@ const LEGAL_TRANSITIONS: &[TransitionRule] = &[
         from: AssignmentPhase::Assigned,
         to: AssignmentPhase::InProgress,
         authorized_roles: &[TransitionActorRole::Hand],
+        allows_override: true,
     },
     TransitionRule {
         from: AssignmentPhase::InProgress,
         to: AssignmentPhase::AwaitingReview,
         authorized_roles: &[TransitionActorRole::Hand],
+        allows_override: true,
     },
     TransitionRule {
         from: AssignmentPhase::AwaitingReview,
         to: AssignmentPhase::Approved,
         authorized_roles: &[TransitionActorRole::ReviewerHand],
+        allows_override: true,
     },
     TransitionRule {
         from: AssignmentPhase::AwaitingReview,
         to: AssignmentPhase::Rejected,
         authorized_roles: &[TransitionActorRole::ReviewerHand],
+        allows_override: true,
+    },
+    // Conflict handoff: Merge Hand observes an Epic-branch merge conflict
+    // with a sub-PR whose owning Assignment is already Approved. It hands
+    // the conflict back by driving Approved → Rejected with
+    // reason=conflict. The reason is enforced separately by
+    // `validate_transition_reason`; here the map pins the role to
+    // MergeHand and disables the Head/Director override path so the
+    // ownership invariant ("only merge_hand may emit this transition")
+    // holds even for orchestrator-driven calls.
+    TransitionRule {
+        from: AssignmentPhase::Approved,
+        to: AssignmentPhase::Rejected,
+        authorized_roles: &[TransitionActorRole::MergeHand],
+        allows_override: false,
     },
     TransitionRule {
         from: AssignmentPhase::Rejected,
         to: AssignmentPhase::InRepair,
         authorized_roles: &[TransitionActorRole::Hand],
+        allows_override: true,
     },
     TransitionRule {
         from: AssignmentPhase::InRepair,
         to: AssignmentPhase::AwaitingReview,
         authorized_roles: &[TransitionActorRole::Hand],
+        allows_override: true,
     },
     TransitionRule {
         from: AssignmentPhase::Approved,
         to: AssignmentPhase::ReadyForMerge,
         authorized_roles: &[TransitionActorRole::MergeHand],
+        allows_override: true,
     },
+    // Merged transition: Merge-Hand contract ([spark ryve-476ef264 /
+    // sp-9f6b0c96]) names Merge Hand as the ONLY actor permitted to mark
+    // an Assignment merged. The rule pins the authorized role to
+    // MergeHand and disables the Head/Director override path (same
+    // lockdown as the Approved → Rejected conflict handoff) so the
+    // ownership invariant holds even against orchestrator-driven calls.
     TransitionRule {
         from: AssignmentPhase::ReadyForMerge,
         to: AssignmentPhase::Merged,
         authorized_roles: &[TransitionActorRole::MergeHand],
+        allows_override: false,
     },
     // Stuck entry paths: a Hand reports itself stuck from any active
     // working phase. Head/Director can also drive these transitions via
@@ -143,16 +214,19 @@ const LEGAL_TRANSITIONS: &[TransitionRule] = &[
         from: AssignmentPhase::InProgress,
         to: AssignmentPhase::Stuck,
         authorized_roles: &[TransitionActorRole::Hand],
+        allows_override: true,
     },
     TransitionRule {
         from: AssignmentPhase::AwaitingReview,
         to: AssignmentPhase::Stuck,
         authorized_roles: &[TransitionActorRole::Hand],
+        allows_override: true,
     },
     TransitionRule {
         from: AssignmentPhase::InRepair,
         to: AssignmentPhase::Stuck,
         authorized_roles: &[TransitionActorRole::Hand],
+        allows_override: true,
     },
     // Stuck recovery: Head/Director only, and only via the explicit
     // override path. The empty `authorized_roles` list means no
@@ -161,6 +235,7 @@ const LEGAL_TRANSITIONS: &[TransitionRule] = &[
         from: AssignmentPhase::Stuck,
         to: AssignmentPhase::InProgress,
         authorized_roles: &[],
+        allows_override: true,
     },
 ];
 
@@ -198,10 +273,13 @@ pub fn validate_transition(
             to: target_phase.as_str(),
         })?;
 
-    // 3. Role authorization (Head/Director may override).
-    if (!override_role_check || !actor_role.can_override())
-        && !rule.authorized_roles.contains(&actor_role)
-    {
+    // 3. Role authorization. Head/Director may override MOST transitions
+    //    via `can_override`, but a rule with `allows_override = false`
+    //    locks the authorized set — the conflict-handoff edge relies on
+    //    this so "only merge_hand may emit this transition" holds even
+    //    against orchestrator overrides.
+    let override_applies = override_role_check && actor_role.can_override() && rule.allows_override;
+    if !override_applies && !rule.authorized_roles.contains(&actor_role) {
         let authorized = rule
             .authorized_roles
             .iter()
@@ -216,6 +294,31 @@ pub fn validate_transition(
         });
     }
 
+    Ok(())
+}
+
+/// Validate the `reason` string attached to a phase transition. Most
+/// transitions take no reason; the `Approved → Rejected` conflict-handoff
+/// transition requires an exact [`REASON_CONFLICT`] match so a review
+/// rejection cannot masquerade as a conflict rejection (or vice versa).
+///
+/// Returns `Ok(())` when the reason is acceptable for the transition.
+pub fn validate_transition_reason(
+    from: AssignmentPhase,
+    to: AssignmentPhase,
+    reason: Option<&str>,
+) -> Result<(), TransitionError> {
+    if from == AssignmentPhase::Approved && to == AssignmentPhase::Rejected {
+        return match reason {
+            Some(r) if r == REASON_CONFLICT => Ok(()),
+            other => Err(TransitionError::InvalidReason {
+                from: from.as_str(),
+                to: to.as_str(),
+                expected: REASON_CONFLICT,
+                actual: other.unwrap_or("").to_string(),
+            }),
+        };
+    }
     Ok(())
 }
 
@@ -281,6 +384,7 @@ pub async fn transition_assignment_phase(
             override_role_check: false,
             event_version,
             repair_cycle_limit: DEFAULT_REPAIR_CYCLE_LIMIT,
+            reason: None,
         },
     )
     .await
@@ -306,7 +410,109 @@ pub async fn transition_assignment_phase_override(
             override_role_check: true,
             event_version,
             repair_cycle_limit: DEFAULT_REPAIR_CYCLE_LIMIT,
+            reason: None,
         },
+    )
+    .await
+}
+
+/// Drive a transition while attaching a reason string to the emitted
+/// phase-change event. Intended for the conflict-handoff path where the
+/// [`REASON_CONFLICT`] tag disambiguates a Merge-Hand rejection from a
+/// Reviewer rejection on the same target phase. The reason is validated
+/// against the transition via [`validate_transition_reason`] before the
+/// UPDATE runs; a mismatched reason aborts the transaction with
+/// [`TransitionError::InvalidReason`] and leaves no side effects.
+pub async fn transition_assignment_phase_with_reason(
+    pool: &SqlitePool,
+    args: PhaseTransitionWithReasonArgs<'_>,
+) -> Result<Assignment, TransitionError> {
+    transition_assignment_phase_inner(
+        pool,
+        TransitionPhaseRequest {
+            assignment_id: args.assignment_id,
+            actor_id: args.actor_id,
+            actor_role: args.actor_role,
+            target_phase: args.target_phase,
+            expected_previous_phase: args.expected_previous_phase,
+            override_role_check: false,
+            event_version: args.event_version,
+            repair_cycle_limit: DEFAULT_REPAIR_CYCLE_LIMIT,
+            reason: Some(args.reason),
+        },
+    )
+    .await
+}
+
+/// Input for [`transition_assignment_phase_with_reason`]. Mirrors the
+/// positional arguments of [`transition_assignment_phase`] plus an
+/// explicit `reason` tag recorded on the emitted phase-change event.
+pub struct PhaseTransitionWithReasonArgs<'a> {
+    pub assignment_id: i64,
+    pub actor_id: &'a str,
+    pub actor_role: TransitionActorRole,
+    pub target_phase: AssignmentPhase,
+    pub expected_previous_phase: AssignmentPhase,
+    pub event_version: i64,
+    pub reason: &'a str,
+}
+
+/// Drive the conflict-handoff transition `Approved → Rejected` on
+/// `assignment_id`, pinning the reason to [`REASON_CONFLICT`] and the
+/// actor role to [`TransitionActorRole::MergeHand`]. Callers (the
+/// Merge-Hand spawn path today) should prefer this wrapper to
+/// [`transition_assignment_phase_with_reason`] so they cannot stamp the
+/// wrong reason or role by accident.
+pub async fn reject_approved_for_conflict(
+    pool: &SqlitePool,
+    assignment_id: i64,
+    actor_id: &str,
+    event_version: i64,
+) -> Result<Assignment, TransitionError> {
+    transition_assignment_phase_with_reason(
+        pool,
+        PhaseTransitionWithReasonArgs {
+            assignment_id,
+            actor_id,
+            actor_role: TransitionActorRole::MergeHand,
+            target_phase: AssignmentPhase::Rejected,
+            expected_previous_phase: AssignmentPhase::Approved,
+            event_version,
+            reason: REASON_CONFLICT,
+        },
+    )
+    .await
+}
+
+/// Drive the Merged transition `ReadyForMerge → Merged` on
+/// `assignment_id`, pinning the actor role to
+/// [`TransitionActorRole::MergeHand`]. Callers (the Merge-Hand
+/// Epic→main merge path today, and the spawn-path consumers in the
+/// sibling wrappers) should prefer this wrapper to the raw
+/// [`transition_assignment_phase`] so they cannot stamp a non-MergeHand
+/// role by accident: the legal-transition map already refuses a
+/// non-MergeHand call with
+/// `allows_override = false`, but this wrapper makes the invariant
+/// explicit at the call site and keeps Epic-merge callers symmetrical
+/// with [`reject_approved_for_conflict`].
+///
+/// Spark sp-9f6b0c96 / [sp-476ef264]: the Merge Hand is the ONLY actor
+/// permitted to transition an Assignment to
+/// [`AssignmentPhase::Merged`].
+pub async fn mark_assignment_merged(
+    pool: &SqlitePool,
+    assignment_id: i64,
+    actor_id: &str,
+    event_version: i64,
+) -> Result<Assignment, TransitionError> {
+    transition_assignment_phase(
+        pool,
+        assignment_id,
+        actor_id,
+        TransitionActorRole::MergeHand,
+        AssignmentPhase::Merged,
+        AssignmentPhase::ReadyForMerge,
+        event_version,
     )
     .await
 }
@@ -332,6 +538,7 @@ pub async fn transition_assignment_phase_with_limit(
             override_role_check: false,
             event_version: args.event_version,
             repair_cycle_limit: args.repair_cycle_limit,
+            reason: None,
         },
     )
     .await
@@ -359,6 +566,10 @@ struct TransitionPhaseRequest<'a> {
     override_role_check: bool,
     event_version: i64,
     repair_cycle_limit: i64,
+    /// Optional human/audit-level reason tag recorded on the emitted
+    /// phase-change event. Required for `Approved → Rejected` (must be
+    /// [`REASON_CONFLICT`]); optional on every other transition.
+    reason: Option<&'a str>,
 }
 
 /// Execute a phase transition: validate, UPDATE state + phase-tracking columns,
@@ -378,6 +589,7 @@ async fn transition_assignment_phase_inner(
         override_role_check,
         event_version,
         repair_cycle_limit,
+        reason,
     } = request;
 
     let row = sqlx::query_as::<_, Assignment>("SELECT * FROM assignments WHERE id = ?")
@@ -404,6 +616,12 @@ async fn transition_assignment_phase_inner(
         override_role_check,
     )?;
 
+    // Reason invariants (e.g. Approved → Rejected must carry
+    // reason=conflict) run after the structural checks so callers see
+    // "illegal transition" / "unauthorized" failures before the more
+    // specific "invalid reason" failure. Reason is otherwise ignored.
+    validate_transition_reason(current_phase, target_phase, reason)?;
+
     // Reviewer identity: enforced independently of override_role_check
     // because the rule ("a reviewer cannot approve their own work")
     // follows the effective role, not the override path. Head/Director
@@ -418,7 +636,7 @@ async fn transition_assignment_phase_inner(
             field_name: "assignment_phase".into(),
             old_value: Some(current_phase.as_str().to_string()),
             new_value: Some(target_phase.as_str().to_string()),
-            reason: None,
+            reason: reason.map(str::to_string),
             actor_type: None,
             change_nature: None,
             session_id: None,
@@ -1075,12 +1293,206 @@ mod tests {
     #[test]
     fn all_legal_transitions_are_covered() {
         // 8 core happy-path edges + 3 Stuck entry edges + 1 Stuck
-        // recovery (Head/Director override only) = 12 total.
+        // recovery (Head/Director override only) + 1 conflict-handoff
+        // (Approved → Rejected, MergeHand-only) = 13 total.
         assert_eq!(
             LEGAL_TRANSITIONS.len(),
-            12,
-            "legal transition map should have exactly 12 entries"
+            13,
+            "legal transition map should have exactly 13 entries"
         );
+    }
+
+    // ── Conflict handoff (Approved → Rejected) [sp-086a4432] ────────
+
+    #[test]
+    fn merge_hand_may_reject_approved_for_conflict() {
+        validate_transition(
+            AssignmentPhase::Approved,
+            AssignmentPhase::Rejected,
+            AssignmentPhase::Approved,
+            TransitionActorRole::MergeHand,
+            false,
+        )
+        .expect("merge_hand must be authorized for Approved → Rejected");
+    }
+
+    #[test]
+    fn reviewer_cannot_reject_an_already_approved_assignment() {
+        // A ReviewerHand may reject from AwaitingReview, but once the
+        // assignment is Approved the only legal rejection path is the
+        // MergeHand conflict handoff.
+        let err = validate_transition(
+            AssignmentPhase::Approved,
+            AssignmentPhase::Rejected,
+            AssignmentPhase::Approved,
+            TransitionActorRole::ReviewerHand,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TransitionError::Unauthorized { .. }),
+            "reviewer must not take the conflict handoff, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn hand_cannot_reject_an_already_approved_assignment() {
+        let err = validate_transition(
+            AssignmentPhase::Approved,
+            AssignmentPhase::Rejected,
+            AssignmentPhase::Approved,
+            TransitionActorRole::Hand,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TransitionError::Unauthorized { .. }));
+    }
+
+    /// Conflict handoff is merge-hand exclusive by contract — even a
+    /// Head/Director override MUST NOT bypass the role check. The
+    /// rule's `allows_override = false` flag is what enforces this.
+    #[test]
+    fn head_and_director_cannot_override_approved_to_rejected() {
+        for role in &[TransitionActorRole::Head, TransitionActorRole::Director] {
+            let err = validate_transition(
+                AssignmentPhase::Approved,
+                AssignmentPhase::Rejected,
+                AssignmentPhase::Approved,
+                *role,
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TransitionError::Unauthorized { .. }),
+                "{role:?} override must not bypass Approved → Rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_to_rejected_requires_reason_conflict() {
+        // No reason at all is rejected.
+        let err =
+            validate_transition_reason(AssignmentPhase::Approved, AssignmentPhase::Rejected, None)
+                .unwrap_err();
+        assert!(matches!(err, TransitionError::InvalidReason { .. }));
+
+        // Wrong reason is rejected.
+        let err = validate_transition_reason(
+            AssignmentPhase::Approved,
+            AssignmentPhase::Rejected,
+            Some("nope"),
+        )
+        .unwrap_err();
+        match err {
+            TransitionError::InvalidReason {
+                from,
+                to,
+                expected,
+                actual,
+            } => {
+                assert_eq!(from, "approved");
+                assert_eq!(to, "rejected");
+                assert_eq!(expected, REASON_CONFLICT);
+                assert_eq!(actual, "nope");
+            }
+            other => panic!("expected InvalidReason, got {other:?}"),
+        }
+
+        // Exact conflict reason is accepted.
+        validate_transition_reason(
+            AssignmentPhase::Approved,
+            AssignmentPhase::Rejected,
+            Some(REASON_CONFLICT),
+        )
+        .expect("reason=conflict must be accepted");
+    }
+
+    #[test]
+    fn non_conflict_transitions_ignore_reason() {
+        // A reason string on an unrelated transition must not cause a
+        // spurious InvalidReason failure — the rule is scoped to the
+        // conflict handoff edge only.
+        validate_transition_reason(
+            AssignmentPhase::InProgress,
+            AssignmentPhase::AwaitingReview,
+            Some("shouldn't matter"),
+        )
+        .expect("non-handoff transitions ignore the reason");
+        validate_transition_reason(
+            AssignmentPhase::AwaitingReview,
+            AssignmentPhase::Rejected,
+            None,
+        )
+        .expect("reviewer rejection takes no reason here");
+    }
+
+    // ── Merged transition lockdown [sp-9f6b0c96 / sp-476ef264] ─────
+
+    /// Acceptance criterion (3) of spark ryve-9f6b0c96: the Merged
+    /// phase transition is accepted only when emitted by merge_hand.
+    /// Mirror of the Approved→Rejected conflict-handoff role guard.
+    #[test]
+    fn merge_hand_may_drive_ready_for_merge_to_merged() {
+        validate_transition(
+            AssignmentPhase::ReadyForMerge,
+            AssignmentPhase::Merged,
+            AssignmentPhase::ReadyForMerge,
+            TransitionActorRole::MergeHand,
+            false,
+        )
+        .expect("merge_hand must be authorized for ReadyForMerge → Merged");
+    }
+
+    #[test]
+    fn hand_cannot_drive_ready_for_merge_to_merged() {
+        let err = validate_transition(
+            AssignmentPhase::ReadyForMerge,
+            AssignmentPhase::Merged,
+            AssignmentPhase::ReadyForMerge,
+            TransitionActorRole::Hand,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TransitionError::Unauthorized { .. }),
+            "Hand must not take the Merged transition, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reviewer_hand_cannot_drive_ready_for_merge_to_merged() {
+        let err = validate_transition(
+            AssignmentPhase::ReadyForMerge,
+            AssignmentPhase::Merged,
+            AssignmentPhase::ReadyForMerge,
+            TransitionActorRole::ReviewerHand,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TransitionError::Unauthorized { .. }));
+    }
+
+    /// The Merged transition is merge-hand exclusive by contract — even
+    /// a Head/Director override MUST NOT bypass the role check. The
+    /// rule's `allows_override = false` flag is what enforces this.
+    #[test]
+    fn head_and_director_cannot_override_ready_for_merge_to_merged() {
+        for role in &[TransitionActorRole::Head, TransitionActorRole::Director] {
+            let err = validate_transition(
+                AssignmentPhase::ReadyForMerge,
+                AssignmentPhase::Merged,
+                AssignmentPhase::ReadyForMerge,
+                *role,
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TransitionError::Unauthorized { .. }),
+                "{role:?} override must not bypass ReadyForMerge → Merged, \
+                 got {err:?}"
+            );
+        }
     }
 
     // ── Stuck-origin validation ─────────────────────────

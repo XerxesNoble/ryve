@@ -104,6 +104,17 @@ pub enum TransitionError {
     )]
     ReviewerIsAuthor { reviewer_actor_id: String },
 
+    #[error(
+        "reason {actual:?} is not valid for transition {from} → {to}; \
+         expected reason {expected:?}"
+    )]
+    InvalidReason {
+        from: &'static str,
+        to: &'static str,
+        expected: &'static str,
+        actual: String,
+    },
+
     #[error("database error during transition: {0}")]
     Database(#[from] sqlx::Error),
 }

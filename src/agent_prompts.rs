@@ -181,6 +181,8 @@ pub fn compose_atlas_prompt() -> String {
          report.\n\n",
     );
 
+    prompt.push_str(ATLAS_CHAT_OF_RECORD);
+
     prompt.push_str(ATLAS_WATCH_SECTION);
 
     prompt.push_str(
@@ -219,6 +221,7 @@ pub fn compose_atlas_prompt() -> String {
 pub fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str(HOUSE_RULES);
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(&format!(
         "ASSIGNMENT: spark {spark_id}. You have been assigned this spark. \
@@ -393,6 +396,8 @@ pub fn compose_head_prompt(
             Then exit.\n\n",
     );
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - Use `ryve` for ALL workgraph operations. No raw SQL. No file edits to \
@@ -509,6 +514,8 @@ pub fn compose_perf_head_prompt(epic_id: Option<&str>, epic_title: Option<&str>)
             comment it on the parent epic.\n\n",
     );
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - You are a Head. You NEVER edit source code yourself. Every file change \
@@ -624,6 +631,8 @@ pub fn compose_investigator_prompt(sparks: &[Spark], spark_id: &str) -> String {
            every finding id/line-range and your overall read of the scope. \
            Then close the spark.\n\n",
     ));
+
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(
         "HARD RULES:\n\
@@ -786,6 +795,8 @@ pub fn compose_architect_prompt(sparks: &[Spark], spark_id: &str) -> String {
          inside the recommendation body, not the category.\n\n",
     );
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - You are read-only. Edit/Write/NotebookEdit are forbidden. \
@@ -910,6 +921,8 @@ pub fn compose_reviewer_prompt(sparks: &[Spark], spark_id: &str) -> String {
          (\"needs cleanup\", \"not quite right\") is not actionable.\n\n"
     ));
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - You are read-only. Edit/Write/NotebookEdit are forbidden.\n\
@@ -937,6 +950,7 @@ pub fn compose_reviewer_prompt(sparks: &[Spark], spark_id: &str) -> String {
 pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str(HOUSE_RULES);
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(&format!(
         "ASSIGNMENT: spark {merge_spark_id} (role: MERGER for crew {crew_id}). \
@@ -1002,6 +1016,268 @@ pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
          - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\
          - If the user closes the crew or the merge spark while you are working, \
            stop, remove the merge worktree (step 7), and exit.\n",
+    );
+
+    prompt
+}
+
+/// Compose the initial prompt for a **MergeHand** — the next-generation
+/// integrator role introduced by spark ryve-10c8baee [sp-476ef264] and
+/// extended by sibling sparks under the same epic to cover preconditions
+/// (ryve-5bd7749b), sub-PR integration (ryve-6b261ad0), conflict handoff
+/// (ryve-086a4432), and the Epic PR → main lifecycle plus the Merged
+/// phase transition (ryve-9f6b0c96).
+///
+/// This composer intentionally returns DIFFERENT text from the Merger
+/// prompt. The MergeHand integrates the Crew's **sub-PRs into the Epic
+/// branch** in a deterministic, history-preserving order — distinct
+/// from the Merger, which integrates member branches into a single PR
+/// for review. The existing Merger role and its gradual-rollout
+/// semantics remain untouched.
+///
+/// The prompt:
+/// 1. Opens with the standard `HOUSE_RULES` EXECUTE directive so the
+///    spawn-time `claude --print` handshake does not stall waiting for
+///    confirmation (the same regression guarded by
+///    `prompts_open_with_execute_directive_not_reading_instruction`).
+/// 2. Names the role as **MergeHand** (not "Merger") so log scans,
+///    operator audits, and snapshot tests can tell the two apart.
+/// 3. Carries the crew id and merge spark id verbatim so the agent can
+///    mark the spark in progress, inspect the crew, and attribute any
+///    commits it makes.
+/// 4. Encodes the sub-PR → Epic merge flow [sp-476ef264 / sp-6b261ad0]:
+///    iterate sub-PRs in **Assignment-creation order** (ascending
+///    `assigned_at` from `ryve assign list <child>`), and merge every
+///    one into the Epic branch with `git merge --no-ff` so each
+///    sub-PR's history is preserved as a merge commit on the epic.
+/// 5. Walks the Epic PR lifecycle [sp-9f6b0c96]: open / update the
+///    Epic PR with a body listing every child Assignment and its
+///    source PR, wait for the required approvals and green CI, merge
+///    Epic → main, then emit the Merged phase transition on the Merge
+///    Hand's own Assignment.
+/// 6. Restates the Merge-Hand contract's forbidden primitives —
+///    force-push, `--no-verify`, `[skip ci]` trailers, `gh pr merge
+///    --admin`, and any other CI-bypass path — so future edits cannot
+///    silently drop them.
+pub fn compose_merge_hand_prompt(crew_id: &str, merge_spark_id: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(HOUSE_RULES);
+
+    prompt.push_str(&format!(
+        "ASSIGNMENT: spark {merge_spark_id} (role: MERGE_HAND for crew {crew_id}). \
+         Mark it in progress now: `ryve spark status {merge_spark_id} in_progress`.\n\n"
+    ));
+
+    prompt.push_str(&format!(
+        "You are a **MergeHand** for crew `{crew_id}`. MergeHand is a distinct \
+         role from the existing Merger: the Merger integrates member branches \
+         into a single PR for review, whereas the MergeHand integrates the \
+         Crew's **sub-PRs into the Epic branch**, preserving each sub-PR's \
+         history as a merge commit, and then drives the Epic PR through to \
+         main. See `compose_merger_prompt` for the Merger contract; \
+         `compose_merge_hand_prompt` is the sub-PR → Epic → main integrator. \
+         Your Assignment is the merge spark `{merge_spark_id}`; read it plus \
+         the parent Epic before acting:\n\
+         `ryve spark show {merge_spark_id}`\n\
+         `ryve --json spark show <epic_id>`\n\
+         `ryve --json assign list <epic_id>`\n\n"
+    ));
+
+    prompt.push_str(&format!(
+        "WORKFLOW — merge every sub-PR into the Epic branch in \
+         **Assignment-creation order**, using `git merge --no-ff` for every \
+         merge so each sub-PR's history is preserved verbatim:\n\n\
+         1. Identify the Epic branch for crew `{crew_id}`. Read the parent epic \
+            of the crew via `ryve --json crew show {crew_id}` and `ryve --json \
+            spark show <parent-epic-id>`; the Epic branch is the branch named \
+            on that epic (typically `epic/<crew-short>` or the `github_artifact` \
+            branch recorded on the epic's assignment). If the Epic branch is \
+            ambiguous, STOP and post a comment on `{merge_spark_id}` asking the \
+            Head to disambiguate — do not guess.\n\n\
+         2. Enumerate every sub-PR (child spark) of the crew: \
+            `ryve --json crew show {crew_id}` lists the member sparks. For \
+            each child spark id `<child>`, fetch its Assignment records with\n\
+            `ryve --json assign list <child>`\n\
+            and read the **`assigned_at`** timestamp of the oldest (first) \
+            assignment — this is the canonical Assignment-creation timestamp.\n\n\
+         3. Sort the sub-PRs ascending by that `assigned_at` timestamp. Ties \
+            on the timestamp are broken by spark id, ascending, so the order \
+            is fully deterministic. This ordering is the workgraph's source \
+            of truth for sub-PR merge order — DO NOT reorder by branch name, \
+            closure time, PR number, `git branch --list` output, or any other \
+            signal. Assignment-creation order is the contract.\n\n\
+         4. Create a dedicated merge worktree off the Epic branch (never \
+            mutate the workshop root's HEAD):\n\
+            `git fetch origin && \\\n\
+             git worktree add .ryve/worktrees/merge-{crew_id} -b merge/{crew_id} \
+             origin/<epic-branch>`\n\
+            Every subsequent git command runs inside that worktree.\n\n\
+         5. Iterate the sorted list from step 3 in order. For each sub-PR's \
+            branch `<sub-branch>` belonging to child spark `<child>`, run:\n\
+            `git merge --no-ff \\\n\
+                -m 'merge <sub-branch> into <epic-branch> [sp-<child>]' \\\n\
+                <sub-branch>`\n\
+            `--no-ff` is MANDATORY for every sub-PR merge. Fast-forward merges \
+            collapse the sub-PR's commits into the Epic and destroy the audit \
+            trail that the `[sp-xxxx]` linkage depends on. Do NOT squash, do \
+            NOT rebase the sub-PR onto the epic, do NOT fast-forward. Every \
+            sub-PR must produce exactly one merge commit on the Epic branch, \
+            in Assignment-creation order.\n\n\
+         6. If a merge has conflicts you cannot resolve mechanically, that is \
+            a bond-discipline failure by the Head (two siblings edited the \
+            same file without a `blocks` bond). Do NOT force the merge. Run\n\
+            `ryve comment add {merge_spark_id} 'bond-discipline conflict \
+            merging <sub-branch>: <details>'` and\n\
+            `ryve spark status {merge_spark_id} blocked`, then exit.\n\n\
+         7. After every sub-PR is merged in order, push the Epic branch \
+            NON-FORCE so CI runs on the integration result:\n\
+            `git push origin <epic-branch>`\n\
+            Do NOT pass `--force`, `--force-with-lease`, or any variant that \
+            rewrites history on origin. Do NOT bypass required checks.\n\n\
+         8. Do NOT merge the Epic into `main` directly from the sub-PR loop \
+            — history-preserving Epic → main merge is driven separately by \
+            the EPIC PR LIFECYCLE section below via `gh pr merge` once \
+            required approvals and green CI are in. Never bypass that gate \
+            with a bare `git merge` or `git push main` from this loop.\n\n"
+    ));
+
+    prompt.push_str(
+        "HARD RULES — non-negotiable integrator discipline, re-stated so \
+         future edits cannot drop them:\n\
+         - **Assignment-creation order is the contract.** Always iterate \
+           sub-PRs by ascending `assigned_at` (ties broken by spark id). Never \
+           merge in ad-hoc, alphabetical, PR-number, or closure-time order.\n\
+         - **`git merge --no-ff` for every sub-PR merge** into the Epic branch. \
+           No fast-forward, no squash, no rebase. Each sub-PR produces exactly \
+           one merge commit on the Epic branch so history is preserved.\n\
+         - **No force-push.** Never `git push --force`, never \
+           `git push --force-with-lease`, never any variant that rewrites the \
+           Epic branch on origin.\n\
+         - **No `--no-verify`.** Never bypass git hooks on any commit or push. \
+           If a pre-commit / pre-push hook fails, fix the root cause and retry.\n\
+         - **No CI bypass.** Never use `[skip ci]`, `[ci skip]`, `***NO_CI***`, \
+           merge-queue overrides, branch-protection overrides, or any \
+           repo-/platform-specific trailer that short-circuits required checks. \
+           CI must run on the integrated Epic branch.\n\
+         - NEVER change the branch checked out in the workshop root. \
+           Integration happens inside a dedicated merge worktree.\n\
+         - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "EPIC PR LIFECYCLE — once every sub-PR is merged into the Epic branch \
+         per the WORKFLOW above (and the precondition checker has cleared the \
+         spawn — all children Approved, no sub-PR conflicts against the Epic \
+         branch, CI green on every sub-PR that has CI, zero Assignments Stuck), \
+         drive the Epic → main lifecycle [sp-9f6b0c96]:\n\n\
+         A. Collect every child Assignment in Assignment-creation order — \
+            same ordering as the WORKFLOW above (`ryve --json assign list \
+            <epic_id>`, ascending `assigned_at`, ties broken by spark id). \
+            Record for each child: spark id, Assignment id, Assignment \
+            `actor_id`, source branch, and PR number \
+            (`github_artifact_pr_number` on the assignment row).\n\n\
+         B. (Already done by the WORKFLOW above.) Each sub-PR is merged into \
+            the Epic branch with `git merge --no-ff` in Assignment-creation \
+            order. On conflict, HAND THE CONFLICT BACK via the transition \
+            validator (`Approved → Rejected`, reason=`conflict`) and wait \
+            for the originating Hand to repair — you NEVER resolve \
+            in-place.\n\n\
+         C. Open or update the Epic PR with base=`main`, \
+            head=`crew/{crew_id}`. If no open Epic PR exists, create one \
+            (`gh pr create --base main --head crew/{crew_id}`); otherwise \
+            update the existing one (`gh pr edit <epic_pr> --body-file ...`). \
+            The Epic PR body MUST list every child Assignment together with \
+            its source PR. Use this template — the E2E test parses it:\n\n\
+            ```\n\
+            ## Epic: <epic title> ([sp-<epic-short>])\n\n\
+            This Epic PR integrates the following child Assignments:\n\n\
+            - Assignment `<asgn_id_1>` (spark `<spark_id_1>`, actor `<actor_id_1>`) \
+            — source PR #<pr_number_1>\n\
+            - Assignment `<asgn_id_2>` (spark `<spark_id_2>`, actor `<actor_id_2>`) \
+            — source PR #<pr_number_2>\n\
+            - ...\n\n\
+            Sub-PRs merged into `crew/{crew_id}` with `git merge --no-ff` in \
+            Assignment-creation order. Merge-Hand precondition checks: all \
+            Approved, no conflicts, CI green, zero Stuck.\n\
+            ```\n\n\
+            Every child Assignment MUST appear, with its source PR number. A \
+            missing child is a protocol violation — investigate before \
+            continuing.\n\n\
+         D. Gate Epic → main on the Epic PR's REQUIRED APPROVALS AND GREEN \
+            CI. Before you merge, you MUST see both:\n\
+            - `gh pr view <epic_pr> --json reviewDecision` → \
+              `\"reviewDecision\": \"APPROVED\"`. Any other value \
+              (`REVIEW_REQUIRED`, `CHANGES_REQUESTED`, `null`) means the \
+              required approvals are not yet in. Do NOT merge. Post a \
+              comment on `{merge_spark_id}` describing what you are waiting \
+              on, and stop.\n\
+            - `gh pr view <epic_pr> --json statusCheckRollup` — every \
+              required check must be `SUCCESS`. A failing, pending, or \
+              cancelled required check is a blocker; do NOT merge. Treat \
+              any failed check as a blocker even if the branch protection \
+              rule technically allows a merge without it.\n\n\
+         E. Execute the Epic → main merge with `gh pr merge <epic_pr> \
+            --merge --match-head-commit=<sha>` (no `--admin`, no `--squash`, \
+            no `--rebase`, no `--delete-branch` without a separate cleanup \
+            step). `gh pr merge` refuses to run when the approval / check \
+            gates fail — that refusal is the mechanical half of the \
+            approval gate; your manual check in D is the belt-and-suspenders \
+            half.\n\n\
+         F. Emit the **Merged** phase transition for THIS Merge-Hand \
+            Assignment (`{merge_spark_id}`). The transition validator \
+            enforces that the Merge Hand is the ONLY actor permitted to \
+            drive an Assignment to `Merged`: the \
+            `ReadyForMerge → Merged` rule is role-locked to `merge_hand` \
+            and cannot be bypassed even by a Head/Director override. \
+            Prefer the `data::sparks::transition::mark_assignment_merged` \
+            helper (pins the actor role to MergeHand so you cannot stamp \
+            a wrong role by accident) over calling \
+            `transition_assignment_phase` raw.\n\n\
+         G. Close the merge spark: `ryve spark close {merge_spark_id} \
+            completed`. Remove the Epic worktree you were working in (if \
+            any), then exit.\n\n"
+    ));
+
+    prompt.push_str(
+        "HARD RULES (Merge-Hand contract — combined from sp-6b261ad0 + \
+         sp-9f6b0c96, re-stated so future edits cannot silently drop them):\n\
+         - **Assignment-creation order is the contract.** Always iterate \
+           sub-PRs by ascending `assigned_at` (ties broken by spark id). \
+           Never merge in ad-hoc, alphabetical, PR-number, or closure-time \
+           order.\n\
+         - **`git merge --no-ff` for every sub-PR merge** into the Epic \
+           branch. No fast-forward, no squash, no rebase. Each sub-PR \
+           produces exactly one merge commit on the Epic branch so history \
+           is preserved.\n\
+         - NEVER change the branch checked out in the workshop root. Every \
+           merge happens inside a dedicated Epic / merge worktree — never in \
+           the main checkout.\n\
+         - **No force-push.** Not `git push --force`, not `git push \
+           --force-with-lease`, not `git push +<ref>`. A rebase-and-force is \
+           not an option; if the Epic branch diverges, hand the conflict \
+           back to the originating Assignment via the transition validator.\n\
+         - **No `--no-verify`.** Never bypass git hooks on any commit or \
+           push. If a pre-commit / pre-push hook fails, fix the root cause \
+           and retry.\n\
+         - **No CI bypass.** Never use `[skip ci]`, `[ci skip]`, `[no ci]`, \
+           `***NO_CI***`, merge-queue overrides, branch-protection \
+           overrides, or any repo-/platform-specific trailer that \
+           short-circuits required checks. CI must run on the integrated \
+           Epic branch.\n\
+         - NEVER use `gh pr merge --admin`. Admin-merge bypasses the \
+           branch-protection gate that enforces the required approvals and \
+           green-CI rules; using it would subvert the entire Merge-Hand \
+           contract.\n\
+         - Do NOT merge to main if `reviewDecision` is not `APPROVED` or if \
+           any required status check is not `SUCCESS`. A failing check is a \
+           blocker, even when the upstream branch-protection rule would let \
+           the merge through.\n\
+         - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\
+         - **Conflict resolution is ALWAYS delegated back** to the \
+           originating Assignment via `Approved → Rejected` \
+           (reason=`conflict`). You NEVER resolve a sub-PR conflict \
+           in-place — that ownership belongs to the Hand that wrote the \
+           sub-PR.\n",
     );
 
     prompt
@@ -1109,6 +1385,8 @@ pub fn compose_release_manager_prompt(sparks: &[Spark], spark_id: &str) -> Strin
          6. Mark this management spark completed with `ryve spark close \
             {spark_id} completed`.\n\n",
     );
+
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(&format!(
         "HARD RULES:\n\
@@ -1231,6 +1509,8 @@ pub fn compose_bug_hunter_prompt(sparks: &[Spark], spark_id: &str) -> String {
          6. CLOSE. When the DONE checklist passes, close the spark with \
             `ryve spark close <id> completed` and exit.\n\n",
     );
+
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(
         "HARD RULES:\n\
@@ -1401,6 +1681,8 @@ pub fn compose_performance_engineer_prompt(sparks: &[Spark], spark_id: &str) -> 
             {spark_id} completed` and exit.\n\n"
     ));
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - Your deliverable is a measured delta plus the targeted fix. \
@@ -1462,7 +1744,11 @@ Violations are blocking.\n\
 4. Before declaring the spark complete, verify your work against \
 `.ryve/checklists/DONE.md`. Every item must be satisfied.\n\
 5. When the work is complete and the DONE checklist passes, close the spark: \
-`ryve spark close <id> completed`. Then exit.\n\n";
+`ryve spark close <id> completed`. Then exit.\n\
+6. Post to chat-of-record at every mandatory boundary (claim, design-pick, \
+block, commit, handoff) via `ryve post --channel <epic-channel>`. \
+`ryve spark close` refuses a zero-post close. See the CHAT-OF-RECORD \
+section below for the full contract and example invocations.\n\n";
 
 /// Mandatory decomposition discipline for any agent that creates child sparks
 /// under an epic (Atlas when briefing, Heads when decomposing). The Merger
@@ -1482,6 +1768,107 @@ conflicts — if the Merger blocks on a conflict, it is a planning bug in this \
 step, not a merge-time problem. Record your scope-overlap reasoning as a \
 comment on the parent epic (`ryve comment add <epic> '<reasoning>'`) so the \
 decision is auditable.\n\n";
+
+/// Mandatory chat-of-record discipline shared by every non-Atlas agent
+/// (Hands, Heads, Mergers). Chat-of-record is the durable record layer
+/// backing sudden-death recovery and cross-agent context: intent, plans,
+/// design picks, blocks, and hand-offs all land in the parent epic's
+/// IRC channel via `ryve post`, and the replacement agent reads them
+/// back via `ryve channel tail`. The five named boundaries (claim /
+/// design-pick / block / commit / handoff) must all post a line so the
+/// `ryve spark close` / `ryve assign close` paths — which are the
+/// mechanical enforcement point for "did this assignment post anything"
+/// — can see a non-empty record since the claim timestamp. Epic
+/// ryve-12f09190 (chat-of-record foundation + enforcement).
+const CHAT_OF_RECORD: &str = "CHAT-OF-RECORD (non-negotiable). Your intent, plans, design picks, \
+blocks, and hand-offs are durable only if you write them to your epic's \
+IRC channel via `ryve post`. The workshop keeps a row per post in \
+`irc_messages`; sudden-death recovery, cross-agent context, and the \
+Merger's read-back of WHY each sibling chose its approach all hinge on \
+these posts. Silence here = future archaeology by the next agent. \
+Enforcement is TOOL-GATED, not prompt-only: `ryve assign close` \
+refuses to close an assignment with zero chat-of-record posts since \
+its claim timestamp (epic ryve-12f09190). `ryve spark close` itself \
+is not gated today — the discipline fires on the assignment-close \
+path. If the tool bounces your close, fix it by posting, not by \
+arguing with this prompt. (PR #54 Copilot c5.)\n\n\
+CHANNEL. Post to the parent epic's channel: `#epic-<epic_id>-<slug>` \
+(canonical form from `ipc::channel_manager::channel_name`; 50-octet IRC \
+limit applies). If you only have a child spark id, run `ryve spark show \
+<spark>` to read its parent epic id and derive the channel from that. \
+Do NOT invent per-Hand channels — they become debug logs nobody reads.\n\n\
+MANDATORY POSTING BOUNDARIES — post a one-line chat-of-record entry at \
+each of these five transitions:\n\
+1. CLAIM — immediately after `ryve assign claim` (or `ryve spark status \
+   <id> in_progress`), post what you are about to do and your plan. \
+   First call `ryve channel tail` to inherit any prior context.\n\
+2. DESIGN-PICK — when you select an approach (algorithm, boundary, \
+   library, migration shape, scope split), post the decision and the \
+   alternative you rejected, in one sentence.\n\
+3. BLOCK — when you hit an unexpected obstacle (failing test you do \
+   not understand, missing dependency, ambiguous intent, bond-discipline \
+   conflict), post the block and your intended resolution or the \
+   question you are raising.\n\
+4. COMMIT — after each non-trivial commit, post a one-liner that names \
+   the change and references the spark id `[sp-xxxx]` so \
+   `ryve commit scan` and the chat log stay aligned.\n\
+5. HANDOFF — before you call `ryve spark close` (or the assignment \
+   close path), post a summary of what shipped, what remains, and \
+   anything the next agent should know. This is the post the \
+   close-gate looks for.\n\n\
+TOOLS — `ryve post` to write, `ryve channel tail` to read. Examples:\n\
+    ryve post --channel '#epic-<epic_id>-<slug>' \\\n\
+        'claim: starting on <task>; plan is <outline> [sp-xxxx]'\n\
+    ryve post --channel '#epic-<epic_id>-<slug>' \\\n\
+        'commit: wired <feature> into <module> [sp-xxxx]'\n\
+    ryve channel tail --channel '#epic-<epic_id>-<slug>' --limit 20\n\
+    ryve channel tail --channel '#epic-<epic_id>-<slug>' \\\n\
+        --since 2026-04-19T00:00:00Z --author <prior_session_id>\n\
+\n\
+Post before acting, tail before handing off.\n\n";
+
+/// Atlas-specific chat-of-record block. Atlas posts to the workshop-wide
+/// `#atlas` channel (vs. per-epic channels used by Hands/Heads): instance
+/// claim on boot, route / design-pick / block per decision, handoff on
+/// shutdown. The same `ryve spark close` tool-gating applies — Atlas
+/// cannot close a user-facing epic it owns without having posted
+/// chat-of-record since claim. Epic ryve-12f09190.
+const ATLAS_CHAT_OF_RECORD: &str = "CHAT-OF-RECORD — the workshop-wide `#atlas` channel is your \
+Director instance log. Every Atlas instance posts on boot, on every \
+delegation / routing decision, and on shutdown. Reading `#atlas` on \
+boot is how the next Atlas inherits the context of the prior one — \
+without it, rotation through the Director seat loses its memory. \
+Enforcement is TOOL-GATED, not prompt-only: `ryve spark close` on any \
+epic you own rejects a close with zero chat-of-record posts since Atlas \
+claimed it (epic ryve-12f09190). If the close bounces, fix it by \
+posting; do not try to route around the gate.\n\n\
+ATLAS POSTING BOUNDARIES — post to `#atlas` at each of these \
+transitions:\n\
+1. BOOT — right after taking the Director seat, post instance id + \
+   \"live, polling state\". First call `ryve channel tail --channel \
+   '#atlas'` to read any prior Atlas's in-flight work.\n\
+2. ROUTE — each time you spawn a Head, post the user goal, the \
+   archetype you chose (build / research / review), and the parent \
+   epic id.\n\
+3. DESIGN-PICK — when you decide between archetypes, decline to \
+   delegate, or choose not to ask the user a clarifying question, \
+   post the decision and the alternative you considered.\n\
+4. BLOCK — when a Head returns incomplete or contradictory work, or \
+   a user goal is genuinely ambiguous, post the block and the \
+   resolution path.\n\
+5. HANDOFF / SHUTDOWN — before releasing the Director seat, post \
+   what is in-flight, which Heads are running, and how to resume.\n\n\
+TOOLS — same CLI every agent uses. Examples:\n\
+    ryve post --channel '#atlas' 'boot: atlas-<instance> seated; \
+resuming <n> active epics'\n\
+    ryve post --channel '#atlas' 'route: user goal <goal> → build head \
+on <epic_id>'\n\
+    ryve channel tail --channel '#atlas' --limit 40\n\
+    ryve channel tail --channel '#atlas' \\\n\
+        --since 2026-04-19T00:00:00Z --author <prior_atlas_session>\n\
+\n\
+Atlas posts on every cross-epic decision. A silent Atlas is an Atlas \
+the next instance cannot inherit from.\n\n";
 
 /// Watch-primitive section for the Atlas prompt. Atlas is the primary
 /// consumer of `ryve watch` — the durable, restart-safe scheduler that
@@ -2072,6 +2459,277 @@ mod tests {
         assert!(p.contains("Do **not** merge to main automatically"));
     }
 
+    // ─── MergeHand skeleton [sp-476ef264 / ryve-10c8baee] ───────────────
+    //
+    // The MergeHand role is a new integrator role distinct from the
+    // existing Merger. These tests lock in the skeleton contract:
+    //
+    //   - the composer exists and opens with the EXECUTE directive,
+    //   - it carries the crew id and merge spark id,
+    //   - it labels itself as MergeHand (not Merger) so consumers and
+    //     operators can tell the two apart,
+    //   - it returns text DIFFERENT from `compose_merger_prompt` so the
+    //     two roles can pivot independently.
+    //
+    // Acceptance criterion (2) of spark ryve-10c8baee depends on these
+    // being behavioural rather than snapshot-level.
+
+    #[test]
+    fn merge_hand_prompt_opens_with_execute_directive() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        assert!(
+            p.starts_with("EXECUTE"),
+            "merge_hand prompt must lead with EXECUTE directive: {:?}",
+            p.chars().take(80).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn merge_hand_prompt_includes_crew_and_spark_ids() {
+        let p = compose_merge_hand_prompt("cr-bbbb", "sp-merge2");
+        assert!(
+            p.contains("cr-bbbb"),
+            "merge_hand prompt must reference the crew id verbatim"
+        );
+        assert!(
+            p.contains("ASSIGNMENT: spark sp-merge2"),
+            "merge_hand prompt must carry the merge spark id in its assignment header"
+        );
+        assert!(
+            p.contains("ryve spark status sp-merge2 in_progress"),
+            "merge_hand prompt must instruct the agent to mark the spark in progress"
+        );
+    }
+
+    #[test]
+    fn merge_hand_prompt_identifies_as_merge_hand_not_merger() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        // Role name must appear explicitly so log scans / audits can
+        // distinguish the skeleton from a legitimate Merger session.
+        assert!(
+            p.contains("MergeHand") || p.contains("MERGE_HAND"),
+            "merge_hand prompt must identify itself by name so it is not \
+             confused with the existing Merger role"
+        );
+    }
+
+    /// Acceptance criterion (2) of spark ryve-10c8baee: the MergeHand
+    /// composer must return a prompt DISTINCT from the existing Merger
+    /// composer. Checking strict inequality locks the independence
+    /// contract — if a future edit collapses the two composers into one
+    /// (by mistake or to "dedupe"), this test fails and surfaces the
+    /// regression.
+    #[test]
+    fn merge_hand_prompt_is_distinct_from_merger_prompt() {
+        let merger = compose_merger_prompt("cr-aaaa", "sp-merge1");
+        let merge_hand = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        assert_ne!(
+            merger, merge_hand,
+            "compose_merge_hand_prompt must return text distinct from \
+             compose_merger_prompt so the two roles can pivot independently"
+        );
+    }
+
+    /// [sp-6b261ad0] Assignment-creation order is the canonical,
+    /// deterministic merge order for sub-PRs into the Epic branch. The
+    /// prompt MUST instruct the MergeHand to pull each child spark's
+    /// Assignment creation timestamp from the workgraph and iterate
+    /// sub-PRs ascending by that timestamp.
+    #[test]
+    fn merge_hand_prompt_merges_sub_prs_in_assignment_creation_order() {
+        let p = compose_merge_hand_prompt("cr-ord", "sp-merge-ord");
+
+        assert!(
+            p.contains("Assignment-creation order"),
+            "prompt must name Assignment-creation order as the merge contract"
+        );
+        assert!(
+            p.contains("ryve --json assign list"),
+            "prompt must instruct the MergeHand to fetch assignments via \
+             `ryve --json assign list <child>`"
+        );
+        assert!(
+            p.contains("assigned_at"),
+            "prompt must point at the `assigned_at` field as the creation \
+             timestamp"
+        );
+        assert!(
+            p.contains("ascending") || p.contains("Sort"),
+            "prompt must specify ascending sort on the creation timestamp"
+        );
+        assert!(
+            p.contains("ryve --json crew show cr-ord"),
+            "prompt must enumerate sub-PRs via `ryve --json crew show <crew>`"
+        );
+        assert!(
+            p.contains("deterministic"),
+            "prompt must state the ordering is deterministic so Heads / \
+             operators can reason about merge order"
+        );
+    }
+
+    /// [sp-6b261ad0] Every sub-PR merge into the Epic branch MUST use
+    /// `git merge --no-ff` so each sub-PR's history is preserved as a
+    /// dedicated merge commit. Fast-forward / squash / rebase all erase
+    /// the audit trail.
+    #[test]
+    fn merge_hand_prompt_requires_no_ff_for_every_sub_pr_merge() {
+        let p = compose_merge_hand_prompt("cr-nf", "sp-merge-nf");
+
+        assert!(
+            p.contains("git merge --no-ff"),
+            "prompt must specify `git merge --no-ff` for sub-PR merges"
+        );
+        assert!(
+            p.contains("MANDATORY") || p.contains("mandatory"),
+            "prompt must mark `--no-ff` as mandatory, not a suggestion"
+        );
+        // Explicitly forbid the three anti-patterns that would erase
+        // sub-PR history if tolerated.
+        assert!(
+            p.contains("squash") || p.contains("Squash"),
+            "prompt must forbid squash merges explicitly by name"
+        );
+        assert!(
+            p.contains("rebase") || p.contains("Rebase"),
+            "prompt must forbid rebasing sub-PRs onto the epic by name"
+        );
+        assert!(
+            p.contains("fast-forward") || p.contains("Fast-forward"),
+            "prompt must forbid fast-forward merges by name"
+        );
+    }
+
+    // ─── MergeHand Epic PR → main lifecycle [sp-9f6b0c96 / sp-476ef264] ──
+    //
+    // These tests lock in the acceptance criteria of spark ryve-9f6b0c96:
+    //   (1) the Epic PR is opened or updated with a body listing every
+    //       child Assignment + its source PR,
+    //   (2) the Epic → main merge is gated on required approvals + green
+    //       CI,
+    //   (3) the Merged phase transition is emitted for the Epic's
+    //       merge_hand Assignment (accepted only when emitted by
+    //       merge_hand — validator-enforced; the prompt references the
+    //       correct helper so callers don't misuse the raw API),
+    //   (4) no path is offered for merge_hand to force-push, use
+    //       --no-verify, or bypass a failing CI check.
+
+    /// (1) The Epic PR body template must be present and name the
+    /// Assignment + source PR fields the E2E test parses.
+    #[test]
+    fn merge_hand_prompt_opens_epic_pr_with_child_assignment_listing() {
+        let p = compose_merge_hand_prompt("cr-epic1", "sp-mergeEpic");
+
+        assert!(
+            p.contains("EPIC PR LIFECYCLE"),
+            "merge_hand prompt must describe the Epic PR lifecycle"
+        );
+        assert!(
+            p.contains("gh pr create --base main --head crew/cr-epic1"),
+            "merge_hand prompt must pin base=main and head=crew/<id> when creating the Epic PR"
+        );
+        assert!(
+            p.contains("gh pr edit"),
+            "merge_hand prompt must describe the update path for an existing Epic PR"
+        );
+        assert!(
+            p.contains("Assignment") && p.contains("source PR"),
+            "Epic PR body template must list each child Assignment with its source PR"
+        );
+    }
+
+    /// (2) Epic → main merge must be gated on `reviewDecision=APPROVED`
+    /// and green `statusCheckRollup`.
+    #[test]
+    fn merge_hand_prompt_gates_epic_merge_on_approvals_and_ci() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+
+        assert!(
+            p.contains("reviewDecision") && p.contains("APPROVED"),
+            "merge_hand prompt must require reviewDecision=APPROVED before merging"
+        );
+        assert!(
+            p.contains("statusCheckRollup"),
+            "merge_hand prompt must consult statusCheckRollup to confirm CI is green"
+        );
+        assert!(
+            p.contains("gh pr merge"),
+            "merge_hand prompt must document the Epic → main merge command"
+        );
+    }
+
+    /// (3) Merged phase transition — the prompt must name the
+    /// merge_hand-only invariant and point callers at the
+    /// `mark_assignment_merged` helper.
+    #[test]
+    fn merge_hand_prompt_emits_merged_phase_transition_via_merge_hand_only_helper() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge-xyz");
+
+        assert!(
+            p.contains("Merged") && p.contains("ReadyForMerge"),
+            "merge_hand prompt must describe the ReadyForMerge → Merged transition"
+        );
+        assert!(
+            p.contains("mark_assignment_merged"),
+            "merge_hand prompt must point callers at the MergeHand-only helper"
+        );
+        assert!(
+            p.contains("ONLY actor"),
+            "merge_hand prompt must state that merge_hand is the ONLY actor \
+             permitted to drive an Assignment to Merged"
+        );
+    }
+
+    /// (4) Combined force-push / --no-verify / CI-bypass ban — from
+    /// sp-6b261ad0 + sp-9f6b0c96. Each forbidden primitive is asserted
+    /// by name so future edits can't soften the contract silently.
+    #[test]
+    fn merge_hand_prompt_forbids_force_push_no_verify_and_ci_bypass() {
+        let p = compose_merge_hand_prompt("cr-f", "sp-merge-f");
+
+        // Force-push in all its variants.
+        assert!(
+            p.contains("force-push") || p.contains("git push --force"),
+            "prompt must forbid force-push by name"
+        );
+        assert!(
+            p.contains("--force-with-lease"),
+            "prompt must forbid `--force-with-lease` explicitly — the most \
+             common force-push variant slipped past a casual reader"
+        );
+
+        // --no-verify.
+        assert!(
+            p.contains("--no-verify"),
+            "prompt must forbid `--no-verify` by name"
+        );
+
+        // CI bypass: category + common trailers.
+        assert!(
+            p.to_lowercase().contains("ci bypass")
+                || p.contains("bypass required checks")
+                || p.contains("No CI bypass"),
+            "prompt must forbid CI bypass as a category"
+        );
+        for trailer in ["[skip ci]", "[ci skip]"] {
+            assert!(
+                p.contains(trailer),
+                "prompt must name the `{trailer}` CI-skip trailer by name so \
+                 a future edit cannot silently allow it back in"
+            );
+        }
+
+        // gh pr merge --admin bypasses branch protection.
+        assert!(
+            p.contains("--admin"),
+            "prompt must forbid `gh pr merge --admin` (admin bypasses \
+             approval + CI gates)"
+        );
+
+        // The HARD RULES block carries all of the above.
+        assert!(p.contains("HARD RULES"), "HARD RULES block must be present");
+    }
+
     /// sp-ryve-c0733c9c: Investigator prompt must open with READ-ONLY
     /// discipline, instruct posting findings via `ryve comment add`, carry
     /// the parent spark id and title, and banish destructive git commands
@@ -2616,6 +3274,176 @@ mod tests {
             !p.contains("git checkout -b crew/"),
             "merger must not branch via `git checkout -b` in the workshop root \
              (use `git worktree add -b` instead)"
+        );
+    }
+
+    // ─── Chat-of-record prompt contract [sp-73fd1c5f / ryve-12f09190] ───
+    //
+    // Every archetype prompt (Atlas, Heads, every Hand flavour, Merger)
+    // must carry the chat-of-record boundaries + `ryve post` / `ryve
+    // channel tail` tool references, and must note that on-close
+    // enforcement is tool-gated (not prompt-only). These tests pin the
+    // contract so a future edit that drops a pillar fails the build.
+
+    /// Hands, Heads, and the Merger share the same CHAT_OF_RECORD block.
+    /// It must name all five boundaries (claim / design-pick / block /
+    /// commit / handoff), document both `ryve post` and `ryve channel
+    /// tail` with concrete example invocations, and explicitly call out
+    /// that the close-gate is tool-gated.
+    fn assert_carries_chat_of_record(name: &str, p: &str) {
+        assert!(
+            p.contains("CHAT-OF-RECORD"),
+            "{name} must include a CHAT-OF-RECORD section"
+        );
+        for boundary in ["CLAIM", "DESIGN-PICK", "BLOCK", "COMMIT", "HANDOFF"] {
+            assert!(
+                p.contains(boundary),
+                "{name} must name mandatory boundary `{boundary}`"
+            );
+        }
+        assert!(
+            p.contains("ryve post --channel"),
+            "{name} must document `ryve post --channel` as the write tool"
+        );
+        assert!(
+            p.contains("ryve channel tail --channel"),
+            "{name} must document `ryve channel tail --channel` as the read tool"
+        );
+        assert!(
+            p.contains("--since") && p.contains("--limit") && p.contains("--author"),
+            "{name} must document the tail filter flags (--since / --limit / --author)"
+        );
+        assert!(
+            p.contains("TOOL-GATED") || p.contains("tool-gated"),
+            "{name} must note that on-close enforcement is tool-gated, not prompt-only"
+        );
+        assert!(
+            p.contains("ryve-12f09190"),
+            "{name} must cite the chat-of-record epic (ryve-12f09190) as the enforcement anchor"
+        );
+    }
+
+    #[test]
+    fn hand_prompt_carries_chat_of_record() {
+        let p = compose_hand_prompt(&[], "sp-cor-hand");
+        assert_carries_chat_of_record("compose_hand_prompt", &p);
+        // HOUSE_RULES must also have an explicit chat-of-record rule so
+        // a reader scanning the numbered rules sees the obligation.
+        assert!(
+            p.contains("HOUSE RULES") && p.contains("chat-of-record"),
+            "HOUSE_RULES must include a chat-of-record rule alongside rules 1-5"
+        );
+    }
+
+    #[test]
+    fn merger_prompt_carries_chat_of_record() {
+        let p = compose_merger_prompt("cr-cor", "sp-cor-merge");
+        assert_carries_chat_of_record("compose_merger_prompt", &p);
+    }
+
+    #[test]
+    fn head_prompts_carry_chat_of_record() {
+        for arch in [
+            HeadArchetype::Build,
+            HeadArchetype::Research,
+            HeadArchetype::Review,
+        ] {
+            let p = compose_head_prompt(arch, Some("sp-cor-epic"), None);
+            assert_carries_chat_of_record(&format!("compose_head_prompt({})", arch.as_str()), &p);
+        }
+    }
+
+    #[test]
+    fn perf_head_prompt_carries_chat_of_record() {
+        let p = compose_perf_head_prompt(Some("sp-cor-perf"), None);
+        assert_carries_chat_of_record("compose_perf_head_prompt", &p);
+    }
+
+    #[test]
+    fn investigator_prompt_carries_chat_of_record() {
+        let p = compose_investigator_prompt(&[], "sp-cor-inv");
+        assert_carries_chat_of_record("compose_investigator_prompt", &p);
+    }
+
+    #[test]
+    fn architect_prompt_carries_chat_of_record() {
+        let p = compose_architect_prompt(&[], "sp-cor-arch");
+        assert_carries_chat_of_record("compose_architect_prompt", &p);
+    }
+
+    #[test]
+    fn reviewer_prompt_carries_chat_of_record() {
+        let p = compose_reviewer_prompt(&[], "sp-cor-rev");
+        assert_carries_chat_of_record("compose_reviewer_prompt", &p);
+    }
+
+    #[test]
+    fn release_manager_prompt_carries_chat_of_record() {
+        let p = compose_release_manager_prompt(&[], "sp-cor-rel");
+        assert_carries_chat_of_record("compose_release_manager_prompt", &p);
+    }
+
+    #[test]
+    fn bug_hunter_prompt_carries_chat_of_record() {
+        let p = compose_bug_hunter_prompt(&[], "sp-cor-bug");
+        assert_carries_chat_of_record("compose_bug_hunter_prompt", &p);
+    }
+
+    #[test]
+    fn performance_engineer_prompt_carries_chat_of_record() {
+        let p = compose_performance_engineer_prompt(&[], "sp-cor-pe");
+        assert_carries_chat_of_record("compose_performance_engineer_prompt", &p);
+    }
+
+    /// Atlas posts to the workshop-wide `#atlas` channel rather than a
+    /// per-epic channel, so its chat-of-record block is Atlas-specific.
+    /// It still carries the same shape: named boundaries, `ryve post`
+    /// + `ryve channel tail` with example invocations, tool-gated
+    /// close enforcement.
+    #[test]
+    fn atlas_prompt_carries_chat_of_record() {
+        let p = compose_atlas_prompt();
+
+        assert!(
+            p.contains("CHAT-OF-RECORD"),
+            "Atlas prompt must include a CHAT-OF-RECORD section"
+        );
+        // Atlas posts to the workshop-wide #atlas channel.
+        assert!(
+            p.contains("#atlas"),
+            "Atlas chat-of-record must target the workshop-wide #atlas channel"
+        );
+        // Boundaries Atlas owns: boot / route / design-pick / block /
+        // handoff-or-shutdown. Claim/commit are per-Hand notions; Atlas
+        // does not claim sparks or commit code.
+        for boundary in ["BOOT", "ROUTE", "DESIGN-PICK", "BLOCK", "HANDOFF"] {
+            assert!(
+                p.contains(boundary),
+                "Atlas chat-of-record must name boundary `{boundary}`"
+            );
+        }
+        // Concrete CLI tool references with example invocations.
+        assert!(
+            p.contains("ryve post --channel '#atlas'"),
+            "Atlas chat-of-record must show `ryve post --channel '#atlas'` example"
+        );
+        assert!(
+            p.contains("ryve channel tail --channel '#atlas'"),
+            "Atlas chat-of-record must show `ryve channel tail --channel '#atlas'` example"
+        );
+        assert!(
+            p.contains("--limit") && p.contains("--since"),
+            "Atlas chat-of-record must document --limit and --since on tail"
+        );
+        // Tool-gated enforcement, not prompt-only — and cite the epic so
+        // audit trails trace back.
+        assert!(
+            p.contains("TOOL-GATED") || p.contains("tool-gated"),
+            "Atlas chat-of-record must note that close-gate enforcement is tool-gated"
+        );
+        assert!(
+            p.contains("ryve-12f09190"),
+            "Atlas chat-of-record must cite the chat-of-record epic id"
         );
     }
 }
