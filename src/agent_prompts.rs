@@ -1134,8 +1134,11 @@ pub fn compose_merge_hand_prompt(crew_id: &str, merge_spark_id: &str) -> String 
             `git push origin <epic-branch>`\n\
             Do NOT pass `--force`, `--force-with-lease`, or any variant that \
             rewrites history on origin. Do NOT bypass required checks.\n\n\
-         8. Do NOT merge the Epic into `main`. The Epic branch is handed off \
-            for human review.\n\n"
+         8. Do NOT merge the Epic into `main` directly from the sub-PR loop \
+            — history-preserving Epic → main merge is driven separately by \
+            the EPIC PR LIFECYCLE section below via `gh pr merge` once \
+            required approvals and green CI are in. Never bypass that gate \
+            with a bare `git merge` or `git push main` from this loop.\n\n"
     ));
 
     prompt.push_str(

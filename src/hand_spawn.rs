@@ -460,7 +460,10 @@ impl MergePreconditionReport {
             ("ci", &self.ci),
             ("stuck", &self.stuck),
         ] {
-            if status.kind() == "fail"
+            // PR #55 Copilot c4: use the typed predicate rather than
+            // `status.kind() == "fail"` so this stays correct if
+            // `kind()`'s string formatting ever changes.
+            if status.is_fail()
                 && let Some(reason) = status.reason()
             {
                 out.push((name, reason));
@@ -610,6 +613,11 @@ pub async fn check_merge_preconditions(
     let mut missing_assignment: Vec<String> = Vec::new(); // spark_ids
     let mut sub_pr_numbers: Vec<(String, i64)> = Vec::new(); // (spark_id, pr_number)
 
+    // PR #55 Copilot c3 — known N+1: one query per child spark. Acceptable
+    // at v1 epic sizes (a handful to a few dozen children per epic); worth
+    // batching into a single `latest_assignments_for_sparks(pool, &ids)`
+    // query that returns a HashMap<spark_id, Assignment> before this runs
+    // on epics with 100+ children. Tracked as a follow-up perf spark.
     for child in &child_sparks {
         match assign_repo::latest_assignment_for_spark(pool, &child.id).await {
             Ok(asgn) => {

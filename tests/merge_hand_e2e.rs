@@ -9,10 +9,14 @@
 //!    the transition state machine to `Approved`, each carrying a mirrored
 //!    GitHub artifact PR number and a real git branch in the test repo.
 //! 2. A merge-spark is created as a third child of the Epic.
-//! 3. The Merge-Hand precondition checker is run against the merge-spark
-//!    with the default `NoopMergePreconditionEnv`. The gate passes — that
-//!    is the "spawn merge_hand" step: the gate is what refuses or admits a
-//!    Merge Hand subprocess, and we verify it admits here.
+//! 3. Rather than calling `check_merge_preconditions` / `spawn_hand`
+//!    (which require extensive gate-env mocking), the test asserts the
+//!    SAME post-conditions the gate is supposed to observe via raw SQL:
+//!    both user Assignments have `assignment_phase = 'approved'` and
+//!    no Assignment is in `Stuck`. PR #55 Copilot c2 — earlier doc
+//!    over-claimed the test drove the real gate path; the SQL checks
+//!    are the effective stand-in because they exercise the same DB
+//!    invariants the gate relies on.
 //! 4. The test plays the role of the spawned Merge Hand: it creates the
 //!    Epic branch, integrates both sub-branches with `git merge --no-ff`
 //!    in Assignment-creation order, composes the Epic PR body using the
