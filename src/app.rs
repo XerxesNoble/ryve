@@ -998,11 +998,20 @@ impl App {
                 // directory to us via the single-instance socket. Raise
                 // the window so the user knows we noticed, and if the
                 // forwarded cwd looks like a workshop (existing
-                // directory) hand it to OpenWorkshopPath — that handler
-                // already deduplicates against open tabs and prunes
-                // stale entries.
+                // directory that is NOT nested inside another
+                // workshop) hand it to OpenWorkshopPath.
+                //
+                // Nested-path guard: every `ryve` CLI call a Hand
+                // makes from its worktree (`ryve post`, `ryve spark
+                // show`, `ryve assign claim`, …) forwards its cwd
+                // here. Without this check the Hand's worktree gets
+                // treated as a new workshop and pollutes
+                // `recent_workshops`. Silently drop the forward when
+                // cwd is inside an existing workshop — no toast, the
+                // user didn't initiate this action; `OpenWorkshopPath`
+                // has the loud toast for user-initiated opens.
                 let focus = window::oldest().and_then(window::gain_focus);
-                if inv.cwd.is_dir() {
+                if inv.cwd.is_dir() && path_is_inside_existing_workshop(&inv.cwd).is_none() {
                     let open = self.update(Message::OpenWorkshopPath(inv.cwd));
                     return Task::batch([focus, open]);
                 }
@@ -1506,6 +1515,37 @@ impl App {
             return self.push_toast(
                 "Workshop not found",
                 format!("Path no longer exists: {}", path.display()),
+                ToastKind::Error,
+            );
+        }
+
+        // HARD GATE — reject any path that is nested inside an existing
+        // workshop's tree. This catches the Hand-worktree-as-workshop
+        // bug: a Hand running `ryve <cmd>` from its own worktree
+        // (`.ryve/worktrees/<short>/`) forwards its cwd to the main UI
+        // via `Message::IpcInvocation`, which used to blindly open it
+        // as a workshop. Every such path ends up in
+        // `global_config.recent_workshops`, and every subsequent
+        // launch auto-opens all of them as phantom tabs.
+        //
+        // The gate treats ANY directory that has an ancestor with
+        // `.ryve/sparks.db` as "inside a workshop" and refuses to
+        // treat it as a separate workshop. Also prunes it from
+        // `recent_workshops` so the pollution self-heals on launch.
+        if let Some(outer_root) = path_is_inside_existing_workshop(&path) {
+            self.global_config.remove_recent_workshop(&path);
+            let cfg = self.global_config.clone();
+            std::thread::spawn(move || {
+                let _ = cfg.save();
+            });
+            return self.push_toast(
+                "Can't nest workshops",
+                format!(
+                    "{} is inside the workshop at {}. Open the outer \
+                     workshop instead.",
+                    path.display(),
+                    outer_root.display()
+                ),
                 ToastKind::Error,
             );
         }
@@ -7449,6 +7489,31 @@ impl App {
 // integration merge — the regression-harness branch ([sp-961b4d5e])
 // replaced it with `perf_core::classify_key_event`, which is exercised
 // by the headless smoke test in `perf_core/tests/sparks_poll_smoke.rs`.
+/// Return `Some(outer_root)` when `candidate` is a STRICT descendant of
+/// some other workshop's root directory — i.e. there's an ancestor of
+/// `candidate` (not `candidate` itself) that contains a
+/// `.ryve/sparks.db`. Used by the open-workshop gate to refuse
+/// Hand-worktree paths, submodule paths, or any other
+/// directory-inside-a-workshop from becoming a separate workshop tab.
+///
+/// Returns `None` when the path is NOT inside any workshop — the
+/// caller treats that as a fresh workshop candidate.
+///
+/// The candidate itself is not probed (a directory that IS a workshop
+/// root is the legal case we want to allow through).
+fn path_is_inside_existing_workshop(candidate: &std::path::Path) -> Option<PathBuf> {
+    let canonical = candidate.canonicalize().ok()?;
+    // Start the walk at the PARENT so the candidate itself can be a
+    // workshop root without self-rejecting.
+    let mut current = canonical.parent()?.to_path_buf();
+    loop {
+        if current.join(".ryve").join("sparks.db").exists() {
+            return Some(current);
+        }
+        current = current.parent()?.to_path_buf();
+    }
+}
+
 /// Pull the owning tab id out of an IRC-view message, falling back to
 /// the currently active tab when the message did not embed one (e.g.
 /// the text-input change events). Spark ryve-5466c372.
@@ -7816,6 +7881,67 @@ mod tests {
     use data::ryve_dir::BackgroundConfig;
 
     use super::*;
+
+    /// Hard-gate regression: a path nested inside a workshop (with
+    /// an ancestor that has `.ryve/sparks.db`) is detected as
+    /// inside-a-workshop, and the workshop root is returned. Models
+    /// the Hand-worktree-as-workshop bug: `<ws>/.ryve/worktrees/<h>`
+    /// is inside `<ws>`.
+    #[test]
+    fn path_is_inside_existing_workshop_detects_hand_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws_root = tmp.path().canonicalize().unwrap();
+        // Seed a minimal "workshop root" marker: .ryve/sparks.db
+        std::fs::create_dir_all(ws_root.join(".ryve")).unwrap();
+        std::fs::write(ws_root.join(".ryve").join("sparks.db"), b"").unwrap();
+        // Simulate a Hand worktree inside that workshop.
+        let hand_worktree = ws_root.join(".ryve").join("worktrees").join("abcd1234");
+        std::fs::create_dir_all(&hand_worktree).unwrap();
+
+        let detected = path_is_inside_existing_workshop(&hand_worktree);
+        assert_eq!(
+            detected.as_deref(),
+            Some(ws_root.as_path()),
+            "Hand worktree under .ryve/worktrees must be detected as \
+             nested inside the outer workshop"
+        );
+    }
+
+    /// The workshop root itself must NOT self-reject — it's the legal
+    /// open target. Only STRICT descendants trip the gate.
+    #[test]
+    fn path_is_inside_existing_workshop_allows_the_workshop_root_itself() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws_root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(ws_root.join(".ryve")).unwrap();
+        std::fs::write(ws_root.join(".ryve").join("sparks.db"), b"").unwrap();
+
+        assert!(
+            path_is_inside_existing_workshop(&ws_root).is_none(),
+            "a workshop root must not be detected as nested inside \
+             itself — the gate only rejects STRICT descendants"
+        );
+    }
+
+    /// A sibling directory (same parent as a workshop, but not a
+    /// descendant of one) must pass the gate so fresh workshops in
+    /// the user's workspace keep working.
+    #[test]
+    fn path_is_inside_existing_workshop_allows_sibling_directories() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent = tmp.path().canonicalize().unwrap();
+        let ws_a = parent.join("ws-a");
+        let ws_b = parent.join("ws-b");
+        std::fs::create_dir_all(ws_a.join(".ryve")).unwrap();
+        std::fs::write(ws_a.join(".ryve").join("sparks.db"), b"").unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+
+        assert!(
+            path_is_inside_existing_workshop(&ws_b).is_none(),
+            "a sibling directory (not a descendant of ws-a) must not \
+             be treated as nested inside ws-a"
+        );
+    }
 
     #[test]
     fn attribution_label_present_when_photographer_set() {
