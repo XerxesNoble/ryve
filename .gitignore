@@ -37,3 +37,16 @@ vendor/ircd/bin/
 # Ryve runtime artifacts (per-Hand prompts and logs)
 .ryve/prompts/
 .ryve/logs/
+
+# Per-workshop runtime config + UI state. These are user-specific
+# (often contain secrets — GitHub PATs, webhook secrets, IRC passwords)
+# and machine-specific (port allocations, layout dimensions, collapsed
+# spark IDs). Tracking them produces both privacy leaks and merge
+# churn. `ryve init` creates a fresh config.toml on first launch;
+# ui_state.json is recreated by the app.
+.ryve/config.toml
+.ryve/ui_state.json
+.ryve/ircd/
+
+# Claude Code session lock — runtime, contains live session ID + PID.
+.claude/scheduled_tasks.lock
