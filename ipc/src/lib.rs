@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod channel_manager;
+pub mod channel_projection;
 pub mod irc_client;
 pub mod irc_renderer;
 pub mod lifecycle;
