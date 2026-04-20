@@ -23,10 +23,10 @@
 //! `epic_id` that foreign-keys to `sparks.id`. The canonical channel
 //! naming produced by [`crate::channel_manager::channel_name`] is
 //! `#epic-<id>-<slug>`, so callers that have only a channel name can
-//! recover the epic id via [`epic_id_from_channel`]. Workshop-scoped
-//! well-known channels (`#atlas` and friends) are out of scope for this
-//! foundation: a sibling spark in the chat-of-record epic adds them with
-//! their own spark-id binding.
+//! recover the epic id via [`resolve_epic_id_for_channel`]. Workshop-
+//! scoped well-known channels (`#atlas` and friends) are out of scope
+//! for this foundation: a sibling spark in the chat-of-record epic adds
+//! them with their own spark-id binding.
 
 use chrono::Utc;
 use data::sparks::error::SparksError;
@@ -52,9 +52,10 @@ pub struct NewPost {
     /// posts (human CLI use outside of any spawned Hand session).
     pub author_session_id: Option<String>,
     /// Optional explicit epic id override. When `None` the epic id is
-    /// parsed from [`NewPost::channel`] via [`epic_id_from_channel`]; pass
-    /// `Some` when the caller already knows the spark id (e.g. a future
-    /// well-known-channel resolver).
+    /// resolved from [`NewPost::channel`] via
+    /// [`resolve_epic_id_for_channel`]; pass `Some` when the caller
+    /// already knows the spark id (e.g. a future well-known-channel
+    /// resolver).
     pub epic_id: Option<String>,
 }
 
