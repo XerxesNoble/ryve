@@ -76,6 +76,7 @@ pub const CLI_COMMANDS: &[&str] = &[
     "post",
     "channel",
     "channels",
+    "mcp",
     "help",
     "--help",
     "-h",
@@ -210,6 +211,7 @@ pub async fn run(args: Vec<String>) {
         }
         "post" => handle_post(&pool, &args_clean[2..], json_mode).await,
         "channel" | "channels" => handle_channel(&pool, &args_clean[2..], json_mode).await,
+        "mcp" => handle_mcp(&pool, &args_clean[2..], json_mode).await,
         other => {
             eprintln!("error: unknown command '{other}'");
             print_usage();
@@ -333,6 +335,9 @@ fn print_usage() {
         "  channel tail --channel <name> [--since <iso-ts>] [--limit <N>] [--author <actor_id>]"
     );
     eprintln!("                                       Read recent channel posts");
+    eprintln!();
+    eprintln!("  mcp list                            List MCP tools registered with the server");
+    eprintln!("  mcp call <tool> <json-input>        Invoke an MCP tool (same paths as the CLI)");
     eprintln!();
     eprintln!("  event list <spark_id>               List audit trail for a spark");
     eprintln!();
@@ -780,6 +785,72 @@ async fn handle_channel_tail(pool: &sqlx::SqlitePool, args: &[String], json_mode
                         m.raw_text
                     );
                 }
+            }
+        }
+        Err(e) => die(&format!("{e}")),
+    }
+}
+
+// ── MCP tool server ─────────────────────────────────
+//
+// CLI bridge into the in-process MCP tool registry. `ryve mcp list`
+// prints the registered tools (name + description + schemas) and
+// `ryve mcp call <name> <json>` invokes one — giving humans and
+// scripts a shell-visible proof that the registry and dispatcher are
+// wired to the same code paths the MCP transport will use.
+
+async fn handle_mcp(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.is_empty() {
+        die("mcp subcommand required (list | call)");
+    }
+    match args[0].as_str() {
+        "list" => handle_mcp_list(json_mode),
+        "call" => handle_mcp_call(pool, &args[1..], json_mode).await,
+        other => die(&format!(
+            "unknown mcp subcommand '{other}' (expected: list | call)"
+        )),
+    }
+}
+
+fn handle_mcp_list(json_mode: bool) {
+    let tools = crate::mcp::all_tools();
+    if json_mode {
+        let rendered: Vec<_> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                    "output_schema": t.output_schema,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rendered).unwrap_or_default()
+        );
+    } else {
+        for t in &tools {
+            println!("{}\t{}", t.name, t.description);
+        }
+    }
+}
+
+async fn handle_mcp_call(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
+    if args.len() < 2 {
+        die("mcp call requires <tool-name> <json-input>");
+    }
+    let name = &args[0];
+    let input: serde_json::Value =
+        serde_json::from_str(&args[1]).unwrap_or_else(|e| die(&format!("invalid JSON input: {e}")));
+
+    match crate::mcp::call_tool(pool, name, input).await {
+        Ok(out) => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            } else {
+                println!("{out}");
             }
         }
         Err(e) => die(&format!("{e}")),
