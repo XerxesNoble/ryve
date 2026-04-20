@@ -181,6 +181,8 @@ pub fn compose_atlas_prompt() -> String {
          report.\n\n",
     );
 
+    prompt.push_str(ATLAS_CHAT_OF_RECORD);
+
     prompt.push_str(ATLAS_WATCH_SECTION);
 
     prompt.push_str(
@@ -219,6 +221,7 @@ pub fn compose_atlas_prompt() -> String {
 pub fn compose_hand_prompt(sparks: &[Spark], spark_id: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str(HOUSE_RULES);
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(&format!(
         "ASSIGNMENT: spark {spark_id}. You have been assigned this spark. \
@@ -393,6 +396,8 @@ pub fn compose_head_prompt(
             Then exit.\n\n",
     );
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - Use `ryve` for ALL workgraph operations. No raw SQL. No file edits to \
@@ -509,6 +514,8 @@ pub fn compose_perf_head_prompt(epic_id: Option<&str>, epic_title: Option<&str>)
             comment it on the parent epic.\n\n",
     );
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - You are a Head. You NEVER edit source code yourself. Every file change \
@@ -624,6 +631,8 @@ pub fn compose_investigator_prompt(sparks: &[Spark], spark_id: &str) -> String {
            every finding id/line-range and your overall read of the scope. \
            Then close the spark.\n\n",
     ));
+
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(
         "HARD RULES:\n\
@@ -786,6 +795,8 @@ pub fn compose_architect_prompt(sparks: &[Spark], spark_id: &str) -> String {
          inside the recommendation body, not the category.\n\n",
     );
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - You are read-only. Edit/Write/NotebookEdit are forbidden. \
@@ -910,6 +921,8 @@ pub fn compose_reviewer_prompt(sparks: &[Spark], spark_id: &str) -> String {
          (\"needs cleanup\", \"not quite right\") is not actionable.\n\n"
     ));
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - You are read-only. Edit/Write/NotebookEdit are forbidden.\n\
@@ -937,6 +950,7 @@ pub fn compose_reviewer_prompt(sparks: &[Spark], spark_id: &str) -> String {
 pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str(HOUSE_RULES);
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(&format!(
         "ASSIGNMENT: spark {merge_spark_id} (role: MERGER for crew {crew_id}). \
@@ -1110,6 +1124,8 @@ pub fn compose_release_manager_prompt(sparks: &[Spark], spark_id: &str) -> Strin
             {spark_id} completed`.\n\n",
     );
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(&format!(
         "HARD RULES:\n\
          - You are the ONLY Release Manager on this release. Do not spawn a \
@@ -1231,6 +1247,8 @@ pub fn compose_bug_hunter_prompt(sparks: &[Spark], spark_id: &str) -> String {
          6. CLOSE. When the DONE checklist passes, close the spark with \
             `ryve spark close <id> completed` and exit.\n\n",
     );
+
+    prompt.push_str(CHAT_OF_RECORD);
 
     prompt.push_str(
         "HARD RULES:\n\
@@ -1401,6 +1419,8 @@ pub fn compose_performance_engineer_prompt(sparks: &[Spark], spark_id: &str) -> 
             {spark_id} completed` and exit.\n\n"
     ));
 
+    prompt.push_str(CHAT_OF_RECORD);
+
     prompt.push_str(
         "HARD RULES:\n\
          - Your deliverable is a measured delta plus the targeted fix. \
@@ -1462,7 +1482,11 @@ Violations are blocking.\n\
 4. Before declaring the spark complete, verify your work against \
 `.ryve/checklists/DONE.md`. Every item must be satisfied.\n\
 5. When the work is complete and the DONE checklist passes, close the spark: \
-`ryve spark close <id> completed`. Then exit.\n\n";
+`ryve spark close <id> completed`. Then exit.\n\
+6. Post to chat-of-record at every mandatory boundary (claim, design-pick, \
+block, commit, handoff) via `ryve post --channel <epic-channel>`. \
+`ryve spark close` refuses a zero-post close. See the CHAT-OF-RECORD \
+section below for the full contract and example invocations.\n\n";
 
 /// Mandatory decomposition discipline for any agent that creates child sparks
 /// under an epic (Atlas when briefing, Heads when decomposing). The Merger
@@ -1482,6 +1506,107 @@ conflicts — if the Merger blocks on a conflict, it is a planning bug in this \
 step, not a merge-time problem. Record your scope-overlap reasoning as a \
 comment on the parent epic (`ryve comment add <epic> '<reasoning>'`) so the \
 decision is auditable.\n\n";
+
+/// Mandatory chat-of-record discipline shared by every non-Atlas agent
+/// (Hands, Heads, Mergers). Chat-of-record is the durable record layer
+/// backing sudden-death recovery and cross-agent context: intent, plans,
+/// design picks, blocks, and hand-offs all land in the parent epic's
+/// IRC channel via `ryve post`, and the replacement agent reads them
+/// back via `ryve channel tail`. The five named boundaries (claim /
+/// design-pick / block / commit / handoff) must all post a line so the
+/// `ryve spark close` / `ryve assign close` paths — which are the
+/// mechanical enforcement point for "did this assignment post anything"
+/// — can see a non-empty record since the claim timestamp. Epic
+/// ryve-12f09190 (chat-of-record foundation + enforcement).
+const CHAT_OF_RECORD: &str = "CHAT-OF-RECORD (non-negotiable). Your intent, plans, design picks, \
+blocks, and hand-offs are durable only if you write them to your epic's \
+IRC channel via `ryve post`. The workshop keeps a row per post in \
+`irc_messages`; sudden-death recovery, cross-agent context, and the \
+Merger's read-back of WHY each sibling chose its approach all hinge on \
+these posts. Silence here = future archaeology by the next agent. \
+Enforcement is TOOL-GATED, not prompt-only: `ryve assign close` \
+refuses to close an assignment with zero chat-of-record posts since \
+its claim timestamp (epic ryve-12f09190). `ryve spark close` itself \
+is not gated today — the discipline fires on the assignment-close \
+path. If the tool bounces your close, fix it by posting, not by \
+arguing with this prompt. (PR #54 Copilot c5.)\n\n\
+CHANNEL. Post to the parent epic's channel: `#epic-<epic_id>-<slug>` \
+(canonical form from `ipc::channel_manager::channel_name`; 50-octet IRC \
+limit applies). If you only have a child spark id, run `ryve spark show \
+<spark>` to read its parent epic id and derive the channel from that. \
+Do NOT invent per-Hand channels — they become debug logs nobody reads.\n\n\
+MANDATORY POSTING BOUNDARIES — post a one-line chat-of-record entry at \
+each of these five transitions:\n\
+1. CLAIM — immediately after `ryve assign claim` (or `ryve spark status \
+   <id> in_progress`), post what you are about to do and your plan. \
+   First call `ryve channel tail` to inherit any prior context.\n\
+2. DESIGN-PICK — when you select an approach (algorithm, boundary, \
+   library, migration shape, scope split), post the decision and the \
+   alternative you rejected, in one sentence.\n\
+3. BLOCK — when you hit an unexpected obstacle (failing test you do \
+   not understand, missing dependency, ambiguous intent, bond-discipline \
+   conflict), post the block and your intended resolution or the \
+   question you are raising.\n\
+4. COMMIT — after each non-trivial commit, post a one-liner that names \
+   the change and references the spark id `[sp-xxxx]` so \
+   `ryve commit scan` and the chat log stay aligned.\n\
+5. HANDOFF — before you call `ryve spark close` (or the assignment \
+   close path), post a summary of what shipped, what remains, and \
+   anything the next agent should know. This is the post the \
+   close-gate looks for.\n\n\
+TOOLS — `ryve post` to write, `ryve channel tail` to read. Examples:\n\
+    ryve post --channel '#epic-<epic_id>-<slug>' \\\n\
+        'claim: starting on <task>; plan is <outline> [sp-xxxx]'\n\
+    ryve post --channel '#epic-<epic_id>-<slug>' \\\n\
+        'commit: wired <feature> into <module> [sp-xxxx]'\n\
+    ryve channel tail --channel '#epic-<epic_id>-<slug>' --limit 20\n\
+    ryve channel tail --channel '#epic-<epic_id>-<slug>' \\\n\
+        --since 2026-04-19T00:00:00Z --author <prior_session_id>\n\
+\n\
+Post before acting, tail before handing off.\n\n";
+
+/// Atlas-specific chat-of-record block. Atlas posts to the workshop-wide
+/// `#atlas` channel (vs. per-epic channels used by Hands/Heads): instance
+/// claim on boot, route / design-pick / block per decision, handoff on
+/// shutdown. The same `ryve spark close` tool-gating applies — Atlas
+/// cannot close a user-facing epic it owns without having posted
+/// chat-of-record since claim. Epic ryve-12f09190.
+const ATLAS_CHAT_OF_RECORD: &str = "CHAT-OF-RECORD — the workshop-wide `#atlas` channel is your \
+Director instance log. Every Atlas instance posts on boot, on every \
+delegation / routing decision, and on shutdown. Reading `#atlas` on \
+boot is how the next Atlas inherits the context of the prior one — \
+without it, rotation through the Director seat loses its memory. \
+Enforcement is TOOL-GATED, not prompt-only: `ryve spark close` on any \
+epic you own rejects a close with zero chat-of-record posts since Atlas \
+claimed it (epic ryve-12f09190). If the close bounces, fix it by \
+posting; do not try to route around the gate.\n\n\
+ATLAS POSTING BOUNDARIES — post to `#atlas` at each of these \
+transitions:\n\
+1. BOOT — right after taking the Director seat, post instance id + \
+   \"live, polling state\". First call `ryve channel tail --channel \
+   '#atlas'` to read any prior Atlas's in-flight work.\n\
+2. ROUTE — each time you spawn a Head, post the user goal, the \
+   archetype you chose (build / research / review), and the parent \
+   epic id.\n\
+3. DESIGN-PICK — when you decide between archetypes, decline to \
+   delegate, or choose not to ask the user a clarifying question, \
+   post the decision and the alternative you considered.\n\
+4. BLOCK — when a Head returns incomplete or contradictory work, or \
+   a user goal is genuinely ambiguous, post the block and the \
+   resolution path.\n\
+5. HANDOFF / SHUTDOWN — before releasing the Director seat, post \
+   what is in-flight, which Heads are running, and how to resume.\n\n\
+TOOLS — same CLI every agent uses. Examples:\n\
+    ryve post --channel '#atlas' 'boot: atlas-<instance> seated; \
+resuming <n> active epics'\n\
+    ryve post --channel '#atlas' 'route: user goal <goal> → build head \
+on <epic_id>'\n\
+    ryve channel tail --channel '#atlas' --limit 40\n\
+    ryve channel tail --channel '#atlas' \\\n\
+        --since 2026-04-19T00:00:00Z --author <prior_atlas_session>\n\
+\n\
+Atlas posts on every cross-epic decision. A silent Atlas is an Atlas \
+the next instance cannot inherit from.\n\n";
 
 /// Watch-primitive section for the Atlas prompt. Atlas is the primary
 /// consumer of `ryve watch` — the durable, restart-safe scheduler that
@@ -2616,6 +2741,176 @@ mod tests {
             !p.contains("git checkout -b crew/"),
             "merger must not branch via `git checkout -b` in the workshop root \
              (use `git worktree add -b` instead)"
+        );
+    }
+
+    // ─── Chat-of-record prompt contract [sp-73fd1c5f / ryve-12f09190] ───
+    //
+    // Every archetype prompt (Atlas, Heads, every Hand flavour, Merger)
+    // must carry the chat-of-record boundaries + `ryve post` / `ryve
+    // channel tail` tool references, and must note that on-close
+    // enforcement is tool-gated (not prompt-only). These tests pin the
+    // contract so a future edit that drops a pillar fails the build.
+
+    /// Hands, Heads, and the Merger share the same CHAT_OF_RECORD block.
+    /// It must name all five boundaries (claim / design-pick / block /
+    /// commit / handoff), document both `ryve post` and `ryve channel
+    /// tail` with concrete example invocations, and explicitly call out
+    /// that the close-gate is tool-gated.
+    fn assert_carries_chat_of_record(name: &str, p: &str) {
+        assert!(
+            p.contains("CHAT-OF-RECORD"),
+            "{name} must include a CHAT-OF-RECORD section"
+        );
+        for boundary in ["CLAIM", "DESIGN-PICK", "BLOCK", "COMMIT", "HANDOFF"] {
+            assert!(
+                p.contains(boundary),
+                "{name} must name mandatory boundary `{boundary}`"
+            );
+        }
+        assert!(
+            p.contains("ryve post --channel"),
+            "{name} must document `ryve post --channel` as the write tool"
+        );
+        assert!(
+            p.contains("ryve channel tail --channel"),
+            "{name} must document `ryve channel tail --channel` as the read tool"
+        );
+        assert!(
+            p.contains("--since") && p.contains("--limit") && p.contains("--author"),
+            "{name} must document the tail filter flags (--since / --limit / --author)"
+        );
+        assert!(
+            p.contains("TOOL-GATED") || p.contains("tool-gated"),
+            "{name} must note that on-close enforcement is tool-gated, not prompt-only"
+        );
+        assert!(
+            p.contains("ryve-12f09190"),
+            "{name} must cite the chat-of-record epic (ryve-12f09190) as the enforcement anchor"
+        );
+    }
+
+    #[test]
+    fn hand_prompt_carries_chat_of_record() {
+        let p = compose_hand_prompt(&[], "sp-cor-hand");
+        assert_carries_chat_of_record("compose_hand_prompt", &p);
+        // HOUSE_RULES must also have an explicit chat-of-record rule so
+        // a reader scanning the numbered rules sees the obligation.
+        assert!(
+            p.contains("HOUSE RULES") && p.contains("chat-of-record"),
+            "HOUSE_RULES must include a chat-of-record rule alongside rules 1-5"
+        );
+    }
+
+    #[test]
+    fn merger_prompt_carries_chat_of_record() {
+        let p = compose_merger_prompt("cr-cor", "sp-cor-merge");
+        assert_carries_chat_of_record("compose_merger_prompt", &p);
+    }
+
+    #[test]
+    fn head_prompts_carry_chat_of_record() {
+        for arch in [
+            HeadArchetype::Build,
+            HeadArchetype::Research,
+            HeadArchetype::Review,
+        ] {
+            let p = compose_head_prompt(arch, Some("sp-cor-epic"), None);
+            assert_carries_chat_of_record(&format!("compose_head_prompt({})", arch.as_str()), &p);
+        }
+    }
+
+    #[test]
+    fn perf_head_prompt_carries_chat_of_record() {
+        let p = compose_perf_head_prompt(Some("sp-cor-perf"), None);
+        assert_carries_chat_of_record("compose_perf_head_prompt", &p);
+    }
+
+    #[test]
+    fn investigator_prompt_carries_chat_of_record() {
+        let p = compose_investigator_prompt(&[], "sp-cor-inv");
+        assert_carries_chat_of_record("compose_investigator_prompt", &p);
+    }
+
+    #[test]
+    fn architect_prompt_carries_chat_of_record() {
+        let p = compose_architect_prompt(&[], "sp-cor-arch");
+        assert_carries_chat_of_record("compose_architect_prompt", &p);
+    }
+
+    #[test]
+    fn reviewer_prompt_carries_chat_of_record() {
+        let p = compose_reviewer_prompt(&[], "sp-cor-rev");
+        assert_carries_chat_of_record("compose_reviewer_prompt", &p);
+    }
+
+    #[test]
+    fn release_manager_prompt_carries_chat_of_record() {
+        let p = compose_release_manager_prompt(&[], "sp-cor-rel");
+        assert_carries_chat_of_record("compose_release_manager_prompt", &p);
+    }
+
+    #[test]
+    fn bug_hunter_prompt_carries_chat_of_record() {
+        let p = compose_bug_hunter_prompt(&[], "sp-cor-bug");
+        assert_carries_chat_of_record("compose_bug_hunter_prompt", &p);
+    }
+
+    #[test]
+    fn performance_engineer_prompt_carries_chat_of_record() {
+        let p = compose_performance_engineer_prompt(&[], "sp-cor-pe");
+        assert_carries_chat_of_record("compose_performance_engineer_prompt", &p);
+    }
+
+    /// Atlas posts to the workshop-wide `#atlas` channel rather than a
+    /// per-epic channel, so its chat-of-record block is Atlas-specific.
+    /// It still carries the same shape: named boundaries, `ryve post`
+    /// + `ryve channel tail` with example invocations, tool-gated
+    /// close enforcement.
+    #[test]
+    fn atlas_prompt_carries_chat_of_record() {
+        let p = compose_atlas_prompt();
+
+        assert!(
+            p.contains("CHAT-OF-RECORD"),
+            "Atlas prompt must include a CHAT-OF-RECORD section"
+        );
+        // Atlas posts to the workshop-wide #atlas channel.
+        assert!(
+            p.contains("#atlas"),
+            "Atlas chat-of-record must target the workshop-wide #atlas channel"
+        );
+        // Boundaries Atlas owns: boot / route / design-pick / block /
+        // handoff-or-shutdown. Claim/commit are per-Hand notions; Atlas
+        // does not claim sparks or commit code.
+        for boundary in ["BOOT", "ROUTE", "DESIGN-PICK", "BLOCK", "HANDOFF"] {
+            assert!(
+                p.contains(boundary),
+                "Atlas chat-of-record must name boundary `{boundary}`"
+            );
+        }
+        // Concrete CLI tool references with example invocations.
+        assert!(
+            p.contains("ryve post --channel '#atlas'"),
+            "Atlas chat-of-record must show `ryve post --channel '#atlas'` example"
+        );
+        assert!(
+            p.contains("ryve channel tail --channel '#atlas'"),
+            "Atlas chat-of-record must show `ryve channel tail --channel '#atlas'` example"
+        );
+        assert!(
+            p.contains("--limit") && p.contains("--since"),
+            "Atlas chat-of-record must document --limit and --since on tail"
+        );
+        // Tool-gated enforcement, not prompt-only — and cite the epic so
+        // audit trails trace back.
+        assert!(
+            p.contains("TOOL-GATED") || p.contains("tool-gated"),
+            "Atlas chat-of-record must note that close-gate enforcement is tool-gated"
+        );
+        assert!(
+            p.contains("ryve-12f09190"),
+            "Atlas chat-of-record must cite the chat-of-record epic id"
         );
     }
 }

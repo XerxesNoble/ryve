@@ -484,6 +484,134 @@ async fn resolve_branch_tip(workshop_dir: &Path, branch: &str) -> Option<String>
     if sha.is_empty() { None } else { Some(sha) }
 }
 
+/// Boot-prepend: maximum number of prior chat-of-record posts tailed
+/// from the epic channel when a Hand is re-spawned onto a spark that
+/// already had an owner. Mirrors [`ipc::chat_of_record::TAIL_DEFAULT_LIMIT`]
+/// so direct `ryve channel tail` reads and the boot prepend stay
+/// symmetrical, but kept as its own constant so it can be tuned
+/// independently without pulling the whole CLI default with it.
+/// Parent epic ryve-12f09190 / [sp-b6d9a53c].
+pub const RESPAWN_CONTEXT_MAX_LINES: i64 = 50;
+
+/// Boot-prepend: hard byte ceiling on the channel-context block attached
+/// to the re-spawn prompt. The acceptance criterion is "50 lines OR 10 KB,
+/// whichever smaller" — oldest messages are dropped from the head of the
+/// window until the rendered block fits. Prevents a single long post from
+/// blowing the new Hand's opening context budget.
+pub const RESPAWN_CONTEXT_MAX_BYTES: usize = 10 * 1024;
+
+/// Compose the re-spawn boot prefix for a Hand being dispatched onto
+/// `spark_id`.
+///
+/// Returns `Some(prefix)` iff the spark has a prior owner assignment
+/// whose session differs from `current_session_id` — i.e. this spawn is
+/// taking over from a Hand that already worked the spark. The returned
+/// string is a ready-to-prepend block containing the last N posts of the
+/// relevant epic channel, capped per [`RESPAWN_CONTEXT_MAX_LINES`] /
+/// [`RESPAWN_CONTEXT_MAX_BYTES`].
+///
+/// Channel resolution: the spark's `parent_id` chain is walked upward
+/// until an epic-typed spark is found; that epic's id + title yield the
+/// canonical `#epic-<id>-<slug>` name via
+/// [`ipc::channel_manager::channel_name`]. Sparks whose chain contains
+/// no epic return `None` (no channel to tail).
+///
+/// The prefix **never** includes previous-owner session log files,
+/// scratchpads, or any other filesystem artifact — only durable
+/// `irc_messages` rows via [`ipc::chat_of_record::tail`]. That matches
+/// the chat-of-record invariant from the parent epic: the IRC table is
+/// the source of truth for agent intent; log files are volatile debug
+/// artefacts that must not leak into the next Hand's boot context.
+async fn compose_respawn_channel_context(
+    pool: &SqlitePool,
+    spark_id: &str,
+    current_session_id: &str,
+) -> Option<String> {
+    let assignments = assign_repo::list_assignments_for_spark(pool, spark_id)
+        .await
+        .ok()?;
+    let has_prior_owner = assignments
+        .iter()
+        .any(|a| a.role == "owner" && a.session_id.as_deref() != Some(current_session_id));
+    if !has_prior_owner {
+        return None;
+    }
+
+    // Walk up the parent chain until we find an epic-typed spark — only
+    // epics have a channel in the chat-of-record schema. Cap the walk so
+    // a metadata cycle (shouldn't happen, but the worker should be
+    // defensive at boot) can't spin forever.
+    let mut cursor = spark_repo::get(pool, spark_id).await.ok()?;
+    for _ in 0..16 {
+        if cursor.spark_type == "epic" {
+            break;
+        }
+        let parent_id = cursor.parent_id.clone()?;
+        cursor = spark_repo::get(pool, &parent_id).await.ok()?;
+    }
+    if cursor.spark_type != "epic" {
+        return None;
+    }
+
+    let channel = ipc::channel_manager::channel_name(&ipc::channel_manager::EpicRef {
+        id: cursor.id.clone(),
+        name: cursor.title.clone(),
+    });
+
+    let filter = ipc::chat_of_record::TailFilter::for_channel(channel.clone())
+        .with_limit(RESPAWN_CONTEXT_MAX_LINES);
+    let messages = ipc::chat_of_record::tail(pool, filter).await.ok()?;
+    if messages.is_empty() {
+        return None;
+    }
+
+    // Render in chronological order (tail returns oldest-first). Trim
+    // oldest lines from the head until the whole block fits under
+    // RESPAWN_CONTEXT_MAX_BYTES so a handful of long posts can't smuggle
+    // past the cap.
+    let header = format!(
+        "# Recent chat-of-record from {channel}\n\
+         The previous owner(s) of spark {spark_id} posted these on the epic \
+         channel before handing off. Use them to pick up context before you \
+         start. (Last {RESPAWN_CONTEXT_MAX_LINES} posts / {} KB cap, whichever smaller.)\n\n",
+        RESPAWN_CONTEXT_MAX_BYTES / 1024,
+    );
+    let footer = "\n";
+
+    let rendered: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            format!(
+                "[{}] {}: {}",
+                m.created_at,
+                m.sender_actor_id.as_deref().unwrap_or("-"),
+                m.raw_text,
+            )
+        })
+        .collect();
+
+    let mut start = 0usize;
+    while start < rendered.len() {
+        let body_bytes: usize = rendered[start..].iter().map(|l| l.len() + 1).sum();
+        if header.len() + body_bytes + footer.len() <= RESPAWN_CONTEXT_MAX_BYTES {
+            break;
+        }
+        start += 1;
+    }
+    if start >= rendered.len() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(header.len() + RESPAWN_CONTEXT_MAX_BYTES);
+    out.push_str(&header);
+    for line in &rendered[start..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(footer);
+    Some(out)
+}
+
 /// Optional context bundle for [`spawn_hand`] and [`spawn_head`]. Bundled
 /// to keep the function signature under clippy's too-many-arguments
 /// threshold while still letting callers pass only the hints they have.
@@ -630,7 +758,7 @@ pub async fn spawn_hand(
     }
 
     // 5. Compose the prompt.
-    let prompt = match kind {
+    let mut prompt = match kind {
         HandKind::Owner => {
             // Pull the spark + siblings so the prompt can include intent.
             let sparks = spark_repo::list(
@@ -726,6 +854,19 @@ pub async fn spawn_hand(
         }
         HandKind::Merger => compose_merger_prompt(crew_id.unwrap_or(""), spark_id),
     };
+
+    // 5b. Boot-prepend chat-of-record context when this is a re-spawn.
+    //     If the spark already had a prior owner (a different session),
+    //     tail the epic channel and prepend the last RESPAWN_CONTEXT_MAX_LINES
+    //     posts (capped at RESPAWN_CONTEXT_MAX_BYTES) to the prompt. Only
+    //     Owner-class Hands re-inherit an in-flight spark; the Merger is
+    //     one-shot per crew merge, so its prompt stays fixed. Parent epic
+    //     ryve-12f09190 / [sp-b6d9a53c].
+    if !matches!(kind, HandKind::Merger)
+        && let Some(ctx) = compose_respawn_channel_context(pool, spark_id, &session_id).await
+    {
+        prompt = format!("{ctx}{prompt}");
+    }
 
     // 6. Write the prompt to a temp file under .ryve/prompts/ so the agent
     //    can pick it up via `--system-prompt <file>` (claude/codex/aider).
@@ -3313,6 +3454,204 @@ mod tests {
                 .await
                 .is_none(),
             "spark with no blocks predecessors returns None (unchanged behavior)"
+        );
+
+        let _ = std::fs::remove_dir_all(&workshop_dir);
+    }
+
+    /// Regression for spark ryve-b6d9a53c / [sp-b6d9a53c]: when `spawn_hand`
+    /// re-enters an epic whose task spark already had a prior owner, the
+    /// boot prompt must include the last N posts from the relevant epic
+    /// channel AND must not include the previous owner's session log file
+    /// content. Exercises the pure composer so the regression is fast and
+    /// has no dependency on tmux / subprocesses.
+    #[tokio::test]
+    async fn respawn_prepends_channel_context_not_log_file() {
+        use data::sparks::types::{
+            AssignmentRole, NewAgentSession, NewHandAssignment, NewSpark, SparkType,
+        };
+        use data::sparks::{agent_session_repo, assignment_repo, spark_repo};
+
+        let workshop_dir =
+            std::env::temp_dir().join(format!("ryve-respawn-context-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workshop_dir).unwrap();
+        let pool = data::db::open_sparks_db(&workshop_dir).await.unwrap();
+        let workshop_id = workshop_id_for(&workshop_dir);
+
+        // --- (1) Parent epic + task spark under it -----------------------
+        let epic = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "respawn context epic".into(),
+                description: String::new(),
+                spark_type: SparkType::Epic,
+                priority: 2,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: None,
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let task = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "child task under the respawn epic".into(),
+                description: String::new(),
+                spark_type: SparkType::Task,
+                priority: 2,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: Some(epic.id.clone()),
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // --- (2) Prior owner Hand — session row, log file, assignment ---
+        let prior_session_id = Uuid::new_v4().to_string();
+        let logs_dir = workshop_dir.join(".ryve").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let prior_log_path = logs_dir.join(format!("hand-{prior_session_id}.log"));
+        // Write a unique sentinel into the log so the test can prove the
+        // composer does NOT leak log file content into the new Hand's prompt.
+        let log_sentinel = "TOPSECRET_LOG_MARKER_DO_NOT_LEAK";
+        std::fs::write(
+            &prior_log_path,
+            format!("boot: tmux attached\n{log_sentinel}\nstderr: exiting\n"),
+        )
+        .unwrap();
+
+        agent_session_repo::create(
+            &pool,
+            &NewAgentSession {
+                id: prior_session_id.clone(),
+                workshop_id: workshop_id.clone(),
+                agent_name: "stub".into(),
+                agent_command: "true".into(),
+                agent_args: vec![],
+                session_label: Some("hand".into()),
+                child_pid: None,
+                resume_id: None,
+                log_path: Some(prior_log_path.to_string_lossy().into_owned()),
+                parent_session_id: None,
+                archetype_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assignment_repo::assign(
+            &pool,
+            NewHandAssignment {
+                session_id: prior_session_id.clone(),
+                spark_id: task.id.clone(),
+                role: AssignmentRole::Owner,
+                actor_id: Some("priorhand".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // --- (3) Prior owner posts "plan X" then "blocked on Y" on the
+        //         epic channel. Use the same chat_of_record primitive the
+        //         CLI / MCP paths call so the test stays aligned with
+        //         production writes.
+        let channel = ipc::channel_manager::channel_name(&ipc::channel_manager::EpicRef {
+            id: epic.id.clone(),
+            name: epic.title.clone(),
+        });
+        ipc::chat_of_record::post_message(
+            &pool,
+            ipc::chat_of_record::NewPost {
+                channel: channel.clone(),
+                body: "plan X".into(),
+                author_session_id: Some(prior_session_id.clone()),
+                epic_id: Some(epic.id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        ipc::chat_of_record::post_message(
+            &pool,
+            ipc::chat_of_record::NewPost {
+                channel: channel.clone(),
+                body: "blocked on Y".into(),
+                author_session_id: Some(prior_session_id.clone()),
+                epic_id: Some(epic.id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // --- (4) Compose the re-spawn prefix as spawn_hand would. The
+        //         replacement Hand's session id is fresh so the composer
+        //         sees the prior owner as "prior".
+        let new_session_id = Uuid::new_v4().to_string();
+        let prefix = super::compose_respawn_channel_context(&pool, &task.id, &new_session_id)
+            .await
+            .expect("re-spawn into a prior-owned spark must yield a channel-context prefix");
+
+        assert!(
+            prefix.contains("plan X"),
+            "prefix must carry the prior owner's first post 'plan X'; got: {prefix}"
+        );
+        assert!(
+            prefix.contains("blocked on Y"),
+            "prefix must carry the prior owner's second post 'blocked on Y'; got: {prefix}"
+        );
+        assert!(
+            !prefix.contains(log_sentinel),
+            "prefix must NOT contain the prior owner's session log file content; got: {prefix}"
+        );
+        assert!(
+            prefix.contains(&channel),
+            "prefix header should name the channel being tailed; got: {prefix}"
+        );
+
+        // --- (5) Control: a spark with NO prior owner returns None (no
+        //         prefix prepended on a first spawn).
+        let fresh_task = spark_repo::create(
+            &pool,
+            NewSpark {
+                title: "fresh task never previously owned".into(),
+                description: String::new(),
+                spark_type: SparkType::Task,
+                priority: 2,
+                workshop_id: workshop_id.clone(),
+                assignee: None,
+                owner: None,
+                parent_id: Some(epic.id.clone()),
+                due_at: None,
+                estimated_minutes: None,
+                metadata: None,
+                risk_level: None,
+                scope_boundary: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            super::compose_respawn_channel_context(
+                &pool,
+                &fresh_task.id,
+                &Uuid::new_v4().to_string(),
+            )
+            .await
+            .is_none(),
+            "first spawn (no prior owner) must not prepend a re-spawn block"
         );
 
         let _ = std::fs::remove_dir_all(&workshop_dir);
