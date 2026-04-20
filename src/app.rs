@@ -282,6 +282,8 @@ pub(crate) enum Message {
     Bench(screen::bench::Message),
     Sparks(screen::sparks::Message),
     Home(screen::home::Message),
+    /// Forwarded to an IRC projection view tab. Spark ryve-5466c372.
+    IrcView(screen::irc_view::Message),
     SparkDetail(screen::spark_detail::Message),
     SparkPicker(screen::spark_picker::Message),
     HeadPicker(screen::head_picker::Message),
@@ -533,6 +535,7 @@ impl std::fmt::Debug for Message {
             Self::Bench(m) => write!(f, "Bench({m:?})"),
             Self::Sparks(m) => write!(f, "Sparks({m:?})"),
             Self::Home(m) => write!(f, "Home({m:?})"),
+            Self::IrcView(m) => write!(f, "IrcView({m:?})"),
             Self::FailingContractsListLoaded(id, c) => {
                 write!(f, "FailingContractsListLoaded({id}, {} contracts)", c.len())
             }
@@ -1051,6 +1054,7 @@ impl App {
                 Task::none()
             }
             Message::Home(home_msg) => self.handle_home_message(home_msg),
+            Message::IrcView(msg) => self.handle_irc_view_message(msg),
             Message::ContractsLoaded(id, spark_id, contracts) => {
                 if let Some(ws) = self.workshops.iter_mut().find(|ws| ws.id == id) {
                     // Only apply if this spark is still selected — avoids
@@ -3978,7 +3982,68 @@ impl App {
         );
         let mut all = warning_tasks;
         all.push(snapshot_task);
+        // Spark ryve-5466c372: piggy-back IRC projection reloads on the
+        // existing sparks-poll cadence rather than adding a dedicated
+        // timer inside the view. Every open IRC view tab gets a fresh
+        // batch of (messages, presets, unread counts) queued alongside
+        // the snapshot work. A tab that hasn't moved since the last
+        // poll still pays a cheap LEFT JOIN, but the sqlx plan reuses
+        // the existing indexes noted on channel_projection.rs.
+        let irc_refresh_tasks = self.schedule_irc_view_refresh();
+        all.extend(irc_refresh_tasks);
         Task::batch(all)
+    }
+
+    /// Queue loader tasks for every open IRC projection view across
+    /// every workshop. Called from the sparks-poll tick so the view's
+    /// liveness is driven by the existing IPC / subscription pipeline
+    /// instead of a per-panel timer. Spark ryve-5466c372.
+    fn schedule_irc_view_refresh(&self) -> Vec<Task<Message>> {
+        let mut out = Vec::new();
+        for (idx, ws) in self.workshops.iter().enumerate() {
+            if ws.irc_views.is_empty() {
+                continue;
+            }
+            let Some(ref pool) = ws.sparks_db else {
+                continue;
+            };
+            for (tab_id, state) in &ws.irc_views {
+                // Only refresh the ACTIVE IRC view on the ACTIVE
+                // workshop plus the presets + unread counts everywhere.
+                // Messages on background tabs are loaded lazily on
+                // focus via the existing `SelectTab` path so idle tabs
+                // don't hammer the DB.
+                let is_active_tab =
+                    Some(*tab_id) == ws.bench.active_tab && Some(idx) == self.active_workshop;
+                if is_active_tab {
+                    out.push(Task::perform(
+                        screen::irc_view::load_messages(
+                            pool.clone(),
+                            *tab_id,
+                            state.current_query(),
+                        ),
+                        Message::IrcView,
+                    ));
+                }
+                out.push(Task::perform(
+                    screen::irc_view::load_presets(
+                        pool.clone(),
+                        *tab_id,
+                        state.workshop_id.clone(),
+                        state.channel.clone(),
+                    ),
+                    Message::IrcView,
+                ));
+                let preset_ids: Vec<i64> = state.presets.iter().map(|p| p.id).collect();
+                if !preset_ids.is_empty() {
+                    out.push(Task::perform(
+                        screen::irc_view::load_unread_counts(pool.clone(), *tab_id, preset_ids),
+                        Message::IrcView,
+                    ));
+                }
+            }
+        }
+        out
     }
 
     fn handle_new_default_hand(&mut self) -> Task<Message> {
@@ -4568,6 +4633,85 @@ impl App {
         }
     }
 
+    /// Kick off a fresh triple-load (messages + presets + unread counts)
+    /// for one IRC projection view tab. Returns a `Task::batch` of the
+    /// three loaders mapped back into [`Message::IrcView`]. A no-op if
+    /// the tab is not an IRC view or the workshop's sparks DB isn't
+    /// open yet. Spark ryve-5466c372.
+    ///
+    /// PR #53 Copilot c4: on the very first refresh of a freshly-opened
+    /// tab, `state.presets` is still empty (the `load_presets` task in
+    /// this same batch hasn't completed yet), so `load_unread_counts`
+    /// runs against an empty `preset_ids` and the badges stay blank
+    /// until the next 3 s poll tick — by then presets are loaded and
+    /// the badges populate. The proper fix is to chain
+    /// `load_unread_counts` after `PresetsLoaded` fires, which needs a
+    /// Task-chaining refactor; tracked as a follow-up spark.
+    fn refresh_irc_view_tab(&mut self, ws_idx: usize, tab_id: u64) -> Task<Message> {
+        use screen::irc_view;
+        let ws = &self.workshops[ws_idx];
+        let Some(state) = ws.irc_views.get(&tab_id) else {
+            return Task::none();
+        };
+        let Some(ref pool) = ws.sparks_db else {
+            return Task::none();
+        };
+        let query = state.current_query();
+        let workshop_id = state.workshop_id.clone();
+        let channel = state.channel.clone();
+        let preset_ids: Vec<i64> = state.presets.iter().map(|p| p.id).collect();
+        let pool_m = pool.clone();
+        let pool_p = pool.clone();
+        let pool_u = pool.clone();
+        let tasks = vec![
+            Task::perform(
+                irc_view::load_messages(pool_m, tab_id, query),
+                Message::IrcView,
+            ),
+            Task::perform(
+                irc_view::load_presets(pool_p, tab_id, workshop_id, channel),
+                Message::IrcView,
+            ),
+            Task::perform(
+                irc_view::load_unread_counts(pool_u, tab_id, preset_ids),
+                Message::IrcView,
+            ),
+        ];
+        Task::batch(tasks)
+    }
+
+    /// Dispatch an IRC projection view message to the tab that owns it
+    /// and, when the state change should trigger a fresh query (filter
+    /// edit, preset activation, cleared filters), schedule the loader
+    /// tasks. Spark ryve-5466c372.
+    fn handle_irc_view_message(&mut self, msg: screen::irc_view::Message) -> Task<Message> {
+        use screen::irc_view;
+        let Some(idx) = self.active_workshop else {
+            return Task::none();
+        };
+        let ws = &mut self.workshops[idx];
+        let tab_id = irc_view_tab_id_for(&msg, ws.bench.active_tab);
+        let Some(tab_id) = tab_id else {
+            return Task::none();
+        };
+        let Some(state) = ws.irc_views.get_mut(&tab_id) else {
+            return Task::none();
+        };
+        let reload = irc_view::update(state, msg);
+        if !reload {
+            return Task::none();
+        }
+        let Some(ref pool) = ws.sparks_db else {
+            return Task::none();
+        };
+        let pool = pool.clone();
+        let query = state.current_query();
+        Task::perform(
+            irc_view::load_messages(pool, tab_id, query),
+            Message::IrcView,
+        )
+    }
+
     /// Apply a terminal-font-size delta from a Cmd+scroll gesture, clamped
     /// to the configured min/max. Updates the global config, mirrors the
     /// new value onto every workshop, and broadcasts a `ChangeFont` command
@@ -5089,6 +5233,18 @@ impl App {
                     prev_viewer.evict();
                 }
 
+                // PR #53 Copilot c11: refresh the IRC projection view
+                // on focus. Background IRC tabs only get presets +
+                // unread counts on the poll tick (per `irc_view_poll`)
+                // — messages are skipped to avoid hammering the DB.
+                // Without this on-focus reload, switching to an IRC
+                // tab shows whatever was loaded the last time it was
+                // active (or nothing if it's never been active),
+                // which feels broken.
+                if ws.irc_views.contains_key(&id) {
+                    return self.refresh_irc_view_tab(idx, id);
+                }
+
                 // Focus the terminal immediately so it accepts keyboard input
                 if let Some(term) = ws.terminals.get(&id) {
                     return iced_term::TerminalView::focus(term.widget_id().clone());
@@ -5122,6 +5278,7 @@ impl App {
                 }
                 ws.terminals.remove(&id);
                 ws.file_viewers.remove(&id);
+                ws.irc_views.remove(&id);
 
                 // Mark agent sessions as ended AND kill their tmux sessions
                 let mut end_tasks: Vec<Task<Message>> = Vec::new();
@@ -5164,6 +5321,21 @@ impl App {
                 // No persistence: Home is a singleton dashboard rebuilt
                 // from in-memory data on demand.
                 return Task::none();
+            }
+            screen::bench::Message::OpenIrcView => {
+                self.workshops[idx].bench.dropdown_open = false;
+                let ws = &mut self.workshops[idx];
+                let Some(channel) = ws.default_irc_view_channel() else {
+                    return self.push_toast(
+                        "IRC view",
+                        "No open epic channels to project yet — create an epic first.".to_string(),
+                        ToastKind::Info,
+                    );
+                };
+                let actor = ws.irc_view_actor_id();
+                let next_id = &mut self.next_terminal_id;
+                let tab_id = self.workshops[idx].open_irc_view_tab(channel.clone(), actor, next_id);
+                return self.refresh_irc_view_tab(idx, tab_id);
             }
             screen::bench::Message::NewTerminal => {
                 let next_id = &mut self.next_terminal_id;
@@ -7207,6 +7379,8 @@ impl App {
                 file_viewer::view(viewer, &ws.directory, pal, has_bg).map(Message::FileViewer)
             } else if let Some(tail) = ws.log_tails.get(&active_id) {
                 log_tail::view(tail, pal).map(Message::LogTail)
+            } else if let Some(irc_state) = ws.irc_views.get(&active_id) {
+                screen::irc_view::view(irc_state, pal, has_bg).map(Message::IrcView)
             } else {
                 container(text("Loading...").size(14))
                     .center(Length::Fill)
@@ -7275,6 +7449,29 @@ impl App {
 // integration merge — the regression-harness branch ([sp-961b4d5e])
 // replaced it with `perf_core::classify_key_event`, which is exercised
 // by the headless smoke test in `perf_core/tests/sparks_poll_smoke.rs`.
+/// Pull the owning tab id out of an IRC-view message, falling back to
+/// the currently active tab when the message did not embed one (e.g.
+/// the text-input change events). Spark ryve-5466c372.
+fn irc_view_tab_id_for(msg: &screen::irc_view::Message, active: Option<u64>) -> Option<u64> {
+    use screen::irc_view::Message as M;
+    match msg {
+        M::Scrolled { tab_id, .. }
+        | M::JumpToTail(tab_id)
+        | M::MessagesLoaded { tab_id, .. }
+        | M::MessagesLoadFailed { tab_id, .. }
+        | M::PresetsLoaded { tab_id, .. }
+        | M::UnreadCountsLoaded { tab_id, .. } => Some(*tab_id),
+        M::EpicFilterChanged(_)
+        | M::SparkFilterChanged(_)
+        | M::AssignmentFilterChanged(_)
+        | M::PrFilterChanged(_)
+        | M::ActorFilterChanged(_)
+        | M::FtsQueryChanged(_)
+        | M::ClearFilters
+        | M::ActivatePreset(_) => active,
+    }
+}
+
 fn splitter_event_filter(
     event: iced::Event,
     _status: event::Status,
