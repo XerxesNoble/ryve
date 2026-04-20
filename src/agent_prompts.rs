@@ -1021,6 +1021,268 @@ pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
     prompt
 }
 
+/// Compose the initial prompt for a **MergeHand** — the next-generation
+/// integrator role introduced by spark ryve-10c8baee [sp-476ef264] and
+/// extended by sibling sparks under the same epic to cover preconditions
+/// (ryve-5bd7749b), sub-PR integration (ryve-6b261ad0), conflict handoff
+/// (ryve-086a4432), and the Epic PR → main lifecycle plus the Merged
+/// phase transition (ryve-9f6b0c96).
+///
+/// This composer intentionally returns DIFFERENT text from the Merger
+/// prompt. The MergeHand integrates the Crew's **sub-PRs into the Epic
+/// branch** in a deterministic, history-preserving order — distinct
+/// from the Merger, which integrates member branches into a single PR
+/// for review. The existing Merger role and its gradual-rollout
+/// semantics remain untouched.
+///
+/// The prompt:
+/// 1. Opens with the standard `HOUSE_RULES` EXECUTE directive so the
+///    spawn-time `claude --print` handshake does not stall waiting for
+///    confirmation (the same regression guarded by
+///    `prompts_open_with_execute_directive_not_reading_instruction`).
+/// 2. Names the role as **MergeHand** (not "Merger") so log scans,
+///    operator audits, and snapshot tests can tell the two apart.
+/// 3. Carries the crew id and merge spark id verbatim so the agent can
+///    mark the spark in progress, inspect the crew, and attribute any
+///    commits it makes.
+/// 4. Encodes the sub-PR → Epic merge flow [sp-476ef264 / sp-6b261ad0]:
+///    iterate sub-PRs in **Assignment-creation order** (ascending
+///    `assigned_at` from `ryve assign list <child>`), and merge every
+///    one into the Epic branch with `git merge --no-ff` so each
+///    sub-PR's history is preserved as a merge commit on the epic.
+/// 5. Walks the Epic PR lifecycle [sp-9f6b0c96]: open / update the
+///    Epic PR with a body listing every child Assignment and its
+///    source PR, wait for the required approvals and green CI, merge
+///    Epic → main, then emit the Merged phase transition on the Merge
+///    Hand's own Assignment.
+/// 6. Restates the Merge-Hand contract's forbidden primitives —
+///    force-push, `--no-verify`, `[skip ci]` trailers, `gh pr merge
+///    --admin`, and any other CI-bypass path — so future edits cannot
+///    silently drop them.
+pub fn compose_merge_hand_prompt(crew_id: &str, merge_spark_id: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(HOUSE_RULES);
+
+    prompt.push_str(&format!(
+        "ASSIGNMENT: spark {merge_spark_id} (role: MERGE_HAND for crew {crew_id}). \
+         Mark it in progress now: `ryve spark status {merge_spark_id} in_progress`.\n\n"
+    ));
+
+    prompt.push_str(&format!(
+        "You are a **MergeHand** for crew `{crew_id}`. MergeHand is a distinct \
+         role from the existing Merger: the Merger integrates member branches \
+         into a single PR for review, whereas the MergeHand integrates the \
+         Crew's **sub-PRs into the Epic branch**, preserving each sub-PR's \
+         history as a merge commit, and then drives the Epic PR through to \
+         main. See `compose_merger_prompt` for the Merger contract; \
+         `compose_merge_hand_prompt` is the sub-PR → Epic → main integrator. \
+         Your Assignment is the merge spark `{merge_spark_id}`; read it plus \
+         the parent Epic before acting:\n\
+         `ryve spark show {merge_spark_id}`\n\
+         `ryve --json spark show <epic_id>`\n\
+         `ryve --json assign list <epic_id>`\n\n"
+    ));
+
+    prompt.push_str(&format!(
+        "WORKFLOW — merge every sub-PR into the Epic branch in \
+         **Assignment-creation order**, using `git merge --no-ff` for every \
+         merge so each sub-PR's history is preserved verbatim:\n\n\
+         1. Identify the Epic branch for crew `{crew_id}`. Read the parent epic \
+            of the crew via `ryve --json crew show {crew_id}` and `ryve --json \
+            spark show <parent-epic-id>`; the Epic branch is the branch named \
+            on that epic (typically `epic/<crew-short>` or the `github_artifact` \
+            branch recorded on the epic's assignment). If the Epic branch is \
+            ambiguous, STOP and post a comment on `{merge_spark_id}` asking the \
+            Head to disambiguate — do not guess.\n\n\
+         2. Enumerate every sub-PR (child spark) of the crew: \
+            `ryve --json crew show {crew_id}` lists the member sparks. For \
+            each child spark id `<child>`, fetch its Assignment records with\n\
+            `ryve --json assign list <child>`\n\
+            and read the **`assigned_at`** timestamp of the oldest (first) \
+            assignment — this is the canonical Assignment-creation timestamp.\n\n\
+         3. Sort the sub-PRs ascending by that `assigned_at` timestamp. Ties \
+            on the timestamp are broken by spark id, ascending, so the order \
+            is fully deterministic. This ordering is the workgraph's source \
+            of truth for sub-PR merge order — DO NOT reorder by branch name, \
+            closure time, PR number, `git branch --list` output, or any other \
+            signal. Assignment-creation order is the contract.\n\n\
+         4. Create a dedicated merge worktree off the Epic branch (never \
+            mutate the workshop root's HEAD):\n\
+            `git fetch origin && \\\n\
+             git worktree add .ryve/worktrees/merge-{crew_id} -b merge/{crew_id} \
+             origin/<epic-branch>`\n\
+            Every subsequent git command runs inside that worktree.\n\n\
+         5. Iterate the sorted list from step 3 in order. For each sub-PR's \
+            branch `<sub-branch>` belonging to child spark `<child>`, run:\n\
+            `git merge --no-ff \\\n\
+                -m 'merge <sub-branch> into <epic-branch> [sp-<child>]' \\\n\
+                <sub-branch>`\n\
+            `--no-ff` is MANDATORY for every sub-PR merge. Fast-forward merges \
+            collapse the sub-PR's commits into the Epic and destroy the audit \
+            trail that the `[sp-xxxx]` linkage depends on. Do NOT squash, do \
+            NOT rebase the sub-PR onto the epic, do NOT fast-forward. Every \
+            sub-PR must produce exactly one merge commit on the Epic branch, \
+            in Assignment-creation order.\n\n\
+         6. If a merge has conflicts you cannot resolve mechanically, that is \
+            a bond-discipline failure by the Head (two siblings edited the \
+            same file without a `blocks` bond). Do NOT force the merge. Run\n\
+            `ryve comment add {merge_spark_id} 'bond-discipline conflict \
+            merging <sub-branch>: <details>'` and\n\
+            `ryve spark status {merge_spark_id} blocked`, then exit.\n\n\
+         7. After every sub-PR is merged in order, push the Epic branch \
+            NON-FORCE so CI runs on the integration result:\n\
+            `git push origin <epic-branch>`\n\
+            Do NOT pass `--force`, `--force-with-lease`, or any variant that \
+            rewrites history on origin. Do NOT bypass required checks.\n\n\
+         8. Do NOT merge the Epic into `main` directly from the sub-PR loop \
+            — history-preserving Epic → main merge is driven separately by \
+            the EPIC PR LIFECYCLE section below via `gh pr merge` once \
+            required approvals and green CI are in. Never bypass that gate \
+            with a bare `git merge` or `git push main` from this loop.\n\n"
+    ));
+
+    prompt.push_str(
+        "HARD RULES — non-negotiable integrator discipline, re-stated so \
+         future edits cannot drop them:\n\
+         - **Assignment-creation order is the contract.** Always iterate \
+           sub-PRs by ascending `assigned_at` (ties broken by spark id). Never \
+           merge in ad-hoc, alphabetical, PR-number, or closure-time order.\n\
+         - **`git merge --no-ff` for every sub-PR merge** into the Epic branch. \
+           No fast-forward, no squash, no rebase. Each sub-PR produces exactly \
+           one merge commit on the Epic branch so history is preserved.\n\
+         - **No force-push.** Never `git push --force`, never \
+           `git push --force-with-lease`, never any variant that rewrites the \
+           Epic branch on origin.\n\
+         - **No `--no-verify`.** Never bypass git hooks on any commit or push. \
+           If a pre-commit / pre-push hook fails, fix the root cause and retry.\n\
+         - **No CI bypass.** Never use `[skip ci]`, `[ci skip]`, `***NO_CI***`, \
+           merge-queue overrides, branch-protection overrides, or any \
+           repo-/platform-specific trailer that short-circuits required checks. \
+           CI must run on the integrated Epic branch.\n\
+         - NEVER change the branch checked out in the workshop root. \
+           Integration happens inside a dedicated merge worktree.\n\
+         - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\n",
+    );
+
+    prompt.push_str(&format!(
+        "EPIC PR LIFECYCLE — once every sub-PR is merged into the Epic branch \
+         per the WORKFLOW above (and the precondition checker has cleared the \
+         spawn — all children Approved, no sub-PR conflicts against the Epic \
+         branch, CI green on every sub-PR that has CI, zero Assignments Stuck), \
+         drive the Epic → main lifecycle [sp-9f6b0c96]:\n\n\
+         A. Collect every child Assignment in Assignment-creation order — \
+            same ordering as the WORKFLOW above (`ryve --json assign list \
+            <epic_id>`, ascending `assigned_at`, ties broken by spark id). \
+            Record for each child: spark id, Assignment id, Assignment \
+            `actor_id`, source branch, and PR number \
+            (`github_artifact_pr_number` on the assignment row).\n\n\
+         B. (Already done by the WORKFLOW above.) Each sub-PR is merged into \
+            the Epic branch with `git merge --no-ff` in Assignment-creation \
+            order. On conflict, HAND THE CONFLICT BACK via the transition \
+            validator (`Approved → Rejected`, reason=`conflict`) and wait \
+            for the originating Hand to repair — you NEVER resolve \
+            in-place.\n\n\
+         C. Open or update the Epic PR with base=`main`, \
+            head=`crew/{crew_id}`. If no open Epic PR exists, create one \
+            (`gh pr create --base main --head crew/{crew_id}`); otherwise \
+            update the existing one (`gh pr edit <epic_pr> --body-file ...`). \
+            The Epic PR body MUST list every child Assignment together with \
+            its source PR. Use this template — the E2E test parses it:\n\n\
+            ```\n\
+            ## Epic: <epic title> ([sp-<epic-short>])\n\n\
+            This Epic PR integrates the following child Assignments:\n\n\
+            - Assignment `<asgn_id_1>` (spark `<spark_id_1>`, actor `<actor_id_1>`) \
+            — source PR #<pr_number_1>\n\
+            - Assignment `<asgn_id_2>` (spark `<spark_id_2>`, actor `<actor_id_2>`) \
+            — source PR #<pr_number_2>\n\
+            - ...\n\n\
+            Sub-PRs merged into `crew/{crew_id}` with `git merge --no-ff` in \
+            Assignment-creation order. Merge-Hand precondition checks: all \
+            Approved, no conflicts, CI green, zero Stuck.\n\
+            ```\n\n\
+            Every child Assignment MUST appear, with its source PR number. A \
+            missing child is a protocol violation — investigate before \
+            continuing.\n\n\
+         D. Gate Epic → main on the Epic PR's REQUIRED APPROVALS AND GREEN \
+            CI. Before you merge, you MUST see both:\n\
+            - `gh pr view <epic_pr> --json reviewDecision` → \
+              `\"reviewDecision\": \"APPROVED\"`. Any other value \
+              (`REVIEW_REQUIRED`, `CHANGES_REQUESTED`, `null`) means the \
+              required approvals are not yet in. Do NOT merge. Post a \
+              comment on `{merge_spark_id}` describing what you are waiting \
+              on, and stop.\n\
+            - `gh pr view <epic_pr> --json statusCheckRollup` — every \
+              required check must be `SUCCESS`. A failing, pending, or \
+              cancelled required check is a blocker; do NOT merge. Treat \
+              any failed check as a blocker even if the branch protection \
+              rule technically allows a merge without it.\n\n\
+         E. Execute the Epic → main merge with `gh pr merge <epic_pr> \
+            --merge --match-head-commit=<sha>` (no `--admin`, no `--squash`, \
+            no `--rebase`, no `--delete-branch` without a separate cleanup \
+            step). `gh pr merge` refuses to run when the approval / check \
+            gates fail — that refusal is the mechanical half of the \
+            approval gate; your manual check in D is the belt-and-suspenders \
+            half.\n\n\
+         F. Emit the **Merged** phase transition for THIS Merge-Hand \
+            Assignment (`{merge_spark_id}`). The transition validator \
+            enforces that the Merge Hand is the ONLY actor permitted to \
+            drive an Assignment to `Merged`: the \
+            `ReadyForMerge → Merged` rule is role-locked to `merge_hand` \
+            and cannot be bypassed even by a Head/Director override. \
+            Prefer the `data::sparks::transition::mark_assignment_merged` \
+            helper (pins the actor role to MergeHand so you cannot stamp \
+            a wrong role by accident) over calling \
+            `transition_assignment_phase` raw.\n\n\
+         G. Close the merge spark: `ryve spark close {merge_spark_id} \
+            completed`. Remove the Epic worktree you were working in (if \
+            any), then exit.\n\n"
+    ));
+
+    prompt.push_str(
+        "HARD RULES (Merge-Hand contract — combined from sp-6b261ad0 + \
+         sp-9f6b0c96, re-stated so future edits cannot silently drop them):\n\
+         - **Assignment-creation order is the contract.** Always iterate \
+           sub-PRs by ascending `assigned_at` (ties broken by spark id). \
+           Never merge in ad-hoc, alphabetical, PR-number, or closure-time \
+           order.\n\
+         - **`git merge --no-ff` for every sub-PR merge** into the Epic \
+           branch. No fast-forward, no squash, no rebase. Each sub-PR \
+           produces exactly one merge commit on the Epic branch so history \
+           is preserved.\n\
+         - NEVER change the branch checked out in the workshop root. Every \
+           merge happens inside a dedicated Epic / merge worktree — never in \
+           the main checkout.\n\
+         - **No force-push.** Not `git push --force`, not `git push \
+           --force-with-lease`, not `git push +<ref>`. A rebase-and-force is \
+           not an option; if the Epic branch diverges, hand the conflict \
+           back to the originating Assignment via the transition validator.\n\
+         - **No `--no-verify`.** Never bypass git hooks on any commit or \
+           push. If a pre-commit / pre-push hook fails, fix the root cause \
+           and retry.\n\
+         - **No CI bypass.** Never use `[skip ci]`, `[ci skip]`, `[no ci]`, \
+           `***NO_CI***`, merge-queue overrides, branch-protection \
+           overrides, or any repo-/platform-specific trailer that \
+           short-circuits required checks. CI must run on the integrated \
+           Epic branch.\n\
+         - NEVER use `gh pr merge --admin`. Admin-merge bypasses the \
+           branch-protection gate that enforces the required approvals and \
+           green-CI rules; using it would subvert the entire Merge-Hand \
+           contract.\n\
+         - Do NOT merge to main if `reviewDecision` is not `APPROVED` or if \
+           any required status check is not `SUCCESS`. A failing check is a \
+           blocker, even when the upstream branch-protection rule would let \
+           the merge through.\n\
+         - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\
+         - **Conflict resolution is ALWAYS delegated back** to the \
+           originating Assignment via `Approved → Rejected` \
+           (reason=`conflict`). You NEVER resolve a sub-PR conflict \
+           in-place — that ownership belongs to the Hand that wrote the \
+           sub-PR.\n",
+    );
+
+    prompt
+}
+
 /// Compose the initial prompt for a **Release Manager** Hand — the
 /// archetype whose entire job is steering one Release through its
 /// lifecycle on behalf of Atlas. Spark ryve-e6713ee7 / [sp-2a82fee7].
@@ -2195,6 +2457,277 @@ mod tests {
         assert!(p.contains("-b crew/cr-aaaa"));
         assert!(p.contains("ryve spark close sp-merge1 completed"));
         assert!(p.contains("Do **not** merge to main automatically"));
+    }
+
+    // ─── MergeHand skeleton [sp-476ef264 / ryve-10c8baee] ───────────────
+    //
+    // The MergeHand role is a new integrator role distinct from the
+    // existing Merger. These tests lock in the skeleton contract:
+    //
+    //   - the composer exists and opens with the EXECUTE directive,
+    //   - it carries the crew id and merge spark id,
+    //   - it labels itself as MergeHand (not Merger) so consumers and
+    //     operators can tell the two apart,
+    //   - it returns text DIFFERENT from `compose_merger_prompt` so the
+    //     two roles can pivot independently.
+    //
+    // Acceptance criterion (2) of spark ryve-10c8baee depends on these
+    // being behavioural rather than snapshot-level.
+
+    #[test]
+    fn merge_hand_prompt_opens_with_execute_directive() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        assert!(
+            p.starts_with("EXECUTE"),
+            "merge_hand prompt must lead with EXECUTE directive: {:?}",
+            p.chars().take(80).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn merge_hand_prompt_includes_crew_and_spark_ids() {
+        let p = compose_merge_hand_prompt("cr-bbbb", "sp-merge2");
+        assert!(
+            p.contains("cr-bbbb"),
+            "merge_hand prompt must reference the crew id verbatim"
+        );
+        assert!(
+            p.contains("ASSIGNMENT: spark sp-merge2"),
+            "merge_hand prompt must carry the merge spark id in its assignment header"
+        );
+        assert!(
+            p.contains("ryve spark status sp-merge2 in_progress"),
+            "merge_hand prompt must instruct the agent to mark the spark in progress"
+        );
+    }
+
+    #[test]
+    fn merge_hand_prompt_identifies_as_merge_hand_not_merger() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        // Role name must appear explicitly so log scans / audits can
+        // distinguish the skeleton from a legitimate Merger session.
+        assert!(
+            p.contains("MergeHand") || p.contains("MERGE_HAND"),
+            "merge_hand prompt must identify itself by name so it is not \
+             confused with the existing Merger role"
+        );
+    }
+
+    /// Acceptance criterion (2) of spark ryve-10c8baee: the MergeHand
+    /// composer must return a prompt DISTINCT from the existing Merger
+    /// composer. Checking strict inequality locks the independence
+    /// contract — if a future edit collapses the two composers into one
+    /// (by mistake or to "dedupe"), this test fails and surfaces the
+    /// regression.
+    #[test]
+    fn merge_hand_prompt_is_distinct_from_merger_prompt() {
+        let merger = compose_merger_prompt("cr-aaaa", "sp-merge1");
+        let merge_hand = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        assert_ne!(
+            merger, merge_hand,
+            "compose_merge_hand_prompt must return text distinct from \
+             compose_merger_prompt so the two roles can pivot independently"
+        );
+    }
+
+    /// [sp-6b261ad0] Assignment-creation order is the canonical,
+    /// deterministic merge order for sub-PRs into the Epic branch. The
+    /// prompt MUST instruct the MergeHand to pull each child spark's
+    /// Assignment creation timestamp from the workgraph and iterate
+    /// sub-PRs ascending by that timestamp.
+    #[test]
+    fn merge_hand_prompt_merges_sub_prs_in_assignment_creation_order() {
+        let p = compose_merge_hand_prompt("cr-ord", "sp-merge-ord");
+
+        assert!(
+            p.contains("Assignment-creation order"),
+            "prompt must name Assignment-creation order as the merge contract"
+        );
+        assert!(
+            p.contains("ryve --json assign list"),
+            "prompt must instruct the MergeHand to fetch assignments via \
+             `ryve --json assign list <child>`"
+        );
+        assert!(
+            p.contains("assigned_at"),
+            "prompt must point at the `assigned_at` field as the creation \
+             timestamp"
+        );
+        assert!(
+            p.contains("ascending") || p.contains("Sort"),
+            "prompt must specify ascending sort on the creation timestamp"
+        );
+        assert!(
+            p.contains("ryve --json crew show cr-ord"),
+            "prompt must enumerate sub-PRs via `ryve --json crew show <crew>`"
+        );
+        assert!(
+            p.contains("deterministic"),
+            "prompt must state the ordering is deterministic so Heads / \
+             operators can reason about merge order"
+        );
+    }
+
+    /// [sp-6b261ad0] Every sub-PR merge into the Epic branch MUST use
+    /// `git merge --no-ff` so each sub-PR's history is preserved as a
+    /// dedicated merge commit. Fast-forward / squash / rebase all erase
+    /// the audit trail.
+    #[test]
+    fn merge_hand_prompt_requires_no_ff_for_every_sub_pr_merge() {
+        let p = compose_merge_hand_prompt("cr-nf", "sp-merge-nf");
+
+        assert!(
+            p.contains("git merge --no-ff"),
+            "prompt must specify `git merge --no-ff` for sub-PR merges"
+        );
+        assert!(
+            p.contains("MANDATORY") || p.contains("mandatory"),
+            "prompt must mark `--no-ff` as mandatory, not a suggestion"
+        );
+        // Explicitly forbid the three anti-patterns that would erase
+        // sub-PR history if tolerated.
+        assert!(
+            p.contains("squash") || p.contains("Squash"),
+            "prompt must forbid squash merges explicitly by name"
+        );
+        assert!(
+            p.contains("rebase") || p.contains("Rebase"),
+            "prompt must forbid rebasing sub-PRs onto the epic by name"
+        );
+        assert!(
+            p.contains("fast-forward") || p.contains("Fast-forward"),
+            "prompt must forbid fast-forward merges by name"
+        );
+    }
+
+    // ─── MergeHand Epic PR → main lifecycle [sp-9f6b0c96 / sp-476ef264] ──
+    //
+    // These tests lock in the acceptance criteria of spark ryve-9f6b0c96:
+    //   (1) the Epic PR is opened or updated with a body listing every
+    //       child Assignment + its source PR,
+    //   (2) the Epic → main merge is gated on required approvals + green
+    //       CI,
+    //   (3) the Merged phase transition is emitted for the Epic's
+    //       merge_hand Assignment (accepted only when emitted by
+    //       merge_hand — validator-enforced; the prompt references the
+    //       correct helper so callers don't misuse the raw API),
+    //   (4) no path is offered for merge_hand to force-push, use
+    //       --no-verify, or bypass a failing CI check.
+
+    /// (1) The Epic PR body template must be present and name the
+    /// Assignment + source PR fields the E2E test parses.
+    #[test]
+    fn merge_hand_prompt_opens_epic_pr_with_child_assignment_listing() {
+        let p = compose_merge_hand_prompt("cr-epic1", "sp-mergeEpic");
+
+        assert!(
+            p.contains("EPIC PR LIFECYCLE"),
+            "merge_hand prompt must describe the Epic PR lifecycle"
+        );
+        assert!(
+            p.contains("gh pr create --base main --head crew/cr-epic1"),
+            "merge_hand prompt must pin base=main and head=crew/<id> when creating the Epic PR"
+        );
+        assert!(
+            p.contains("gh pr edit"),
+            "merge_hand prompt must describe the update path for an existing Epic PR"
+        );
+        assert!(
+            p.contains("Assignment") && p.contains("source PR"),
+            "Epic PR body template must list each child Assignment with its source PR"
+        );
+    }
+
+    /// (2) Epic → main merge must be gated on `reviewDecision=APPROVED`
+    /// and green `statusCheckRollup`.
+    #[test]
+    fn merge_hand_prompt_gates_epic_merge_on_approvals_and_ci() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+
+        assert!(
+            p.contains("reviewDecision") && p.contains("APPROVED"),
+            "merge_hand prompt must require reviewDecision=APPROVED before merging"
+        );
+        assert!(
+            p.contains("statusCheckRollup"),
+            "merge_hand prompt must consult statusCheckRollup to confirm CI is green"
+        );
+        assert!(
+            p.contains("gh pr merge"),
+            "merge_hand prompt must document the Epic → main merge command"
+        );
+    }
+
+    /// (3) Merged phase transition — the prompt must name the
+    /// merge_hand-only invariant and point callers at the
+    /// `mark_assignment_merged` helper.
+    #[test]
+    fn merge_hand_prompt_emits_merged_phase_transition_via_merge_hand_only_helper() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge-xyz");
+
+        assert!(
+            p.contains("Merged") && p.contains("ReadyForMerge"),
+            "merge_hand prompt must describe the ReadyForMerge → Merged transition"
+        );
+        assert!(
+            p.contains("mark_assignment_merged"),
+            "merge_hand prompt must point callers at the MergeHand-only helper"
+        );
+        assert!(
+            p.contains("ONLY actor"),
+            "merge_hand prompt must state that merge_hand is the ONLY actor \
+             permitted to drive an Assignment to Merged"
+        );
+    }
+
+    /// (4) Combined force-push / --no-verify / CI-bypass ban — from
+    /// sp-6b261ad0 + sp-9f6b0c96. Each forbidden primitive is asserted
+    /// by name so future edits can't soften the contract silently.
+    #[test]
+    fn merge_hand_prompt_forbids_force_push_no_verify_and_ci_bypass() {
+        let p = compose_merge_hand_prompt("cr-f", "sp-merge-f");
+
+        // Force-push in all its variants.
+        assert!(
+            p.contains("force-push") || p.contains("git push --force"),
+            "prompt must forbid force-push by name"
+        );
+        assert!(
+            p.contains("--force-with-lease"),
+            "prompt must forbid `--force-with-lease` explicitly — the most \
+             common force-push variant slipped past a casual reader"
+        );
+
+        // --no-verify.
+        assert!(
+            p.contains("--no-verify"),
+            "prompt must forbid `--no-verify` by name"
+        );
+
+        // CI bypass: category + common trailers.
+        assert!(
+            p.to_lowercase().contains("ci bypass")
+                || p.contains("bypass required checks")
+                || p.contains("No CI bypass"),
+            "prompt must forbid CI bypass as a category"
+        );
+        for trailer in ["[skip ci]", "[ci skip]"] {
+            assert!(
+                p.contains(trailer),
+                "prompt must name the `{trailer}` CI-skip trailer by name so \
+                 a future edit cannot silently allow it back in"
+            );
+        }
+
+        // gh pr merge --admin bypasses branch protection.
+        assert!(
+            p.contains("--admin"),
+            "prompt must forbid `gh pr merge --admin` (admin bypasses \
+             approval + CI gates)"
+        );
+
+        // The HARD RULES block carries all of the above.
+        assert!(p.contains("HARD RULES"), "HARD RULES block must be present");
     }
 
     /// sp-ryve-c0733c9c: Investigator prompt must open with READ-ONLY
