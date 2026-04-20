@@ -1137,11 +1137,13 @@ impl Workshop {
     }
 
     /// Open (or focus) an IRC projection view for `channel`. Idempotent
-    /// per channel: if a tab already exists for the same channel, it is
-    /// activated instead of creating a duplicate. Returns the tab id on
-    /// success and `None` when no channel could be inferred (e.g. the
-    /// caller asked for "first known channel" on a workshop with no
-    /// epics yet). Spark ryve-5466c372.
+    /// per channel: if a tab already exists for the same channel, it
+    /// is activated instead of creating a duplicate. Returns the tab
+    /// id of the activated or newly-created tab. Caller is responsible
+    /// for resolving "what channel?" before calling — see
+    /// [`Workshop::default_irc_view_channel`]. PR #53 Copilot c8: doc
+    /// previously claimed `Option<u64>` return semantics that don't
+    /// match the actual `u64` signature. Spark ryve-5466c372.
     pub fn open_irc_view_tab(
         &mut self,
         channel: String,
@@ -1179,10 +1181,15 @@ impl Workshop {
     /// Pick the channel name for the default "Open IRC View" action —
     /// the channel of the first open epic (in the order
     /// [`Workshop::sparks`] reports them). Returns `None` when no open
-    /// epic exists so the caller can surface a toast instead of opening
-    /// an empty tab. Spark ryve-5466c372.
+    /// epic exists so the caller can surface a toast instead of
+    /// opening an empty tab. PR #53 Copilot c9: now actually filters
+    /// to `status != "closed"` so a closed-out epic from a prior
+    /// release isn't picked as the default. Spark ryve-5466c372.
     pub fn default_irc_view_channel(&self) -> Option<String> {
-        let epic = self.sparks.iter().find(|s| s.spark_type == "epic")?;
+        let epic = self
+            .sparks
+            .iter()
+            .find(|s| s.spark_type == "epic" && s.status != "closed")?;
         Some(ipc::channel_manager::channel_name(
             &ipc::channel_manager::EpicRef {
                 id: epic.id.clone(),
@@ -1192,15 +1199,23 @@ impl Workshop {
     }
 
     /// Effective actor id for mention-override filtering in IRC view.
-    /// Falls back to the configured IRC nick when no session actor is
-    /// available yet. Spark ryve-5466c372.
+    /// Returns the user's explicitly configured `irc_nick` when set,
+    /// otherwise `None` so mention-override is disabled.
+    ///
+    /// PR #53 Copilot c10: previously called `effective_irc_nick()`
+    /// which always falls back to `"ryve"`, making this method
+    /// effectively always return `Some`. That meant every workshop
+    /// with default config would treat the literal string `@ryve`
+    /// as a mention bypass — surprising and rarely what the user
+    /// wants. Now we read the raw `irc_nick` field so the override
+    /// only fires when the user opted into a nick. Spark ryve-5466c372.
     pub fn irc_view_actor_id(&self) -> Option<String> {
-        let nick = self.config.effective_irc_nick();
-        if nick.trim().is_empty() {
-            None
-        } else {
-            Some(nick)
-        }
+        self.config
+            .irc_nick
+            .as_ref()
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
     }
 
     /// Open a file viewer tab, or switch to it if already open.

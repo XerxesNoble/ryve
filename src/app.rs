@@ -4638,6 +4638,15 @@ impl App {
     /// three loaders mapped back into [`Message::IrcView`]. A no-op if
     /// the tab is not an IRC view or the workshop's sparks DB isn't
     /// open yet. Spark ryve-5466c372.
+    ///
+    /// PR #53 Copilot c4: on the very first refresh of a freshly-opened
+    /// tab, `state.presets` is still empty (the `load_presets` task in
+    /// this same batch hasn't completed yet), so `load_unread_counts`
+    /// runs against an empty `preset_ids` and the badges stay blank
+    /// until the next 3 s poll tick — by then presets are loaded and
+    /// the badges populate. The proper fix is to chain
+    /// `load_unread_counts` after `PresetsLoaded` fires, which needs a
+    /// Task-chaining refactor; tracked as a follow-up spark.
     fn refresh_irc_view_tab(&mut self, ws_idx: usize, tab_id: u64) -> Task<Message> {
         use screen::irc_view;
         let ws = &self.workshops[ws_idx];
@@ -5222,6 +5231,18 @@ impl App {
                     && let Some(prev_viewer) = ws.file_viewers.get_mut(&prev_id)
                 {
                     prev_viewer.evict();
+                }
+
+                // PR #53 Copilot c11: refresh the IRC projection view
+                // on focus. Background IRC tabs only get presets +
+                // unread counts on the poll tick (per `irc_view_poll`)
+                // — messages are skipped to avoid hammering the DB.
+                // Without this on-focus reload, switching to an IRC
+                // tab shows whatever was loaded the last time it was
+                // active (or nothing if it's never been active),
+                // which feels broken.
+                if ws.irc_views.contains_key(&id) {
+                    return self.refresh_irc_view_tab(idx, id);
                 }
 
                 // Focus the terminal immediately so it accepts keyboard input

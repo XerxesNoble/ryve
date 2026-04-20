@@ -382,6 +382,20 @@ pub fn update(state: &mut IrcViewState, msg: Message) -> bool {
             false
         }
         Message::JumpToTail(_) => {
+            // PR #53 Copilot c13 — known incomplete: this updates the
+            // model's scroll offset and clears the new-messages banner
+            // counter, but the iced `scrollable` widget owns its own
+            // internal scroll state and isn't bound to a
+            // `scrollable::Id` here, so the viewport doesn't actually
+            // move. To make "jump to latest" land the viewport, the
+            // model state needs a `scrollable::Id` field, the
+            // `message_list` view needs to attach it, and this branch
+            // needs to bubble a `scrollable::snap_to(id, END)` Task
+            // through to app.rs (which today receives a `bool` from
+            // this handler, not a Task). Tracked as a follow-up
+            // spark; the banner-clear half of the behaviour still
+            // works so users at least lose the unread badge once they
+            // scroll there manually.
             let max = (state.content_height - state.viewport_height).max(0.0);
             state.scroll_offset_y = max;
             state.new_messages_banner_count = 0;
@@ -464,6 +478,12 @@ pub async fn load_presets(
 
 /// Query the unread count for every preset id in `ids`, skipping those
 /// that error so a single bad preset does not blank the whole sidebar.
+///
+/// PR #53 Copilot c5: today this is N+1 — one DB roundtrip per preset
+/// per poll tick. Acceptable for the v1 ceiling (a handful of presets
+/// per workshop) but worth batching into a single grouped query (or
+/// joining unread state into the preset list query) before users
+/// accumulate dozens of presets. Tracked as a follow-up perf spark.
 pub async fn load_unread_counts(pool: SqlitePool, tab_id: u64, ids: Vec<i64>) -> Message {
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
@@ -753,9 +773,17 @@ fn message_list<'a>(state: &'a IrcViewState, pal: &Palette) -> Element<'a, Messa
 
 fn message_row<'a>(msg: &'a ProjectedMessage, pal: &Palette) -> Element<'a, Message> {
     let pal = *pal;
+    // PR #53 Copilot c12: prefer the human-meaningful actor id from
+    // the joined event_outbox row (`metadata.actor_id` — agent role
+    // tag like atlas/head/hand/<vendor>); fall back to
+    // `sender_actor_id` (an agent_sessions FK / session id) for
+    // posts that didn't go through the outbox; "system" only for
+    // fully-anonymous rows.
     let sender = msg
-        .sender_actor_id
-        .clone()
+        .metadata
+        .as_ref()
+        .and_then(|m| m.actor_id.clone())
+        .or_else(|| msg.sender_actor_id.clone())
         .unwrap_or_else(|| "system".to_string());
     let ts = format_timestamp(&msg.timestamp);
     let badge = msg.event_type.clone().unwrap_or_else(|| "chat".to_string());

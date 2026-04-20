@@ -136,8 +136,11 @@ pub struct ChannelProjectionQuery {
     /// override — the UI sets it to the current session's actor so the
     /// user never misses an `@mention` hidden behind an active filter.
     pub current_actor_id: Option<String>,
-    /// Upper bound on rows returned. `0` means unlimited; callers that
-    /// want pagination should set a real cap.
+    /// Upper bound on rows returned. Values `<= 0` fall back to
+    /// [`DEFAULT_LIMIT`] (see [`Self::effective_limit`]) — there is no
+    /// truly-unlimited path; callers that want pagination should set
+    /// a real cap. PR #53 Copilot c1: earlier doc said "0 means
+    /// unlimited" which contradicted the implementation.
     pub limit: i64,
 }
 
@@ -372,9 +375,13 @@ impl PresetFilters {
     /// overwrite; [`ChannelProjectionQuery::current_actor_id`] and
     /// `limit` are left untouched so the caller's session state wins.
     pub fn apply_to(&self, base: &mut ChannelProjectionQuery) {
-        if self.epic_id.is_some() {
-            base.epic_id = self.epic_id.clone();
-        }
+        // PR #53 Copilot c6: assign every axis unconditionally so a
+        // preset with `None` actually clears that axis on `base`. The
+        // earlier `if self.epic_id.is_some()` made `epic_id` a
+        // set-only field, inconsistent with the other axes and
+        // surprising for users who built a preset to *narrow* off the
+        // epic axis.
+        base.epic_id = self.epic_id.clone();
         base.spark_id = self.spark_id.clone();
         base.assignment_id = self.assignment_id.clone();
         base.pr_number = self.pr_number;
@@ -549,14 +556,13 @@ pub async fn delete_preset(pool: &SqlitePool, id: i64) -> Result<bool, Projectio
 /// preset's filters on its channel whose `id` is greater than
 /// `last_seen_message_id`.
 ///
-/// Implemented as
-/// `max(irc_messages.id matching filters) - last_seen_message_id` only
-/// when the max is non-NULL; otherwise returns 0. That arithmetic is
-/// exact whenever `irc_messages.id` is gap-free within a channel's
-/// filter slice — which is not guaranteed in general, so the
-/// implementation uses a `COUNT(*) WHERE id > last_seen` instead for
-/// correctness. The arithmetic form in the spark is a hot-path optimisation
-/// we can adopt later if the count-path shows up in profiling.
+/// Implementation uses `COUNT(*) WHERE id > last_seen` rather than
+/// the arithmetic `max(id) - last_seen` form in the original spark
+/// description, because `irc_messages.id` is not gap-free within a
+/// channel's filter slice (deletes, FTS-mismatches, cross-channel
+/// inserts all break the assumption). PR #53 Copilot c3 + c7 — the
+/// migration comment + this doc both used to imply the arithmetic
+/// form was canonical; corrected.
 pub async fn preset_unread_count(
     pool: &SqlitePool,
     preset_id: i64,
@@ -571,6 +577,14 @@ pub async fn preset_unread_count(
         ..ChannelProjectionQuery::default()
     };
     preset.filters.apply_to(&mut q);
+
+    // PR #53 Copilot c2: the preset's fts_query flows into
+    // push_filter_predicate via apply_to above. Without an explicit
+    // validate_fts call the unread-count query path could hit a
+    // SQLite error on an empty/unbalanced preset, leaking that
+    // error all the way to the caller. Validate up front so we
+    // surface ProjectionError::InvalidFts cleanly instead.
+    validate_fts(q.fts_query.as_deref())?;
 
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
         "SELECT COUNT(*) AS unread FROM irc_messages m \
