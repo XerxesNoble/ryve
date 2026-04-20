@@ -54,6 +54,13 @@ pub enum TabKind {
         session_id: String,
         tmux_session_name: String,
     },
+    /// Projected IRC message view pinned to one channel. Spark
+    /// ryve-5466c372: the scrollable, real-time view that renders the
+    /// output of `ipc::channel_projection::query` alongside filter
+    /// inputs, an FTS search, and a preset sidebar.
+    IrcView {
+        channel: String,
+    },
 }
 
 /// Per-terminal-tab Cmd+F search state. Lives in [`BenchState`] keyed
@@ -107,6 +114,10 @@ pub enum Message {
     /// Open (or focus) the Home / multi-Hand coordination dashboard tab.
     /// Singleton per workshop.
     OpenHome,
+    /// Open (or focus) the IRC projection view. Spark ryve-5466c372 —
+    /// the app picks the first known epic channel as the initial target.
+    /// If the workshop has no epic channels yet, the handler is a no-op.
+    OpenIrcView,
     /// Focus the pinned Atlas tab. Atlas is auto-spawned on workshop open
     /// (spark ryve-fa0f8f93); this message switches the bench to show it.
     /// If no Atlas tab exists yet (e.g. no agents installed at boot),
@@ -257,6 +268,7 @@ impl BenchState {
                 TabKind::TmuxAttach {
                     tmux_session_name, ..
                 } => ("\u{2318}", format!("tmux: {tmux_session_name}")),
+                TabKind::IrcView { channel } => ("\u{1F4AC}", format!("IRC: {channel}")),
             };
 
             let is_atlas = tab.is_atlas;
@@ -453,6 +465,17 @@ impl BenchState {
                 .style(button::text)
                 .width(Length::Fill)
                 .on_press(Message::OpenHome),
+        );
+
+        menu = menu.push(
+            button(
+                text("Open IRC View")
+                    .size(FONT_BODY)
+                    .color(pal.text_primary),
+            )
+            .style(button::text)
+            .width(Length::Fill)
+            .on_press(Message::OpenIrcView),
         );
 
         // Spark ryve-fa0f8f93 — Atlas is auto-spawned as a pinned

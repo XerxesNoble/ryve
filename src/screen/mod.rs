@@ -12,6 +12,7 @@ pub mod head_picker;
 pub mod home;
 pub mod integrations;
 pub mod intent_list_editor;
+pub mod irc_view;
 pub mod log_tail;
 pub mod releases;
 pub mod settings;
