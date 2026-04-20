@@ -8,7 +8,9 @@
 //! - Invalid `limit` values are surfaced, not silently clamped.
 
 use ipc::channel_manager::{EpicRef, channel_name};
-use ipc::chat_of_record::{ChatError, NewPost, TAIL_MAX_LIMIT, TailFilter, post_message, tail};
+use ipc::chat_of_record::{
+    ChatError, NewPost, TAIL_MAX_LIMIT, TailFilter, count_posts_since_claim, post_message, tail,
+};
 use sqlx::SqlitePool;
 
 const EPIC_TITLE: &str = "Chat epic";
@@ -242,6 +244,151 @@ async fn tail_rejects_out_of_range_limit(pool: SqlitePool) {
     .await
     .unwrap_err();
     assert!(matches!(negative, ChatError::InvalidLimit { got: -1, .. }));
+}
+
+/// Raw insert helper for `count_posts_since_claim` tests: bypasses
+/// [`post_message`]'s channel→epic resolution so rows can be tagged with
+/// any spark id (child-task ids, not just epics). The mandatory-post
+/// gate queries `irc_messages.epic_id` directly, so the tests exercise
+/// that column as a generic spark FK.
+async fn insert_irc_row(
+    pool: &SqlitePool,
+    epic_id: &str,
+    author: Option<&str>,
+    created_at: &str,
+    body: &str,
+) {
+    sqlx::query(
+        "INSERT INTO irc_messages \
+         (epic_id, channel, irc_message_id, sender_actor_id, command, raw_text, created_at) \
+         VALUES (?, '#test', ?, ?, 'PRIVMSG', ?, ?)",
+    )
+    .bind(epic_id)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(author)
+    .bind(body)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "../data/migrations")]
+async fn count_posts_since_claim_counts_only_matching_session_spark_and_cutoff(pool: SqlitePool) {
+    // Seed the sparks referenced by epic_id (FK NOT NULL).
+    seed_epic(&pool, "sp-target").await;
+    seed_epic(&pool, "sp-other").await;
+    seed_session(&pool, "sess-claimer").await;
+    seed_session(&pool, "sess-stranger").await;
+
+    let claim_ts = "2026-04-20T00:00:00Z";
+
+    // Before the claim: must NOT count, even though session + spark match.
+    insert_irc_row(
+        &pool,
+        "sp-target",
+        Some("sess-claimer"),
+        "2026-04-19T23:59:59Z",
+        "pre-claim",
+    )
+    .await;
+
+    // After claim, right session + right spark: counts.
+    insert_irc_row(
+        &pool,
+        "sp-target",
+        Some("sess-claimer"),
+        "2026-04-20T00:05:00Z",
+        "on-handoff one",
+    )
+    .await;
+    insert_irc_row(
+        &pool,
+        "sp-target",
+        Some("sess-claimer"),
+        "2026-04-20T00:10:00Z",
+        "on-handoff two",
+    )
+    .await;
+
+    // After claim, right session but wrong spark: does NOT count (scope).
+    insert_irc_row(
+        &pool,
+        "sp-other",
+        Some("sess-claimer"),
+        "2026-04-20T00:06:00Z",
+        "wrong spark",
+    )
+    .await;
+
+    // After claim, right spark but wrong session: does NOT count (authorship).
+    insert_irc_row(
+        &pool,
+        "sp-target",
+        Some("sess-stranger"),
+        "2026-04-20T00:07:00Z",
+        "someone else",
+    )
+    .await;
+
+    // Anonymous post (sender_actor_id NULL): does NOT count — the gate
+    // must attribute the post to the closing session specifically.
+    insert_irc_row(&pool, "sp-target", None, "2026-04-20T00:08:00Z", "anon").await;
+
+    let n = count_posts_since_claim(&pool, "sess-claimer", "sp-target", claim_ts)
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 2,
+        "only rows with matching session, matching spark, and created_at >= claim_ts count",
+    );
+}
+
+#[sqlx::test(migrations = "../data/migrations")]
+async fn count_posts_since_claim_returns_zero_when_nothing_posted(pool: SqlitePool) {
+    seed_epic(&pool, "sp-empty").await;
+    seed_session(&pool, "sess-claimer").await;
+    seed_session(&pool, "sess-other").await;
+
+    // Cross-noise to prove the query is scoped, not returning everything.
+    insert_irc_row(
+        &pool,
+        "sp-empty",
+        Some("sess-other"),
+        "2026-04-20T00:05:00Z",
+        "not me",
+    )
+    .await;
+
+    let n = count_posts_since_claim(&pool, "sess-claimer", "sp-empty", "2026-04-20T00:00:00Z")
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[sqlx::test(migrations = "../data/migrations")]
+async fn count_posts_since_claim_boundary_is_inclusive(pool: SqlitePool) {
+    seed_epic(&pool, "sp-edge").await;
+    seed_session(&pool, "sess-edge").await;
+
+    let claim_ts = "2026-04-20T00:00:00Z";
+
+    // A post at exactly the claim timestamp must satisfy the gate — the
+    // "since" boundary is inclusive (claim and post land in the same tx
+    // for same-instant race cases).
+    insert_irc_row(
+        &pool,
+        "sp-edge",
+        Some("sess-edge"),
+        claim_ts,
+        "same instant",
+    )
+    .await;
+
+    let n = count_posts_since_claim(&pool, "sess-edge", "sp-edge", claim_ts)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
 }
 
 #[sqlx::test(migrations = "../data/migrations")]
