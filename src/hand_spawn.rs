@@ -34,6 +34,7 @@ use data::sparks::types::{
 use data::sparks::{
     agent_session_repo, assign_repo, assignment_repo, bond_repo, crew_repo, spark_repo,
 };
+use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::io::AsyncWrite;
 use tokio::process::Command;
@@ -296,6 +297,520 @@ pub enum HandSpawnError {
         #[source]
         source: std::io::Error,
     },
+    /// Merge-Hand spawn refused because the merge spark has no parent
+    /// epic. The checker walks `merge_spark.parent_id` to find the epic
+    /// whose children it validates; an orphan merge spark cannot be
+    /// validated, so the spawn is rejected before any DB mutations.
+    /// Spark ryve-5bd7749b [sp-476ef264].
+    #[error(
+        "merge_hand spawn refused: merge spark {merge_spark_id} has no parent epic to validate"
+    )]
+    MergeSparkHasNoEpic { merge_spark_id: String },
+    /// Merge-Hand spawn refused because one or more preconditions from
+    /// the Merge-Hand contract (approvals / conflicts / CI / stuck) did
+    /// not pass. The checker has already emitted a structured
+    /// precondition-failure event to `event_outbox` — the caller must not
+    /// re-emit. Spark ryve-5bd7749b [sp-476ef264].
+    #[error(
+        "merge_hand spawn refused: preconditions failed for epic {}: {}",
+        .report.epic_id,
+        .report.summary_reason()
+    )]
+    MergePreconditionsFailed {
+        report: Box<MergePreconditionReport>,
+    },
+}
+
+// ── Merge-Hand precondition checker ──────────────────────────────
+//
+// Spark ryve-5bd7749b [sp-476ef264]. The Merge-Hand contract (epic
+// ryve-476ef264) forbids spawning a Merge-Hand until four preconditions
+// all hold on the epic it would integrate:
+//
+//   (a) every child Assignment is in `Approved` phase,
+//   (b) the epic branch has no merge conflicts with any sub-PR,
+//   (c) CI is passing on every sub-PR where CI is configured, and
+//   (d) zero child Assignments are in `Stuck` phase.
+//
+// (a) and (d) are authoritative from the `assignments` table — no env
+// probe needed. (b) and (c) cannot be answered from the DB alone, so the
+// checker takes a [`MergePreconditionEnv`] that sibling sparks will fill
+// in with real git / `gh` probes; the default [`NoopMergePreconditionEnv`]
+// here is deliberately non-blocking (`NotApplicable`) so the DB-level gate
+// lands in isolation today and the env-level gates bolt on without
+// reshaping the spawn path.
+//
+// Any failure triggers an `epic.blocker_raised` outbox row (the v1
+// allow-listed blocker shape) carrying the full structured report in
+// its payload. That row flows through the existing IRC outbox relay to
+// the epic's channel without needing a new allow-list entry.
+
+/// Pass / fail status of a single precondition criterion.
+///
+/// `NotApplicable` is distinct from `Pass` on purpose: the audit trail
+/// must show whether a gate was affirmatively satisfied or skipped (e.g.
+/// CI-passing check skipped because no sub-PR has CI configured yet).
+/// Neither blocks the spawn — only [`Self::Fail`] does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CriterionStatus {
+    Pass,
+    NotApplicable { reason: String },
+    Fail { reason: String },
+}
+
+impl CriterionStatus {
+    /// Reject-the-spawn predicate. Pass and NotApplicable both count as
+    /// non-blocking.
+    pub fn is_fail(&self) -> bool {
+        matches!(self, Self::Fail { .. })
+    }
+
+    /// The human-readable explanation attached to this status, if any.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Pass => None,
+            Self::NotApplicable { reason } | Self::Fail { reason } => Some(reason),
+        }
+    }
+
+    /// Stable kind tag used in structured payloads and logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::NotApplicable { .. } => "not_applicable",
+            Self::Fail { .. } => "fail",
+        }
+    }
+}
+
+/// Structured pass / fail report produced by [`check_merge_preconditions`].
+/// The four criterion fields map 1:1 to the Merge-Hand contract; the
+/// [`Self::is_pass`] predicate is the gate the spawn path consults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MergePreconditionReport {
+    /// Merge spark the Merge-Hand would own.
+    pub merge_spark_id: String,
+    /// Epic under which the merge-spark sits. Every child-Assignment
+    /// check runs against this spark's children.
+    pub epic_id: String,
+    /// Epic title — cached so the outbox event carries enough context
+    /// for IRC rendering without a second DB round-trip.
+    pub epic_title: String,
+    /// Criterion (a): every child Assignment is in `Approved` phase.
+    pub approvals: CriterionStatus,
+    /// Criterion (b): the epic branch has no merge conflicts with any
+    /// sub-PR. Requires an env probe; `NotApplicable` until a real
+    /// probe is wired by a sibling spark.
+    pub conflicts: CriterionStatus,
+    /// Criterion (c): CI is passing on every sub-PR where CI is
+    /// configured. Requires an env probe.
+    pub ci: CriterionStatus,
+    /// Criterion (d): zero child Assignments are in `Stuck` phase.
+    /// A single stuck Assignment anywhere in the epic blocks the
+    /// merge — no partial merges.
+    pub stuck: CriterionStatus,
+}
+
+impl MergePreconditionReport {
+    /// True when no criterion is [`CriterionStatus::Fail`]. The Merge-
+    /// Hand spawn path MUST refuse to launch a subprocess unless this
+    /// predicate holds.
+    pub fn is_pass(&self) -> bool {
+        !self.approvals.is_fail()
+            && !self.conflicts.is_fail()
+            && !self.ci.is_fail()
+            && !self.stuck.is_fail()
+    }
+
+    /// Every failing criterion paired with its reason, in stable
+    /// reporting order (approvals → conflicts → ci → stuck). Uses the
+    /// public [`CriterionStatus::kind`] / [`CriterionStatus::reason`]
+    /// accessors so the iteration works the same way external consumers
+    /// can reproduce it.
+    pub fn failing(&self) -> Vec<(&'static str, &str)> {
+        let mut out = Vec::new();
+        for (name, status) in [
+            ("approvals", &self.approvals),
+            ("conflicts", &self.conflicts),
+            ("ci", &self.ci),
+            ("stuck", &self.stuck),
+        ] {
+            if status.kind() == "fail"
+                && let Some(reason) = status.reason()
+            {
+                out.push((name, reason));
+            }
+        }
+        out
+    }
+
+    /// One-line summary of every failure suitable for an error message
+    /// or an IRC line. Returns a placeholder string when no criterion
+    /// failed, so callers can unconditionally include it in logs.
+    pub fn summary_reason(&self) -> String {
+        let parts: Vec<String> = self
+            .failing()
+            .into_iter()
+            .map(|(name, reason)| format!("{name}: {reason}"))
+            .collect();
+        if parts.is_empty() {
+            "all merge-hand preconditions passed".to_string()
+        } else {
+            parts.join("; ")
+        }
+    }
+}
+
+/// Environmental probes that the precondition checker delegates to when
+/// answering criteria that require git or GitHub. Sibling sparks will
+/// replace the default [`NoopMergePreconditionEnv`] with a real
+/// implementation; tests inject a stub to assert the wiring.
+///
+/// The trait is dyn-safe (returns boxed futures explicitly) so the spawn
+/// path can take `&dyn MergePreconditionEnv` without pulling a new
+/// dependency.
+pub trait MergePreconditionEnv: Send + Sync {
+    /// Does the epic branch merge cleanly with `pr_number`'s head?
+    /// Implementations that cannot probe (no git, no network) should
+    /// return [`CriterionStatus::NotApplicable`] rather than
+    /// [`CriterionStatus::Fail`] — the Merge-Hand contract treats "no
+    /// probe" as "no evidence of conflict", and a real probe landing
+    /// later will flip the same criterion from NA to Pass/Fail without
+    /// rewriting the checker.
+    fn epic_merges_cleanly_with_pr<'a>(
+        &'a self,
+        pr_number: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CriterionStatus> + Send + 'a>>;
+
+    /// CI status on `pr_number`. Implementations that cannot probe
+    /// should return [`CriterionStatus::NotApplicable`] with a reason.
+    /// Returning `NotApplicable` for sub-PRs that genuinely have no CI
+    /// configured is the contract's explicit carve-out ("where CI is
+    /// configured").
+    fn ci_status_for_pr<'a>(
+        &'a self,
+        pr_number: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CriterionStatus> + Send + 'a>>;
+}
+
+/// Conservative default env. Every probe returns
+/// [`CriterionStatus::NotApplicable`] — the DB-level gates (a) and (d)
+/// still run authoritatively, but no env-level gate blocks a spawn
+/// until a real probe is supplied by a sibling spark.
+///
+/// Deliberately not named `Default`: a caller explicitly opting into
+/// "no env probes" is easier to audit than a silent trait-derived
+/// default.
+pub struct NoopMergePreconditionEnv;
+
+impl MergePreconditionEnv for NoopMergePreconditionEnv {
+    fn epic_merges_cleanly_with_pr<'a>(
+        &'a self,
+        _pr_number: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CriterionStatus> + Send + 'a>> {
+        Box::pin(async {
+            CriterionStatus::NotApplicable {
+                reason: "no merge-conflict probe wired (sibling spark will supply)".to_string(),
+            }
+        })
+    }
+
+    fn ci_status_for_pr<'a>(
+        &'a self,
+        _pr_number: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CriterionStatus> + Send + 'a>> {
+        Box::pin(async {
+            CriterionStatus::NotApplicable {
+                reason: "no CI probe wired (sibling spark will supply)".to_string(),
+            }
+        })
+    }
+}
+
+/// Run the Merge-Hand precondition checker for `merge_spark_id`. Walks
+/// `merge_spark.parent_id` to find the epic, gathers every sibling
+/// spark's latest `Assignment` row, and evaluates the four criteria.
+///
+/// Returns a structured [`MergePreconditionReport`]. The caller decides
+/// whether to emit a precondition-failure event — see
+/// [`emit_merge_precondition_failure`] and [`spawn_hand`] for the
+/// gated-spawn wiring.
+///
+/// Errors:
+/// * [`HandSpawnError::Sparks`] for any DB / repo error.
+/// * [`HandSpawnError::MergeSparkHasNoEpic`] when the merge spark has
+///   no `parent_id` — the checker has nothing to validate against.
+pub async fn check_merge_preconditions(
+    pool: &SqlitePool,
+    merge_spark_id: &str,
+    env: &dyn MergePreconditionEnv,
+) -> Result<MergePreconditionReport, HandSpawnError> {
+    use data::sparks::types::AssignmentPhase;
+
+    let merge_spark = spark_repo::get(pool, merge_spark_id).await?;
+
+    let epic_id =
+        merge_spark
+            .parent_id
+            .clone()
+            .ok_or_else(|| HandSpawnError::MergeSparkHasNoEpic {
+                merge_spark_id: merge_spark_id.to_string(),
+            })?;
+
+    let epic = spark_repo::get(pool, &epic_id).await?;
+
+    // All children of the epic except the merge spark itself. Excluding
+    // the merge spark keeps the checker from grading the Merge-Hand's
+    // own assignment — its phase is driven by the spawn we are about
+    // to gate.
+    let children = spark_repo::list(
+        pool,
+        SparkFilter {
+            workshop_id: Some(epic.workshop_id.clone()),
+            parent_id: Some(epic_id.clone()),
+            ..SparkFilter::default()
+        },
+    )
+    .await?;
+    let child_sparks: Vec<_> = children
+        .into_iter()
+        .filter(|s| s.id != merge_spark_id)
+        .collect();
+
+    // DB-level criteria (a) and (d). We collect a list of every
+    // artifact PR number encountered so env-level criteria (b) and (c)
+    // can iterate once over exactly the sub-PRs that exist.
+    let mut not_approved: Vec<String> = Vec::new(); // spark_ids
+    let mut stuck: Vec<String> = Vec::new(); // spark_ids
+    let mut missing_assignment: Vec<String> = Vec::new(); // spark_ids
+    let mut sub_pr_numbers: Vec<(String, i64)> = Vec::new(); // (spark_id, pr_number)
+
+    for child in &child_sparks {
+        match assign_repo::latest_assignment_for_spark(pool, &child.id).await {
+            Ok(asgn) => {
+                let phase = asgn
+                    .assignment_phase
+                    .as_deref()
+                    .and_then(AssignmentPhase::from_str);
+                // A `Stuck` child fails BOTH criterion (a) and (d):
+                // it is not in `Approved` phase, and it is in `Stuck`.
+                // The two criteria are reported independently so the
+                // failure event enumerates every offender under every
+                // contract clause it violates.
+                match phase {
+                    Some(AssignmentPhase::Approved) => {}
+                    Some(AssignmentPhase::Stuck) => {
+                        stuck.push(child.id.clone());
+                        not_approved.push(child.id.clone());
+                    }
+                    Some(_) | None => not_approved.push(child.id.clone()),
+                }
+
+                if let Some(pr) = asgn.github_artifact_pr_number {
+                    sub_pr_numbers.push((child.id.clone(), pr));
+                }
+            }
+            Err(data::sparks::SparksError::NotFound(_)) => {
+                missing_assignment.push(child.id.clone());
+            }
+            Err(e) => return Err(HandSpawnError::Sparks(e)),
+        }
+    }
+
+    // Criterion (a): every child is in Approved phase (no missing
+    // assignments either — a child with no assignment row still has
+    // un-approved work).
+    let approvals = if not_approved.is_empty() && missing_assignment.is_empty() {
+        if child_sparks.is_empty() {
+            CriterionStatus::NotApplicable {
+                reason: format!("epic {epic_id} has no child sparks to approve"),
+            }
+        } else {
+            CriterionStatus::Pass
+        }
+    } else {
+        let mut parts = Vec::new();
+        if !not_approved.is_empty() {
+            parts.push(format!(
+                "{} child spark(s) not in Approved phase: {}",
+                not_approved.len(),
+                not_approved.join(", ")
+            ));
+        }
+        if !missing_assignment.is_empty() {
+            parts.push(format!(
+                "{} child spark(s) have no Assignment row yet: {}",
+                missing_assignment.len(),
+                missing_assignment.join(", ")
+            ));
+        }
+        CriterionStatus::Fail {
+            reason: parts.join("; "),
+        }
+    };
+
+    // Criterion (d): zero children in Stuck phase. Evaluated
+    // independently so the failure event surfaces the stuck set even if
+    // other criteria also fail.
+    let stuck_status = if stuck.is_empty() {
+        if child_sparks.is_empty() {
+            CriterionStatus::NotApplicable {
+                reason: format!("epic {epic_id} has no child sparks to evaluate"),
+            }
+        } else {
+            CriterionStatus::Pass
+        }
+    } else {
+        CriterionStatus::Fail {
+            reason: format!(
+                "{} stuck child Assignment(s) block the merge: {}",
+                stuck.len(),
+                stuck.join(", ")
+            ),
+        }
+    };
+
+    // Env-level criteria (b) and (c). If no child assignment has a
+    // mirrored PR yet, both criteria are NotApplicable ("where CI is
+    // configured" short-circuits on no PRs at all). Otherwise we iterate
+    // each sub-PR and fold failures; the first env-level Fail wins the
+    // criterion but its reason string enumerates every offending PR.
+    let (conflicts, ci) = if sub_pr_numbers.is_empty() {
+        (
+            CriterionStatus::NotApplicable {
+                reason: "no sub-PRs mirrored for any child assignment".to_string(),
+            },
+            CriterionStatus::NotApplicable {
+                reason: "no sub-PRs mirrored for any child assignment".to_string(),
+            },
+        )
+    } else {
+        let mut conflict_fails: Vec<String> = Vec::new();
+        let mut ci_fails: Vec<String> = Vec::new();
+        let mut conflict_all_na = true;
+        let mut ci_all_na = true;
+
+        for (spark_id, pr) in &sub_pr_numbers {
+            match env.epic_merges_cleanly_with_pr(*pr).await {
+                CriterionStatus::Pass => conflict_all_na = false,
+                CriterionStatus::NotApplicable { .. } => {}
+                CriterionStatus::Fail { reason } => {
+                    conflict_all_na = false;
+                    conflict_fails.push(format!("{spark_id} (PR #{pr}): {reason}"));
+                }
+            }
+            match env.ci_status_for_pr(*pr).await {
+                CriterionStatus::Pass => ci_all_na = false,
+                CriterionStatus::NotApplicable { .. } => {}
+                CriterionStatus::Fail { reason } => {
+                    ci_all_na = false;
+                    ci_fails.push(format!("{spark_id} (PR #{pr}): {reason}"));
+                }
+            }
+        }
+
+        let conflicts = if !conflict_fails.is_empty() {
+            CriterionStatus::Fail {
+                reason: format!("conflicts on {}", conflict_fails.join("; ")),
+            }
+        } else if conflict_all_na {
+            CriterionStatus::NotApplicable {
+                reason: "env reported no conflict evidence for any sub-PR".to_string(),
+            }
+        } else {
+            CriterionStatus::Pass
+        };
+
+        let ci = if !ci_fails.is_empty() {
+            CriterionStatus::Fail {
+                reason: format!("CI failures on {}", ci_fails.join("; ")),
+            }
+        } else if ci_all_na {
+            CriterionStatus::NotApplicable {
+                reason: "no sub-PR has CI configured".to_string(),
+            }
+        } else {
+            CriterionStatus::Pass
+        };
+
+        (conflicts, ci)
+    };
+
+    Ok(MergePreconditionReport {
+        merge_spark_id: merge_spark_id.to_string(),
+        epic_id,
+        epic_title: epic.title,
+        approvals,
+        conflicts,
+        ci,
+        stuck: stuck_status,
+    })
+}
+
+/// Emit a structured precondition-failure row to `event_outbox` so the
+/// outbox relay surfaces it on the epic's IRC channel. The row piggybacks
+/// on the v1 `epic.blocker_raised` allow-list entry (the Merge-Hand
+/// contract's failure semantics are shaped exactly like an epic-level
+/// blocker), so no new renderer / discipline arm is required — but the
+/// payload carries the full [`MergePreconditionReport`] as an extra
+/// `precondition_report` field for machine-readable replay.
+///
+/// Idempotency is the caller's responsibility: calling this twice for
+/// the same spawn attempt writes two outbox rows (one per invocation)
+/// and the relay will surface both lines on IRC. The spawn path only
+/// calls it once per refused spawn.
+pub(crate) async fn emit_merge_precondition_failure(
+    pool: &SqlitePool,
+    report: &MergePreconditionReport,
+) -> Result<String, HandSpawnError> {
+    use serde_json::json;
+
+    let event_id = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let reason = format!(
+        "merge-hand preconditions failed: {}",
+        report.summary_reason()
+    );
+
+    let payload = json!({
+        // Fields the outbox relay's EpicBlockerRaised parser consumes.
+        // Its PayloadEnvelope extracts `epic_id`/`epic_name` for channel
+        // routing; the inner EventPayload parser picks `assignment_id`
+        // + `reason`.
+        "epic_id": report.epic_id,
+        "epic_name": report.epic_title,
+        "assignment_id": report.merge_spark_id,
+        "reason": reason,
+        // Extra fields the IRC renderer ignores but downstream
+        // structured-event consumers (replay, UI, tests) can read.
+        "precondition_report": report,
+        "merge_spark_id": report.merge_spark_id,
+    });
+    let payload_str = serde_json::to_string(&payload).map_err(|e| {
+        // Serialising a static report never realistically fails; coerce
+        // into the Io variant rather than adding a new error variant
+        // for an essentially-unreachable path.
+        HandSpawnError::Io(std::io::Error::other(format!(
+            "merge precondition payload serialisation: {e}"
+        )))
+    })?;
+
+    sqlx::query(
+        "INSERT INTO event_outbox \
+         (event_id, schema_version, timestamp, assignment_id, actor_id, event_type, payload) \
+         VALUES (?, 1, ?, ?, ?, 'epic.blocker_raised', ?)",
+    )
+    .bind(&event_id)
+    .bind(&now)
+    .bind(&report.merge_spark_id)
+    .bind("merge_hand_preflight")
+    .bind(&payload_str)
+    .execute(pool)
+    .await
+    .map_err(|e| HandSpawnError::Sparks(data::sparks::SparksError::Database(e)))?;
+
+    Ok(event_id)
 }
 
 /// Run a subprocess under a streaming-heartbeat wrapper so long silent
@@ -555,6 +1070,32 @@ pub async fn spawn_hand(
 
     if matches!(kind, HandKind::Merger | HandKind::MergeHand) && crew_id.is_none() {
         return Err(HandSpawnError::MergerNeedsCrew);
+    }
+
+    // Merge-Hand precondition gate (spark ryve-5bd7749b [sp-476ef264]).
+    //
+    // The Merge-Hand contract forbids spawning the integrator until every
+    // child Assignment is approved, no Assignment is stuck, the epic
+    // branch has no conflict with any sub-PR, and CI is passing on every
+    // sub-PR where CI is configured. The gate runs BEFORE any worktree
+    // is created or DB row is written so a refused spawn leaves zero
+    // side effects other than the structured precondition-failure event
+    // emitted to `event_outbox` (which the caller relies on to route the
+    // failure to IRC).
+    //
+    // A sibling spark will wire a real [`MergePreconditionEnv`] with git
+    // + `gh` probes; until then the default [`NoopMergePreconditionEnv`]
+    // leaves criteria (b) and (c) as `NotApplicable` so the DB-level
+    // gates (a) and (d) still run authoritatively.
+    if matches!(kind, HandKind::MergeHand) {
+        let env = NoopMergePreconditionEnv;
+        let report = check_merge_preconditions(pool, spark_id, &env).await?;
+        if !report.is_pass() {
+            emit_merge_precondition_failure(pool, &report).await?;
+            return Err(HandSpawnError::MergePreconditionsFailed {
+                report: Box::new(report),
+            });
+        }
     }
 
     // Resolve the actor up front so every subsequent step (worktree branch
@@ -3531,5 +4072,574 @@ mod run_with_stream_heartbeat_tests {
             "child env must carry caller-supplied vars; got {text:?}",
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── Spark ryve-5bd7749b [sp-476ef264]: Merge-Hand precondition gate ───
+
+    mod merge_preconditions {
+        //! Unit + DB tests for the Merge-Hand precondition checker,
+        //! [`emit_merge_precondition_failure`], and the gated-spawn
+        //! branch in [`spawn_hand`]. These do not touch tmux or spawn
+        //! any subprocess — the gate runs before any worktree / tmux
+        //! plumbing, so a DB-only pool is enough to exercise it.
+        use std::path::PathBuf;
+
+        use data::sparks::types::{
+            AssignmentPhase, NewAssignment, NewSpark, SparkType, UpdateSpark,
+        };
+        use data::sparks::{assign_repo, crew_repo, spark_repo};
+        use uuid::Uuid;
+
+        use crate::coding_agents::{CodingAgent, ResumeStrategy};
+        use crate::hand_spawn::{
+            CriterionStatus, HandKind, HandSpawnError, MergePreconditionEnv,
+            MergePreconditionReport, NoopMergePreconditionEnv, SpawnContext,
+            check_merge_preconditions, emit_merge_precondition_failure, spawn_hand,
+            workshop_id_for,
+        };
+
+        /// Minimal test harness: a temp directory + an open sparks pool.
+        /// Unlike [`setup_workshop`], this does not run `git init` or
+        /// author a stub agent — the precondition gate never reaches
+        /// either. Keeps these tests fast and immune to CI's tmux/git
+        /// environment.
+        async fn setup_pool() -> (PathBuf, sqlx::SqlitePool) {
+            let base = std::env::temp_dir().join(format!("ryve-preflight-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&base).unwrap();
+            let pool = data::db::open_sparks_db(&base).await.unwrap();
+            (base, pool)
+        }
+
+        /// Seed a standalone spark in the pool's workshop. Returns the
+        /// created spark id. Callers pass `parent_id=None` for epics and
+        /// an epic id for children.
+        async fn seed_spark(
+            pool: &sqlx::SqlitePool,
+            workshop_id: &str,
+            title: &str,
+            spark_type: SparkType,
+            parent_id: Option<&str>,
+        ) -> String {
+            let s = spark_repo::create(
+                pool,
+                NewSpark {
+                    title: title.into(),
+                    description: String::new(),
+                    spark_type,
+                    priority: 2,
+                    workshop_id: workshop_id.into(),
+                    assignee: None,
+                    owner: None,
+                    parent_id: parent_id.map(String::from),
+                    due_at: None,
+                    estimated_minutes: None,
+                    metadata: None,
+                    risk_level: None,
+                    scope_boundary: None,
+                },
+            )
+            .await
+            .unwrap();
+            s.id
+        }
+
+        /// Create an Assignment row starting in `Assigned`, then drive it
+        /// to `target` via direct SQL. The transition validator is strict
+        /// about source/target pairs; we bypass it for test scaffolding
+        /// because the checker only reads the current phase, not the
+        /// transition history.
+        async fn seed_assignment(
+            pool: &sqlx::SqlitePool,
+            spark_id: &str,
+            actor_id: &str,
+            target: AssignmentPhase,
+        ) {
+            assign_repo::create_assignment(
+                pool,
+                NewAssignment {
+                    spark_id: spark_id.to_string(),
+                    actor_id: actor_id.to_string(),
+                    assignment_phase: AssignmentPhase::Assigned,
+                    source_branch: None,
+                    target_branch: None,
+                },
+            )
+            .await
+            .unwrap();
+            if !matches!(target, AssignmentPhase::Assigned) {
+                sqlx::query("UPDATE assignments SET assignment_phase = ? WHERE spark_id = ?")
+                    .bind(target.as_str())
+                    .bind(spark_id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        /// Stub env that returns a configured status for every probe.
+        /// Sibling sparks swap in a real env; these tests need control
+        /// over the env-side criteria to verify the checker's wiring.
+        struct FixedEnv {
+            conflicts: CriterionStatus,
+            ci: CriterionStatus,
+        }
+
+        impl MergePreconditionEnv for FixedEnv {
+            fn epic_merges_cleanly_with_pr<'a>(
+                &'a self,
+                _pr_number: i64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CriterionStatus> + Send + 'a>>
+            {
+                let c = self.conflicts.clone();
+                Box::pin(async move { c })
+            }
+            fn ci_status_for_pr<'a>(
+                &'a self,
+                _pr_number: i64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CriterionStatus> + Send + 'a>>
+            {
+                let c = self.ci.clone();
+                Box::pin(async move { c })
+            }
+        }
+
+        // ── Pure data-model assertions (no DB) ──────────────────
+
+        #[test]
+        fn criterion_status_is_fail_only_for_fail_variant() {
+            assert!(CriterionStatus::Fail { reason: "x".into() }.is_fail());
+            assert!(!CriterionStatus::Pass.is_fail());
+            assert!(
+                !CriterionStatus::NotApplicable { reason: "x".into() }.is_fail(),
+                "NotApplicable must not block the spawn — it's an audit nuance, not a failure"
+            );
+        }
+
+        #[test]
+        fn criterion_status_reason_and_kind_round_trip_each_variant() {
+            assert_eq!(CriterionStatus::Pass.reason(), None);
+            assert_eq!(CriterionStatus::Pass.kind(), "pass");
+
+            let na = CriterionStatus::NotApplicable {
+                reason: "no-op".into(),
+            };
+            assert_eq!(na.reason(), Some("no-op"));
+            assert_eq!(na.kind(), "not_applicable");
+
+            let f = CriterionStatus::Fail {
+                reason: "nope".into(),
+            };
+            assert_eq!(f.reason(), Some("nope"));
+            assert_eq!(f.kind(), "fail");
+        }
+
+        #[test]
+        fn report_is_pass_requires_zero_failures() {
+            let mut r = MergePreconditionReport {
+                merge_spark_id: "sp-m".into(),
+                epic_id: "sp-e".into(),
+                epic_title: "Epic".into(),
+                approvals: CriterionStatus::Pass,
+                conflicts: CriterionStatus::NotApplicable { reason: "_".into() },
+                ci: CriterionStatus::NotApplicable { reason: "_".into() },
+                stuck: CriterionStatus::Pass,
+            };
+            assert!(r.is_pass(), "no failures → pass");
+
+            r.stuck = CriterionStatus::Fail { reason: "x".into() };
+            assert!(!r.is_pass(), "one Fail anywhere → fail");
+        }
+
+        #[test]
+        fn report_failing_enumerates_every_failed_criterion() {
+            let r = MergePreconditionReport {
+                merge_spark_id: "sp-m".into(),
+                epic_id: "sp-e".into(),
+                epic_title: "Epic".into(),
+                approvals: CriterionStatus::Fail {
+                    reason: "a-bad".into(),
+                },
+                conflicts: CriterionStatus::Pass,
+                ci: CriterionStatus::Fail {
+                    reason: "ci-bad".into(),
+                },
+                stuck: CriterionStatus::Fail {
+                    reason: "s-bad".into(),
+                },
+            };
+            let fails = r.failing();
+            assert_eq!(fails.len(), 3);
+            assert_eq!(fails[0].0, "approvals");
+            assert_eq!(fails[1].0, "ci");
+            assert_eq!(fails[2].0, "stuck");
+
+            let summary = r.summary_reason();
+            assert!(summary.contains("approvals: a-bad"), "summary: {summary}");
+            assert!(summary.contains("ci: ci-bad"), "summary: {summary}");
+            assert!(summary.contains("stuck: s-bad"), "summary: {summary}");
+        }
+
+        // ── DB-backed checker semantics ─────────────────────────
+
+        #[tokio::test]
+        async fn checker_errors_when_merge_spark_has_no_parent() {
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            // Top-level epic as the "merge spark" — no parent_id.
+            let orphan = seed_spark(&pool, &wid, "orphan merge", SparkType::Epic, None).await;
+
+            let err = check_merge_preconditions(&pool, &orphan, &NoopMergePreconditionEnv)
+                .await
+                .expect_err("merge spark with no parent must be refused");
+            match err {
+                HandSpawnError::MergeSparkHasNoEpic { merge_spark_id } => {
+                    assert_eq!(merge_spark_id, orphan);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[tokio::test]
+        async fn checker_passes_when_every_child_is_approved_and_no_stuck() {
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "green epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let child1 = seed_spark(&pool, &wid, "child 1", SparkType::Task, Some(&epic)).await;
+            let child2 = seed_spark(&pool, &wid, "child 2", SparkType::Task, Some(&epic)).await;
+
+            seed_assignment(&pool, &child1, "actor-1", AssignmentPhase::Approved).await;
+            seed_assignment(&pool, &child2, "actor-2", AssignmentPhase::Approved).await;
+
+            let report = check_merge_preconditions(&pool, &merge, &NoopMergePreconditionEnv)
+                .await
+                .unwrap();
+            assert!(report.is_pass(), "report: {report:?}");
+            assert_eq!(report.approvals, CriterionStatus::Pass);
+            assert_eq!(report.stuck, CriterionStatus::Pass);
+            assert!(matches!(
+                report.conflicts,
+                CriterionStatus::NotApplicable { .. }
+            ));
+            assert!(matches!(report.ci, CriterionStatus::NotApplicable { .. }));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[tokio::test]
+        async fn checker_fails_when_any_child_is_stuck() {
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "stuck epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let c_ok = seed_spark(&pool, &wid, "ok", SparkType::Task, Some(&epic)).await;
+            let c_stk = seed_spark(&pool, &wid, "stuck", SparkType::Task, Some(&epic)).await;
+
+            seed_assignment(&pool, &c_ok, "actor-1", AssignmentPhase::Approved).await;
+            seed_assignment(&pool, &c_stk, "actor-2", AssignmentPhase::Stuck).await;
+
+            let report = check_merge_preconditions(&pool, &merge, &NoopMergePreconditionEnv)
+                .await
+                .unwrap();
+            assert!(!report.is_pass(), "one stuck must block the merge spawn");
+            assert!(matches!(report.stuck, CriterionStatus::Fail { .. }));
+            assert!(
+                report.stuck.reason().unwrap().contains(&c_stk),
+                "reason must name the offending child id: {:?}",
+                report.stuck.reason()
+            );
+            // The stuck child is also not-approved, so the approvals
+            // criterion surfaces it too — the contract explicitly calls
+            // both out.
+            assert!(matches!(report.approvals, CriterionStatus::Fail { .. }));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[tokio::test]
+        async fn checker_fails_when_any_child_not_in_approved_phase() {
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "wip epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let c_ok = seed_spark(&pool, &wid, "ok", SparkType::Task, Some(&epic)).await;
+            let c_wip = seed_spark(&pool, &wid, "wip", SparkType::Task, Some(&epic)).await;
+
+            seed_assignment(&pool, &c_ok, "actor-1", AssignmentPhase::Approved).await;
+            seed_assignment(&pool, &c_wip, "actor-2", AssignmentPhase::InProgress).await;
+
+            let report = check_merge_preconditions(&pool, &merge, &NoopMergePreconditionEnv)
+                .await
+                .unwrap();
+            assert!(!report.is_pass());
+            match &report.approvals {
+                CriterionStatus::Fail { reason } => {
+                    assert!(
+                        reason.contains(&c_wip),
+                        "not-approved list must name the offender: {reason}"
+                    );
+                }
+                other => panic!("expected Fail, got {other:?}"),
+            }
+            assert_eq!(report.stuck, CriterionStatus::Pass);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[tokio::test]
+        async fn checker_fails_when_a_child_has_no_assignment_row_yet() {
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "partial epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let c_ok = seed_spark(&pool, &wid, "ok", SparkType::Task, Some(&epic)).await;
+            let c_noasgn =
+                seed_spark(&pool, &wid, "no-assignment", SparkType::Task, Some(&epic)).await;
+
+            seed_assignment(&pool, &c_ok, "actor-1", AssignmentPhase::Approved).await;
+            // No assignment row for c_noasgn — work hasn't started yet.
+
+            let report = check_merge_preconditions(&pool, &merge, &NoopMergePreconditionEnv)
+                .await
+                .unwrap();
+            assert!(!report.is_pass());
+            match &report.approvals {
+                CriterionStatus::Fail { reason } => {
+                    assert!(
+                        reason.contains(&c_noasgn),
+                        "missing-assignment list must name the offender: {reason}"
+                    );
+                }
+                other => panic!("expected Fail, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[tokio::test]
+        async fn checker_env_failures_surface_on_conflicts_and_ci_criteria() {
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "pr epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let child = seed_spark(&pool, &wid, "child", SparkType::Task, Some(&epic)).await;
+            seed_assignment(&pool, &child, "actor-1", AssignmentPhase::Approved).await;
+            // Attach a mirrored PR so env probes actually run.
+            sqlx::query(
+                "UPDATE assignments SET github_artifact_pr_number = 42, \
+                 github_artifact_branch = 'hand/x' WHERE spark_id = ?",
+            )
+            .bind(&child)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let env = FixedEnv {
+                conflicts: CriterionStatus::Fail {
+                    reason: "has conflict".into(),
+                },
+                ci: CriterionStatus::Fail {
+                    reason: "red build".into(),
+                },
+            };
+            let report = check_merge_preconditions(&pool, &merge, &env)
+                .await
+                .unwrap();
+            assert!(!report.is_pass());
+            assert!(matches!(report.conflicts, CriterionStatus::Fail { .. }));
+            assert!(matches!(report.ci, CriterionStatus::Fail { .. }));
+            assert!(report.conflicts.reason().unwrap().contains("PR #42"));
+            assert!(report.ci.reason().unwrap().contains("PR #42"));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[tokio::test]
+        async fn checker_env_pass_lands_pass_not_not_applicable() {
+            // If env actively reports Pass on at least one sub-PR, the
+            // criterion must settle on Pass — not fall back to the "no
+            // evidence" NotApplicable path reserved for empty/silent envs.
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "pr epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let child = seed_spark(&pool, &wid, "child", SparkType::Task, Some(&epic)).await;
+            seed_assignment(&pool, &child, "actor-1", AssignmentPhase::Approved).await;
+            sqlx::query(
+                "UPDATE assignments SET github_artifact_pr_number = 7, \
+                 github_artifact_branch = 'hand/y' WHERE spark_id = ?",
+            )
+            .bind(&child)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let env = FixedEnv {
+                conflicts: CriterionStatus::Pass,
+                ci: CriterionStatus::Pass,
+            };
+            let report = check_merge_preconditions(&pool, &merge, &env)
+                .await
+                .unwrap();
+            assert!(report.is_pass(), "report: {report:?}");
+            assert_eq!(report.conflicts, CriterionStatus::Pass);
+            assert_eq!(report.ci, CriterionStatus::Pass);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ── Outbox wiring ───────────────────────────────────────
+
+        #[tokio::test]
+        async fn precondition_failure_writes_epic_blocker_raised_outbox_row() {
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "stuck epic", SparkType::Epic, None).await;
+            // Give the epic a known title so the outbox payload carries
+            // it for IRC channel routing.
+            spark_repo::update(
+                &pool,
+                &epic,
+                UpdateSpark {
+                    title: Some("My Big Epic".into()),
+                    ..UpdateSpark::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let c_stk = seed_spark(&pool, &wid, "stuck", SparkType::Task, Some(&epic)).await;
+            seed_assignment(&pool, &c_stk, "actor-2", AssignmentPhase::Stuck).await;
+
+            let report = check_merge_preconditions(&pool, &merge, &NoopMergePreconditionEnv)
+                .await
+                .unwrap();
+            assert!(!report.is_pass());
+
+            let event_id = emit_merge_precondition_failure(&pool, &report)
+                .await
+                .unwrap();
+            assert!(!event_id.is_empty());
+
+            // 1. Row exists in event_outbox under the v1 allow-listed
+            //    event type so the existing outbox relay can forward it
+            //    to IRC without a new allow-list entry.
+            let (count, payload_str): (i64, String) = sqlx::query_as(
+                "SELECT COUNT(*), COALESCE(MAX(payload), '') FROM event_outbox \
+                 WHERE event_id = ? AND event_type = 'epic.blocker_raised'",
+            )
+            .bind(&event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 1, "exactly one outbox row per precondition failure");
+
+            // 2. Payload has the fields the outbox relay parses for
+            //    channel routing + IRC line rendering, and carries the
+            //    full structured report as an extra field.
+            let payload: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+            assert_eq!(payload["epic_id"], epic);
+            assert_eq!(payload["epic_name"], "My Big Epic");
+            assert_eq!(payload["assignment_id"], merge);
+            assert!(
+                payload["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("preconditions failed"),
+                "payload.reason must mention preconditions: {payload}"
+            );
+            assert_eq!(payload["merge_spark_id"], merge);
+            assert!(
+                payload["precondition_report"]["stuck"]["status"] == "fail",
+                "structured report must round-trip through the payload: {payload}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ── Gated spawn: the checker failure path short-circuits ──
+
+        #[tokio::test]
+        async fn spawn_hand_merge_hand_is_rejected_when_preconditions_fail() {
+            // Exercises the production gate in [`spawn_hand`]: a failing
+            // precondition (one stuck child) must refuse the spawn
+            // BEFORE any worktree is created or tmux session starts, and
+            // MUST emit exactly one precondition-failure row to
+            // event_outbox.
+            let (base, pool) = setup_pool().await;
+            let wid = workshop_id_for(&base);
+            let epic = seed_spark(&pool, &wid, "gate epic", SparkType::Epic, None).await;
+            let merge = seed_spark(&pool, &wid, "merge", SparkType::Task, Some(&epic)).await;
+            let c_stk = seed_spark(&pool, &wid, "stuck", SparkType::Task, Some(&epic)).await;
+            seed_assignment(&pool, &c_stk, "actor-1", AssignmentPhase::Stuck).await;
+
+            // Seed a crew so MergerNeedsCrew doesn't short-circuit us
+            // ahead of the precondition gate. The gate must fire even
+            // when every other spawn precondition is satisfied.
+            let crew = crew_repo::create(
+                &pool,
+                data::sparks::types::NewCrew {
+                    name: "merge crew".into(),
+                    purpose: None,
+                    workshop_id: wid.clone(),
+                    head_session_id: None,
+                    parent_spark_id: Some(epic.clone()),
+                },
+            )
+            .await
+            .unwrap();
+
+            let agent = CodingAgent {
+                display_name: "stub".into(),
+                command: "/bin/true".into(),
+                args: Vec::new(),
+                resume: ResumeStrategy::None,
+                compatibility: crate::coding_agents::CompatStatus::Unknown,
+            };
+
+            let outcome = spawn_hand(
+                &base,
+                &pool,
+                &agent,
+                &merge,
+                HandKind::MergeHand,
+                SpawnContext {
+                    crew_id: Some(&crew.id),
+                    ..SpawnContext::default()
+                },
+            )
+            .await;
+
+            match outcome {
+                Err(HandSpawnError::MergePreconditionsFailed { report }) => {
+                    assert_eq!(report.epic_id, epic);
+                    assert!(!report.is_pass());
+                    assert!(matches!(report.stuck, CriterionStatus::Fail { .. }));
+                }
+                Err(other) => panic!("expected MergePreconditionsFailed, got {other:?}"),
+                Ok(_) => panic!("merge_hand spawn must be refused when a child is stuck"),
+            }
+
+            // No agent_sessions row should be persisted for a refused
+            // spawn — the gate runs before the session INSERT.
+            let sessions: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE workshop_id = ?")
+                    .bind(&wid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                sessions, 0,
+                "a refused merge-hand spawn must not create a session row"
+            );
+
+            // And exactly one precondition-failure outbox row was written.
+            let outbox: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM event_outbox WHERE event_type = 'epic.blocker_raised' \
+                 AND assignment_id = ?",
+            )
+            .bind(&merge)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(outbox, 1, "exactly one outbox row per refused spawn");
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }
