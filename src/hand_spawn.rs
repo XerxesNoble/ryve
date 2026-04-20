@@ -375,6 +375,16 @@ impl CriterionStatus {
     }
 
     /// Stable kind tag used in structured payloads and logs.
+    ///
+    /// Retained as a public API for external consumers (outbox event
+    /// payloads, IRC lines, CLI output) even though no in-tree caller
+    /// currently uses it — PR #55 Copilot c4 replaced the one call
+    /// site inside `MergePreconditionReport::failing` with the typed
+    /// `is_fail()` predicate. Kept public + allow(dead_code) so the
+    /// stringly-typed representation stays available (and exercised
+    /// by the unit test `criterion_status_kind_is_stable`) without
+    /// tripping `-D dead_code` in release builds.
+    #[allow(dead_code)]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Pass => "pass",
