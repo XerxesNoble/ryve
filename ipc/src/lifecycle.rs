@@ -46,7 +46,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::channel_manager::{self, Epic};
+use crate::channel_manager::{self, ATLAS_CHANNEL, ATLAS_SEAT_SPARK_ID, Epic};
+use crate::chat_of_record::{self, NewPost, TAIL_MAX_LIMIT, TailFilter};
 use crate::irc_client::{ConnectConfig, IrcClient, IrcError, IrcMessage, MessageCallback};
 use crate::irc_command_parser::{
     self, CommandExecutor, DispatchOutcome, ExecError, ExecFuture, IrcReplyKind, ReviewDecision,
@@ -72,6 +73,9 @@ pub enum LifecycleError {
 
     #[error("database error while listing epics: {0}")]
     Database(#[from] data::sparks::error::SparksError),
+
+    #[error("failed to bootstrap #atlas seat row: {0}")]
+    AtlasSeat(#[source] sqlx::Error),
 }
 
 /// Configuration snapshot extracted from [`WorkshopConfig`] at boot time.
@@ -132,12 +136,33 @@ fn split_host_port(addr: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port))
 }
 
+/// Whether this Atlas instance holds the Director seat (`Claim`) or is
+/// running alongside another live Atlas that already holds it
+/// (`Follower`). Serialised into the `#atlas` boot post so the
+/// chat-of-record captures seat hand-offs over time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtlasSeatRole {
+    Claim,
+    Follower,
+}
+
+impl AtlasSeatRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AtlasSeatRole::Claim => "claim",
+            AtlasSeatRole::Follower => "follower",
+        }
+    }
+}
+
 /// Owner of the per-workshop IRC subsystem. Holds the client, the relay
 /// shutdown handle, and the inbound executor.
 pub struct IrcRuntime {
     client: Arc<IrcClient>,
     stop_tx: Option<oneshot::Sender<()>>,
     relay_join: Option<JoinHandle<()>>,
+    pool: SqlitePool,
+    atlas_instance_id: String,
 }
 
 impl IrcRuntime {
@@ -167,6 +192,14 @@ impl IrcRuntime {
         open_epics: Vec<Epic>,
         executor: Arc<dyn CommandExecutor>,
     ) -> Result<Self, LifecycleError> {
+        // Ensure the #atlas sentinel spark exists before connecting so
+        // the boot post has a valid FK target. Idempotent across
+        // workshop re-opens — this is what keeps the `#atlas` channel
+        // preserved across launches at the DB layer.
+        channel_manager::ensure_atlas_seat_spark(&pool, &config.workshop_id)
+            .await
+            .map_err(LifecycleError::AtlasSeat)?;
+
         let client_slot: Arc<Mutex<Option<Arc<IrcClient>>>> = Arc::new(Mutex::new(None));
         let callback: MessageCallback =
             build_inbound_callback(executor, Arc::clone(&client_slot), config.nick.clone());
@@ -184,11 +217,33 @@ impl IrcRuntime {
         let client = Arc::new(client);
         *client_slot.lock().await = Some(Arc::clone(&client));
 
+        // Join #atlas *before* per-epic channels so the workshop's
+        // Director presence is always first on the wire regardless of
+        // how many epics are open.
+        channel_manager::ensure_atlas_channel(&client)
+            .await
+            .map_err(LifecycleError::Channel)?;
+
         for epic in &open_epics {
             channel_manager::ensure_channel(&client, epic)
                 .await
                 .map_err(LifecycleError::Channel)?;
         }
+
+        // Decide seat role from the durable #atlas history: if a prior
+        // Atlas boot post has no matching seat-released, this instance
+        // is a follower. Best-effort — a DB scan failure falls back to
+        // `Claim` so a transient read error doesn't block boot.
+        let atlas_instance_id = uuid::Uuid::new_v4().to_string();
+        let seat_role = match detect_active_seat_claim(&pool).await {
+            Ok(true) => AtlasSeatRole::Follower,
+            Ok(false) => AtlasSeatRole::Claim,
+            Err(e) => {
+                log::warn!("atlas seat: failed to read #atlas history; defaulting to claim: {e}");
+                AtlasSeatRole::Claim
+            }
+        };
+        post_atlas_online(&pool, &atlas_instance_id, seat_role).await;
 
         let relay_config = RelayConfig {
             workshop_id: config.workshop_id.clone(),
@@ -201,6 +256,8 @@ impl IrcRuntime {
             client,
             stop_tx: Some(stop_tx),
             relay_join: Some(relay_join),
+            pool,
+            atlas_instance_id,
         })
     }
 
@@ -222,6 +279,12 @@ impl IrcRuntime {
     /// send QUIT on the client. Awaits the relay task's join handle so
     /// no mid-drain write is abandoned.
     pub async fn shutdown(mut self) {
+        // Post the seat-released marker to #atlas *before* tearing down
+        // the relay so a future Atlas booting against the same DB sees
+        // a clean hand-off and can claim the seat. Best-effort: DB
+        // errors are logged but do not block shutdown.
+        post_atlas_offline(&self.pool, &self.atlas_instance_id).await;
+
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -235,6 +298,12 @@ impl IrcRuntime {
         if let Err(e) = self.client.disconnect().await {
             log::warn!("irc client disconnect reported error: {e}");
         }
+    }
+
+    /// Identifier assigned to this Atlas instance at boot. Surfaced for
+    /// tests + diagnostics; production callers rarely need it directly.
+    pub fn atlas_instance_id(&self) -> &str {
+        &self.atlas_instance_id
     }
 
     /// Persist a `flare` ember announcing that the IRC server was
@@ -345,6 +414,101 @@ fn spawn_relay_loop(
             }
         }
     })
+}
+
+/// Scan the durable `#atlas` history and return `true` when there is an
+/// outstanding seat claim — i.e. a boot post whose matching
+/// seat-released post has not yet been written.
+///
+/// Walks the channel in chronological order and tracks the set of
+/// instance ids that have posted `online, seat claim` without a later
+/// `offline, seat released`. A non-empty set at the end means some
+/// prior Atlas either still holds the seat or crashed without posting
+/// a release; either way the new Atlas must boot as a follower.
+async fn detect_active_seat_claim(pool: &SqlitePool) -> Result<bool, chat_of_record::ChatError> {
+    // Use the chat_of_record tail primitive so the seat scan stays on
+    // the same indexed path as every other #atlas reader. The
+    // chat-of-record epic caps sane windows at TAIL_MAX_LIMIT; for a
+    // single workshop's boot history that's more than enough headroom.
+    let rows = chat_of_record::tail(
+        pool,
+        TailFilter::for_channel(ATLAS_CHANNEL).with_limit(TAIL_MAX_LIMIT),
+    )
+    .await?;
+
+    let mut outstanding: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in rows {
+        if let Some(id) = parse_atlas_online_instance_id(&row.raw_text) {
+            outstanding.insert(id);
+        } else if let Some(id) = parse_atlas_offline_instance_id(&row.raw_text) {
+            outstanding.remove(&id);
+        }
+    }
+    Ok(!outstanding.is_empty())
+}
+
+/// Extract the instance id from an "atlas <id> online, seat <role>" body.
+/// Returns `None` for any other shape so the scan simply skips over
+/// unrelated traffic (topic changes, free-text posts from the CLI, …).
+fn parse_atlas_online_instance_id(body: &str) -> Option<String> {
+    let rest = body.strip_prefix("atlas ")?;
+    let (id, tail) = rest.split_once(' ')?;
+    if tail.starts_with("online, seat ") {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+/// Counterpart of [`parse_atlas_online_instance_id`] for the
+/// "atlas <id> offline, seat released" shape.
+fn parse_atlas_offline_instance_id(body: &str) -> Option<String> {
+    let rest = body.strip_prefix("atlas ")?;
+    let (id, tail) = rest.split_once(' ')?;
+    if tail == "offline, seat released" {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+/// Insert the "atlas <instance-id> online, seat <role>" post into
+/// `#atlas`. Best-effort: a DB failure is logged and swallowed so a
+/// transient write error does not block the rest of the boot sequence.
+async fn post_atlas_online(pool: &SqlitePool, instance_id: &str, seat: AtlasSeatRole) {
+    let body = format!("atlas {} online, seat {}", instance_id, seat.as_str());
+    if let Err(e) = chat_of_record::post_message(
+        pool,
+        NewPost {
+            channel: ATLAS_CHANNEL.to_string(),
+            body,
+            author_session_id: None,
+            epic_id: Some(ATLAS_SEAT_SPARK_ID.to_string()),
+        },
+    )
+    .await
+    {
+        log::warn!("atlas seat: failed to persist boot post for {instance_id}: {e}");
+    }
+}
+
+/// Counterpart of [`post_atlas_online`] — writes the seat-released
+/// marker on graceful shutdown. Same best-effort contract.
+async fn post_atlas_offline(pool: &SqlitePool, instance_id: &str) {
+    let body = format!("atlas {} offline, seat released", instance_id);
+    if let Err(e) = chat_of_record::post_message(
+        pool,
+        NewPost {
+            channel: ATLAS_CHANNEL.to_string(),
+            body,
+            author_session_id: None,
+            epic_id: Some(ATLAS_SEAT_SPARK_ID.to_string()),
+        },
+    )
+    .await
+    {
+        log::warn!("atlas seat: failed to persist shutdown post for {instance_id}: {e}");
+    }
 }
 
 async fn list_open_epics(
