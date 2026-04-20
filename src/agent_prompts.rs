@@ -1007,6 +1007,72 @@ pub fn compose_merger_prompt(crew_id: &str, merge_spark_id: &str) -> String {
     prompt
 }
 
+/// Compose the initial prompt for a **MergeHand** — the next-generation
+/// integrator role introduced by spark ryve-10c8baee [sp-476ef264] as a
+/// skeleton distinct from the existing [`compose_merger_prompt`].
+///
+/// This composer intentionally returns DIFFERENT text from the Merger
+/// prompt. The existing Merger role and its gradual-rollout semantics
+/// remain untouched; sibling sparks that build on this plumbing will fill
+/// in the real behaviour (branch policy, PR lifecycle, review handoff)
+/// incrementally. For now the prompt is a minimal skeleton that:
+///
+/// 1. Opens with the standard `HOUSE_RULES` EXECUTE directive so the
+///    spawn-time `claude --print` handshake does not stall waiting for
+///    confirmation (the same regression guarded by
+///    `prompts_open_with_execute_directive_not_reading_instruction`).
+/// 2. Names the role as **MergeHand** (not "Merger") so log scans,
+///    operator audits, and snapshot tests can tell the two apart.
+/// 3. Carries the crew id and merge spark id verbatim so the agent can
+///    mark the spark in progress, inspect the crew, and attribute any
+///    commits it makes.
+/// 4. Explicitly states that end-to-end integration behaviour is
+///    deferred to sibling sparks — the MergeHand today is a plumbing
+///    skeleton, not a live integrator. A future spark will replace
+///    this body with the real workflow once the broader role is in
+///    place.
+pub fn compose_merge_hand_prompt(crew_id: &str, merge_spark_id: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(HOUSE_RULES);
+
+    prompt.push_str(&format!(
+        "ASSIGNMENT: spark {merge_spark_id} (role: MERGE_HAND for crew {crew_id}). \
+         Mark it in progress now: `ryve spark status {merge_spark_id} in_progress`.\n\n"
+    ));
+
+    prompt.push_str(&format!(
+        "You are a **MergeHand** for crew `{crew_id}`. MergeHand is a new role, \
+         distinct from the existing Merger: it is the next-generation integrator \
+         that sibling sparks will build out. The existing Merger role and its \
+         gradual-rollout semantics are unchanged — if you were looking for the \
+         Merger contract, this is not it. See `compose_merger_prompt` for that \
+         role; `compose_merge_hand_prompt` is where the next integrator lives.\n\n\
+         SKELETON NOTE: today this role is plumbing only — a hook the spawn path \
+         can dispatch on and a prompt composer callers can discover. The full \
+         integration workflow (branch policy, PR lifecycle, review handoff) is \
+         deferred to sibling sparks that are blocked on this one. Do NOT attempt \
+         to integrate branches, open PRs, or close `{merge_spark_id}` until a \
+         sibling spark has landed the real behaviour and updated this prompt. \
+         If you were spawned against this skeleton by mistake, post a comment on \
+         the merge spark and exit:\n\
+         `ryve comment add {merge_spark_id} 'merge_hand skeleton — no integration \
+         behaviour yet; spawned in error, see spark ryve-10c8baee'`\n\n"
+    ));
+
+    prompt.push_str(
+        "HARD RULES (inherited from the integrator discipline, re-stated so \
+         future edits cannot drop them):\n\
+         - NEVER change the branch checked out in the workshop root. Integration \
+           work, when it lands, happens inside a dedicated worktree — never in \
+           the main checkout.\n\
+         - Never force-push, never `--no-verify`, never bypass git hooks.\n\
+         - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\
+         - Do NOT merge to main automatically — human review is required.\n",
+    );
+
+    prompt
+}
+
 /// Compose the initial prompt for a **Release Manager** Hand — the
 /// archetype whose entire job is steering one Release through its
 /// lifecycle on behalf of Atlas. Spark ryve-e6713ee7 / [sp-2a82fee7].
@@ -2070,6 +2136,77 @@ mod tests {
         assert!(p.contains("-b crew/cr-aaaa"));
         assert!(p.contains("ryve spark close sp-merge1 completed"));
         assert!(p.contains("Do **not** merge to main automatically"));
+    }
+
+    // ─── MergeHand skeleton [sp-476ef264 / ryve-10c8baee] ───────────────
+    //
+    // The MergeHand role is a new integrator role distinct from the
+    // existing Merger. These tests lock in the skeleton contract:
+    //
+    //   - the composer exists and opens with the EXECUTE directive,
+    //   - it carries the crew id and merge spark id,
+    //   - it labels itself as MergeHand (not Merger) so consumers and
+    //     operators can tell the two apart,
+    //   - it returns text DIFFERENT from `compose_merger_prompt` so the
+    //     two roles can pivot independently.
+    //
+    // Acceptance criterion (2) of spark ryve-10c8baee depends on these
+    // being behavioural rather than snapshot-level.
+
+    #[test]
+    fn merge_hand_prompt_opens_with_execute_directive() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        assert!(
+            p.starts_with("EXECUTE"),
+            "merge_hand prompt must lead with EXECUTE directive: {:?}",
+            p.chars().take(80).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn merge_hand_prompt_includes_crew_and_spark_ids() {
+        let p = compose_merge_hand_prompt("cr-bbbb", "sp-merge2");
+        assert!(
+            p.contains("cr-bbbb"),
+            "merge_hand prompt must reference the crew id verbatim"
+        );
+        assert!(
+            p.contains("ASSIGNMENT: spark sp-merge2"),
+            "merge_hand prompt must carry the merge spark id in its assignment header"
+        );
+        assert!(
+            p.contains("ryve spark status sp-merge2 in_progress"),
+            "merge_hand prompt must instruct the agent to mark the spark in progress"
+        );
+    }
+
+    #[test]
+    fn merge_hand_prompt_identifies_as_merge_hand_not_merger() {
+        let p = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        // Role name must appear explicitly so log scans / audits can
+        // distinguish the skeleton from a legitimate Merger session.
+        assert!(
+            p.contains("MergeHand") || p.contains("MERGE_HAND"),
+            "merge_hand prompt must identify itself by name so it is not \
+             confused with the existing Merger role"
+        );
+    }
+
+    /// Acceptance criterion (2) of spark ryve-10c8baee: the MergeHand
+    /// composer must return a prompt DISTINCT from the existing Merger
+    /// composer. Checking strict inequality locks the independence
+    /// contract — if a future edit collapses the two composers into one
+    /// (by mistake or to "dedupe"), this test fails and surfaces the
+    /// regression.
+    #[test]
+    fn merge_hand_prompt_is_distinct_from_merger_prompt() {
+        let merger = compose_merger_prompt("cr-aaaa", "sp-merge1");
+        let merge_hand = compose_merge_hand_prompt("cr-aaaa", "sp-merge1");
+        assert_ne!(
+            merger, merge_hand,
+            "compose_merge_hand_prompt must return text distinct from \
+             compose_merger_prompt so the two roles can pivot independently"
+        );
     }
 
     /// sp-ryve-c0733c9c: Investigator prompt must open with READ-ONLY

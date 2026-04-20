@@ -345,7 +345,7 @@ fn print_usage() {
     eprintln!("  crew status <crew_id> active|merging|completed|abandoned");
     eprintln!();
     eprintln!(
-        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]"
+        "  hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger|merge_hand] [--crew <id>]"
     );
     eprintln!("                                       Spawn a Hand subprocess on a spark");
     eprintln!("  hand list                            List active hand assignments");
@@ -2580,7 +2580,7 @@ async fn handle_hand(
             }
             if args.len() < 2 {
                 die(
-                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]. Try `ryve hand spawn --help`.",
+                    "hand spawn requires <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger|merge_hand] [--crew <id>]. Try `ryve hand spawn --help`.",
                 );
             }
             let spark_id = args[1].clone();
@@ -2621,8 +2621,9 @@ async fn handle_hand(
                                 | "perf_engineer"
                                 | "perf-engineer" => HandKind::PerformanceEngineer,
                                 "merger" => HandKind::Merger,
+                                "merge_hand" | "merge-hand" => HandKind::MergeHand,
                                 other => die(&format!(
-                                    "invalid role '{other}' (owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger)"
+                                    "invalid role '{other}' (owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger|merge_hand)"
                                 )),
                             };
                         }
@@ -2947,7 +2948,7 @@ worktree under `.ryve/worktrees/<short>/` on branch `hand/<short>`. Hands
 are the only layer that edits code.
 
 USAGE:
-  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger] [--crew <id>]
+  ryve hand spawn <spark_id> [--agent <name>] [--role owner|head|investigator|architect|reviewer|release_manager|bug_hunter|performance_engineer|merger|merge_hand] [--crew <id>]
   ryve hand list
   ryve hand --help
   ryve hand spawn --help
@@ -2993,6 +2994,11 @@ ROLES:
   merger            Crew integrator. Collects sibling worktrees, merges them
                     into a single `crew/<id>` branch, and opens one PR.
                     Requires --crew.
+  merge_hand        Next-generation integrator role (skeleton — spark
+                    ryve-10c8baee [sp-476ef264]). Distinct from the existing
+                    Merger; sibling sparks build real behaviour on top of
+                    this plumbing. Requires --crew. The existing Merger role
+                    and its gradual-rollout semantics remain unchanged.
 
 See also:
   ryve head --help                    Head-specific documentation.
@@ -3018,7 +3024,7 @@ OPTIONS:
   --agent <name>           Coding agent to run (claude, codex, aider,
                            opencode, …). Defaults to the first detected
                            agent on your PATH.
-  --role <role>            owner | head | investigator | architect | reviewer | release_manager | bug_hunter | performance_engineer | merger.
+  --role <role>            owner | head | investigator | architect | reviewer | release_manager | bug_hunter | performance_engineer | merger | merge_hand.
                            Default: owner.
                              owner            — standard worker Hand.
                              head             — crew orchestrator (prefer `ryve head spawn`).
@@ -3032,8 +3038,11 @@ OPTIONS:
                              performance_engineer
                                               — Refactorer+Cartographer hybrid; baseline → profile → propose → verify.
                              merger           — crew integrator (requires --crew).
+                             merge_hand       — next-generation integrator skeleton (requires --crew).
+                                                Distinct from `merger`; sibling sparks build
+                                                real behaviour on top (spark ryve-10c8baee).
   --crew <crew_id>         Attach the new Hand to an existing crew as a
-                           member. Required when --role merger.
+                           member. Required when --role merger or --role merge_hand.
   --author-actor <id>      (--role reviewer) Actor of the Hand whose work is
                            under review. The reviewer is selected to be
                            different from this actor.
@@ -3054,7 +3063,7 @@ EFFECTS:
   1. Creates a git worktree at `.ryve/worktrees/<short>/` on branch
      `hand/<short>`.
   2. Persists an `agent_sessions` row (session_label = hand / head /
-     investigator / architect / release_manager / bug_hunter / performance_engineer / merger)
+     investigator / architect / release_manager / bug_hunter / performance_engineer / merger / merge_hand)
      and a `hand_assignments` row claiming the spark.
   3. If --crew is set, inserts a `crew_members` row.
   4. Writes a role-specific initial prompt under `.ryve/prompts/` and
