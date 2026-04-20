@@ -90,10 +90,13 @@ pub fn tool_policy_for(kind: HandKind) -> ToolPolicy {
         // same chmod gate as Investigator/Architect.
         // Spark ryve-b0a369dc / [sp-f6259067].
         HandKind::Reviewer => ToolPolicy::ReadOnly,
-        // Standard worker, Head (orchestrator), Merger (integrator) all
-        // require worktree writes today. Changing these to read-only
-        // would regress existing Crews.
-        HandKind::Owner | HandKind::Head | HandKind::Merger => ToolPolicy::WriteCapable,
+        // Standard worker, Head (orchestrator), Merger (integrator), and
+        // the next-generation MergeHand integrator all require worktree
+        // writes today. Changing these to read-only would regress
+        // existing Crews.
+        HandKind::Owner | HandKind::Head | HandKind::Merger | HandKind::MergeHand => {
+            ToolPolicy::WriteCapable
+        }
     }
 }
 
@@ -111,6 +114,7 @@ pub fn archetype_id_for(kind: HandKind) -> &'static str {
         HandKind::Architect => "architect",
         HandKind::Reviewer => "reviewer",
         HandKind::Merger => "merger",
+        HandKind::MergeHand => "merge_hand",
     }
 }
 
@@ -421,6 +425,18 @@ mod tests {
         assert_eq!(tool_policy_for(HandKind::Merger), ToolPolicy::WriteCapable);
     }
 
+    /// Spark ryve-10c8baee [sp-476ef264]: the MergeHand skeleton must be
+    /// write-capable because it is an integrator role — sibling sparks
+    /// will build branch-integration behaviour on top. Flipping it to
+    /// read-only would block every future implementation.
+    #[test]
+    fn merge_hand_is_write_capable() {
+        assert_eq!(
+            tool_policy_for(HandKind::MergeHand),
+            ToolPolicy::WriteCapable
+        );
+    }
+
     #[test]
     fn release_manager_is_write_capable() {
         // The RM commits to its release branch and writes artifact
@@ -479,6 +495,15 @@ mod tests {
         assert_eq!(archetype_id_for(HandKind::Architect), "architect");
         assert_eq!(archetype_id_for(HandKind::Reviewer), "reviewer");
         assert_eq!(archetype_id_for(HandKind::Merger), "merger");
+        // Skeleton: MergeHand carries its own archetype id so log
+        // attribution and session-row inspection can tell it apart
+        // from the existing Merger. Spark ryve-10c8baee [sp-476ef264].
+        assert_eq!(archetype_id_for(HandKind::MergeHand), "merge_hand");
+        assert_ne!(
+            archetype_id_for(HandKind::MergeHand),
+            archetype_id_for(HandKind::Merger),
+            "MergeHand must not share the Merger's archetype id"
+        );
     }
 
     /// Invariant (spark ryve-b0a369dc / [sp-f6259067]): the Reviewer Hand

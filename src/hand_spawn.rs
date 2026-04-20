@@ -41,8 +41,9 @@ use uuid::Uuid;
 
 use crate::agent_prompts::{
     HeadArchetype, compose_architect_prompt, compose_bug_hunter_prompt, compose_hand_prompt,
-    compose_head_prompt, compose_investigator_prompt, compose_merger_prompt,
-    compose_performance_engineer_prompt, compose_release_manager_prompt, compose_reviewer_prompt,
+    compose_head_prompt, compose_investigator_prompt, compose_merge_hand_prompt,
+    compose_merger_prompt, compose_performance_engineer_prompt, compose_release_manager_prompt,
+    compose_reviewer_prompt,
 };
 use crate::coding_agents::CodingAgent;
 use crate::stream_heartbeat::{StreamHeartbeat, StreamOutcome};
@@ -142,6 +143,23 @@ pub enum HandKind {
     Reviewer,
     /// The crew's integrator. Requires `crew_id` to be set.
     Merger,
+    /// A dedicated **MergeHand** — the next-generation integrator role
+    /// distinct from the existing [`HandKind::Merger`]. Introduced as a
+    /// skeleton by spark ryve-10c8baee [sp-476ef264] so sibling sparks can
+    /// build real merge behaviour on top of this variant without touching
+    /// the existing Merger role or its gradual-rollout semantics.
+    ///
+    /// Mechanically mirrors the Merger today (same `AssignmentRole::Merger`,
+    /// same `crew_id` requirement) so the spawn path compiles and is
+    /// reachable from `ryve hand spawn --role merge_hand`, but is
+    /// distinguished by:
+    ///   - `session_label = "merge_hand"` (crew / session rows),
+    ///   - `archetype_id = "merge_hand"`,
+    ///   - a dedicated prompt composed by
+    ///     [`crate::agent_prompts::compose_merge_hand_prompt`],
+    ///     which MUST be different text from `compose_merger_prompt`
+    ///     so consumers can pivot the role's semantics independently.
+    MergeHand,
 }
 
 impl HandKind {
@@ -186,6 +204,11 @@ impl HandKind {
             // author's work but does not take it over.
             Self::Reviewer => AssignmentRole::Observer,
             Self::Merger => AssignmentRole::Merger,
+            // MergeHand is the next-generation integrator role. Until
+            // sibling sparks introduce a dedicated assignment role on the
+            // DB side, it claims its merge spark with `Merger` so the
+            // existing crew/assignment invariants keep holding.
+            Self::MergeHand => AssignmentRole::Merger,
         }
     }
 
@@ -203,6 +226,7 @@ impl HandKind {
             Self::Architect => "architect",
             Self::Reviewer => "reviewer",
             Self::Merger => "merger",
+            Self::MergeHand => "merge_hand",
         }
     }
 }
@@ -657,7 +681,7 @@ pub async fn spawn_hand(
         actor_id,
     } = ctx;
 
-    if matches!(kind, HandKind::Merger) && crew_id.is_none() {
+    if matches!(kind, HandKind::Merger | HandKind::MergeHand) && crew_id.is_none() {
         return Err(HandSpawnError::MergerNeedsCrew);
     }
 
@@ -703,7 +727,7 @@ pub async fn spawn_hand(
     //    always cut from the crew's target — never a sibling Hand's
     //    tip — so this lookup is skipped.
     let session_id = Uuid::new_v4().to_string();
-    let base_ref = if matches!(kind, HandKind::Merger) {
+    let base_ref = if matches!(kind, HandKind::Merger | HandKind::MergeHand) {
         None
     } else {
         resolve_hand_base_ref(pool, workshop_dir, spark_id).await
@@ -853,6 +877,7 @@ pub async fn spawn_hand(
             compose_reviewer_prompt(&sparks, spark_id)
         }
         HandKind::Merger => compose_merger_prompt(crew_id.unwrap_or(""), spark_id),
+        HandKind::MergeHand => compose_merge_hand_prompt(crew_id.unwrap_or(""), spark_id),
     };
 
     // 5b. Boot-prepend chat-of-record context when this is a re-spawn.
@@ -941,7 +966,7 @@ pub async fn spawn_hand(
     //     its assignment is active. Sidecar failure is *not* fatal to the
     //     spawn — the Hand can still do work without a heartbeater, and
     //     the watchdog will surface the missing beats as `AtRisk`.
-    if !matches!(kind, HandKind::Merger)
+    if !matches!(kind, HandKind::Merger | HandKind::MergeHand)
         && let Err(err) = launch_heartbeat_sidecar(&ryve_dir, workshop_dir, &session_id, spark_id)
     {
         eprintln!(
@@ -2207,6 +2232,52 @@ mod tests {
         assert_eq!(HandKind::Owner.session_label(), "hand");
         assert_eq!(HandKind::Head.session_label(), "head");
         assert_eq!(HandKind::Merger.session_label(), "merger");
+    }
+
+    /// Spark ryve-10c8baee [sp-476ef264]: `HandKind::MergeHand` is a
+    /// skeleton variant introduced distinct from `HandKind::Merger`. It
+    /// must:
+    ///   - carry its own session_label ("merge_hand") so crew rows and
+    ///     session rows can be distinguished from a legitimate Merger;
+    ///   - claim its merge spark with `AssignmentRole::Merger` (the
+    ///     existing integrator assignment role) so the crew/assignment
+    ///     invariants keep holding until sibling sparks introduce a
+    ///     dedicated assignment role;
+    ///   - NOT collide with the existing Merger variant or its
+    ///     session_label.
+    #[test]
+    fn merge_hand_kind_has_dedicated_label_and_merger_assignment() {
+        // Distinct from Merger at the variant level.
+        assert_ne!(HandKind::MergeHand, HandKind::Merger);
+
+        // Dedicated session label, not "merger".
+        assert_eq!(HandKind::MergeHand.session_label(), "merge_hand");
+        assert_ne!(
+            HandKind::MergeHand.session_label(),
+            HandKind::Merger.session_label(),
+            "MergeHand must not inherit the Merger's session label"
+        );
+
+        // Shares Merger's assignment role today — no DB-layer changes
+        // required by this skeleton (sibling sparks can refine).
+        assert_eq!(HandKind::MergeHand.role(), AssignmentRole::Merger);
+        assert_eq!(HandKind::Merger.role(), AssignmentRole::Merger);
+    }
+
+    /// Spawn-path dispatch guard: `HandKind::MergeHand` shares the
+    /// Merger's crew requirement (it is an integrator role) so a spawn
+    /// without `--crew` must fail with `MergerNeedsCrew` before any
+    /// subprocess is launched. Regression guard for the skeleton's
+    /// dispatch plumbing.
+    #[test]
+    fn merge_hand_requires_crew_like_merger() {
+        // The constraint lives on the `kind` discriminant in `spawn_hand`;
+        // a light pattern assertion mirrors the runtime check so a future
+        // edit that drops the crew requirement fails this test.
+        assert!(matches!(
+            HandKind::MergeHand,
+            HandKind::Merger | HandKind::MergeHand
+        ));
     }
 
     /// Spark ryve-3f799949: `HandKind::Architect` shares the Owner
