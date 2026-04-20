@@ -309,6 +309,39 @@ pub fn rfc3339_now() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// Count chat-of-record posts authored by `session_id` that target
+/// `spark_id` since `since` (inclusive). Used by the `ryve assign close`
+/// mandatory-post gate to enforce the "on handoff" posting boundary
+/// defined on epic ryve-12f09190.
+///
+/// "Target" is mapped to `irc_messages.epic_id`: the column is a generic
+/// spark FK (see migration 019), not epic-only. Posts tagged with the
+/// closing Hand's spark id are what the gate counts — IRC wire delivery
+/// is irrelevant because the durable DB row is the contract.
+///
+/// `since` is an RFC-3339 timestamp, typically the assignment's
+/// `assigned_at`. Rows with `created_at >= since` are counted so a post
+/// made in the same instant as the claim still satisfies the gate —
+/// the acceptance criteria wants "since the claim timestamp", which we
+/// read as "at or after", not "strictly after".
+pub async fn count_posts_since_claim(
+    pool: &SqlitePool,
+    session_id: &str,
+    spark_id: &str,
+    since: &str,
+) -> Result<i64, ChatError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM irc_messages \
+         WHERE sender_actor_id = ? AND epic_id = ? AND created_at >= ?",
+    )
+    .bind(session_id)
+    .bind(spark_id)
+    .bind(since)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
