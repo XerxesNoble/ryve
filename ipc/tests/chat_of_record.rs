@@ -391,6 +391,60 @@ async fn count_posts_since_claim_boundary_is_inclusive(pool: SqlitePool) {
     assert_eq!(n, 1);
 }
 
+/// PR #54 Copilot c3 regression: when a Hand on a non-epic spark
+/// (a task under a parent epic) posts to the parent epic's channel,
+/// `count_posts_since_claim(session, task_spark_id, ...)` must count
+/// that post via the parent_child bond fallback. Without the
+/// fallback, the gate would always count 0 for non-epic assignments
+/// and refuse every close.
+#[sqlx::test(migrations = "../data/migrations")]
+async fn count_posts_since_claim_falls_back_to_parent_epic_via_bond(pool: SqlitePool) {
+    // Seed: epic + child task spark + parent_child bond.
+    seed_epic(&pool, "sp-parent-epic").await;
+    sqlx::query(
+        "INSERT INTO sparks \
+         (id, title, description, status, priority, spark_type, workshop_id, created_at, updated_at) \
+         VALUES ('sp-child-task', 'child task', '', 'in_progress', 1, 'task', 'ws-chat', \
+                 '2026-04-20T00:00:00Z', '2026-04-20T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO bonds (from_id, to_id, bond_type) \
+         VALUES ('sp-parent-epic', 'sp-child-task', 'parent_child')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_session(&pool, "sess-task-hand").await;
+
+    let claim_ts = "2026-04-20T01:00:00Z";
+
+    // The Hand posts to the EPIC channel (epic_id = "sp-parent-epic"),
+    // because that's where chat-of-record discipline lands chatter for
+    // children of an epic. The post happens after the claim ts.
+    insert_irc_row(
+        &pool,
+        "sp-parent-epic",
+        Some("sess-task-hand"),
+        "2026-04-20T01:05:00Z",
+        "claim: starting the task",
+    )
+    .await;
+
+    // Counting posts for the CHILD spark must surface the post via the
+    // parent_child bond, not return zero just because epic_id !=
+    // child task id.
+    let n = count_posts_since_claim(&pool, "sess-task-hand", "sp-child-task", claim_ts)
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 1,
+        "post to parent epic's channel must count for the child task's gate"
+    );
+}
+
 #[sqlx::test(migrations = "../data/migrations")]
 async fn tail_empty_channel_returns_empty(pool: SqlitePool) {
     // Query a channel with no rows — valid channel shape, no epic

@@ -236,10 +236,11 @@ These hold for **every** Head, regardless of archetype:
   `#atlas` channel (boot / route / design-pick / block / handoff).
   Posts go through `ryve post --channel <name> <body>`; prior context
   is read back with `ryve channel tail --channel <name>
-  [--since <rfc3339>] [--limit <N>] [--author <actor>]`. The on-close
-  path is **tool-gated**, not prompt-only: `ryve spark close` /
-  `ryve assign close` refuse an assignment with zero chat-of-record
-  posts since claim (epic `ryve-12f09190`). The canonical prompt
+  [--since <rfc3339>] [--limit <N>] [--author <session_id>]`. The
+  on-close path is **tool-gated**, not prompt-only: `ryve assign
+  close` refuses an assignment with zero chat-of-record posts since
+  claim (epic `ryve-12f09190`). `ryve spark close` itself is not
+  gated today. The canonical prompt
   blocks live in `CHAT_OF_RECORD` and `ATLAS_CHAT_OF_RECORD` in
   `src/agent_prompts.rs`; see `RYVE.md` § Chat-of-record for the
   house-rules summary and example invocations.

@@ -1524,11 +1524,12 @@ IRC channel via `ryve post`. The workshop keeps a row per post in \
 `irc_messages`; sudden-death recovery, cross-agent context, and the \
 Merger's read-back of WHY each sibling chose its approach all hinge on \
 these posts. Silence here = future archaeology by the next agent. \
-Enforcement is TOOL-GATED, not prompt-only: the `ryve spark close` \
-path (and the assignment-close gate it shares with `ryve assign`) \
-refuse to close an assignment with zero chat-of-record posts since \
-its claim timestamp (epic ryve-12f09190). If the tool bounces \
-your close, fix it by posting — not by arguing with this prompt.\n\n\
+Enforcement is TOOL-GATED, not prompt-only: `ryve assign close` \
+refuses to close an assignment with zero chat-of-record posts since \
+its claim timestamp (epic ryve-12f09190). `ryve spark close` itself \
+is not gated today — the discipline fires on the assignment-close \
+path. If the tool bounces your close, fix it by posting, not by \
+arguing with this prompt. (PR #54 Copilot c5.)\n\n\
 CHANNEL. Post to the parent epic's channel: `#epic-<epic_id>-<slug>` \
 (canonical form from `ipc::channel_manager::channel_name`; 50-octet IRC \
 limit applies). If you only have a child spark id, run `ryve spark show \

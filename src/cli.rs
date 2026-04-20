@@ -332,7 +332,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("  post --channel <name> <body>        Post to a channel (chat-of-record)");
     eprintln!(
-        "  channel tail --channel <name> [--since <iso-ts>] [--limit <N>] [--author <actor_id>]"
+        "  channel tail --channel <name> [--since <iso-ts>] [--limit <N>] [--author <session_id>]"
     );
     eprintln!("                                       Read recent channel posts");
     eprintln!();
@@ -648,8 +648,15 @@ async fn handle_status(pool: &sqlx::SqlitePool, ws_id: &str) {
 //
 // Authorship defaults to `RYVE_HAND_SESSION_ID` when set so Hands spawned
 // by Ryve are automatically attributed without each caller having to
-// remember the flag. Pass `--author <actor_id>` to override or `--author
+// remember the flag. Pass `--author <session_id>` to override or `--author
 // ""` for an intentionally anonymous human post.
+//
+// PR #54 Copilot c4: the `--author` value is a Ryve agent_sessions.id
+// (FK target of irc_messages.sender_actor_id). Despite the column name,
+// the field stores a session id (the actor namespace used elsewhere in
+// Ryve — git actor, etc. — is a different concept). User-facing copy
+// uses `<session_id>` to avoid the collision; the column name stays
+// for now to avoid a multi-call-site rename.
 
 async fn handle_post(pool: &sqlx::SqlitePool, args: &[String], json_mode: bool) {
     let mut channel: Option<String> = None;

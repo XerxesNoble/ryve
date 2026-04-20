@@ -136,9 +136,12 @@ pub struct TailFilter {
     /// RFC-3339 timestamp cutoff. Returns rows with `created_at > since`.
     /// `None` returns the first page from the channel's start.
     pub since: Option<String>,
-    /// Maximum rows to return. Clamped to [`TAIL_MAX_LIMIT`] at the call
-    /// site — [`tail`] rejects out-of-range values so the caller can
-    /// surface the misuse rather than silently truncating.
+    /// Maximum rows to return. [`tail`] rejects out-of-range values
+    /// (anything outside `1..=TAIL_MAX_LIMIT`) with
+    /// [`ChatError::InvalidLimit`] so the caller can surface the
+    /// misuse rather than silently truncating. PR #54 Copilot c2:
+    /// earlier wording said "clamped" which contradicted the actual
+    /// reject-on-invalid behaviour.
     pub limit: i64,
     /// Optional author filter. Matches `irc_messages.sender_actor_id`
     /// exactly. `None` returns every author's posts.
@@ -315,9 +318,20 @@ pub fn rfc3339_now() -> String {
 /// defined on epic ryve-12f09190.
 ///
 /// "Target" is mapped to `irc_messages.epic_id`: the column is a generic
-/// spark FK (see migration 019), not epic-only. Posts tagged with the
-/// closing Hand's spark id are what the gate counts — IRC wire delivery
-/// is irrelevant because the durable DB row is the contract.
+/// spark FK (see migration 019), not epic-only. The gate counts posts
+/// tagged with EITHER the closing Hand's own spark id OR its parent
+/// epic id — IRC wire delivery is irrelevant because the durable DB
+/// row is the contract.
+///
+/// PR #54 Copilot c3 — parent-epic fallback:
+/// `ryve post --channel '#epic-<id>'` resolves `irc_messages.epic_id`
+/// from the channel name, so a Hand working on a child task posts
+/// with `epic_id = <parent epic id>`. If the gate only matched
+/// `epic_id == spark_id`, every Hand on a non-epic spark would fail
+/// the gate even after posting correctly. Counting `epic_id IN
+/// (spark_id, parent_epic_of(spark_id))` matches both: posts that
+/// reference the spark directly AND posts to the parent epic's
+/// channel (the canonical channel for in-flight Hand chatter).
 ///
 /// `since` is an RFC-3339 timestamp, typically the assignment's
 /// `assigned_at`. Rows with `created_at >= since` are counted so a post
@@ -332,9 +346,17 @@ pub async fn count_posts_since_claim(
 ) -> Result<i64, ChatError> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM irc_messages \
-         WHERE sender_actor_id = ? AND epic_id = ? AND created_at >= ?",
+         WHERE sender_actor_id = ? \
+           AND epic_id IN ( \
+             ?, \
+             (SELECT from_id FROM bonds \
+              WHERE to_id = ? AND bond_type = 'parent_child' \
+              LIMIT 1) \
+           ) \
+           AND created_at >= ?",
     )
     .bind(session_id)
+    .bind(spark_id)
     .bind(spark_id)
     .bind(since)
     .fetch_one(pool)

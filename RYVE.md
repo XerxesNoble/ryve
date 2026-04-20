@@ -135,7 +135,7 @@ ryve ember sweep                        # clean up expired
 ### Chat-of-record (post + channel tail)
 ```sh
 ryve post --channel <name> <body>                                      # write one chat-of-record line
-ryve channel tail --channel <name> [--since <ts>] [--limit <N>] [--author <actor_id>]
+ryve channel tail --channel <name> [--since <ts>] [--limit <N>] [--author <session_id>]
 ```
 
 The full contract — mandatory posting boundaries, channel naming, tool-gated on-close enforcement — lives in the **Chat-of-record** section below. Epic `ryve-12f09190`.
@@ -211,17 +211,17 @@ Every agent in a Ryve workshop writes its intent, plans, design picks, blocks, a
 | design-pick | when selecting an approach, library, boundary, or scope split   | `design: chose <A> over <B> because <reason> [sp-xxxx]`               |
 | block       | when stuck on an obstacle, ambiguity, or bond-discipline clash   | `block: tests red on <file>; escalating as <question> [sp-xxxx]`      |
 | commit      | after each non-trivial commit                                    | `commit: wired <feature> into <module> [sp-xxxx]`                     |
-| handoff     | before `ryve spark close` / `ryve assign release`                | `handoff: shipped X/Y; next agent should do Z [sp-xxxx]`              |
+| handoff     | before `ryve assign close`                                       | `handoff: shipped X/Y; next agent should do Z [sp-xxxx]`              |
 
 Atlas replaces `claim`/`commit` with `boot`/`route` since Atlas never claims sparks or commits code itself.
 
-**On-close enforcement is tool-gated.** `ryve spark close` and `ryve assign close` refuse to close an assignment with zero chat-of-record posts since its claim timestamp. This is not prompt-only rhetoric — the tool bounces the close if the record is empty. Fix it by posting, not by arguing with the prompt.
+**On-close enforcement is tool-gated.** `ryve assign close` refuses to close an assignment with zero chat-of-record posts since its claim timestamp. This is not prompt-only rhetoric — the tool bounces the close if the record is empty. Fix it by posting, not by arguing with the prompt. (`ryve spark close` itself is not gated today; the gate fires on the assignment-close path. PR #54 Copilot c5 + c7.)
 
 ### Writing: `ryve post`
 
 ```sh
 ryve post --channel <name> <body>                            # returns the message id
-ryve post --channel <name> --author <actor_id> <body>         # override the default author
+ryve post --channel <name> --author <session_id> <body>         # override the default author
 ryve post --channel <name> --author "" <body>                 # anonymous (human CLI use)
 ```
 
@@ -243,7 +243,7 @@ ryve post --channel '#atlas' \
 ryve channel tail --channel <name>                            # default limit=50, from channel start
 ryve channel tail --channel <name> --since <rfc3339-ts>       # incremental read
 ryve channel tail --channel <name> --limit <N>                # up to 1000
-ryve channel tail --channel <name> --author <actor_id>        # filter by author
+ryve channel tail --channel <name> --author <session_id>        # filter by author
 ```
 
 Add `--json` for machine-readable output (e.g. `ryve --json channel tail --channel <name>`).
