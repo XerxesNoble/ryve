@@ -20,6 +20,7 @@ use crate::panel_state::background_picker::PickerState;
 use crate::panel_state::bench::{BenchState, TabKind};
 use crate::panel_state::file_explorer::FileExplorerState;
 use crate::panel_state::file_viewer::FileViewerState;
+use crate::panel_state::irc_view::IrcViewState;
 use crate::panel_state::log_tail::LogTailState;
 use crate::process_snapshot::ProcessSnapshot;
 use crate::style::{Appearance, Palette};
@@ -236,6 +237,10 @@ pub struct Workshop {
     /// Open spy views (read-only log tails for background Hands), keyed by
     /// tab ID. Spark ryve-8c14734a.
     pub log_tails: HashMap<u64, LogTailState>,
+    /// Open IRC projection views, keyed by tab ID. Spark ryve-5466c372 —
+    /// each entry owns the per-tab filter form, loaded messages, preset
+    /// sidebar state, and scroll cursor so the view renderer stays pure.
+    pub irc_views: HashMap<u64, IrcViewState>,
     /// File explorer state for this workshop.
     pub file_explorer: FileExplorerState,
     /// Workgraph database for this workshop.
@@ -458,6 +463,7 @@ impl Workshop {
             agent_sessions: Vec::new(),
             file_viewers: HashMap::new(),
             log_tails: HashMap::new(),
+            irc_views: HashMap::new(),
             file_explorer: FileExplorerState::new(),
             sparks_db: None,
             sparks: Vec::new(),
@@ -1039,6 +1045,11 @@ impl Workshop {
                     // data on demand; persisting it would just create a
                     // duplicate when the user reopens it manually.
                     TabKind::Home => return None,
+                    // IRC projection views rebuild from live DB state on
+                    // open. Persisting the per-tab filter form would
+                    // snapshot transient UI state onto disk, so skip it.
+                    // Spark ryve-5466c372.
+                    TabKind::IrcView { .. } => return None,
                 };
                 Some(data::sparks::open_tab_repo::PersistedTab {
                     workshop_id: workshop_id.clone(),
@@ -1123,6 +1134,73 @@ impl Workshop {
         self.bench
             .create_tab(tab_id, "Home".to_string(), TabKind::Home);
         tab_id
+    }
+
+    /// Open (or focus) an IRC projection view for `channel`. Idempotent
+    /// per channel: if a tab already exists for the same channel, it is
+    /// activated instead of creating a duplicate. Returns the tab id on
+    /// success and `None` when no channel could be inferred (e.g. the
+    /// caller asked for "first known channel" on a workshop with no
+    /// epics yet). Spark ryve-5466c372.
+    pub fn open_irc_view_tab(
+        &mut self,
+        channel: String,
+        current_actor_id: Option<String>,
+        next_terminal_id: &mut u64,
+    ) -> u64 {
+        if let Some(existing) = self
+            .bench
+            .tabs
+            .iter()
+            .find(|t| matches!(&t.kind, TabKind::IrcView { channel: c } if c == &channel))
+            .map(|t| t.id)
+        {
+            self.bench.active_tab = Some(existing);
+            return existing;
+        }
+
+        let tab_id = *next_terminal_id;
+        *next_terminal_id += 1;
+        let title = format!("IRC {channel}");
+        self.bench.create_tab(
+            tab_id,
+            title,
+            TabKind::IrcView {
+                channel: channel.clone(),
+            },
+        );
+        self.irc_views.insert(
+            tab_id,
+            IrcViewState::new(tab_id, self.workshop_id(), channel, current_actor_id),
+        );
+        tab_id
+    }
+
+    /// Pick the channel name for the default "Open IRC View" action —
+    /// the channel of the first open epic (in the order
+    /// [`Workshop::sparks`] reports them). Returns `None` when no open
+    /// epic exists so the caller can surface a toast instead of opening
+    /// an empty tab. Spark ryve-5466c372.
+    pub fn default_irc_view_channel(&self) -> Option<String> {
+        let epic = self.sparks.iter().find(|s| s.spark_type == "epic")?;
+        Some(ipc::channel_manager::channel_name(
+            &ipc::channel_manager::EpicRef {
+                id: epic.id.clone(),
+                name: epic.title.clone(),
+            },
+        ))
+    }
+
+    /// Effective actor id for mention-override filtering in IRC view.
+    /// Falls back to the configured IRC nick when no session actor is
+    /// available yet. Spark ryve-5466c372.
+    pub fn irc_view_actor_id(&self) -> Option<String> {
+        let nick = self.config.effective_irc_nick();
+        if nick.trim().is_empty() {
+            None
+        } else {
+            Some(nick)
+        }
     }
 
     /// Open a file viewer tab, or switch to it if already open.

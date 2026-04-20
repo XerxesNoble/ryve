@@ -35,6 +35,10 @@ pub mod intent_list_editor {
     pub use crate::screen::intent_list_editor::IntentListDrafts;
 }
 
+pub mod irc_view {
+    pub use crate::screen::irc_view::IrcViewState;
+}
+
 pub mod log_tail {
     pub use crate::screen::log_tail::LogTailState;
 }
