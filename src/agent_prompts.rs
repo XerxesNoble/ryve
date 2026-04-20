@@ -1158,7 +1158,7 @@ pub fn compose_merge_hand_prompt(crew_id: &str, merge_spark_id: &str) -> String 
            CI must run on the integrated Epic branch.\n\
          - NEVER change the branch checked out in the workshop root. \
            Integration happens inside a dedicated merge worktree.\n\
-         - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\n"
+         - Reference the merge spark id in every commit message: `[sp-xxxx]`.\n\n",
     );
 
     prompt.push_str(&format!(
@@ -1274,7 +1274,7 @@ pub fn compose_merge_hand_prompt(crew_id: &str, merge_spark_id: &str) -> String 
            originating Assignment via `Approved → Rejected` \
            (reason=`conflict`). You NEVER resolve a sub-PR conflict \
            in-place — that ownership belongs to the Hand that wrote the \
-           sub-PR.\n"
+           sub-PR.\n",
     );
 
     prompt
@@ -2724,10 +2724,7 @@ mod tests {
         );
 
         // The HARD RULES block carries all of the above.
-        assert!(
-            p.contains("HARD RULES"),
-            "HARD RULES block must be present"
-        );
+        assert!(p.contains("HARD RULES"), "HARD RULES block must be present");
     }
 
     /// sp-ryve-c0733c9c: Investigator prompt must open with READ-ONLY
